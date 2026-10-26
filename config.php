@@ -8,10 +8,10 @@
 return [
     'app_name' => 'Venter App API',
     'app_env' => 'production', // local or production
-    'app_url' => 'http://127.0.0.1:8000',
+    'app_url' => 'https://knowlipop.shop',
 
     'db' => [
-        'host' => '127.0.0.1',
+        'host' => 'localhost',
         'port' => '3306',
         'name' => 'venter_app',
         'user' => 'root',

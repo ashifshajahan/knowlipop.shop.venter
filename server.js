@@ -16,7 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Database Connection Pool
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || '127.0.0.1',
+  host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '3306', 10),
   user: process.env.DB_USERNAME || 'root',
   password: process.env.DB_PASSWORD || '',
@@ -573,5 +573,5 @@ app.get('/admin', async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Venter App Server running on http://127.0.0.1:${PORT}`);
+  console.log(`Venter App Server running on port ${PORT} (https://knowlipop.shop)`);
 });

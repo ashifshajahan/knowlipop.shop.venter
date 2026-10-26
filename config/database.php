@@ -31,7 +31,7 @@ function getDatabaseConfig(): array
     }
 
     return [
-        'host' => $env['DB_HOST'] ?? getenv('DB_HOST') ?: '127.0.0.1',
+        'host' => $env['DB_HOST'] ?? getenv('DB_HOST') ?: 'localhost',
         'port' => $env['DB_PORT'] ?? getenv('DB_PORT') ?: '3306',
         'name' => $env['DB_DATABASE'] ?? getenv('DB_DATABASE') ?: 'venter_app',
         'user' => $env['DB_USERNAME'] ?? getenv('DB_USERNAME') ?: 'root',
