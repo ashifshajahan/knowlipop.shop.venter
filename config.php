@@ -29,7 +29,7 @@ return [
         'port' => $env['DB_PORT'] ?? '3306',
         'name' => $env['DB_DATABASE'] ?? 'u999617803_knolipop',
         'user' => $env['DB_USERNAME'] ?? 'u999617803_xtragclub',
-        'pass' => $env['DB_PASSWORD'] ?? '',
+        'pass' => $env['DB_PASSWORD'] ?? 'Xtragclub_venter2026',
     ],
 
     // CORS allowed origins (comma-separated or '*' for public API)

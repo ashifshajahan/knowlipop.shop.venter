@@ -7,7 +7,7 @@ async function seedAdmin() {
   const host = process.env.DB_HOST || '127.0.0.1';
   const port = parseInt(process.env.DB_PORT || '3306', 10);
   const user = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_xtragclub';
-  const password = process.env.DB_PASSWORD || '';
+  const password = process.env.DB_PASSWORD || 'Xtragclub_venter2026';
   const database = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knolipop';
 
   const adminEmail = process.env.ADMIN_EMAIL || 'admin@vendor.app';

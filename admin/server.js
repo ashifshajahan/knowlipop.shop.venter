@@ -34,7 +34,7 @@ if (dbHost === 'localhost') {
 
 const dbUser = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_xtragclub';
 const dbName = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knolipop';
-const dbPass = process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : '';
+const dbPass = process.env.DB_PASSWORD ? process.env.DB_PASSWORD : 'Xtragclub_venter2026';
 
 const app = express();
 const PORT = process.env.PORT || 8000;
