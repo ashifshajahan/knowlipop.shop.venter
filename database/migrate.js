@@ -7,9 +7,9 @@ require('dotenv').config({ path: path.join(__dirname, '../.env') });
 async function runMigration() {
   const host = process.env.DB_HOST || '127.0.0.1';
   const port = parseInt(process.env.DB_PORT || '3306', 10);
-  const user = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_xtragclub';
-  const password = process.env.DB_PASSWORD || 'Xtragclub_venter2026';
-  const database = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knolipop';
+  const user = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_knowlipop1';
+  const password = process.env.DB_PASSWORD || 'Xtragclub_vendor2026';
+  const database = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knowlipop1';
 
   console.log(`[Vendor DB] Connecting to MySQL server:`);
   console.log(`  Host:     ${host}:${port}`);

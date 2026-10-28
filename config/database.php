@@ -33,9 +33,9 @@ function getDatabaseConfig(): array
     return [
         'host' => $env['DB_HOST'] ?? getenv('DB_HOST') ?: '127.0.0.1',
         'port' => $env['DB_PORT'] ?? getenv('DB_PORT') ?: '3306',
-        'name' => $env['DB_DATABASE'] ?? getenv('DB_DATABASE') ?: 'u999617803_knolipop',
-        'user' => $env['DB_USERNAME'] ?? getenv('DB_USERNAME') ?: 'u999617803_xtragclub',
-        'pass' => $env['DB_PASSWORD'] ?? getenv('DB_PASSWORD') ?: 'Xtragclub_venter2026',
+        'name' => $env['DB_DATABASE'] ?? getenv('DB_DATABASE') ?: 'u999617803_knowlipop1',
+        'user' => $env['DB_USERNAME'] ?? getenv('DB_USERNAME') ?: 'u999617803_knowlipop1',
+        'pass' => $env['DB_PASSWORD'] ?? getenv('DB_PASSWORD') ?: 'Xtragclub_vendor2026',
     ];
 }
 

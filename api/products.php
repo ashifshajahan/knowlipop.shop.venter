@@ -113,6 +113,7 @@ function apiCreateProduct(PDO $pdo): void
     $product['seller_id'] = (int) $product['seller_id'];
     $product['price'] = (string) number_format((float) $product['price'], 2, '.', '');
     $product['stock'] = (int) $product['stock'];
+    
     $product['is_active'] = (bool) $product['is_active'];
 
     jsonResponse(['message' => 'Product created.', 'product' => $product], 201);

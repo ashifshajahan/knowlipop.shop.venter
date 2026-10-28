@@ -27,9 +27,9 @@ return [
     'db' => [
         'host' => $env['DB_HOST'] ?? '127.0.0.1',
         'port' => $env['DB_PORT'] ?? '3306',
-        'name' => $env['DB_DATABASE'] ?? 'u999617803_knolipop',
-        'user' => $env['DB_USERNAME'] ?? 'u999617803_xtragclub',
-        'pass' => $env['DB_PASSWORD'] ?? 'Xtragclub_venter2026',
+        'name' => $env['DB_DATABASE'] ?? 'u999617803_knowlipop1',
+        'user' => $env['DB_USERNAME'] ?? 'u999617803_knowlipop1',
+        'pass' => $env['DB_PASSWORD'] ?? 'Xtragclub_vendor2026',
     ],
 
     // CORS allowed origins (comma-separated or '*' for public API)

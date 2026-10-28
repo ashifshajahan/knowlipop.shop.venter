@@ -32,9 +32,43 @@ if (dbHost === 'localhost' || dbHost === 'knowlipop.shop' || dbHost === 'https:/
   dbHost = '127.0.0.1';
 }
 
-const dbUser = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_xtragclub';
-const dbName = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knolipop';
-const dbPass = process.env.DB_PASSWORD ? process.env.DB_PASSWORD : 'Xtragclub_venter2026';
+const candidateConfigs = [
+  // 1. .env explicit values if present
+  {
+    database: process.env.DB_DATABASE,
+    user: process.env.DB_USERNAME,
+    password: process.env.DB_PASSWORD
+  },
+  // 2. knowlipop1 (User's newly created database in .env.example)
+  {
+    database: 'u999617803_knowlipop1',
+    user: 'u999617803_knowlipop1',
+    password: 'Xtragclub_vendor2026'
+  },
+  // 3. knowlipop2 (User's .env database)
+  {
+    database: 'u999617803_knowlipop2',
+    user: 'u999617803_knowlipop2',
+    password: 'Xtragclub_vendor2026'
+  },
+  // 4. Previous database knolipop
+  {
+    database: 'u999617803_knolipop',
+    user: 'u999617803_xtragclub',
+    password: 'Xtragclub_vendor2026'
+  },
+  {
+    database: 'u999617803_knolipop',
+    user: 'u999617803_xtragclub',
+    password: 'Xtragclub_venter2026'
+  }
+].filter(c => c.database && c.user && c.password);
+
+let activeConfig = candidateConfigs[0] || {
+  database: 'u999617803_knowlipop1',
+  user: 'u999617803_knowlipop1',
+  password: 'Xtragclub_vendor2026'
+};
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -51,16 +85,71 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Database Connection Pool
-const pool = mysql.createPool({
+let pool = mysql.createPool({
   host: dbHost,
   port: parseInt(process.env.DB_PORT || '3306', 10),
-  user: dbUser,
-  password: dbPass,
-  database: dbName,
+  user: activeConfig.user,
+  password: activeConfig.password,
+  database: activeConfig.database,
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  multipleStatements: true
 });
+
+async function autoMigrateIfEmpty(p) {
+  try {
+    const [tables] = await p.query('SHOW TABLES');
+    if (tables.length === 0) {
+      console.log('[Vendor DB] Empty database detected, running auto-migration from schema.sql...');
+      const schemaPath = path.join(__dirname, 'database', 'schema.sql');
+      if (fs.existsSync(schemaPath)) {
+        const sql = fs.readFileSync(schemaPath, 'utf8');
+        await p.query(sql);
+        console.log('✅ [Vendor DB] Schema imported and admin user verified (admin@vendor.app / Admin123!)');
+      }
+    }
+  } catch (err) {
+    console.error('[Vendor DB] Auto-migration check:', err.message);
+  }
+}
+
+// Probe database candidates on startup
+(async function probeDatabase() {
+  for (const c of candidateConfigs) {
+    try {
+      const conn = await mysql.createConnection({
+        host: dbHost,
+        port: parseInt(process.env.DB_PORT || '3306', 10),
+        user: c.user,
+        password: c.password,
+        database: c.database,
+        connectTimeout: 3000
+      });
+      await conn.query('SELECT 1');
+      await conn.end();
+
+      console.log(`✅ [Vendor DB] Connected to Hostinger DB: ${c.database} (user: ${c.user})`);
+      activeConfig = c;
+      pool = mysql.createPool({
+        host: dbHost,
+        port: parseInt(process.env.DB_PORT || '3306', 10),
+        user: c.user,
+        password: c.password,
+        database: c.database,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        multipleStatements: true
+      });
+      await autoMigrateIfEmpty(pool);
+      return;
+    } catch (e) {
+      // try next candidate
+    }
+  }
+  console.warn('[Vendor DB] Warning: Could not connect to any candidate database.');
+})();
 
 // Helper: safe seller output
 function safeSeller(user) {
@@ -175,8 +264,8 @@ app.get('/api/health', async (req, res) => {
     database: {
       status: dbStatus,
       host: dbHost,
-      name: dbName,
-      user: dbUser,
+      name: activeConfig.database,
+      user: activeConfig.user,
       ...(dbError ? { error: dbError } : {})
     }
   });
@@ -608,17 +697,14 @@ app.post('/admin/login', async (req, res) => {
       <body>
         <div class="card">
           <h2>Database Connection Error</h2>
-          <div class="err-box">${err.message}</div>
-          <p>The backend was unable to connect to the MySQL database (Host: <code>${dbHost}</code>, User: <code>${dbUser}</code>, Database: <code>${dbName}</code>).</p>
-          <p><strong>Solution for Hostinger:</strong><br>
-          Ensure a <code>.env</code> file exists in your project directory on Hostinger with your database credentials:</p>
+          <p>The backend was unable to connect to the MySQL database (Host: <code>${dbHost}</code>, User: <code>${activeConfig.user}</code>, Database: <code>${activeConfig.database}</code>).</p>
+          <p><strong>Configured database details:</strong></p>
           <pre>DB_CONNECTION=mysql
 DB_HOST=127.0.0.1
 DB_PORT=3306
-DB_DATABASE=u999617803_knolipop
-DB_USERNAME=u999617803_xtragclub
-DB_PASSWORD=&lt;your_hostinger_database_password&gt;</pre>
-          <p>Also ensure <code>database/schema.sql</code> has been imported into phpMyAdmin in Hostinger.</p>
+DB_DATABASE=${activeConfig.database}
+DB_USERNAME=${activeConfig.user}
+DB_PASSWORD=Xtragclub_vendor2026</pre>
           <a href="/admin/login" class="btn">Back to Login</a>
         </div>
       </body>
