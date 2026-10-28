@@ -48,6 +48,22 @@
       "item": [
         {
           "name": "API Welcome Page (GET /)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Welcome page loaded', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Vendor App Backend');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -62,6 +78,25 @@
         },
         {
           "name": "Database Health Check (GET /api/health)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Database is connected to Hostinger', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.status).to.eql('ok');",
+                  "    pm.expect(json.database.status).to.eql('connected');",
+                  "    pm.expect(json.database.name).to.eql('u999617803_knowlipop1');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [
@@ -91,7 +126,7 @@
               "listen": "prerequest",
               "script": {
                 "exec": [
-                  "// Generate unique phone for registration so tests always succeed without collision",
+                  "// Generate fresh unique phone number for registration",
                   "var randomSuffix = Math.floor(1000000 + Math.random() * 9000000);",
                   "var phone = '+91987' + randomSuffix;",
                   "var password = 'SecretPass123!';",
@@ -109,11 +144,17 @@
               "listen": "test",
               "script": {
                 "exec": [
+                  "pm.test('Status code is 201 Created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Returns Bearer token', function () {",
+                  "    pm.expect(jsonData.token).to.be.a('string');",
+                  "    pm.expect(jsonData.token_type).to.eql('Bearer');",
+                  "});",
                   "if (jsonData.token) {",
                   "    pm.collectionVariables.set('token', jsonData.token);",
                   "    if (pm.environment) pm.environment.set('token', jsonData.token);",
-                  "    console.log('Saved token to environment:', jsonData.token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -141,7 +182,7 @@
               "host": ["{{base_url}}"],
               "path": ["api", "register"]
             },
-            "description": "Registers a new seller with dynamically generated phone to avoid duplicate conflict. Automatically saves returned Bearer token into {{token}}."
+            "description": "Registers a new seller with dynamically generated phone. Automatically saves returned Bearer token into {{token}}."
           },
           "response": []
         },
@@ -152,11 +193,17 @@
               "listen": "test",
               "script": {
                 "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Login returns valid token and user', function () {",
+                  "    pm.expect(jsonData.token).to.be.a('string');",
+                  "    pm.expect(jsonData.user.phone).to.eql(pm.collectionVariables.get('seller_phone'));",
+                  "});",
                   "if (jsonData.token) {",
                   "    pm.collectionVariables.set('token', jsonData.token);",
                   "    if (pm.environment) pm.environment.set('token', jsonData.token);",
-                  "    console.log('Saved token:', jsonData.token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -184,12 +231,30 @@
               "host": ["{{base_url}}"],
               "path": ["api", "login"]
             },
-            "description": "Logs in the registered seller and updates JWT Bearer token into {{token}}."
+            "description": "Logs in the seller and saves JWT Bearer token into {{token}}."
           },
           "response": []
         },
         {
           "name": "Get Current Profile (GET /api/me)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Returns authenticated user profile', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.user).to.be.an('object');",
+                  "    pm.expect(json.user.id).to.be.a('number');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -224,6 +289,24 @@
       "item": [
         {
           "name": "List Products (GET /api/products)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Products list is paginated', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.products).to.be.an('object');",
+                  "    pm.expect(json.products.data).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [
@@ -254,12 +337,17 @@
               "listen": "test",
               "script": {
                 "exec": [
+                  "pm.test('Status code is 201 Created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Product created with ID', function () {",
+                  "    pm.expect(jsonData.product.id).to.be.a('number');",
+                  "});",
                   "if (jsonData.product && jsonData.product.id) {",
                   "    var idStr = jsonData.product.id.toString();",
                   "    pm.collectionVariables.set('product_id', idStr);",
                   "    if (pm.environment) pm.environment.set('product_id', idStr);",
-                  "    console.log('Saved product_id:', idStr);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -297,12 +385,29 @@
               "host": ["{{base_url}}"],
               "path": ["api", "products"]
             },
-            "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id for subsequent requests."
+            "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id."
           },
           "response": []
         },
         {
           "name": "Get Product Details (GET /api/products/:id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Product details matched', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.product.id.toString()).to.eql(pm.collectionVariables.get('product_id'));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [
@@ -322,6 +427,23 @@
         },
         {
           "name": "Update Product (PUT /api/products/:id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Product price and name updated', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.product.price).to.eql('3499.00');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -359,6 +481,23 @@
         },
         {
           "name": "Delete Product (DELETE /api/products/:id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Product successfully deleted', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.message).to.include('deleted');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -393,6 +532,23 @@
       "item": [
         {
           "name": "Save Bank Account Onboarding (POST /api/seller/bank-account/onboarding)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Bank account reference saved', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.account.status).to.eql('created');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -430,6 +586,23 @@
         },
         {
           "name": "Get Bank Account Status (GET /api/seller/bank-account/status)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Returns bank status', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.status).to.be.a('string');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -459,6 +632,24 @@
         },
         {
           "name": "Preview Marketplace Commission (POST /api/marketplace/commission-preview)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Commission calculated accurately', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.commission_paise).to.eql(5000);",
+                  "    pm.expect(json.seller_receives_paise).to.eql(95000);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -496,6 +687,23 @@
         },
         {
           "name": "List Seller Payouts (GET /api/seller/payouts)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Payouts returned array', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.payouts).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
@@ -535,11 +743,13 @@
               "listen": "test",
               "script": {
                 "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
                   "var jsonData = pm.response.json();",
                   "if (jsonData.dev_otp) {",
                   "    pm.collectionVariables.set('otp_code', jsonData.dev_otp);",
                   "    if (pm.environment) pm.environment.set('otp_code', jsonData.dev_otp);",
-                  "    console.log('Saved OTP code:', jsonData.dev_otp);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -578,11 +788,16 @@
               "listen": "test",
               "script": {
                 "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('OTP verified with reset_token', function () {",
+                  "    pm.expect(jsonData.reset_token).to.be.a('string');",
+                  "});",
                   "if (jsonData.reset_token) {",
                   "    pm.collectionVariables.set('reset_token', jsonData.reset_token);",
                   "    if (pm.environment) pm.environment.set('reset_token', jsonData.reset_token);",
-                  "    console.log('Saved Reset Token:', jsonData.reset_token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -616,6 +831,23 @@
         },
         {
           "name": "3. Reset Password (POST /api/reset-password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Password reset successful', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.message).to.include('successful');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -648,6 +880,22 @@
       "item": [
         {
           "name": "Admin Login UI (GET /admin/login)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Admin sign-in form loaded', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Admin sign in');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -662,6 +910,19 @@
         },
         {
           "name": "Admin Login Form (POST /admin/login)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Admin authenticated successfully', function () {",
+                  "    pm.expect([200, 302]).to.include(pm.response.code);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [
@@ -696,6 +957,22 @@
         },
         {
           "name": "Admin Dashboard (GET /admin)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Dashboard loaded', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Vendor Admin');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "header": [],
@@ -715,6 +992,23 @@
       "item": [
         {
           "name": "Logout (POST /api/logout)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Logout confirmed', function () {",
+                  "    var json = pm.response.json();",
+                  "    pm.expect(json.message).to.include('successful');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "auth": {
               "type": "bearer",
