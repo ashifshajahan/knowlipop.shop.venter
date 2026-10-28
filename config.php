@@ -27,8 +27,8 @@ return [
     'db' => [
         'host' => $env['DB_HOST'] ?? '127.0.0.1',
         'port' => $env['DB_PORT'] ?? '3306',
-        'name' => $env['DB_DATABASE'] ?? 'vendor_app',
-        'user' => $env['DB_USERNAME'] ?? 'root',
+        'name' => $env['DB_DATABASE'] ?? 'u999617803_knolipop',
+        'user' => $env['DB_USERNAME'] ?? 'u999617803_xtragclub',
         'pass' => $env['DB_PASSWORD'] ?? '',
     ],
 

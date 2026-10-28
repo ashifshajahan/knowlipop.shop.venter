@@ -26,14 +26,14 @@ const isHostinger = process.cwd().includes('u999617803') ||
                     (process.env.USER && process.env.USER.includes('u999617803')) ||
                     fs.existsSync('/home/u999617803');
 
-// Always use 127.0.0.1 (never 'localhost' to prevent IPv6 ::1 lookup on Node.js)
+// Main Host Database Configuration (Hostinger)
 let dbHost = process.env.DB_HOST || '127.0.0.1';
 if (dbHost === 'localhost') {
   dbHost = '127.0.0.1';
 }
 
-const dbUser = process.env.DB_USERNAME || (isHostinger ? 'u999617803_xtragclub' : 'root');
-const dbName = process.env.DB_DATABASE || (isHostinger ? 'u999617803_knolipop' : 'vendor_app');
+const dbUser = (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : 'u999617803_xtragclub';
+const dbName = (process.env.DB_DATABASE && process.env.DB_DATABASE !== 'vendor_app' && process.env.DB_DATABASE !== 'venter_app') ? process.env.DB_DATABASE : 'u999617803_knolipop';
 const dbPass = process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : '';
 
 const app = express();
