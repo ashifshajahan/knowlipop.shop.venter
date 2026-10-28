@@ -1,0 +1,724 @@
+{
+  "info": {
+    "_postman_id": "b3e0c05a-8d19-4a7b-a2c9-95e29788f219",
+    "name": "Vendor App API (Production - Hostinger)",
+    "description": "Complete production API collection for Vendor App running on Hostinger (https://knowlipop.shop).\nIncludes automatic JWT Bearer token capture on Login & Register, full product CRUD, password reset OTP flows, seller bank onboarding, and Admin endpoints.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://knowlipop.shop",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "seller_phone",
+      "value": "+919876543210",
+      "type": "string"
+    },
+    {
+      "key": "seller_password",
+      "value": "SecretPass123!",
+      "type": "string"
+    },
+    {
+      "key": "product_id",
+      "value": "1",
+      "type": "string"
+    },
+    {
+      "key": "otp_code",
+      "value": "123456",
+      "type": "string"
+    },
+    {
+      "key": "reset_token",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. System & Health",
+      "item": [
+        {
+          "name": "API Welcome Page (GET /)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": ["{{base_url}}"],
+              "path": [""]
+            },
+            "description": "Returns HTML status page confirming backend engine and available routes."
+          },
+          "response": []
+        },
+        {
+          "name": "Database Health Check (GET /api/health)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Verifies live connectivity to Hostinger MySQL database u999617803_knowlipop1."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Authentication",
+      "item": [
+        {
+          "name": "Register Seller (POST /api/register)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
+                  "    pm.environment.set(\"token\", jsonData.token);",
+                  "    console.log(\"Saved token to environment:\", jsonData.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_name\": \"Apex Store {{ $randomInt }}\",\n  \"phone\": \"+91987{{ $randomInt }}12\",\n  \"address\": \"452 MG Road, Suite 300\",\n  \"landmark\": \"Opposite Tech Park\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\",\n  \"password\": \"SecretPass123!\",\n  \"password_confirmation\": \"SecretPass123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/register",
+              "host": ["{{base_url}}"],
+              "path": ["api", "register"]
+            },
+            "description": "Registers a new seller. Note: phone uses random integer so this can be clicked repeatedly without duplicate phone errors. Automatically saves the returned Bearer token into {{token}}."
+          },
+          "response": []
+        },
+        {
+          "name": "Login Seller (POST /api/login)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
+                  "    pm.environment.set(\"token\", jsonData.token);",
+                  "    console.log(\"Saved token:\", jsonData.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"password\": \"ResetPassword123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/login",
+              "host": ["{{base_url}}"],
+              "path": ["api", "login"]
+            },
+            "description": "Logs in the seller and automatically saves JWT Bearer token into {{token}} for all subsequent requests."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Current Profile (GET /api/me)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/me",
+              "host": ["{{base_url}}"],
+              "path": ["api", "me"]
+            },
+            "description": "Returns current authenticated seller profile (safe seller details without password hash)."
+          },
+          "response": []
+        },
+        {
+          "name": "Logout (POST /api/logout)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/logout",
+              "host": ["{{base_url}}"],
+              "path": ["api", "logout"]
+            },
+            "description": "Invalidates seller session."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Password Reset Flow (OTP)",
+      "item": [
+        {
+          "name": "1. Request OTP (POST /api/forgot-password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.dev_otp) {",
+                  "    pm.collectionVariables.set(\"otp_code\", jsonData.dev_otp);",
+                  "    pm.environment.set(\"otp_code\", jsonData.dev_otp);",
+                  "    console.log(\"Saved OTP code:\", jsonData.dev_otp);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919989162203\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/forgot-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "forgot-password"]
+            },
+            "description": "Sends password reset OTP. In dev/testing mode, the response also includes dev_otp, which is automatically saved to {{otp_code}}!"
+          },
+          "response": []
+        },
+        {
+          "name": "2. Verify OTP (POST /api/verify-otp)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.reset_token) {",
+                  "    pm.collectionVariables.set(\"reset_token\", jsonData.reset_token);",
+                  "    pm.environment.set(\"reset_token\", jsonData.reset_token);",
+                  "    console.log(\"Saved Reset Token:\", jsonData.reset_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"code\": \"{{otp_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/verify-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "verify-otp"]
+            },
+            "description": "Verifies OTP code and returns reset_token, saving it to {{reset_token}}."
+          },
+          "response": []
+        },
+        {
+          "name": "3. Reset Password (POST /api/reset-password)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"password\": \"ResetPassword123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reset-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "reset-password"]
+            },
+            "description": "Sets new password using verified reset_token."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Products Catalog & CRUD",
+      "item": [
+        {
+          "name": "List Products (GET /api/products)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/products?page=1",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                }
+              ]
+            },
+            "description": "Public catalog of all active products with pagination."
+          },
+          "response": []
+        },
+        {
+          "name": "Create Product (POST /api/products)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.product && jsonData.product.id) {",
+                  "    pm.collectionVariables.set(\"product_id\", jsonData.product.id);",
+                  "    pm.environment.set(\"product_id\", jsonData.product.id);",
+                  "    console.log(\"Saved product_id:\", jsonData.product.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Smart Wireless Headset\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 2999.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products"]
+            },
+            "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Product Details (GET /api/products/:id)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            },
+            "description": "Fetches a single product by ID."
+          },
+          "response": []
+        },
+        {
+          "name": "Update Product (PUT /api/products/:id)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Smart Wireless Headset (Pro Edition)\",\n  \"price\": 3499.00,\n  \"stock\": 75,\n  \"description\": \"Updated upgraded sound with Spatial Audio.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            },
+            "description": "Updates fields of an existing product owned by the authenticated seller."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Product (DELETE /api/products/:id)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            },
+            "description": "Deletes the product."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "5. Seller Bank Account & Payments",
+      "item": [
+        {
+          "name": "Save Bank Account Onboarding (POST /api/seller/bank-account/onboarding)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_reference\": \"acc_live_rzp_992144\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/seller/bank-account/onboarding",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "bank-account", "onboarding"]
+            },
+            "description": "Stores seller payment/bank account reference for payouts."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Bank Account Status (GET /api/seller/bank-account/status)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/bank-account/status",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "bank-account", "status"]
+            },
+            "description": "Retrieves the status of the seller's payment account."
+          },
+          "response": []
+        },
+        {
+          "name": "Preview Marketplace Commission (POST /api/marketplace/commission-preview)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_in_paise\": 100000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/marketplace/commission-preview",
+              "host": ["{{base_url}}"],
+              "path": ["api", "marketplace", "commission-preview"]
+            },
+            "description": "Calculates commission fee and net seller payout for any order amount."
+          },
+          "response": []
+        },
+        {
+          "name": "List Seller Payouts (GET /api/seller/payouts)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/payouts",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "payouts"]
+            },
+            "description": "Lists seller payouts."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "6. Admin Panel",
+      "item": [
+        {
+          "name": "Admin Login UI (GET /admin/login)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/admin/login",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "login"]
+            },
+            "description": "Returns HTML login page for Administrator."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin Login Form (POST /admin/login)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "email",
+                  "value": "admin@vendor.app",
+                  "type": "text"
+                },
+                {
+                  "key": "password",
+                  "value": "Admin123!",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/admin/login",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "login"]
+            },
+            "description": "Submits admin credentials and redirects (302) to /admin."
+          },
+          "response": []
+        },
+        {
+          "name": "Admin Dashboard (GET /admin)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/admin",
+              "host": ["{{base_url}}"],
+              "path": ["admin"]
+            },
+            "description": "Displays Vendor Administrator Dashboard with seller count, product metrics, and settings."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
