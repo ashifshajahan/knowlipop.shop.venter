@@ -1,4 +1,4 @@
-# Venter App Backend (Pure Native PHP & MySQL)
+# Vendor App Backend (Pure Native PHP & MySQL)
 
 A lightweight, high-performance REST API and Admin Dashboard with **zero dependencies**. 
 Works 100% out of the box on **Hostinger**, **cPanel**, or any standard PHP host (PHP 7.4 - 8.3+).
@@ -50,5 +50,5 @@ In Hostinger phpMyAdmin:
 
 ### 4. Admin Access
 - Open `https://yourdomain.com/login`
-- Default admin email: `admin@venter.app`
+- Default admin email: `admin@vendor.app` (or `admin@venter.app`)
 - Default password: `Admin123!`

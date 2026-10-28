@@ -46,7 +46,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $error = 'A seller with this phone number already exists.';
         } else {
             $phoneDigits = preg_replace('/\D+/', '', $phone);
-            $email = 'seller_' . $phoneDigits . '@phone.venter.local';
+            $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
             $hashed = hashPassword($password);
 
             $ins = $pdo->prepare("
@@ -83,7 +83,7 @@ $sellers = $sellersStmt->fetchAll();
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Venter Admin Dashboard</title>
+    <title>Vendor Admin Dashboard</title>
     <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
@@ -111,7 +111,7 @@ $sellers = $sellersStmt->fetchAll();
 </head>
 <body>
     <header class="top">
-        <div class="brand">Venter <span style="font-weight:400; opacity:.85;">Admin</span></div>
+        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
         <div>
             <span style="margin-right:15px; font-size:14px; opacity:.9;">Welcome, <?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?></span>
             <a href="/admin/logout" class="logout-btn">Sign out</a>

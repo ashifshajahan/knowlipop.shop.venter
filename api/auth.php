@@ -56,7 +56,7 @@ function apiRegister(PDO $pdo): void
     }
 
     $phoneDigits = preg_replace('/\D+/', '', $input['phone']);
-    $email = 'seller_' . $phoneDigits . '@phone.venter.local';
+    $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
     $hashedPassword = hashPassword($input['password']);
 
     $stmt = $pdo->prepare("
@@ -155,6 +155,7 @@ function apiForgotPassword(PDO $pdo): void
     $stmt->execute([':phone' => $phone]);
     $user = $stmt->fetch();
 
+    $otp = null;
     if ($user) {
         $otp = sprintf('%06d', mt_rand(100000, 999999));
         $hashedOtp = hashPassword($otp);
@@ -164,7 +165,11 @@ function apiForgotPassword(PDO $pdo): void
         $ins->execute([':phone' => $phone, ':token' => $hashedOtp]);
     }
 
-    jsonResponse(['message' => 'If this phone number is registered, an OTP will be sent.']);
+    $response = ['message' => 'If this phone number is registered, an OTP will be sent.'];
+    if ($otp !== null) {
+        $response['dev_otp'] = $otp; // Included for Postman & frontend developer testing
+    }
+    jsonResponse($response);
 }
 
 function apiVerifyOtp(PDO $pdo): void
@@ -174,7 +179,7 @@ function apiVerifyOtp(PDO $pdo): void
         errorResponse('Validation error', ['phone' => ['Phone and OTP code are required.']], 422);
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY id DESC LIMIT 1");
+    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY created_at DESC LIMIT 1");
     $stmt->execute([':phone' => $input['phone']]);
     $row = $stmt->fetch();
 
@@ -185,8 +190,8 @@ function apiVerifyOtp(PDO $pdo): void
     $resetToken = bin2hex(random_bytes(32));
     $hashedResetToken = hashPassword($resetToken);
 
-    $upd = $pdo->prepare("UPDATE password_reset_otps SET token = :token WHERE id = :id");
-    $upd->execute([':token' => $hashedResetToken, ':id' => $row['id']]);
+    $upd = $pdo->prepare("UPDATE password_reset_otps SET token = :token WHERE phone = :phone");
+    $upd->execute([':token' => $hashedResetToken, ':phone' => $input['phone']]);
 
     jsonResponse([
         'message' => 'OTP verified successfully.',
@@ -201,7 +206,7 @@ function apiResetPassword(PDO $pdo): void
         errorResponse('All fields are required.', [], 422);
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY id DESC LIMIT 1");
+    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY created_at DESC LIMIT 1");
     $stmt->execute([':phone' => $input['phone']]);
     $row = $stmt->fetch();
 

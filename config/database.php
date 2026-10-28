@@ -33,7 +33,7 @@ function getDatabaseConfig(): array
     return [
         'host' => $env['DB_HOST'] ?? getenv('DB_HOST') ?: 'localhost',
         'port' => $env['DB_PORT'] ?? getenv('DB_PORT') ?: '3306',
-        'name' => $env['DB_DATABASE'] ?? getenv('DB_DATABASE') ?: 'venter_app',
+        'name' => $env['DB_DATABASE'] ?? getenv('DB_DATABASE') ?: 'vendor_app',
         'user' => $env['DB_USERNAME'] ?? getenv('DB_USERNAME') ?: 'root',
         'pass' => $env['DB_PASSWORD'] ?? getenv('DB_PASSWORD') ?: '',
     ];
@@ -52,20 +52,22 @@ function getDatabaseConnection(): PDO
     $options = [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
+        PDO::ATTR_EMULATE_PREPARES => true,
     ];
 
     try {
         $pdo = new PDO($dsn, $config['user'], $config['pass'], $options);
         return $pdo;
     } catch (PDOException $e) {
-        http_response_code(500);
-        header('Content-Type: application/json; charset=utf-8');
+        if (!headers_sent()) {
+            http_response_code(500);
+            header('Content-Type: application/json; charset=utf-8');
+        }
         echo json_encode([
             'error' => 'Database connection failed',
             'message' => $e->getMessage(),
             'hint' => 'Please check your database credentials in config.php or .env'
-        ]);
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         exit;
     }
 }

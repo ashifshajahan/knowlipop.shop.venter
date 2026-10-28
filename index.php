@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Venter App — Pure PHP Entry Point & Router
+ * Vendor App — Pure PHP Entry Point & Router
  * Zero dependencies, works on 100% of PHP hosting environments (Hostinger / cPanel / Apache / Nginx / PHP CLI)
  */
 
@@ -26,8 +26,6 @@ if (str_starts_with($requestUri, '/index.php')) {
     $requestUri = substr($requestUri, 10) ?: '/';
 }
 
-$pdo = getDatabaseConnection();
-
 // ==========================================
 // 1. Web & Admin Routes
 // ==========================================
@@ -40,7 +38,7 @@ if ($requestUri === '/' || $requestUri === '') {
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Venter App Backend</title>
+        <title>Vendor App Backend</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
             .card { background: #1e293b; padding: 40px; border-radius: 16px; border: 1px solid #334155; max-width: 520px; width: 90%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
@@ -55,8 +53,8 @@ if ($requestUri === '/' || $requestUri === '') {
     <body>
         <div class="card">
             <span class="badge">● Pure Native PHP Online</span>
-            <h1>Venter App Backend</h1>
-            <p>High-performance, zero-dependency REST API for Venter seller marketplace.</p>
+            <h1>Vendor App Backend</h1>
+            <p>High-performance, zero-dependency REST API for Vendor marketplace.</p>
             <a href="/admin/login" class="btn">Go to Admin Dashboard</a>
             <div class="endpoints">
                 <strong>Available Endpoints:</strong><br>
@@ -103,12 +101,28 @@ require_once __DIR__ . '/api/payment.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
+    $dbStatus = 'connected';
+    $dbError = null;
+    try {
+        $checkPdo = getDatabaseConnection();
+        $checkPdo->query('SELECT 1');
+    } catch (Throwable $e) {
+        $dbStatus = 'disconnected';
+        $dbError = $e->getMessage();
+    }
+
     jsonResponse([
-        'status' => 'ok',
-        'app' => 'Venter App API',
-        'engine' => 'Pure PHP'
-    ]);
+        'status' => $dbStatus === 'connected' ? 'ok' : 'degraded',
+        'app' => 'Vendor App API',
+        'engine' => 'Pure PHP',
+        'database' => [
+            'status' => $dbStatus,
+            ...( $dbError ? ['error' => $dbError] : [] )
+        ]
+    ], $dbStatus === 'connected' ? 200 : 503);
 }
+
+$pdo = getDatabaseConnection();
 
 // Authentication
 if ($requestUri === '/api/register') {

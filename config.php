@@ -1,21 +1,35 @@
 <?php
 
 /**
- * Venter App Configuration
- * Update database credentials below for your server (e.g. Hostinger / cPanel / Localhost)
+ * Vendor App Configuration
+ * Reads from .env if available, with fallbacks for your server (e.g. Hostinger / cPanel / Localhost)
  */
 
+$envFile = __DIR__ . '/.env';
+$env = [];
+if (file_exists($envFile)) {
+    $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) continue;
+        if (str_contains($line, '=')) {
+            [$k, $v] = explode('=', $line, 2);
+            $env[trim($k)] = trim(trim($v), '"\'');
+        }
+    }
+}
+
 return [
-    'app_name' => 'Venter App API',
-    'app_env' => 'production', // local or production
-    'app_url' => 'https://knowlipop.shop',
+    'app_name' => $env['APP_NAME'] ?? 'Vendor App API',
+    'app_env' => $env['APP_ENV'] ?? 'production',
+    'app_url' => $env['APP_URL'] ?? 'https://knowlipop.shop',
 
     'db' => [
-        'host' => 'localhost',
-        'port' => '3306',
-        'name' => 'venter_app',
-        'user' => 'root',
-        'pass' => '',
+        'host' => $env['DB_HOST'] ?? '127.0.0.1',
+        'port' => $env['DB_PORT'] ?? '3306',
+        'name' => $env['DB_DATABASE'] ?? 'vendor_app',
+        'user' => $env['DB_USERNAME'] ?? 'root',
+        'pass' => $env['DB_PASSWORD'] ?? '',
     ],
 
     // CORS allowed origins (comma-separated or '*' for public API)

@@ -7,10 +7,15 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 8000;
-const JWT_SECRET = process.env.JWT_SECRET || 'venter_jwt_secret_key_987654321';
+const JWT_SECRET = process.env.JWT_SECRET || 'vendor_jwt_secret_key_987654321';
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: (origin, callback) => callback(null, true), // Dynamic origin reflection for frontend developer machines & production
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Origin']
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -20,7 +25,7 @@ const pool = mysql.createPool({
   port: parseInt(process.env.DB_PORT || '3306', 10),
   user: process.env.DB_USERNAME || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_DATABASE || 'venter_app',
+  database: process.env.DB_DATABASE || 'vendor_app',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
@@ -90,7 +95,7 @@ app.get('/', (req, res) => {
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Venter App Backend (Node.js)</title>
+      <title>Vendor App Backend (Node.js)</title>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
         .card { background: #1e293b; padding: 40px; border-radius: 16px; border: 1px solid #334155; max-width: 520px; width: 90%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
@@ -105,7 +110,7 @@ app.get('/', (req, res) => {
     <body>
       <div class="card">
         <span class="badge">● Node.js + PHP Dual Engine Active</span>
-        <h1>Venter App Backend</h1>
+        <h1>Vendor App Backend</h1>
         <p>Full REST API & Admin Panel running with high-concurrency Node.js support.</p>
         <a href="/admin/login" class="btn">Go to Admin Dashboard</a>
         <div class="endpoints">
@@ -122,11 +127,27 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    app: 'Venter App API',
-    engine: 'Node.js (Express)'
+app.get('/api/health', async (req, res) => {
+  let dbStatus = 'disconnected';
+  let dbError = null;
+  try {
+    await pool.query('SELECT 1');
+    dbStatus = 'connected';
+  } catch (err) {
+    dbError = err.message;
+  }
+
+  res.status(dbStatus === 'connected' ? 200 : 503).json({
+    status: dbStatus === 'connected' ? 'ok' : 'degraded',
+    app: 'Vendor App API',
+    engine: 'Node.js (Express)',
+    database: {
+      status: dbStatus,
+      host: process.env.DB_HOST || 'localhost',
+      name: process.env.DB_DATABASE || 'vendor_app',
+      user: process.env.DB_USERNAME || 'root',
+      ...(dbError ? { error: dbError } : {})
+    }
   });
 });
 
@@ -170,7 +191,7 @@ app.post('/api/register', async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const phoneDigits = phone.replace(/\D/g, '');
-    const email = `seller_${phoneDigits}@phone.venter.local`;
+    const email = `seller_${phoneDigits}@phone.vendor.local`;
 
     const [result] = await pool.query(
       `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
@@ -255,46 +276,66 @@ app.post('/api/forgot-password', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(422).json({ errors: { phone: ['Phone is required.'] } });
 
-  const [rows] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
-  if (rows.length > 0) {
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const hash = await bcrypt.hash(otp, 10);
-    await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
-    await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [phone, hash]);
+  try {
+    const [rows] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
+    let otp = null;
+    if (rows.length > 0) {
+      otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const hash = await bcrypt.hash(otp, 10);
+      await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
+      await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [phone, hash]);
+    }
+    const response = { message: 'If this phone number is registered, an OTP will be sent.' };
+    if (otp) {
+      response.dev_otp = otp; // Returned for Postman & frontend developer testing
+    }
+    res.json(response);
+  } catch (err) {
+    console.error('Forgot-Password Error:', err);
+    res.status(500).json({ error: 'Database error occurred.', details: err.message });
   }
-  res.json({ message: 'If this phone number is registered, an OTP will be sent.' });
 });
 
 app.post('/api/verify-otp', async (req, res) => {
   const { phone, code } = req.body;
   if (!phone || !code) return res.status(422).json({ message: 'Phone and code are required.' });
 
-  const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY id DESC LIMIT 1', [phone]);
-  if (rows.length === 0 || !(await bcrypt.compare(code, rows[0].token))) {
-    return res.status(422).json({ message: 'Invalid or expired OTP code.' });
+  try {
+    const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+    if (rows.length === 0 || !(await bcrypt.compare(code, rows[0].token))) {
+      return res.status(422).json({ message: 'Invalid or expired OTP code.' });
+    }
+
+    const resetToken = require('crypto').randomBytes(32).toString('hex');
+    const hashedReset = await bcrypt.hash(resetToken, 10);
+    await pool.query('UPDATE password_reset_otps SET token = ? WHERE phone = ?', [hashedReset, phone]);
+
+    res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
+  } catch (err) {
+    console.error('Verify-OTP Error:', err);
+    res.status(500).json({ error: 'Database error occurred.', details: err.message });
   }
-
-  const resetToken = require('crypto').randomBytes(32).toString('hex');
-  const hashedReset = await bcrypt.hash(resetToken, 10);
-  await pool.query('UPDATE password_reset_otps SET token = ? WHERE id = ?', [hashedReset, rows[0].id]);
-
-  res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
 });
 
 app.post('/api/reset-password', async (req, res) => {
   const { phone, reset_token, password } = req.body;
   if (!phone || !reset_token || !password) return res.status(422).json({ message: 'All fields required.' });
 
-  const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY id DESC LIMIT 1', [phone]);
-  if (rows.length === 0 || !(await bcrypt.compare(reset_token, rows[0].token))) {
-    return res.status(422).json({ message: 'Invalid or expired reset token.' });
+  try {
+    const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+    if (rows.length === 0 || !(await bcrypt.compare(reset_token, rows[0].token))) {
+      return res.status(422).json({ message: 'Invalid or expired reset token.' });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ?', [hashed, phone]);
+    await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
+
+    res.json({ message: 'Password reset successful. Please log in again.' });
+  } catch (err) {
+    console.error('Reset-Password Error:', err);
+    res.status(500).json({ error: 'Database error occurred.', details: err.message });
   }
-
-  const hashed = await bcrypt.hash(password, 10);
-  await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ?', [hashed, phone]);
-  await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
-
-  res.json({ message: 'Password reset successful. Please log in again.' });
 });
 
 // ==========================================
@@ -470,7 +511,7 @@ app.get('/admin/login', (req, res) => {
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Venter Admin — Sign In</title>
+      <title>Vendor Admin — Sign In</title>
       <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
@@ -488,14 +529,14 @@ app.get('/admin/login', (req, res) => {
       </style>
     </head>
     <body>
-      <header class="top"><div class="brand">Venter <span style="font-weight:400; opacity:.85;">Admin</span></div></header>
+      <header class="top"><div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div></header>
       <main class="wrap">
         <div class="card">
           <h1>Admin sign in</h1>
-          <p class="muted">Sign in to manage Venter sellers and catalog.</p>
+          <p class="muted">Sign in to manage Vendor sellers and catalog.</p>
           <form method="POST" action="/admin/login">
             <label>Admin email</label>
-            <input type="email" name="email" value="admin@venter.app" required autofocus>
+            <input type="email" name="email" value="admin@vendor.app" required autofocus>
             <label>Password</label>
             <input type="password" name="password" required>
             <button type="submit">Sign in</button>
@@ -508,24 +549,30 @@ app.get('/admin/login', (req, res) => {
 });
 
 app.post('/admin/login', async (req, res) => {
-  const { email, password } = req.body;
-  const [rows] = await pool.query('SELECT * FROM users WHERE email = ? AND role = "admin" LIMIT 1', [email]);
-  if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
-    return res.status(401).send(`<h3>Invalid admin credentials.</h3><a href="/admin/login">Try again</a>`);
+  try {
+    const { email, password } = req.body;
+    const [rows] = await pool.query('SELECT * FROM users WHERE (email = ? OR (? IN ("admin@vendor.app", "admin@venter.app") AND email IN ("admin@vendor.app", "admin@venter.app"))) AND role = "admin" LIMIT 1', [email, email]);
+    if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
+      return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
+    }
+    res.redirect('/admin');
+  } catch (err) {
+    console.error('Admin Login Error:', err);
+    return res.status(500).send(`<h3>Database Error: ${err.message}</h3><p>Please ensure database credentials in .env are correct and database/schema.sql has been imported.</p><a href="/admin/login">Back to login</a>`);
   }
-  res.redirect('/admin');
 });
 
 app.get('/admin', async (req, res) => {
-  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
-  const [sellers] = await pool.query('SELECT id, name, seller_name, phone, state, created_at FROM users WHERE role = "seller" ORDER BY id DESC LIMIT 50');
+  try {
+    const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
+    const [sellers] = await pool.query('SELECT id, name, seller_name, phone, state, created_at FROM users WHERE role = "seller" ORDER BY id DESC LIMIT 50');
 
   res.send(`
     <!doctype html>
     <html lang="en">
     <head>
       <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Venter Admin Dashboard</title>
+      <title>Vendor Admin Dashboard</title>
       <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
@@ -545,7 +592,7 @@ app.get('/admin', async (req, res) => {
     </head>
     <body>
       <header class="top">
-        <div class="brand">Venter <span style="font-weight:400; opacity:.85;">Admin</span></div>
+        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
         <div><a href="/admin/login" class="logout-btn">Sign out</a></div>
       </header>
       <main class="wrap">
@@ -569,9 +616,13 @@ app.get('/admin', async (req, res) => {
     </body>
     </html>
   `);
+  } catch (err) {
+    console.error('Admin Dashboard Error:', err);
+    res.status(500).send(`<h3>Database Error: ${err.message}</h3><p>Could not load sellers. Ensure database connection is active and schema is imported.</p><a href="/admin/login">Back to Login</a>`);
+  }
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Venter App Server running on port ${PORT} (https://knowlipop.shop)`);
+  console.log(`Vendor App Server running on port ${PORT} (https://knowlipop.shop)`);
 });

@@ -29,7 +29,7 @@ function getBearerToken(): ?string
     return null;
 }
 
-function createToken(PDO $pdo, int $userId, string $name = 'venter-app'): string
+function createToken(PDO $pdo, int $userId, string $name = 'vendor-app'): string
 {
     $plainText = bin2hex(random_bytes(24));
     $tokenHash = hash('sha256', $plainText);

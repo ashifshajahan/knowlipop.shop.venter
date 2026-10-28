@@ -1,12 +1,14 @@
 {
-  "name": "venter-api",
+  "name": "vendor-api",
   "version": "1.0.0",
-  "description": "Venter App Marketplace Backend API & Admin Dashboard",
+  "description": "Vendor App Marketplace Backend API & Admin Dashboard",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "migrate": "node database/migrate.js",
+    "seed:admin": "node database/seed-admin.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

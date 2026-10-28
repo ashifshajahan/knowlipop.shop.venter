@@ -1,7 +1,7 @@
 {
-  "name": "venter-api",
+  "name": "vendor-api",
   "version": "1.0.0",
-  "description": "Venter App Marketplace Backend API & Admin Dashboard",
+  "description": "Vendor App Marketplace Backend API & Admin Dashboard",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

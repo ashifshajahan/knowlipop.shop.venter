@@ -1,5 +1,5 @@
 -- ======================================================
--- Venter App Database Schema (Pure PHP & MySQL)
+-- Vendor App Database Schema (Pure PHP & MySQL)
 -- Import this file into phpMyAdmin on Hostinger / cPanel
 -- ======================================================
 
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS `personal_access_tokens` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `tokenable_type` VARCHAR(255) NOT NULL DEFAULT 'App\\Models\\User',
   `tokenable_id` BIGINT UNSIGNED NOT NULL,
-  `name` VARCHAR(255) NOT NULL DEFAULT 'venter-app',
+  `name` VARCHAR(255) NOT NULL DEFAULT 'vendor-app',
   `token` VARCHAR(64) NOT NULL UNIQUE,
   `abilities` TEXT NULL DEFAULT NULL,
   `last_used_at` TIMESTAMP NULL DEFAULT NULL,
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS `seller_payment_accounts` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Default Admin Account: admin@venter.app / Admin123!
+-- Default Admin Account: admin@vendor.app / Admin123!
 INSERT INTO `users` (`id`, `name`, `email`, `password`, `role`)
-VALUES (1, 'Venter Administrator', 'admin@venter.app', '$2y$12$e8Z4w1/lXkE4dFjQ12.eouy3iF5JqB2QJ6F6fGjL7bX8xK2r9eW7u', 'admin')
-ON DUPLICATE KEY UPDATE `role` = 'admin';
+VALUES (1, 'Vendor Administrator', 'admin@vendor.app', '$2y$10$KqFHH9/yS.H5eLF3TbK/AO/U8w9auESJ1u5LZLCMKO0fNpAlPtnTC', 'admin')
+ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `email` = VALUES(`email`), `password` = VALUES(`password`), `role` = 'admin';

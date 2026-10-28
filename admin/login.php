@@ -21,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (empty($email) || empty($password)) {
         $error = 'Email and password are required.';
     } else {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = :email AND role = 'admin' LIMIT 1");
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE (email = :email OR (:email IN ('admin@vendor.app', 'admin@venter.app') AND email IN ('admin@vendor.app', 'admin@venter.app'))) AND role = 'admin' LIMIT 1");
         $stmt->execute([':email' => $email]);
         $admin = $stmt->fetch();
 
@@ -42,7 +42,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Venter Admin — Sign In</title>
+    <title>Vendor Admin — Sign In</title>
     <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
@@ -62,12 +62,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </head>
 <body>
     <header class="top">
-        <div class="brand">Venter <span style="font-weight:400; opacity:.85;">Admin</span></div>
+        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
     </header>
     <main class="wrap">
         <div class="card">
             <h1>Admin sign in</h1>
-            <p class="muted">Sign in to manage Venter sellers and catalog.</p>
+            <p class="muted">Sign in to manage Vendor sellers and catalog.</p>
 
             <?php if ($error): ?>
                 <div class="error"><?= htmlspecialchars($error) ?></div>
@@ -75,7 +75,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <form method="POST" action="/admin/login">
                 <label>Admin email</label>
-                <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? 'admin@venter.app') ?>" required autofocus autocomplete="username">
+                <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? 'admin@vendor.app') ?>" required autofocus autocomplete="username">
 
                 <label>Password</label>
                 <input type="password" name="password" required autocomplete="current-password">
