@@ -3,7 +3,38 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const path = require('path');
+const fs = require('fs');
+
+// Attempt loading .env from candidate paths
+const candidateEnvPaths = [
+  path.join(__dirname, '.env'),
+  path.join(__dirname, '../.env'),
+  path.join(process.cwd(), '.env'),
+  path.join(process.cwd(), '../.env')
+];
+for (const envPath of candidateEnvPaths) {
+  if (fs.existsSync(envPath)) {
+    require('dotenv').config({ path: envPath });
+    break;
+  }
+}
 require('dotenv').config();
+
+// Auto-detect Hostinger production environment
+const isHostinger = process.cwd().includes('u999617803') ||
+                    (process.env.USER && process.env.USER.includes('u999617803')) ||
+                    fs.existsSync('/home/u999617803');
+
+// Always use 127.0.0.1 (never 'localhost' to prevent IPv6 ::1 lookup on Node.js)
+let dbHost = process.env.DB_HOST || '127.0.0.1';
+if (dbHost === 'localhost') {
+  dbHost = '127.0.0.1';
+}
+
+const dbUser = process.env.DB_USERNAME || (isHostinger ? 'u999617803_xtragclub' : 'root');
+const dbName = process.env.DB_DATABASE || (isHostinger ? 'u999617803_knolipop' : 'vendor_app');
+const dbPass = process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : '';
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -21,11 +52,11 @@ app.use(express.urlencoded({ extended: true }));
 
 // Database Connection Pool
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
+  host: dbHost,
   port: parseInt(process.env.DB_PORT || '3306', 10),
-  user: process.env.DB_USERNAME || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_DATABASE || 'vendor_app',
+  user: dbUser,
+  password: dbPass,
+  database: dbName,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
@@ -143,9 +174,9 @@ app.get('/api/health', async (req, res) => {
     engine: 'Node.js (Express)',
     database: {
       status: dbStatus,
-      host: process.env.DB_HOST || 'localhost',
-      name: process.env.DB_DATABASE || 'vendor_app',
-      user: process.env.DB_USERNAME || 'root',
+      host: dbHost,
+      name: dbName,
+      user: dbUser,
       ...(dbError ? { error: dbError } : {})
     }
   });
@@ -558,7 +589,41 @@ app.post('/admin/login', async (req, res) => {
     res.redirect('/admin');
   } catch (err) {
     console.error('Admin Login Error:', err);
-    return res.status(500).send(`<h3>Database Error: ${err.message}</h3><p>Please ensure database credentials in .env are correct and database/schema.sql has been imported.</p><a href="/admin/login">Back to login</a>`);
+    return res.status(500).send(`
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <title>Database Error — Vendor Admin</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+          .card { background: #1e293b; padding: 36px; border-radius: 16px; border: 1px solid #334155; max-width: 620px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); text-align: left; }
+          h2 { color: #f87171; margin-top: 0; }
+          .err-box { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; padding: 12px 16px; border-radius: 8px; font-family: monospace; font-size: 13px; margin: 16px 0; word-break: break-all; }
+          p { color: #cbd5e1; line-height: 1.6; font-size: 14px; }
+          pre { background: #0b1120; border: 1px solid #334155; color: #38bdf8; padding: 14px; border-radius: 8px; font-size: 13px; overflow-x: auto; }
+          .btn { display: inline-block; background: #6366f1; color: white; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 14px; margin-top: 16px; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Database Connection Error</h2>
+          <div class="err-box">${err.message}</div>
+          <p>The backend was unable to connect to the MySQL database (Host: <code>${dbHost}</code>, User: <code>${dbUser}</code>, Database: <code>${dbName}</code>).</p>
+          <p><strong>Solution for Hostinger:</strong><br>
+          Ensure a <code>.env</code> file exists in your project directory on Hostinger with your database credentials:</p>
+          <pre>DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=u999617803_knolipop
+DB_USERNAME=u999617803_xtragclub
+DB_PASSWORD=&lt;your_hostinger_database_password&gt;</pre>
+          <p>Also ensure <code>database/schema.sql</code> has been imported into phpMyAdmin in Hostinger.</p>
+          <a href="/admin/login" class="btn">Back to Login</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
 });
 
