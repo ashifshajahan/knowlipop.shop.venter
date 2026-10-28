@@ -106,8 +106,20 @@ async function autoMigrateIfEmpty(p) {
       if (fs.existsSync(schemaPath)) {
         const sql = fs.readFileSync(schemaPath, 'utf8');
         await p.query(sql);
-        console.log('✅ [Vendor DB] Schema imported and admin user verified (admin@vendor.app / Admin123!)');
+        console.log('✅ [Vendor DB] Schema imported successfully!');
       }
+    }
+    // Ensure admin user exists with password Admin123!
+    const [admins] = await p.query('SELECT id, password FROM users WHERE role = "admin" LIMIT 1');
+    const adminHash = await bcrypt.hash('Admin123!', 10);
+    if (admins.length === 0) {
+      await p.query(
+        `INSERT INTO users (id, name, email, password, role)
+         VALUES (1, 'Vendor Administrator', 'admin@vendor.app', ?, 'admin')
+         ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), password = VALUES(password), role = 'admin'`,
+        [adminHash]
+      );
+      console.log('✅ [Vendor DB] Seeded admin user: admin@vendor.app');
     }
   } catch (err) {
     console.error('[Vendor DB] Auto-migration check:', err.message);
@@ -671,7 +683,20 @@ app.get('/admin/login', (req, res) => {
 app.post('/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const [rows] = await pool.query('SELECT * FROM users WHERE (email = ? OR (? IN ("admin@vendor.app", "admin@venter.app") AND email IN ("admin@vendor.app", "admin@venter.app"))) AND role = "admin" LIMIT 1', [email, email]);
+    let [rows] = await pool.query('SELECT * FROM users WHERE (email = ? OR (? IN ("admin@vendor.app", "admin@venter.app") AND email IN ("admin@vendor.app", "admin@venter.app"))) AND role = "admin" LIMIT 1', [email, email]);
+    
+    // Auto-seed admin user on newly created databases
+    if (rows.length === 0 && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
+      const adminHash = await bcrypt.hash('Admin123!', 10);
+      await pool.query(
+        `INSERT INTO users (id, name, email, password, role)
+         VALUES (1, 'Vendor Administrator', 'admin@vendor.app', ?, 'admin')
+         ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), password = VALUES(password), role = 'admin'`,
+        [adminHash]
+      );
+      [rows] = await pool.query('SELECT * FROM users WHERE (email = "admin@vendor.app" OR email = "admin@venter.app") AND role = "admin" LIMIT 1');
+    }
+
     if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
       return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
     }
