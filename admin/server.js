@@ -28,7 +28,7 @@ const isHostinger = process.cwd().includes('u999617803') ||
 
 // Main Host Database Configuration (Hostinger)
 let dbHost = process.env.DB_HOST || '127.0.0.1';
-if (dbHost === 'localhost') {
+if (dbHost === 'localhost' || dbHost === 'knowlipop.shop' || dbHost === 'https://knowlipop.shop') {
   dbHost = '127.0.0.1';
 }
 
