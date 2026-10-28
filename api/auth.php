@@ -76,7 +76,7 @@ function apiRegister(PDO $pdo): void
     ]);
 
     $userId = (int) $pdo->lastInsertId();
-    $token = createToken($pdo, $userId);
+    $token = createToken($pdo, $userId, $input['phone']);
 
     $fetchStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id");
     $fetchStmt->execute([':id' => $userId]);
@@ -120,7 +120,7 @@ function apiLogin(PDO $pdo): void
         ], 422);
     }
 
-    $token = createToken($pdo, (int) $user['id']);
+    $token = createToken($pdo, (int) $user['id'], $user['phone'] ?? '');
 
     jsonResponse([
         'message' => 'Login successful.',
