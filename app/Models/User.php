@@ -2,33 +2,69 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Factories\HasFactory;
-use Illuminate\Foundation\Auth\User as Authenticatable;
-use Illuminate\Notifications\Notifiable;
-use Laravel\Sanctum\HasApiTokens;
+use PDO;
 
-class User extends Authenticatable
+/**
+ * Pure PHP User Model (Hostinger Production)
+ * Zero framework dependencies (no Laravel or XAMPP required).
+ */
+class User
 {
-    use HasApiTokens, HasFactory, Notifiable;
+    public int $id;
+    public string $name;
+    public string $email;
+    public ?string $seller_name = null;
+    public ?string $phone = null;
+    public ?string $address = null;
+    public ?string $landmark = null;
+    public ?string $state = null;
+    public ?string $country = null;
+    public string $role = 'seller';
 
-    protected $fillable = [
-        'name', 'email', 'seller_name', 'phone', 'address', 'landmark', 'state', 'country', 'password',
-    ];
-
-    protected $hidden = ['password', 'remember_token'];
-
-    protected function casts(): array
+    public function __construct(array $attributes = [])
     {
-        return ['email_verified_at' => 'datetime', 'password' => 'hashed'];
+        foreach ($attributes as $key => $val) {
+            if (property_exists($this, $key)) {
+                $this->{$key} = $val;
+            }
+        }
     }
 
-    public function products()
+    public static function find(PDO $pdo, int $id): ?self
     {
-        return $this->hasMany(Product::class, 'seller_id');
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => $id]);
+        $row = $stmt->fetch();
+        return $row ? new self($row) : null;
     }
 
-    public function paymentAccount()
+    public static function findByPhone(PDO $pdo, string $phone): ?self
     {
-        return $this->hasOne(SellerPaymentAccount::class, 'seller_id');
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone LIMIT 1");
+        $stmt->execute([':phone' => $phone]);
+        $row = $stmt->fetch();
+        return $row ? new self($row) : null;
+    }
+
+    public static function findByEmail(PDO $pdo, string $email): ?self
+    {
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = :email LIMIT 1");
+        $stmt->execute([':email' => $email]);
+        $row = $stmt->fetch();
+        return $row ? new self($row) : null;
+    }
+
+    public function toArray(): array
+    {
+        return [
+            'id' => $this->id ?? null,
+            'seller_name' => $this->seller_name ?? $this->name ?? null,
+            'phone' => $this->phone,
+            'address' => $this->address,
+            'landmark' => $this->landmark,
+            'state' => $this->state,
+            'country' => $this->country,
+            'role' => $this->role,
+        ];
     }
 }

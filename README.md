@@ -1,54 +1,65 @@
-# Vendor App Backend (Pure Native PHP & MySQL)
+# Vendor App Backend (Pure PHP & Node.js Dual Engine)
 
-A lightweight, high-performance REST API and Admin Dashboard with **zero dependencies**. 
-Works 100% out of the box on **Hostinger**, **cPanel**, or any standard PHP host (PHP 7.4 - 8.3+).
-
----
-
-## Features
-- **Zero Dependencies**: No Composer, no `vendor/`, no Node.js, no build scripts required on server.
-- **REST API**:
-  - `GET /api/health` — Health check
-  - `POST /api/register` — Seller registration
-  - `POST /api/login` — Seller login (returns Bearer token)
-  - `GET /api/me` — Authenticated seller profile
-  - `POST /api/logout` — Revoke token
-  - `POST /api/forgot-password`, `POST /api/verify-otp`, `POST /api/reset-password`
-  - `GET /api/products` — Public catalog with pagination
-  - `GET /api/products/{id}` — Public product detail
-  - `POST /api/products` — Create product (seller only)
-  - `PUT /api/products/{id}` — Update product (seller only)
-  - `DELETE /api/products/{id}` — Delete product (seller only)
-  - `POST /api/seller/bank-account/onboarding`
-  - `GET /api/seller/bank-account/status`
-- **Web Admin Dashboard**:
-  - `GET /admin/login` — Sign-in page
-  - `GET /admin` — Dashboard with seller counts, seller creation form, and seller table
+A high-performance REST API and Admin Dashboard designed specifically for **Hostinger Production** (`https://knowlipop.shop`).
+Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 
 ---
 
-## Hostinger / Shared Hosting Deployment
+## Architecture & Technology Stack
 
-### 1. Upload files
-Upload all project files directly to your **`public_html`** folder (via Hostinger Git or File Manager).
+1. **Dual Engine Execution**:
+   - **Node.js (Express)**: Provides ultra-fast JSON REST API endpoints, JWT token verification, and automated admin provisioning.
+   - **Pure Native PHP**: Provides fallback routing via `.htaccess` and `index.php` with native PDO MySQL connections.
+2. **Database Engine**:
+   - MySQL running directly on Hostinger internal socket (`127.0.0.1:3306`).
+   - Production Database: `u999617803_knowlipop1`
+3. **Authentication**:
+   - JSON Web Tokens (JWT) for sellers (`/api/login`, `/api/register`, `/api/me`, `/api/products`).
+   - Password reset via 6-digit OTP codes stored securely in `password_reset_otps`.
+4. **Admin Dashboard**:
+   - Accessible at `https://knowlipop.shop/admin`
+   - Default credentials: `admin@vendor.app` / `Admin123!`
 
-### 2. Configure Database
-Open `config.php` and set your MySQL credentials:
-```php
-'db' => [
-    'host' => 'localhost', // or 127.0.0.1
-    'port' => '3306',
-    'name' => 'your_database_name',
-    'user' => 'your_database_user',
-    'pass' => 'your_database_password',
-]
-```
+---
 
-### 3. Import Database
-In Hostinger phpMyAdmin:
-- Select your database &rarr; click **Import** &rarr; choose `database/schema.sql` &rarr; click **Go**.
+## Available Endpoints
 
-### 4. Admin Access
-- Open `https://yourdomain.com/login`
-- Default admin email: `admin@vendor.app` (or `admin@venter.app`)
-- Default password: `Admin123!`
+### System & Health
+* `GET /` — Backend status card
+* `GET /api/health` — Hostinger MySQL connectivity check
+
+### Authentication
+* `POST /api/register` — Seller registration (returns JWT Bearer token)
+* `POST /api/login` — Seller login (returns JWT Bearer token)
+* `GET /api/me` — Authenticated seller profile (`Authorization: Bearer <token>`)
+* `POST /api/logout` — Invalidate session
+
+### Products Catalog & CRUD
+* `GET /api/products` — Public catalog with pagination
+* `POST /api/products` — Create product (`Authorization: Bearer <token>`)
+* `GET /api/products/{id}` — Single product details
+* `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`)
+* `DELETE /api/products/{id}` — Delete product (`Authorization: Bearer <token>`)
+
+### Password Reset Flow (OTP)
+* `POST /api/forgot-password` — Request 6-digit OTP
+* `POST /api/verify-otp` — Verify OTP code and obtain reset token
+* `POST /api/reset-password` — Set new password using reset token
+
+### Seller Bank & Commission
+* `POST /api/seller/bank-account/onboarding` — Store seller payment account reference
+* `GET /api/seller/bank-account/status` — Payment account status
+* `POST /api/marketplace/commission-preview` — Calculate platform fee and net payout
+* `GET /api/seller/payouts` — Payout history
+
+### Admin Panel
+* `GET /admin/login` — Administrator login page
+* `POST /admin/login` — Sign in with email and password
+* `GET /admin` — Administrator dashboard
+
+---
+
+## Postman Testing
+The complete collection with 40 automated test checks is available in the repository root:
+* `Vendor_App_API.postman_collection.json`
+* `Vendor_App_Environment.postman_environment.json`
