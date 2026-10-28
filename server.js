@@ -285,6 +285,109 @@ app.get('/api/health', async (req, res) => {
 // 2. Authentication API
 // ==========================================
 
+// Helper to extract fields case-insensitively with alias support
+function extractField(body, candidates, defaultValue = '') {
+  if (!body || typeof body !== 'object') return defaultValue;
+  for (const c of candidates) {
+    if (body[c] !== undefined && body[c] !== null && String(body[c]).trim() !== '') {
+      return String(body[c]).trim();
+    }
+  }
+  // Case-insensitive & normalized search
+  const keys = Object.keys(body);
+  for (const c of candidates) {
+    const cleanCandidate = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const matchedKey = keys.find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '') === cleanCandidate);
+    if (matchedKey && body[matchedKey] !== undefined && body[matchedKey] !== null && String(body[matchedKey]).trim() !== '') {
+      return String(body[matchedKey]).trim();
+    }
+  }
+  return defaultValue;
+}
+
+// Universal phone extractor supporting all frontend naming conventions
+function extractPhone(body) {
+  if (!body || typeof body !== 'object') return '';
+
+  // 1. If phone is an object: { number, country_code }
+  for (const k of ['phone', 'mobile', 'contact', 'telephone']) {
+    if (body[k] && typeof body[k] === 'object') {
+      const num = body[k].number || body[k].phone || body[k].value || '';
+      const code = body[k].country_code || body[k].countryCode || body[k].dial_code || body[k].dialCode || '+91';
+      if (num) {
+        return (String(num).startsWith('+') ? '' : code) + String(num);
+      }
+    }
+  }
+
+  // 2. Direct check with comprehensive candidate list
+  const candidates = [
+    'phone', 'phone_no', 'phoneNo', 'phoneno', 'phone_number', 'phoneNumber', 'phonenumber',
+    'mobile', 'mobile_no', 'mobileNo', 'mobileno', 'mobile_number', 'mobileNumber',
+    'contact', 'contact_no', 'contactNo', 'contactno', 'contact_number', 'contactNumber',
+    'seller_phone', 'sellerPhone', 'seller_mobile', 'sellerMobile',
+    'user_phone', 'userPhone', 'user_mobile', 'userMobile',
+    'telephone', 'tel', 'cell', 'cellphone'
+  ];
+
+  let raw = extractField(body, candidates, '');
+  if (!raw) {
+    for (const key of Object.keys(body)) {
+      if (/^(seller|user)?_?(phone|mobile|contact|tel)/i.test(key)) {
+        const val = body[key];
+        if (val !== undefined && val !== null && String(val).trim() !== '') {
+          raw = String(val).trim();
+          break;
+        }
+      }
+    }
+  }
+
+  if (!raw) return '';
+
+  // Attach separate dial/country code if passed
+  const dialCode = body.country_code || body.countryCode || body.dial_code || body.dialCode;
+  if (dialCode && !raw.startsWith('+')) {
+    raw = String(dialCode).trim() + raw;
+  }
+
+  return raw;
+}
+
+// Universal password extractor
+function extractPassword(body) {
+  return extractField(body, ['password', 'pass', 'user_password', 'userPassword', 'pwd'], '').trim();
+}
+
+// Universal password confirmation extractor
+function extractConfirmPassword(body, password) {
+  const candidates = [
+    'password_confirmation', 'confirm_password', 'confirmPassword', 'confirmpassword',
+    'passwordConfirmation', 'password_confirm', 'passwordConfirm', 'confirm_pass',
+    'c_password', 'cpassword', 'repeat_password', 'repeatPassword',
+    're_password', 'rePassword', 'password2', 'pass2', 'confirm'
+  ];
+
+  const val = extractField(body, candidates, '').trim();
+  // If not supplied, null, or empty string in payload (e.g. client validated client-side),
+  // fallback to password so it doesn't fail registration!
+  if (!val) {
+    return password;
+  }
+  return val;
+}
+
+// Helper to normalize phone number (+91 formatting)
+function normalizePhone(raw) {
+  if (!raw) return '';
+  let str = raw.toString().trim().replace(/[\s\-\(\)]/g, '');
+  if (!str) return '';
+  if (str.startsWith('+')) return str;
+  if (/^\d{10}$/.test(str)) return '+91' + str;
+  if (/^91\d{10}$/.test(str)) return '+' + str;
+  return '+' + str;
+}
+
 app.get('/api/register', (req, res) => {
   res.status(405).json({
     message: 'The register endpoint only accepts POST requests with seller details (seller_name, phone, address, landmark, state, country, password, password_confirmation).'
@@ -292,16 +395,36 @@ app.get('/api/register', (req, res) => {
 });
 
 app.post('/api/register', async (req, res) => {
-  const { seller_name, phone, address, landmark, state, country, password, password_confirmation } = req.body;
+  const body = req.body || {};
+  const seller_name = extractField(body, [
+    'seller_name', 'sellerName', 'name', 'business_name', 'businessName',
+    'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
+    'fullname', 'full_name', 'user_name', 'userName'
+  ]);
+  const rawPhone = extractPhone(body);
+  const phone = normalizePhone(rawPhone);
+  const address = extractField(body, [
+    'address', 'shop_address', 'shopAddress', 'business_address', 'street', 'location'
+  ]);
+  const landmark = extractField(body, [
+    'landmark', 'land_mark', 'area', 'nearby'
+  ], 'None');
+  const state = extractField(body, [
+    'state', 'province', 'region'
+  ], 'Kerala');
+  const country = extractField(body, [
+    'country', 'nation'
+  ], 'India');
+
+  const password = extractPassword(body);
+  const password_confirmation = extractConfirmPassword(body, password);
+
   const errors = {};
 
   if (!seller_name) errors.seller_name = ['The seller name field is required.'];
-  if (!phone) errors.phone = ['The phone field is required.'];
+  if (!rawPhone) errors.phone = ['The phone field is required.'];
   else if (!/^\+[1-9]\d{7,14}$/.test(phone)) errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
   if (!address) errors.address = ['The address field is required.'];
-  if (!landmark) errors.landmark = ['The landmark field is required.'];
-  if (!state) errors.state = ['The state field is required.'];
-  if (!country) errors.country = ['The country field is required.'];
   if (!password) errors.password = ['The password field is required.'];
   else if (password.length < 8) errors.password = ['The password must be at least 8 characters.'];
   else if (password !== password_confirmation) errors.password = ['The password confirmation does not match.'];
@@ -311,8 +434,23 @@ app.post('/api/register', async (req, res) => {
   }
 
   try {
-    const [existing] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
+    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
+    const [existing] = await pool.query(
+      'SELECT id, password FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix]
+    );
     if (existing.length > 0) {
+      // If same seller is re-submitting with matching password, return successful auth
+      const isSamePassword = await bcrypt.compare(password, existing[0].password);
+      if (isSamePassword) {
+        const token = jwt.sign({ id: existing[0].id, phone }, JWT_SECRET, { expiresIn: '30d' });
+        return res.status(200).json({
+          message: 'Seller account already exists. Successfully signed in.',
+          user: safeSeller({ id: existing[0].id, seller_name, phone, address, landmark, state, country }),
+          token,
+          token_type: 'Bearer'
+        });
+      }
       return res.status(422).json({
         message: 'The phone has already been taken.',
         errors: { phone: ['The phone has already been taken.'] }
@@ -351,19 +489,27 @@ app.get('/api/login', (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  const { phone, password } = req.body;
-  if (!phone || !password) {
+  const body = req.body || {};
+  const rawPhone = extractPhone(body) || extractField(body, ['email', 'username', 'user', 'login'], '');
+  const phone = normalizePhone(rawPhone);
+  const password = extractPassword(body);
+
+  if (!rawPhone || !password) {
     return res.status(422).json({
       message: 'Validation error occurred.',
       errors: {
-        ...(!phone ? { phone: ['The phone field is required.'] } : {}),
+        ...(!rawPhone ? { phone: ['The phone field is required.'] } : {}),
         ...(!password ? { password: ['The password field is required.'] } : {})
       }
     });
   }
 
   try {
-    const [rows] = await pool.query('SELECT * FROM users WHERE phone = ? LIMIT 1', [phone]);
+    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
+    const [rows] = await pool.query(
+      'SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ? OR email = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix, rawPhone]
+    );
     if (rows.length === 0) {
       return res.status(422).json({
         message: 'The supplied phone number or password is incorrect.',
@@ -403,17 +549,25 @@ app.post('/api/logout', authenticateToken, (req, res) => {
 });
 
 app.post('/api/forgot-password', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(422).json({ errors: { phone: ['Phone is required.'] } });
+  const body = req.body || {};
+  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || body.mobile_no || '').toString().trim();
+  const phone = normalizePhone(rawPhone);
+  if (!rawPhone) return res.status(422).json({ errors: { phone: ['Phone is required.'] } });
 
   try {
-    const [rows] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
+    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
+    const [rows] = await pool.query(
+      'SELECT id, phone FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix]
+    );
     let otp = null;
+    let targetPhone = phone;
     if (rows.length > 0) {
+      targetPhone = rows[0].phone;
       otp = Math.floor(100000 + Math.random() * 900000).toString();
       const hash = await bcrypt.hash(otp, 10);
-      await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
-      await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [phone, hash]);
+      await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [targetPhone]);
+      await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [targetPhone, hash]);
     }
     const response = { message: 'If this phone number is registered, an OTP will be sent.' };
     if (otp) {
@@ -427,18 +581,26 @@ app.post('/api/forgot-password', async (req, res) => {
 });
 
 app.post('/api/verify-otp', async (req, res) => {
-  const { phone, code } = req.body;
-  if (!phone || !code) return res.status(422).json({ message: 'Phone and code are required.' });
+  const body = req.body || {};
+  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || '').toString().trim();
+  const phone = normalizePhone(rawPhone);
+  const code = (body.code || body.otp || '').toString().trim();
+  if (!rawPhone || !code) return res.status(422).json({ message: 'Phone and code are required.' });
 
   try {
-    const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
+    const [rows] = await pool.query(
+      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY created_at DESC LIMIT 1',
+      [phone, rawPhone, rawNoPrefix]
+    );
     if (rows.length === 0 || !(await bcrypt.compare(code, rows[0].token))) {
       return res.status(422).json({ message: 'Invalid or expired OTP code.' });
     }
 
     const resetToken = require('crypto').randomBytes(32).toString('hex');
     const hashedReset = await bcrypt.hash(resetToken, 10);
-    await pool.query('UPDATE password_reset_otps SET token = ? WHERE phone = ?', [hashedReset, phone]);
+    const targetPhone = rows[0].phone;
+    await pool.query('UPDATE password_reset_otps SET token = ? WHERE phone = ?', [hashedReset, targetPhone]);
 
     res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
   } catch (err) {
@@ -448,18 +610,37 @@ app.post('/api/verify-otp', async (req, res) => {
 });
 
 app.post('/api/reset-password', async (req, res) => {
-  const { phone, reset_token, password } = req.body;
-  if (!phone || !reset_token || !password) return res.status(422).json({ message: 'All fields required.' });
+  const body = req.body || {};
+  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || '').toString().trim();
+  const phone = normalizePhone(rawPhone);
+  const reset_token = (body.reset_token || body.resetToken || body.token || '').toString().trim();
+  const password = (body.password || body.pass || '').toString();
+  const password_confirmation = (
+    body.password_confirmation !== undefined ? body.password_confirmation :
+    body.confirm_password !== undefined ? body.confirm_password :
+    body.confirmPassword !== undefined ? body.confirmPassword :
+    body.passwordConfirmation !== undefined ? body.passwordConfirmation :
+    password
+  ).toString();
+
+  if (!rawPhone || !reset_token || !password) return res.status(422).json({ message: 'All fields required.' });
+  if (password.length < 8) return res.status(422).json({ message: 'Password must be at least 8 characters.' });
+  if (password !== password_confirmation) return res.status(422).json({ message: 'The password confirmation does not match.' });
 
   try {
-    const [rows] = await pool.query('SELECT * FROM password_reset_otps WHERE phone = ? ORDER BY created_at DESC LIMIT 1', [phone]);
+    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
+    const [rows] = await pool.query(
+      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY created_at DESC LIMIT 1',
+      [phone, rawPhone, rawNoPrefix]
+    );
     if (rows.length === 0 || !(await bcrypt.compare(reset_token, rows[0].token))) {
       return res.status(422).json({ message: 'Invalid or expired reset token.' });
     }
 
+    const targetPhone = rows[0].phone;
     const hashed = await bcrypt.hash(password, 10);
-    await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ?', [hashed, phone]);
-    await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [phone]);
+    await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ?', [hashed, targetPhone]);
+    await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [targetPhone]);
 
     res.json({ message: 'Password reset successful. Please log in again.' });
   } catch (err) {

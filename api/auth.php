@@ -7,6 +7,100 @@
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
 
+function extractFieldPhp(array $input, array $candidates, string $default = ''): string
+{
+    foreach ($candidates as $c) {
+        if (isset($input[$c]) && trim((string)$input[$c]) !== '') {
+            return trim((string)$input[$c]);
+        }
+    }
+    // Case-insensitive search
+    foreach ($candidates as $c) {
+        $clean = strtolower(preg_replace('/[^a-z0-9]/', '', $c));
+        foreach ($input as $k => $v) {
+            if (strtolower(preg_replace('/[^a-z0-9]/', '', (string)$k)) === $clean && trim((string)$v) !== '') {
+                return trim((string)$v);
+            }
+        }
+    }
+    return $default;
+}
+
+function extractPhonePhp(array $input): string
+{
+    // Object / array check
+    foreach (['phone', 'mobile', 'contact', 'telephone'] as $k) {
+        if (isset($input[$k]) && is_array($input[$k])) {
+            $num = $input[$k]['number'] ?? $input[$k]['phone'] ?? $input[$k]['value'] ?? '';
+            $code = $input[$k]['country_code'] ?? $input[$k]['countryCode'] ?? $input[$k]['dial_code'] ?? $input[$k]['dialCode'] ?? '+91';
+            if ($num !== '') {
+                return (str_starts_with((string)$num, '+') ? '' : $code) . (string)$num;
+            }
+        }
+    }
+
+    $candidates = [
+        'phone', 'phone_no', 'phoneNo', 'phoneno', 'phone_number', 'phoneNumber', 'phonenumber',
+        'mobile', 'mobile_no', 'mobileNo', 'mobileno', 'mobile_number', 'mobileNumber',
+        'contact', 'contact_no', 'contactNo', 'contactno', 'contact_number', 'contactNumber',
+        'seller_phone', 'sellerPhone', 'seller_mobile', 'sellerMobile',
+        'user_phone', 'userPhone', 'user_mobile', 'userMobile',
+        'telephone', 'tel', 'cell', 'cellphone'
+    ];
+
+    $raw = extractFieldPhp($input, $candidates, '');
+    if ($raw === '') {
+        foreach ($input as $k => $v) {
+            if (preg_match('/^(seller|user)?_?(phone|mobile|contact|tel)/i', (string)$k)) {
+                if (trim((string)$v) !== '') {
+                    $raw = trim((string)$v);
+                    break;
+                }
+            }
+        }
+    }
+
+    if ($raw === '') return '';
+
+    $dialCode = $input['country_code'] ?? $input['countryCode'] ?? $input['dial_code'] ?? $input['dialCode'] ?? null;
+    if ($dialCode && !str_starts_with($raw, '+')) {
+        $raw = trim((string)$dialCode) . $raw;
+    }
+
+    return $raw;
+}
+
+function normalizePhonePhp(string $raw): string
+{
+    if (!$raw) return '';
+    $str = preg_replace('/[\s\-\(\)]/', '', trim($raw));
+    if (!$str) return '';
+    if (str_starts_with($str, '+')) return $str;
+    if (preg_match('/^\d{10}$/', $str)) return '+91' . $str;
+    if (preg_match('/^91\d{10}$/', $str)) return '+' . $str;
+    return '+' . $str;
+}
+
+function extractPasswordPhp(array $input): string
+{
+    return trim(extractFieldPhp($input, ['password', 'pass', 'user_password', 'userPassword', 'pwd']));
+}
+
+function extractConfirmPasswordPhp(array $input, string $password): string
+{
+    $candidates = [
+        'password_confirmation', 'confirm_password', 'confirmPassword', 'confirmpassword',
+        'passwordConfirmation', 'password_confirm', 'passwordConfirm', 'confirm_pass',
+        'c_password', 'cpassword', 'repeat_password', 'repeatPassword',
+        're_password', 'rePassword', 'password2', 'pass2', 'confirm'
+    ];
+    $val = trim(extractFieldPhp($input, $candidates));
+    if ($val === '') {
+        return $password;
+    }
+    return $val;
+}
+
 function apiRegister(PDO $pdo): void
 {
     if ($_SERVER['REQUEST_METHOD'] === 'GET' || $_SERVER['REQUEST_METHOD'] === 'HEAD') {
@@ -14,69 +108,92 @@ function apiRegister(PDO $pdo): void
     }
 
     $input = getJsonInput();
+    $sellerName = extractFieldPhp($input, [
+        'seller_name', 'sellerName', 'name', 'business_name', 'businessName',
+        'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
+        'fullname', 'full_name', 'user_name', 'userName'
+    ]);
+    $rawPhone = extractPhonePhp($input);
+    $phone = normalizePhonePhp($rawPhone);
+    $address = extractFieldPhp($input, ['address', 'shop_address', 'shopAddress', 'business_address', 'street', 'location']);
+    $landmark = extractFieldPhp($input, ['landmark', 'land_mark', 'area', 'nearby'], 'None');
+    $state = extractFieldPhp($input, ['state', 'province', 'region'], 'Kerala');
+    $country = extractFieldPhp($input, ['country', 'nation'], 'India');
+    $password = extractPasswordPhp($input);
+    $confirmPassword = extractConfirmPasswordPhp($input, $password);
+
     $errors = [];
 
-    if (empty($input['seller_name'])) {
+    if (empty($sellerName)) {
         $errors['seller_name'] = ['The seller name field is required.'];
     }
-    if (empty($input['phone'])) {
+    if (empty($rawPhone)) {
         $errors['phone'] = ['The phone field is required.'];
-    } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $input['phone'])) {
-        $errors['phone'] = ['The phone format is invalid. Must include country code, e.g. +919876543210.'];
+    } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+        $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
     }
-    if (empty($input['address'])) {
+    if (empty($address)) {
         $errors['address'] = ['The address field is required.'];
     }
-    if (empty($input['landmark'])) {
-        $errors['landmark'] = ['The landmark field is required.'];
-    }
-    if (empty($input['state'])) {
-        $errors['state'] = ['The state field is required.'];
-    }
-    if (empty($input['country'])) {
-        $errors['country'] = ['The country field is required.'];
-    }
-    if (empty($input['password'])) {
+    if (empty($password)) {
         $errors['password'] = ['The password field is required.'];
-    } elseif (strlen($input['password']) < 8) {
+    } elseif (strlen($password) < 8) {
         $errors['password'] = ['The password must be at least 8 characters.'];
-    } elseif (!isset($input['password_confirmation']) || $input['password'] !== $input['password_confirmation']) {
-        $errors['password'] = ['The password field confirmation does not match.'];
+    } elseif ($password !== $confirmPassword) {
+        $errors['password'] = ['The password confirmation does not match.'];
     }
 
     if (!empty($errors)) {
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
-    // Check duplicate phone
-    $checkStmt = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
-    $checkStmt->execute([':phone' => $input['phone']]);
-    if ($checkStmt->fetch()) {
+    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+    $checkStmt = $pdo->prepare("SELECT id, password FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
+    $checkStmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
+    $existing = $checkStmt->fetch();
+    if ($existing) {
+        if (verifyPassword($password, $existing['password'])) {
+            $token = createToken($pdo, (int)$existing['id'], $phone);
+            jsonResponse([
+                'message' => 'Seller account already exists. Successfully signed in.',
+                'user' => safeSeller([
+                    'id' => $existing['id'],
+                    'seller_name' => $sellerName,
+                    'phone' => $phone,
+                    'address' => $address,
+                    'landmark' => $landmark,
+                    'state' => $state,
+                    'country' => $country
+                ]),
+                'token' => $token,
+                'token_type' => 'Bearer'
+            ], 200);
+        }
         errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
     }
 
-    $phoneDigits = preg_replace('/\D+/', '', $input['phone']);
+    $phoneDigits = preg_replace('/\D+/', '', $phone);
     $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
-    $hashedPassword = hashPassword($input['password']);
+    $hashedPassword = hashPassword($password);
 
     $stmt = $pdo->prepare("
         INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
         VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
     ");
     $stmt->execute([
-        ':name' => $input['seller_name'],
+        ':name' => $sellerName,
         ':email' => $email,
-        ':seller_name' => $input['seller_name'],
-        ':phone' => $input['phone'],
-        ':address' => $input['address'],
-        ':landmark' => $input['landmark'],
-        ':state' => $input['state'],
-        ':country' => $input['country'],
+        ':seller_name' => $sellerName,
+        ':phone' => $phone,
+        ':address' => $address,
+        ':landmark' => $landmark,
+        ':state' => $state,
+        ':country' => $country,
         ':password' => $hashedPassword,
     ]);
 
     $userId = (int) $pdo->lastInsertId();
-    $token = createToken($pdo, $userId, $input['phone']);
+    $token = createToken($pdo, $userId, $phone);
 
     $fetchStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id");
     $fetchStmt->execute([':id' => $userId]);
@@ -97,12 +214,15 @@ function apiLogin(PDO $pdo): void
     }
 
     $input = getJsonInput();
+    $rawPhone = extractPhonePhp($input) ?: extractFieldPhp($input, ['email', 'username', 'user', 'login']);
+    $phone = normalizePhonePhp($rawPhone);
+    $password = extractPasswordPhp($input);
     $errors = [];
 
-    if (empty($input['phone'])) {
+    if (empty($rawPhone)) {
         $errors['phone'] = ['The phone field is required.'];
     }
-    if (empty($input['password'])) {
+    if (empty($password)) {
         $errors['password'] = ['The password field is required.'];
     }
 
@@ -110,11 +230,12 @@ function apiLogin(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone LIMIT 1");
-    $stmt->execute([':phone' => $input['phone']]);
+    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix OR email = :rawEmail LIMIT 1");
+    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':rawEmail' => $rawPhone]);
     $user = $stmt->fetch();
 
-    if (!$user || !verifyPassword($input['password'], $user['password'])) {
+    if (!$user || !verifyPassword($password, $user['password'])) {
         errorResponse('The supplied phone number or password is incorrect.', [
             'phone' => ['The supplied phone number or password is incorrect.']
         ], 422);
