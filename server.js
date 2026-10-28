@@ -89,7 +89,10 @@ let pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  multipleStatements: true
+  multipleStatements: true,
+  connectTimeout: 10000,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0
 });
 
 async function autoMigrateIfEmpty(p) {
