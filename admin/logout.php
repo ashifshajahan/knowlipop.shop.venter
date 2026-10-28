@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pure PHP: Admin Logout
+ * Pure PHP: Admin Logout (Hostinger Production)
  */
 
 if (session_status() === PHP_SESSION_NONE) {
@@ -17,6 +17,11 @@ if (ini_get("session.use_cookies")) {
     );
 }
 session_destroy();
+
+// Clear authentication cookies
+setcookie('admin_logged_in', '', time() - 3600, '/');
+setcookie('admin_email', '', time() - 3600, '/');
+setcookie('admin_token', '', time() - 3600, '/');
 
 header('Location: /admin/login');
 exit;

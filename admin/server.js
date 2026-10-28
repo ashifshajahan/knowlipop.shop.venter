@@ -704,6 +704,13 @@ app.post('/admin/login', async (req, res) => {
     if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
       return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
     }
+
+    const adminToken = jwt.sign({ id: rows[0].id, role: 'admin', email: rows[0].email }, JWT_SECRET, { expiresIn: '7d' });
+    res.setHeader('Set-Cookie', [
+      `admin_logged_in=1; Path=/; Max-Age=604800; SameSite=Lax`,
+      `admin_email=${encodeURIComponent(rows[0].email)}; Path=/; Max-Age=604800; SameSite=Lax`,
+      `admin_token=${adminToken}; Path=/; HttpOnly; Max-Age=604800; SameSite=Lax`
+    ]);
     res.redirect('/admin');
   } catch (err) {
     console.error('Admin Login Error:', err);
@@ -800,6 +807,15 @@ app.get('/admin', async (req, res) => {
     console.error('Admin Dashboard Error:', err);
     res.status(500).send(`<h3>Database Error: ${err.message}</h3><p>Could not load sellers. Ensure database connection is active and schema is imported.</p><a href="/admin/login">Back to Login</a>`);
   }
+});
+
+app.get('/admin/logout', (req, res) => {
+  res.setHeader('Set-Cookie', [
+    'admin_logged_in=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+    'admin_email=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+    'admin_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT'
+  ]);
+  res.redirect('/admin/login');
 });
 
 // Start server

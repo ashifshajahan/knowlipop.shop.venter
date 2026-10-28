@@ -9,8 +9,12 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 if (empty($_SESSION['admin_logged_in'])) {
-    header('Location: /admin/login');
-    exit;
+    if (!empty($_COOKIE['admin_logged_in'])) {
+        $_SESSION['admin_logged_in'] = true;
+    } else {
+        header('Location: /admin/login');
+        exit;
+    }
 }
 
 require_once __DIR__ . '/../config/database.php';
