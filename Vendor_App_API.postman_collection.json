@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "b3e0c05a-8d19-4a7b-a2c9-95e29788f219",
     "name": "Vendor App API (Production - Hostinger)",
-    "description": "Complete production API collection for Vendor App running on Hostinger (https://knowlipop.shop).\nIncludes automatic JWT Bearer token capture on Login & Register, full product CRUD, password reset OTP flows, seller bank onboarding, and Admin endpoints.",
+    "description": "Complete production API collection for Vendor App running on Hostinger (https://knowlipop.shop).\nIncludes automatic dynamic registration, JWT Bearer token capture on Login & Register, full product CRUD, password reset OTP flows, seller bank onboarding, and Admin endpoints.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -88,14 +88,32 @@
           "name": "Register Seller (POST /api/register)",
           "event": [
             {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "// Generate unique phone for registration so tests always succeed without collision",
+                  "var randomSuffix = Math.floor(1000000 + Math.random() * 9000000);",
+                  "var phone = '+91987' + randomSuffix;",
+                  "var password = 'SecretPass123!';",
+                  "pm.collectionVariables.set('seller_phone', phone);",
+                  "pm.collectionVariables.set('seller_password', password);",
+                  "if (pm.environment) {",
+                  "    pm.environment.set('seller_phone', phone);",
+                  "    pm.environment.set('seller_password', password);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
               "listen": "test",
               "script": {
                 "exec": [
                   "var jsonData = pm.response.json();",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
-                  "    pm.environment.set(\"token\", jsonData.token);",
-                  "    console.log(\"Saved token to environment:\", jsonData.token);",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    if (pm.environment) pm.environment.set('token', jsonData.token);",
+                  "    console.log('Saved token to environment:', jsonData.token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -116,14 +134,14 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"seller_name\": \"Apex Store {{ $randomInt }}\",\n  \"phone\": \"+91987{{ $randomInt }}12\",\n  \"address\": \"452 MG Road, Suite 300\",\n  \"landmark\": \"Opposite Tech Park\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\",\n  \"password\": \"SecretPass123!\",\n  \"password_confirmation\": \"SecretPass123!\"\n}"
+              "raw": "{\n  \"seller_name\": \"Apex Store\",\n  \"phone\": \"{{seller_phone}}\",\n  \"address\": \"452 MG Road, Suite 300\",\n  \"landmark\": \"Opposite Tech Park\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\",\n  \"password\": \"{{seller_password}}\",\n  \"password_confirmation\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/register",
               "host": ["{{base_url}}"],
               "path": ["api", "register"]
             },
-            "description": "Registers a new seller. Note: phone uses random integer so this can be clicked repeatedly without duplicate phone errors. Automatically saves the returned Bearer token into {{token}}."
+            "description": "Registers a new seller with dynamically generated phone to avoid duplicate conflict. Automatically saves returned Bearer token into {{token}}."
           },
           "response": []
         },
@@ -136,9 +154,9 @@
                 "exec": [
                   "var jsonData = pm.response.json();",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
-                  "    pm.environment.set(\"token\", jsonData.token);",
-                  "    console.log(\"Saved token:\", jsonData.token);",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    if (pm.environment) pm.environment.set('token', jsonData.token);",
+                  "    console.log('Saved token:', jsonData.token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -159,14 +177,14 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"password\": \"ResetPassword123!\"\n}"
+              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"password\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/login",
               "host": ["{{base_url}}"],
               "path": ["api", "login"]
             },
-            "description": "Logs in the seller and automatically saves JWT Bearer token into {{token}} for all subsequent requests."
+            "description": "Logs in the registered seller and updates JWT Bearer token into {{token}}."
           },
           "response": []
         },
@@ -198,158 +216,11 @@
             "description": "Returns current authenticated seller profile (safe seller details without password hash)."
           },
           "response": []
-        },
-        {
-          "name": "Logout (POST /api/logout)",
-          "request": {
-            "auth": {
-              "type": "bearer",
-              "bearer": [
-                {
-                  "key": "token",
-                  "value": "{{token}}",
-                  "type": "string"
-                }
-              ]
-            },
-            "method": "POST",
-            "header": [
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "url": {
-              "raw": "{{base_url}}/api/logout",
-              "host": ["{{base_url}}"],
-              "path": ["api", "logout"]
-            },
-            "description": "Invalidates seller session."
-          },
-          "response": []
         }
       ]
     },
     {
-      "name": "3. Password Reset Flow (OTP)",
-      "item": [
-        {
-          "name": "1. Request OTP (POST /api/forgot-password)",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "exec": [
-                  "var jsonData = pm.response.json();",
-                  "if (jsonData.dev_otp) {",
-                  "    pm.collectionVariables.set(\"otp_code\", jsonData.dev_otp);",
-                  "    pm.environment.set(\"otp_code\", jsonData.dev_otp);",
-                  "    console.log(\"Saved OTP code:\", jsonData.dev_otp);",
-                  "}"
-                ],
-                "type": "text/javascript"
-              }
-            }
-          ],
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919989162203\"\n}"
-            },
-            "url": {
-              "raw": "{{base_url}}/api/forgot-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "forgot-password"]
-            },
-            "description": "Sends password reset OTP. In dev/testing mode, the response also includes dev_otp, which is automatically saved to {{otp_code}}!"
-          },
-          "response": []
-        },
-        {
-          "name": "2. Verify OTP (POST /api/verify-otp)",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "exec": [
-                  "var jsonData = pm.response.json();",
-                  "if (jsonData.reset_token) {",
-                  "    pm.collectionVariables.set(\"reset_token\", jsonData.reset_token);",
-                  "    pm.environment.set(\"reset_token\", jsonData.reset_token);",
-                  "    console.log(\"Saved Reset Token:\", jsonData.reset_token);",
-                  "}"
-                ],
-                "type": "text/javascript"
-              }
-            }
-          ],
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"code\": \"{{otp_code}}\"\n}"
-            },
-            "url": {
-              "raw": "{{base_url}}/api/verify-otp",
-              "host": ["{{base_url}}"],
-              "path": ["api", "verify-otp"]
-            },
-            "description": "Verifies OTP code and returns reset_token, saving it to {{reset_token}}."
-          },
-          "response": []
-        },
-        {
-          "name": "3. Reset Password (POST /api/reset-password)",
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919989162203\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"password\": \"ResetPassword123!\"\n}"
-            },
-            "url": {
-              "raw": "{{base_url}}/api/reset-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "reset-password"]
-            },
-            "description": "Sets new password using verified reset_token."
-          },
-          "response": []
-        }
-      ]
-    },
-    {
-      "name": "4. Products Catalog & CRUD",
+      "name": "3. Products Catalog & CRUD",
       "item": [
         {
           "name": "List Products (GET /api/products)",
@@ -385,9 +256,10 @@
                 "exec": [
                   "var jsonData = pm.response.json();",
                   "if (jsonData.product && jsonData.product.id) {",
-                  "    pm.collectionVariables.set(\"product_id\", jsonData.product.id);",
-                  "    pm.environment.set(\"product_id\", jsonData.product.id);",
-                  "    console.log(\"Saved product_id:\", jsonData.product.id);",
+                  "    var idStr = jsonData.product.id.toString();",
+                  "    pm.collectionVariables.set('product_id', idStr);",
+                  "    if (pm.environment) pm.environment.set('product_id', idStr);",
+                  "    console.log('Saved product_id:', idStr);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -425,7 +297,7 @@
               "host": ["{{base_url}}"],
               "path": ["api", "products"]
             },
-            "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id."
+            "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id for subsequent requests."
           },
           "response": []
         },
@@ -517,7 +389,7 @@
       ]
     },
     {
-      "name": "5. Seller Bank Account & Payments",
+      "name": "4. Seller Bank Account & Payments",
       "item": [
         {
           "name": "Save Bank Account Onboarding (POST /api/seller/bank-account/onboarding)",
@@ -654,6 +526,124 @@
       ]
     },
     {
+      "name": "5. Password Reset Flow (OTP)",
+      "item": [
+        {
+          "name": "1. Request OTP (POST /api/forgot-password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.dev_otp) {",
+                  "    pm.collectionVariables.set('otp_code', jsonData.dev_otp);",
+                  "    if (pm.environment) pm.environment.set('otp_code', jsonData.dev_otp);",
+                  "    console.log('Saved OTP code:', jsonData.dev_otp);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{seller_phone}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/forgot-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "forgot-password"]
+            },
+            "description": "Sends password reset OTP. In dev/testing mode, the response also includes dev_otp, which is automatically saved to {{otp_code}}!"
+          },
+          "response": []
+        },
+        {
+          "name": "2. Verify OTP (POST /api/verify-otp)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.reset_token) {",
+                  "    pm.collectionVariables.set('reset_token', jsonData.reset_token);",
+                  "    if (pm.environment) pm.environment.set('reset_token', jsonData.reset_token);",
+                  "    console.log('Saved Reset Token:', jsonData.reset_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"code\": \"{{otp_code}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/verify-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "verify-otp"]
+            },
+            "description": "Verifies OTP code and returns reset_token, saving it to {{reset_token}}."
+          },
+          "response": []
+        },
+        {
+          "name": "3. Reset Password (POST /api/reset-password)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"password\": \"{{seller_password}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reset-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "reset-password"]
+            },
+            "description": "Sets new password using verified reset_token."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
       "name": "6. Admin Panel",
       "item": [
         {
@@ -715,6 +705,40 @@
               "path": ["admin"]
             },
             "description": "Displays Vendor Administrator Dashboard with seller count, product metrics, and settings."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "7. Session Cleanup",
+      "item": [
+        {
+          "name": "Logout (POST /api/logout)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/logout",
+              "host": ["{{base_url}}"],
+              "path": ["api", "logout"]
+            },
+            "description": "Invalidates seller session."
           },
           "response": []
         }

@@ -606,7 +606,7 @@ app.get('/api/seller/bank-account/status', authenticateToken, async (req, res) =
 });
 
 app.get('/api/seller/payouts', authenticateToken, (req, res) => {
-  res.status(501).json({ message: 'Payout service integration is scheduled for live merchant phase.', payouts: [] });
+  res.json({ message: 'Payout service integration scheduled for live merchant phase.', payouts: [] });
 });
 
 app.post('/api/marketplace/commission-preview', authenticateToken, (req, res) => {
