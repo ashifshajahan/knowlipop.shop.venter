@@ -1253,7 +1253,12 @@ app.get('/admin/logout', (req, res) => {
 });
 
 app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
-  res.sendFile(path.join(__dirname, 'test-firebase.html'));
+  const filePath = path.resolve(__dirname, 'test-firebase.html');
+  if (fs.existsSync(filePath)) {
+    res.sendFile(filePath);
+  } else {
+    res.status(404).send('Firebase tester page not found.');
+  }
 });
 
 // Start server
