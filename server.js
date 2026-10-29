@@ -181,6 +181,12 @@ async function autoMigrateIfEmpty(p) {
       );
       console.log('✅ [Vendor DB] Seeded admin user: admin@vendor.app');
     }
+    // Ensure image_url column is LONGTEXT to prevent Base64/URL truncation
+    try {
+      await p.query('ALTER TABLE products MODIFY COLUMN image_url LONGTEXT NULL DEFAULT NULL');
+    } catch (e) {
+      // Already LONGTEXT or modified
+    }
   } catch (err) {
     console.error('[Vendor DB] Auto-migration check:', err.message);
   }
