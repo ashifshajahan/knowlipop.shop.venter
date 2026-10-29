@@ -6,6 +6,8 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
+const multer = require('multer');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -77,8 +79,67 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'Origin']
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
+
+// File Upload & Image Storage Configuration
+const uploadDir = path.resolve(__dirname, 'uploads', 'products');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+    cb(null, `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+  }
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
+
+function saveBase64Image(dataString) {
+  if (typeof dataString !== 'string' || !dataString.startsWith('data:image/')) return null;
+  const matches = dataString.match(/^data:image\/(\w+);base64,(.+)$/);
+  if (!matches) return null;
+  let ext = matches[1].toLowerCase();
+  if (ext === 'jpeg') ext = 'jpg';
+  if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
+  const buffer = Buffer.from(matches[2], 'base64');
+  const filename = `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(uploadDir, filename), buffer);
+  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
+  return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
+}
+
+function resolveProductImage(req) {
+  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
+  // 1. Multipart uploaded file
+  if (req.files && req.files.length > 0) {
+    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${req.files[0].filename}`;
+  }
+  if (req.file) {
+    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${req.file.filename}`;
+  }
+  // 2. Base64 encoded image
+  const body = req.body || {};
+  const base64Candidate = body.image || body.image_base64 || body.file;
+  if (base64Candidate && typeof base64Candidate === 'string' && base64Candidate.startsWith('data:image/')) {
+    const saved = saveBase64Image(base64Candidate);
+    if (saved) return saved;
+  }
+  // 3. Fallback to existing URL string
+  if (body.image_url && typeof body.image_url === 'string') {
+    return body.image_url;
+  }
+  if (body.image && typeof body.image === 'string' && (body.image.startsWith('http://') || body.image.startsWith('https://') || body.image.startsWith('/uploads/'))) {
+    return body.image;
+  }
+  return null;
+}
 
 // Database Connection Pool
 let pool = mysql.createPool({
@@ -965,8 +1026,30 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-app.post('/api/products', authenticateToken, async (req, res) => {
-  const { name, description, price, stock, image_url } = req.body;
+// Dedicated Image Upload Endpoint
+app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), (req, res) => {
+  const imageUrl = resolveProductImage(req);
+  if (!imageUrl) {
+    return res.status(422).json({
+      message: 'No image uploaded or invalid format.',
+      errors: { image: ['Please upload an image file (jpg, png, webp) or provide base64 image data.'] }
+    });
+  }
+  res.status(201).json({
+    message: 'Image uploaded successfully.',
+    image_url: imageUrl,
+    url: imageUrl
+  });
+});
+
+app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
+  const body = req.body || {};
+  const name = (body.name || '').toString().trim();
+  const description = body.description || null;
+  const price = body.price;
+  const stock = body.stock;
+  const imageUrl = resolveProductImage(req);
+
   if (!name || price === undefined || stock === undefined) {
     return res.status(422).json({ message: 'Name, price and stock are required.' });
   }
@@ -974,9 +1057,16 @@ app.post('/api/products', authenticateToken, async (req, res) => {
   try {
     const [result] = await pool.query(
       'INSERT INTO products (seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW())',
-      [req.user.id, name, description || null, parseFloat(price), parseInt(stock, 10), image_url || null]
+      [req.user.id, name, description, parseFloat(price), parseInt(stock, 10), imageUrl]
     );
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ?', [result.insertId]);
+    const [rows] = await pool.query(
+      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+              p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.id = ?`,
+      [result.insertId]
+    );
     const product = rows[0];
     product.price = parseFloat(product.price).toFixed(2);
     product.is_active = Boolean(product.is_active);
@@ -988,20 +1078,42 @@ app.post('/api/products', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/products/:id', authenticateToken, async (req, res) => {
+app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) => {
   const [rows] = await pool.query('SELECT * FROM products WHERE id = ? AND seller_id = ? LIMIT 1', [req.params.id, req.user.id]);
   if (rows.length === 0) return res.status(404).json({ message: 'Product not found or access denied.' });
 
-  const { name, description, price, stock, image_url, is_active } = req.body;
+  const body = req.body || {};
   const updates = [];
   const params = [];
 
-  if (name !== undefined) { updates.push('name = ?'); params.push(name); }
-  if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-  if (price !== undefined) { updates.push('price = ?'); params.push(parseFloat(price)); }
-  if (stock !== undefined) { updates.push('stock = ?'); params.push(parseInt(stock, 10)); }
-  if (image_url !== undefined) { updates.push('image_url = ?'); params.push(image_url); }
-  if (is_active !== undefined) { updates.push('is_active = ?'); params.push(is_active ? 1 : 0); }
+  if (body.name !== undefined && body.name.toString().trim() !== '') {
+    updates.push('name = ?');
+    params.push(body.name.toString().trim());
+  }
+  if (body.description !== undefined) {
+    updates.push('description = ?');
+    params.push(body.description);
+  }
+  if (body.price !== undefined && !isNaN(body.price)) {
+    updates.push('price = ?');
+    params.push(parseFloat(body.price));
+  }
+  if (body.stock !== undefined && !isNaN(body.stock)) {
+    updates.push('stock = ?');
+    params.push(parseInt(body.stock, 10));
+  }
+
+  // Resolve newly uploaded image file or base64 if provided
+  const newImageUrl = resolveProductImage(req);
+  if (newImageUrl) {
+    updates.push('image_url = ?');
+    params.push(newImageUrl);
+  }
+
+  if (body.is_active !== undefined) {
+    updates.push('is_active = ?');
+    params.push(body.is_active ? 1 : 0);
+  }
 
   if (updates.length > 0) {
     updates.push('updated_at = NOW()');
@@ -1009,7 +1121,14 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
     await pool.query(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`, params);
   }
 
-  const [updated] = await pool.query('SELECT * FROM products WHERE id = ?', [req.params.id]);
+  const [updated] = await pool.query(
+    `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+            p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+     FROM products p
+     LEFT JOIN users u ON p.seller_id = u.id
+     WHERE p.id = ?`,
+    [req.params.id]
+  );
   updated[0].price = parseFloat(updated[0].price).toFixed(2);
   updated[0].is_active = Boolean(updated[0].is_active);
 

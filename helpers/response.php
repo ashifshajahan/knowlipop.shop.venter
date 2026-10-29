@@ -43,5 +43,9 @@ function getJsonInput(): array
         return $_POST;
     }
     $decoded = json_decode($raw, true);
-    return is_array($decoded) ? $decoded : [];
+    if (is_array($decoded)) {
+        return array_merge($_POST, $decoded);
+    }
+    return $_POST;
 }
+

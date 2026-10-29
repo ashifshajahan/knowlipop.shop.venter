@@ -36,9 +36,10 @@ Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 
 ### Products Catalog & CRUD
 * `GET /api/products` — Public catalog with pagination, rich details, and seller information
-* `POST /api/products` — Create product (`Authorization: Bearer <token>`)
+* `POST /api/products` — Create product (`Authorization: Bearer <token>`) — supports `multipart/form-data` image file upload (`image`), Base64 image data, or image URL
+* `POST /api/upload` — Dedicated image file upload endpoint (`Authorization: Bearer <token>`)
 * `GET /api/products/{id}` — Single product details including seller details
-* `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`)
+* `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`) — supports image file replacement
 * `DELETE /api/products/{id}` — Delete product (`Authorization: Bearer <token>`)
 
 ### Password Reset Flow & Firebase Phone OTP Gateway

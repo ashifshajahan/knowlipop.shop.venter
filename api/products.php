@@ -75,19 +75,94 @@ function apiGetProduct(PDO $pdo, int $id): void
     jsonResponse(['product' => $product]);
 }
 
+function saveUploadedProductImage(?string $fallback = null): ?string
+{
+    $uploadDir = __DIR__ . '/../uploads/products/';
+    if (!is_dir($uploadDir)) {
+        @mkdir($uploadDir, 0755, true);
+    }
+
+    $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+
+    // 1. Check $_FILES for multipart/form-data upload (field names: image, file, product_image, photo, picture, img)
+    $fileFields = ['image', 'file', 'product_image', 'photo', 'picture', 'img'];
+    foreach ($fileFields as $field) {
+        if (!empty($_FILES[$field]['tmp_name']) && is_uploaded_file($_FILES[$field]['tmp_name'])) {
+            $tmp = $_FILES[$field]['tmp_name'];
+            $origName = $_FILES[$field]['name'] ?? 'product.jpg';
+            $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
+            if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'])) {
+                $ext = 'jpg';
+            }
+            $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+            $destination = $uploadDir . $filename;
+            if (move_uploaded_file($tmp, $destination)) {
+                return $baseUrl . '/uploads/products/' . $filename;
+            }
+        }
+    }
+
+    // 2. Check for Base64 encoded image string in input
+    $input = getJsonInput();
+    $base64Candidates = [$input['image'] ?? null, $input['image_base64'] ?? null, $input['file'] ?? null, $fallback];
+    foreach ($base64Candidates as $candidate) {
+        if (is_string($candidate) && str_starts_with($candidate, 'data:image/')) {
+            if (preg_match('/^data:image\/(\w+);base64,(.+)$/', $candidate, $matches)) {
+                $ext = strtolower($matches[1]);
+                if ($ext === 'jpeg') $ext = 'jpg';
+                if (!in_array($ext, ['jpg', 'png', 'webp', 'gif', 'svg'])) $ext = 'png';
+                $data = base64_decode($matches[2]);
+                if ($data !== false) {
+                    $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+                    if (file_put_contents($uploadDir . $filename, $data)) {
+                        return $baseUrl . '/uploads/products/' . $filename;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: if user supplied an already hosted URL (e.g. https://...), keep it
+    if (!empty($fallback) && (str_starts_with($fallback, 'http://') || str_starts_with($fallback, 'https://') || str_starts_with($fallback, '/uploads/'))) {
+        return $fallback;
+    }
+
+    return null;
+}
+
+function apiUploadImage(PDO $pdo): void
+{
+    authenticateUser($pdo);
+    $imageUrl = saveUploadedProductImage();
+    if (!$imageUrl) {
+        errorResponse('No image uploaded or invalid format.', [
+            'image' => ['Please upload an image file (jpg, png, webp) or provide base64 image data.']
+        ], 422);
+    }
+    jsonResponse([
+        'message' => 'Image uploaded successfully.',
+        'image_url' => $imageUrl,
+        'url' => $imageUrl
+    ], 201);
+}
+
 function apiCreateProduct(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
     $input = getJsonInput();
     $errors = [];
 
-    if (empty($input['name'])) {
+    $name = trim($input['name'] ?? '');
+    $price = $input['price'] ?? null;
+    $stock = $input['stock'] ?? null;
+
+    if (empty($name)) {
         $errors['name'] = ['The name field is required.'];
     }
-    if (!isset($input['price']) || !is_numeric($input['price']) || $input['price'] < 0) {
+    if (!isset($price) || !is_numeric($price) || $price < 0) {
         $errors['price'] = ['The price field is required and must be a positive number.'];
     }
-    if (!isset($input['stock']) || !is_numeric($input['stock']) || $input['stock'] < 0) {
+    if (!isset($stock) || !is_numeric($stock) || $stock < 0) {
         $errors['stock'] = ['The stock field is required and must be an integer.'];
     }
 
@@ -95,21 +170,30 @@ function apiCreateProduct(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
+    // Process image file upload, base64, or fallback URL
+    $imageUrl = saveUploadedProductImage($input['image_url'] ?? $input['image'] ?? null);
+
     $stmt = $pdo->prepare("
         INSERT INTO products (seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at)
         VALUES (:seller_id, :name, :description, :price, :stock, :image_url, 1, NOW(), NOW())
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
-        ':name' => $input['name'],
+        ':name' => $name,
         ':description' => $input['description'] ?? null,
-        ':price' => number_format((float) $input['price'], 2, '.', ''),
-        ':stock' => (int) $input['stock'],
-        ':image_url' => $input['image_url'] ?? null,
+        ':price' => number_format((float) $price, 2, '.', ''),
+        ':stock' => (int) $stock,
+        ':image_url' => $imageUrl,
     ]);
 
     $id = (int) $pdo->lastInsertId();
-    $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id");
+    $fetchStmt = $pdo->prepare("
+        SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        WHERE p.id = :id
+    ");
     $fetchStmt->execute([':id' => $id]);
     $product = $fetchStmt->fetch();
 
@@ -137,9 +221,9 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     $updates = [];
     $params = [':id' => $id];
 
-    if (isset($input['name'])) {
+    if (isset($input['name']) && trim($input['name']) !== '') {
         $updates[] = "name = :name";
-        $params[':name'] = $input['name'];
+        $params[':name'] = trim($input['name']);
     }
     if (isset($input['description'])) {
         $updates[] = "description = :description";
@@ -153,10 +237,14 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $updates[] = "stock = :stock";
         $params[':stock'] = (int) $input['stock'];
     }
-    if (isset($input['image_url'])) {
+
+    // Process uploaded file or base64 or fallback URL
+    $newImageUrl = saveUploadedProductImage($input['image_url'] ?? $input['image'] ?? null);
+    if (!empty($newImageUrl)) {
         $updates[] = "image_url = :image_url";
-        $params[':image_url'] = $input['image_url'];
+        $params[':image_url'] = $newImageUrl;
     }
+
     if (isset($input['is_active'])) {
         $updates[] = "is_active = :is_active";
         $params[':is_active'] = $input['is_active'] ? 1 : 0;
@@ -169,7 +257,13 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $updStmt->execute($params);
     }
 
-    $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id");
+    $fetchStmt = $pdo->prepare("
+        SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        WHERE p.id = :id
+    ");
     $fetchStmt->execute([':id' => $id]);
     $updated = $fetchStmt->fetch();
 
@@ -196,3 +290,4 @@ function apiDeleteProduct(PDO $pdo, int $id): void
 
     jsonResponse(['message' => 'Product deleted.']);
 }
+

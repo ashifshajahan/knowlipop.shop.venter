@@ -40,6 +40,24 @@ if ($requestUri === '/test-firebase' || $requestUri === '/firebase-otp') {
     exit;
 }
 
+// Static uploaded files handler (/uploads/products/...)
+if (str_starts_with($requestUri, '/uploads/')) {
+    $filePath = __DIR__ . $requestUri;
+    if (file_exists($filePath) && is_file($filePath)) {
+        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+        $mimes = [
+            'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+            'png' => 'image/png', 'webp' => 'image/webp',
+            'gif' => 'image/gif', 'svg' => 'image/svg+xml'
+        ];
+        header('Content-Type: ' . ($mimes[$ext] ?? 'application/octet-stream'));
+        header('Cache-Control: public, max-age=86400');
+        readfile($filePath);
+        exit;
+    }
+    errorResponse('File not found.', [], 404);
+}
+
 if ($requestUri === '/' || $requestUri === '') {
     header('Content-Type: text/html; charset=utf-8');
     ?>
@@ -187,6 +205,12 @@ if ($requestUri === '/api/products') {
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
+}
+
+// Dedicated Image Upload Endpoint: /api/upload or /api/products/upload
+if ($requestUri === '/api/upload' || $requestUri === '/api/products/upload') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiUploadImage($pdo);
 }
 
 // Product detail / update / delete: /api/products/{id}
