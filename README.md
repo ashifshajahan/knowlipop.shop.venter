@@ -35,15 +35,16 @@ Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 * `POST /api/logout` — Invalidate session
 
 ### Products Catalog & CRUD
-* `GET /api/products` — Public catalog with pagination
+* `GET /api/products` — Public catalog with pagination, rich details, and seller information
 * `POST /api/products` — Create product (`Authorization: Bearer <token>`)
-* `GET /api/products/{id}` — Single product details
+* `GET /api/products/{id}` — Single product details including seller details
 * `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`)
 * `DELETE /api/products/{id}` — Delete product (`Authorization: Bearer <token>`)
 
-### Password Reset Flow (OTP)
-* `POST /api/forgot-password` — Request 6-digit OTP
-* `POST /api/verify-otp` — Verify OTP code and obtain reset token
+### Password Reset Flow & Firebase Phone OTP Gateway
+* `GET /test-firebase` or `GET /firebase-otp` — Interactive Firebase Phone Auth tester UI
+* `POST /api/forgot-password` — Request 6-digit OTP via Firebase Gateway / Fast2SMS
+* `POST /api/verify-otp` — Verify OTP (supports Firebase test code `000000`, client-side Firebase `id_token`, and local OTP)
 * `POST /api/reset-password` — Set new password using reset token
 
 ### Seller Bank & Commission
