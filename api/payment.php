@@ -74,19 +74,21 @@ function apiCommissionPreview(PDO $pdo): void
     authenticateUser($pdo);
     $input = getJsonInput();
 
-    if (!isset($input['amount_in_paise']) || !is_numeric($input['amount_in_paise'])) {
-        errorResponse('amount_in_paise is required and must be numeric.', [], 422);
+    $amount = $input['amount_in_paise'] ?? $input['amount'] ?? null;
+    if ($amount === null || !is_numeric($amount)) {
+        errorResponse('amount (or amount_in_paise) is required and must be numeric.', [], 422);
     }
 
-    $amount = (int) $input['amount_in_paise'];
+    $amountPaise = isset($input['amount_in_paise']) ? (int) $input['amount_in_paise'] : (int) round(((float) $amount) * 100);
     $rate = 0.05; // 5% default marketplace commission
-    $fee = (int) round($amount * $rate);
-    $sellerReceives = $amount - $fee;
+    $feePaise = (int) round($amountPaise * $rate);
+    $netPaise = $amountPaise - $feePaise;
 
     jsonResponse([
-        'order_amount_paise' => $amount,
+        'order_amount_paise' => $amountPaise,
         'commission_rate' => $rate,
-        'commission_paise' => $fee,
-        'seller_receives_paise' => $sellerReceives,
+        'commission_paise' => $feePaise,
+        'seller_receives_paise' => $netPaise,
+        'net_payout' => (float) number_format($netPaise / 100, 2, '.', ''),
     ]);
 }

@@ -1058,18 +1058,21 @@ app.get('/api/seller/payouts', authenticateToken, (req, res) => {
 });
 
 app.post('/api/marketplace/commission-preview', authenticateToken, (req, res) => {
-  const { amount_in_paise } = req.body;
-  if (!amount_in_paise || isNaN(amount_in_paise)) {
-    return res.status(422).json({ message: 'amount_in_paise is required and must be numeric.' });
+  const body = req.body || {};
+  const amount = body.amount_in_paise !== undefined ? body.amount_in_paise : body.amount;
+  if (amount === undefined || isNaN(amount)) {
+    return res.status(422).json({ message: 'amount (or amount_in_paise) is required and must be numeric.' });
   }
-  const amount = parseInt(amount_in_paise, 10);
+  const amountPaise = body.amount_in_paise !== undefined ? parseInt(body.amount_in_paise, 10) : Math.round(parseFloat(amount) * 100);
   const rate = 0.05;
-  const fee = Math.round(amount * rate);
+  const feePaise = Math.round(amountPaise * rate);
+  const netPaise = amountPaise - feePaise;
   res.json({
-    order_amount_paise: amount,
+    order_amount_paise: amountPaise,
     commission_rate: rate,
-    commission_paise: fee,
-    seller_receives_paise: amount - fee
+    commission_paise: feePaise,
+    seller_receives_paise: netPaise,
+    net_payout: parseFloat((netPaise / 100).toFixed(2))
   });
 });
 
