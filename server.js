@@ -911,7 +911,13 @@ app.get('/api/products', async (req, res) => {
   try {
     const [[{ total }]] = await pool.query('SELECT COUNT(*) as total FROM products WHERE is_active = 1');
     const [products] = await pool.query(
-      'SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at FROM products WHERE is_active = 1 ORDER BY id DESC LIMIT ? OFFSET ?',
+      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+              p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.is_active = 1
+       ORDER BY p.id DESC
+       LIMIT ? OFFSET ?`,
       [limit, offset]
     );
 
@@ -938,7 +944,15 @@ app.get('/api/products', async (req, res) => {
 
 app.get('/api/products/:id', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? AND is_active = 1 LIMIT 1', [req.params.id]);
+    const [rows] = await pool.query(
+      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+              p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.id = ? AND p.is_active = 1
+       LIMIT 1`,
+      [req.params.id]
+    );
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Product not found.' });
     }

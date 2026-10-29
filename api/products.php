@@ -17,10 +17,12 @@ function apiGetProducts(PDO $pdo): void
     $total = (int) $countStmt->fetchColumn();
 
     $stmt = $pdo->prepare("
-        SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at
-        FROM products
-        WHERE is_active = 1
-        ORDER BY id DESC
+        SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        WHERE p.is_active = 1
+        ORDER BY p.id DESC
         LIMIT :limit OFFSET :offset
     ");
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
@@ -50,9 +52,11 @@ function apiGetProducts(PDO $pdo): void
 function apiGetProduct(PDO $pdo, int $id): void
 {
     $stmt = $pdo->prepare("
-        SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at
-        FROM products
-        WHERE id = :id AND is_active = 1
+        SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        WHERE p.id = :id AND p.is_active = 1
         LIMIT 1
     ");
     $stmt->execute([':id' => $id]);
