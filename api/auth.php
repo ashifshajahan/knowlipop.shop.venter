@@ -267,28 +267,48 @@ function apiLogout(PDO $pdo): void
 function apiForgotPassword(PDO $pdo): void
 {
     $input = getJsonInput();
-    if (empty($input['phone'])) {
+    $rawPhone = extractPhonePhp($input);
+    if (empty($rawPhone)) {
         errorResponse('The phone field is required.', ['phone' => ['The phone field is required.']], 422);
     }
 
-    $phone = $input['phone'];
-    $stmt = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
-    $stmt->execute([':phone' => $phone]);
+    $phone = normalizePhonePhp($rawPhone);
+    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+
+    $stmt = $pdo->prepare("SELECT id, phone FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
+    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
     $user = $stmt->fetch();
 
     $otp = null;
+    $smsResult = null;
     if ($user) {
-        $otp = sprintf('%06d', mt_rand(100000, 999999));
+        $targetPhone = $user['phone'] ?? $phone;
+        $otp = isFirebaseTestPhone($targetPhone) ? getFirebaseTestOtp() : sprintf('%06d', mt_rand(100000, 999999));
         $hashedOtp = hashPassword($otp);
 
-        $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone")->execute([':phone' => $phone]);
+        $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
+            ->execute([':phone' => $targetPhone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
         $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, token, created_at) VALUES (:phone, :token, NOW())");
-        $ins->execute([':phone' => $phone, ':token' => $hashedOtp]);
+        $ins->execute([':phone' => $targetPhone, ':token' => $hashedOtp]);
+
+        // Dispatch SMS via configured gateway (Firebase / Fast2SMS) or return mock in dev
+        $recaptchaToken = extractFieldPhp($input, ['recaptcha_token', 'recaptchaToken', 'recaptcha']);
+        $smsResult = sendOtpSms($targetPhone, $otp, $recaptchaToken);
     }
 
     $response = ['message' => 'If this phone number is registered, an OTP will be sent.'];
     if ($otp !== null) {
         $response['dev_otp'] = $otp; // Included for Postman & frontend developer testing
+        if ($smsResult && isset($smsResult['provider'])) {
+            $response['sms_status'] = $smsResult['sent'] ? 'dispatched' : 'mock_mode';
+            $response['gateway'] = $smsResult['provider'];
+            if (!empty($smsResult['session_info'])) {
+                $response['session_info'] = $smsResult['session_info'];
+            }
+            if (!$smsResult['sent'] && isset($smsResult['reason'])) {
+                $response['sms_note'] = $smsResult['reason'];
+            }
+        }
     }
     jsonResponse($response);
 }
@@ -296,23 +316,37 @@ function apiForgotPassword(PDO $pdo): void
 function apiVerifyOtp(PDO $pdo): void
 {
     $input = getJsonInput();
-    if (empty($input['phone']) || empty($input['code'])) {
-        errorResponse('Validation error', ['phone' => ['Phone and OTP code are required.']], 422);
+    $rawPhone = extractPhonePhp($input);
+    $code = trim(extractFieldPhp($input, ['code', 'otp', 'otp_code', 'verification_code']));
+    $sessionInfo = trim(extractFieldPhp($input, ['session_info', 'sessionInfo', 'session']));
+    $idToken = trim(extractFieldPhp($input, ['id_token', 'idToken', 'firebase_token']));
+
+    if (empty($rawPhone) || (empty($code) && empty($idToken))) {
+        errorResponse('Validation error', ['phone' => ['Phone and OTP code (or Firebase ID Token) are required.']], 422);
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY created_at DESC LIMIT 1");
-    $stmt->execute([':phone' => $input['phone']]);
+    $phone = normalizePhonePhp($rawPhone);
+    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+
+    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY created_at DESC LIMIT 1");
+    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
     $row = $stmt->fetch();
 
-    if (!$row || !verifyPassword($input['code'], $row['token'])) {
+    $firebaseApproved = verifyFirebaseOtp($phone, $code, $sessionInfo, $idToken);
+    $localValid = $row && !empty($code) && verifyPassword($code, $row['token']);
+
+    if (!$firebaseApproved && !$localValid) {
         errorResponse('Invalid or expired OTP code.', ['code' => ['Invalid or expired OTP code.']], 422);
     }
 
     $resetToken = bin2hex(random_bytes(32));
     $hashedResetToken = hashPassword($resetToken);
+    $targetPhone = $row['phone'] ?? $phone;
 
-    $upd = $pdo->prepare("UPDATE password_reset_otps SET token = :token WHERE phone = :phone");
-    $upd->execute([':token' => $hashedResetToken, ':phone' => $input['phone']]);
+    $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
+        ->execute([':phone' => $targetPhone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
+    $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, token, created_at) VALUES (:phone, :token, NOW())");
+    $ins->execute([':phone' => $targetPhone, ':token' => $hashedResetToken]);
 
     jsonResponse([
         'message' => 'OTP verified successfully.',
@@ -323,24 +357,62 @@ function apiVerifyOtp(PDO $pdo): void
 function apiResetPassword(PDO $pdo): void
 {
     $input = getJsonInput();
-    if (empty($input['phone']) || empty($input['reset_token']) || empty($input['password'])) {
-        errorResponse('All fields are required.', [], 422);
+    $rawPhone = extractPhonePhp($input);
+    $resetToken = trim(extractFieldPhp($input, ['reset_token', 'resetToken', 'token']));
+    $password = extractPasswordPhp($input);
+    $confirmPassword = extractConfirmPasswordPhp($input, $password);
+
+    $errors = [];
+    if (empty($rawPhone)) {
+        $errors['phone'] = ['The phone field is required.'];
+    }
+    if (empty($resetToken)) {
+        $errors['reset_token'] = ['The reset token field is required.'];
+    }
+    if (empty($password)) {
+        $errors['password'] = ['The password field is required.'];
+    } elseif (strlen($password) < 8) {
+        $errors['password'] = ['The password must be at least 8 characters.'];
+    } elseif ($password !== $confirmPassword) {
+        $errors['password'] = ['The password confirmation does not match.'];
     }
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone ORDER BY created_at DESC LIMIT 1");
-    $stmt->execute([':phone' => $input['phone']]);
+    if (!empty($errors)) {
+        errorResponse('Validation error occurred.', $errors, 422);
+    }
+
+    $phone = normalizePhonePhp($rawPhone);
+    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+
+    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY created_at DESC LIMIT 1");
+    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
     $row = $stmt->fetch();
 
-    if (!$row || !verifyPassword($input['reset_token'], $row['token'])) {
+    if (!$row || !verifyPassword($resetToken, $row['token'])) {
         errorResponse('The reset token is invalid or expired. Verify your OTP again.', [], 422);
     }
 
-    $hashed = hashPassword($input['password']);
-    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = NOW() WHERE phone = :phone");
-    $upd->execute([':password' => $hashed, ':phone' => $input['phone']]);
+    $targetPhone = $row['phone'] ?? $phone;
+    $hashed = hashPassword($password);
 
-    // Delete token and revoke tokens
-    $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone")->execute([':phone' => $input['phone']]);
+    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = NOW() WHERE phone = :targetPhone OR phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix");
+    $upd->execute([
+        ':password' => $hashed,
+        ':targetPhone' => $targetPhone,
+        ':phone' => $phone,
+        ':rawPhone' => $rawPhone,
+        ':rawNoPrefix' => $rawNoPrefix
+    ]);
+
+    // Delete token after successful password reset
+    $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :targetPhone OR phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
+        ->execute([
+            ':targetPhone' => $targetPhone,
+            ':phone' => $phone,
+            ':rawPhone' => $rawPhone,
+            ':rawNoPrefix' => $rawNoPrefix
+        ]);
 
     jsonResponse(['message' => 'Password reset successful. Please log in again.']);
 }
+

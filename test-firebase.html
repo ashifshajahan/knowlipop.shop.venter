@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Firebase Phone OTP Gateway — Live Tester</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+  <!-- Firebase App & Auth SDK (v9 compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+
+  <style>
+    :root {
+      --primary: #f5820d;
+      --primary-hover: #e07406;
+      --primary-glow: rgba(245, 130, 13, 0.25);
+      --bg: #090d16;
+      --surface: #111827;
+      --surface-light: #1f2937;
+      --border: #374151;
+      --text: #f9fafb;
+      --text-muted: #9ca3af;
+      --success: #10b981;
+      --error: #ef4444;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .container {
+      width: 100%;
+      max-width: 540px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 36px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 40px var(--primary-glow);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .logo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(245, 130, 13, 0.1);
+      border: 1px solid rgba(245, 130, 13, 0.3);
+      color: var(--primary);
+      font-size: 13px;
+      font-weight: 700;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: -0.5px;
+    }
+    p.subtitle {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+    .info-box {
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      border-radius: 12px;
+      padding: 14px 16px;
+      font-size: 13px;
+      color: #bae6fd;
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }
+    .info-box strong { color: #fff; }
+    .step-card {
+      background: var(--surface-light);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }
+    .step-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--primary);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .input-group {
+      display: flex;
+      gap: 10px;
+    }
+    input {
+      width: 100%;
+      background: #0d121f;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-family: inherit;
+      color: #fff;
+      outline: none;
+      transition: all 0.2s;
+    }
+    input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-glow);
+    }
+    .btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 12px 20px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+    .btn:hover:not(:disabled) {
+      background: var(--primary-hover);
+      transform: translateY(-1px);
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-block {
+      width: 100%;
+      margin-top: 10px;
+    }
+    .btn-secondary {
+      background: #374151;
+      color: #f3f4f6;
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: #4b5563;
+    }
+    .status-badge {
+      display: none;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.4;
+      font-family: 'JetBrains Mono', monospace;
+      word-break: break-all;
+    }
+    .status-badge.success {
+      display: block;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid var(--success);
+      color: #6ee7b7;
+    }
+    .status-badge.error {
+      display: block;
+      background: rgba(239, 68, 68, 0.12);
+      border: 1px solid var(--error);
+      color: #fca5a5;
+    }
+    .status-badge.loading {
+      display: block;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid var(--accent);
+      color: #7dd3fc;
+    }
+    .otp-inputs {
+      display: flex;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .otp-inputs input {
+      text-align: center;
+      font-size: 20px;
+      font-weight: 700;
+      padding: 10px 0;
+      letter-spacing: 2px;
+    }
+    .footer {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .footer a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <div class="header">
+      <div class="logo-badge">🔥 Firebase Gateway</div>
+      <h1>Phone OTP Live Gateway</h1>
+      <p class="subtitle">Direct Firebase Phone Authentication & Verification System</p>
+    </div>
+
+    <div class="info-box">
+      <strong>How Firebase OTP Works:</strong><br>
+      • <strong>Test Phone Number:</strong> If configured in Firebase Console (e.g. <code>+919633426254</code>), Google generates fixed test code <code>000000</code> without sending carrier SMS.<br>
+      • <strong>Real SMS to Mobile:</strong> If the number is NOT in the Firebase test list, Google dispatches a real carrier SMS to the phone handset after reCAPTCHA verification.
+    </div>
+
+    <!-- Step 1: Send OTP -->
+    <div class="step-card">
+      <div class="step-title">Step 1: Send OTP via Firebase</div>
+      <label for="phoneNumber">Mobile Number (with country code):</label>
+      <div class="input-group">
+        <input type="text" id="phoneNumber" value="+919633426254" placeholder="+919633426254">
+        <button id="sendOtpBtn" class="btn">Send OTP</button>
+      </div>
+      <div id="recaptcha-container"></div>
+      <div id="step1Status" class="status-badge"></div>
+    </div>
+
+    <!-- Step 2: Verify OTP -->
+    <div class="step-card" id="step2Card" style="opacity: 0.5; pointer-events: none;">
+      <div class="step-title">Step 2: Enter & Verify OTP</div>
+      <label for="otpCode">6-Digit Verification Code:</label>
+      <input type="text" id="otpCode" maxlength="6" placeholder="000000" style="text-align: center; font-size: 20px; font-weight: 700; letter-spacing: 4px;">
+      <button id="verifyOtpBtn" class="btn btn-block">Verify OTP & Sync with Backend</button>
+      <div id="step2Status" class="status-badge"></div>
+    </div>
+
+    <div class="footer">
+      Connected to Firebase Project: <strong>vendor-app-18b18</strong><br>
+      Backend: <strong>knowlipop.shop API</strong>
+    </div>
+  </div>
+
+  <script>
+    // 1. Firebase Configuration from your Firebase Console
+    const firebaseConfig = {
+      apiKey: "AIzaSyC2n8FfdHiQqYBI7v818vMd08QUYOHBlRM",
+      authDomain: "vendor-app-18b18.firebaseapp.com",
+      projectId: "vendor-app-18b18",
+      storageBucket: "vendor-app-18b18.firebasestorage.app",
+      messagingSenderId: "48531726693",
+      appId: "1:48531726693:web:b99c4badec66b4a94f818c"
+    };
+
+    // Initialize Firebase
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    const auth = firebase.auth();
+
+    let confirmationResult = null;
+
+    // Helper: UI Status
+    function setStatus(elId, type, text) {
+      const el = document.getElementById(elId);
+      el.className = 'status-badge ' + type;
+      el.innerHTML = text;
+    }
+
+    // Step 1: Send OTP Button
+    document.getElementById('sendOtpBtn').addEventListener('click', async () => {
+      const phoneInput = document.getElementById('phoneNumber').value.trim();
+      const sendBtn = document.getElementById('sendOtpBtn');
+
+      if (!phoneInput) {
+        setStatus('step1Status', 'error', 'Please enter a valid phone number with country code (e.g. +919633426254).');
+        return;
+      }
+
+      sendBtn.disabled = true;
+      setStatus('step1Status', 'loading', '⏳ Initializing Firebase reCAPTCHA & contacting Firebase Gateway...');
+
+      try {
+        // Invisible reCAPTCHA verifier
+        if (!window.recaptchaVerifier) {
+          window.recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', {
+            size: 'invisible',
+            callback: () => {
+              console.log('reCAPTCHA solved');
+            }
+          });
+        }
+
+        // Firebase sends SMS or matches test number
+        confirmationResult = await auth.signInWithPhoneNumber(phoneInput, window.recaptchaVerifier);
+
+        setStatus('step1Status', 'success', `✅ Firebase Gateway accepted request!<br>• If using Firebase Test Number: enter test code <b>000000</b>.<br>• If using real carrier number: check SMS inbox on your phone.`);
+
+        // Enable Step 2
+        const step2 = document.getElementById('step2Card');
+        step2.style.opacity = '1';
+        step2.style.pointerEvents = 'auto';
+        document.getElementById('otpCode').focus();
+
+      } catch (err) {
+        console.error('Firebase Send Error:', err);
+        setStatus('step1Status', 'error', `❌ Firebase Error: ${err.message}`);
+        if (window.recaptchaVerifier) {
+          try { window.recaptchaVerifier.clear(); } catch(e){}
+          window.recaptchaVerifier = null;
+        }
+      } finally {
+        sendBtn.disabled = false;
+      }
+    });
+
+    // Step 2: Verify OTP Button
+    document.getElementById('verifyOtpBtn').addEventListener('click', async () => {
+      const code = document.getElementById('otpCode').value.trim();
+      const phoneInput = document.getElementById('phoneNumber').value.trim();
+      const verifyBtn = document.getElementById('verifyOtpBtn');
+
+      if (!code || code.length < 6) {
+        setStatus('step2Status', 'error', 'Please enter the complete 6-digit verification code.');
+        return;
+      }
+
+      verifyBtn.disabled = true;
+      setStatus('step2Status', 'loading', '⏳ Verifying code with Firebase Gateway...');
+
+      try {
+        let idToken = null;
+        if (confirmationResult) {
+          const result = await confirmationResult.confirm(code);
+          idToken = await result.user.getIdToken();
+        }
+
+        setStatus('step2Status', 'loading', '✅ Code confirmed by Firebase! Syncing with backend API...');
+
+        // Call backend /api/verify-otp
+        const cleanPhone = phoneInput.replace(/^\+91/, '').replace(/^\+/, '');
+        const res = await fetch('/api/verify-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            phone: cleanPhone,
+            code: code,
+            id_token: idToken || ''
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          setStatus('step2Status', 'success', `🎉 SUCCESS! OTP Verified by Firebase & Backend!<br>Reset Token: <code>${data.reset_token || 'Generated'}</code><br>Ready for password reset.`);
+        } else {
+          setStatus('step2Status', 'error', `Backend rejected: ${data.message || JSON.stringify(data)}`);
+        }
+
+      } catch (err) {
+        console.error('Firebase Verify Error:', err);
+        setStatus('step2Status', 'error', `❌ Verification Error: ${err.message}`);
+      } finally {
+        verifyBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

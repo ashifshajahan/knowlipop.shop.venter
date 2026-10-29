@@ -30,6 +30,16 @@ if (str_starts_with($requestUri, '/index.php')) {
 // 1. Web & Admin Routes
 // ==========================================
 
+if ($requestUri === '/test-firebase' || $requestUri === '/firebase-otp') {
+    header('Content-Type: text/html; charset=utf-8');
+    if (file_exists(__DIR__ . '/test-firebase.html')) {
+        readfile(__DIR__ . '/test-firebase.html');
+    } else {
+        echo 'Firebase tester file not found.';
+    }
+    exit;
+}
+
 if ($requestUri === '/' || $requestUri === '') {
     header('Content-Type: text/html; charset=utf-8');
     ?>

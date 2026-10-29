@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -548,9 +549,234 @@ app.post('/api/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logout successful.' });
 });
 
+function isFirebaseTestPhoneNode(phone) {
+  const testPhone = (process.env.FIREBASE_TEST_PHONE || '+919633426254').replace(/\D+/g, '');
+  const clean = phone.replace(/\D+/g, '');
+  return clean.length >= 10 && testPhone.length >= 10 && clean.endsWith(testPhone.slice(-10));
+}
+
+async function sendOtpSmsNode(phone, otp, recaptchaToken = '') {
+  // 0. Firebase Test Phone Check
+  if (isFirebaseTestPhoneNode(phone)) {
+    return {
+      sent: true,
+      provider: 'firebase',
+      status: 'dispatched',
+      test_mode: true,
+      note: 'Firebase test phone number active. Verified with test OTP: ' + (process.env.FIREBASE_TEST_OTP || '000000')
+    };
+  }
+
+  const firebaseApiKey = process.env.FIREBASE_API_KEY;
+  const fast2smsKey = process.env.FAST2SMS_API_KEY;
+
+  // 1. Firebase Identity Toolkit REST API (Phone OTP)
+  if (firebaseApiKey) {
+    try {
+      const payload = { phoneNumber: phone };
+      if (recaptchaToken) payload.recaptchaToken = recaptchaToken;
+      const postData = JSON.stringify(payload);
+
+      const result = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'identitytoolkit.googleapis.com',
+          path: `/v1/accounts:sendVerificationCode?key=${firebaseApiKey}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                const parsed = JSON.parse(data);
+                resolve({ sent: true, provider: 'firebase', session_info: parsed.sessionInfo });
+              } catch (e) {
+                resolve({ sent: true, provider: 'firebase' });
+              }
+            } else {
+              console.warn('[Firebase Send Error]', res.statusCode, data);
+              resolve({ sent: false, provider: 'firebase', error: data });
+            }
+          });
+        });
+        req.on('error', (e) => resolve({ sent: false, error: e.message }));
+        req.setTimeout(15000, () => {
+          req.destroy();
+          resolve({ sent: false, error: 'Timeout' });
+        });
+        req.write(postData);
+        req.end();
+      });
+      if (result.sent) return result;
+    } catch (err) {
+      console.warn('[Firebase Error]', err.message);
+    }
+  }
+
+  // 2. Fast2SMS (Indian numbers)
+  if (fast2smsKey) {
+    try {
+      const digits = phone.replace(/\D+/g, '');
+      const num = digits.slice(-10);
+      const postData = new URLSearchParams({
+        route: 'otp',
+        variables_values: otp,
+        numbers: num
+      }).toString();
+
+      const result = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'www.fast2sms.com',
+          path: '/dev/bulkV2',
+          method: 'POST',
+          headers: {
+            'authorization': fast2smsKey,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve({ sent: true, provider: 'fast2sms' });
+            } else {
+              resolve({ sent: false, provider: 'fast2sms', error: data });
+            }
+          });
+        });
+        req.on('error', (e) => resolve({ sent: false, error: e.message }));
+        req.setTimeout(15000, () => {
+          req.destroy();
+          resolve({ sent: false, error: 'Timeout' });
+        });
+        req.write(postData);
+        req.end();
+      });
+      return result;
+    } catch (err) {
+      return { sent: false, error: err.message };
+    }
+  }
+
+  return {
+    sent: false,
+    provider: 'mock',
+    reason: 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+  };
+}
+
+async function verifyFirebaseOtpNode(phone, code = '', sessionInfo = '', idToken = '') {
+  // 0. Firebase Test Phone & OTP Check
+  const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
+  if (isFirebaseTestPhoneNode(phone) && (code === testOtp || code === '000000')) {
+    return true;
+  }
+
+  const firebaseApiKey = process.env.FIREBASE_API_KEY;
+  if (!firebaseApiKey) return false;
+
+  const cleanPhone = phone.replace(/\D+/g, '');
+
+  // Flow A: Client-side Firebase Phone Auth ID Token
+  if (idToken) {
+    try {
+      const postData = JSON.stringify({ idToken });
+      const approved = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'identitytoolkit.googleapis.com',
+          path: `/v1/accounts:lookup?key=${firebaseApiKey}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                const parsed = JSON.parse(data);
+                const userPhone = (parsed.users && parsed.users[0] && parsed.users[0].phoneNumber) ? parsed.users[0].phoneNumber.replace(/\D+/g, '') : '';
+                resolve(userPhone.endsWith(cleanPhone.slice(-10)));
+              } catch (e) {
+                resolve(false);
+              }
+            } else {
+              resolve(false);
+            }
+          });
+        });
+        req.on('error', () => resolve(false));
+        req.setTimeout(15000, () => {
+          req.destroy();
+          resolve(false);
+        });
+        req.write(postData);
+        req.end();
+      });
+      if (approved) return true;
+    } catch (err) {
+      // Continue to next check
+    }
+  }
+
+  // Flow B: Backend Firebase signInWithPhoneNumber (sessionInfo + code)
+  if (sessionInfo && code) {
+    try {
+      const postData = JSON.stringify({ sessionInfo, code });
+      const approved = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'identitytoolkit.googleapis.com',
+          path: `/v1/accounts:signInWithPhoneNumber?key=${firebaseApiKey}`,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                const parsed = JSON.parse(data);
+                const userPhone = parsed.phoneNumber ? parsed.phoneNumber.replace(/\D+/g, '') : '';
+                resolve(userPhone.endsWith(cleanPhone.slice(-10)));
+              } catch (e) {
+                resolve(false);
+              }
+            } else {
+              resolve(false);
+            }
+          });
+        });
+        req.on('error', () => resolve(false));
+        req.setTimeout(15000, () => {
+          req.destroy();
+          resolve(false);
+        });
+        req.write(postData);
+        req.end();
+      });
+      if (approved) return true;
+    } catch (err) {
+      // Return false
+    }
+  }
+
+  return false;
+}
+
 app.post('/api/forgot-password', async (req, res) => {
   const body = req.body || {};
   const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || body.mobile_no || '').toString().trim();
+  const recaptchaToken = (body.recaptcha_token || body.recaptchaToken || body.recaptcha || '').toString().trim();
   const phone = normalizePhone(rawPhone);
   if (!rawPhone) return res.status(422).json({ errors: { phone: ['Phone is required.'] } });
 
@@ -562,16 +788,30 @@ app.post('/api/forgot-password', async (req, res) => {
     );
     let otp = null;
     let targetPhone = phone;
+    let smsResult = null;
     if (rows.length > 0) {
       targetPhone = rows[0].phone;
-      otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
+      otp = isFirebaseTestPhoneNode(targetPhone) ? testOtp : Math.floor(100000 + Math.random() * 900000).toString();
       const hash = await bcrypt.hash(otp, 10);
-      await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [targetPhone]);
+      await pool.query('DELETE FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ?', [targetPhone, rawPhone, rawNoPrefix]);
       await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [targetPhone, hash]);
+
+      smsResult = await sendOtpSmsNode(targetPhone, otp, recaptchaToken);
     }
     const response = { message: 'If this phone number is registered, an OTP will be sent.' };
     if (otp) {
       response.dev_otp = otp; // Returned for Postman & frontend developer testing
+      if (smsResult && smsResult.provider) {
+        response.sms_status = smsResult.sent ? 'dispatched' : 'mock_mode';
+        response.gateway = smsResult.provider;
+        if (smsResult.session_info) {
+          response.session_info = smsResult.session_info;
+        }
+        if (!smsResult.sent && smsResult.reason) {
+          response.sms_note = smsResult.reason;
+        }
+      }
     }
     res.json(response);
   } catch (err) {
@@ -585,7 +825,12 @@ app.post('/api/verify-otp', async (req, res) => {
   const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || '').toString().trim();
   const phone = normalizePhone(rawPhone);
   const code = (body.code || body.otp || '').toString().trim();
-  if (!rawPhone || !code) return res.status(422).json({ message: 'Phone and code are required.' });
+  const sessionInfo = (body.session_info || body.sessionInfo || body.session || '').toString().trim();
+  const idToken = (body.id_token || body.idToken || body.firebase_token || '').toString().trim();
+
+  if (!rawPhone || (!code && !idToken)) {
+    return res.status(422).json({ message: 'Phone and OTP code (or Firebase ID Token) are required.' });
+  }
 
   try {
     const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
@@ -593,14 +838,19 @@ app.post('/api/verify-otp', async (req, res) => {
       'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY created_at DESC LIMIT 1',
       [phone, rawPhone, rawNoPrefix]
     );
-    if (rows.length === 0 || !(await bcrypt.compare(code, rows[0].token))) {
+
+    const firebaseApproved = await verifyFirebaseOtpNode(phone, code, sessionInfo, idToken);
+    const localValid = rows.length > 0 && code && (await bcrypt.compare(code, rows[0].token));
+
+    if (!firebaseApproved && !localValid) {
       return res.status(422).json({ message: 'Invalid or expired OTP code.' });
     }
 
     const resetToken = require('crypto').randomBytes(32).toString('hex');
     const hashedReset = await bcrypt.hash(resetToken, 10);
-    const targetPhone = rows[0].phone;
-    await pool.query('UPDATE password_reset_otps SET token = ? WHERE phone = ?', [hashedReset, targetPhone]);
+    const targetPhone = rows.length > 0 ? rows[0].phone : phone;
+    await pool.query('DELETE FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ?', [targetPhone, rawPhone, rawNoPrefix]);
+    await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [targetPhone, hashedReset]);
 
     res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
   } catch (err) {
@@ -1000,6 +1250,10 @@ app.get('/admin/logout', (req, res) => {
     'admin_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT'
   ]);
   res.redirect('/admin/login');
+});
+
+app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
+  res.sendFile(path.join(__dirname, 'test-firebase.html'));
 });
 
 // Start server
