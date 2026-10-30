@@ -290,7 +290,6 @@ function safeSeller(user) {
   const data = {
     id: user.id,
     seller_name: user.seller_name || user.name || '',
-    name: user.name || user.seller_name || '',
     phone: user.phone || null,
     address: user.address || null,
     landmark: user.landmark || null,

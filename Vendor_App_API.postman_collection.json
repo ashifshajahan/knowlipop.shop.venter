@@ -331,6 +331,7 @@
                   "    pm.expect(json.seller).to.be.an(\"object\");",
                   "    pm.expect(json.seller.id).to.be.a(\"number\");",
                   "    pm.expect(json.seller.seller_name).to.be.a(\"string\");",
+                  "    pm.expect(json.seller).to.not.have.property(\"name\");",
                   "});",
                   "if (json.seller && json.seller.id) {",
                   "    pm.collectionVariables.set(\"seller_id\", String(json.seller.id));",
