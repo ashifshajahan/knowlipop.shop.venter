@@ -32,7 +32,16 @@ Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 * `POST /api/register` — Seller registration (returns JWT Bearer token)
 * `POST /api/login` — Seller login (returns JWT Bearer token)
 * `GET /api/me` — Authenticated seller profile (`Authorization: Bearer <token>`)
+* `PUT /api/me` — Edit authenticated seller profile
 * `POST /api/logout` — Invalidate session
+
+### Seller Profile & Directory
+* `GET /api/seller/profile` — Authenticated seller profile with products count & payment account info (`Authorization: Bearer <token>`)
+* `PUT /api/seller/profile` — Edit authenticated seller profile (shop name, address, landmark, state, country, phone, email, password, avatar image)
+* `POST /api/seller/profile/update` — Convenient POST alias for editing profile (supports `multipart/form-data`, JSON, and Base64 avatar)
+* `GET /api/sellers/{id}` — Seller profile & active products catalog by Seller ID (e.g. `/api/sellers/1` or `/api/seller/1`)
+* `PUT /api/sellers/{id}` — Edit seller profile by Seller ID (authorized for the seller or admin)
+* `GET /api/sellers` — Paginated directory of marketplace sellers with search filter (`?page=1&limit=20&search=keyword`)
 
 ### Products Catalog & CRUD
 * `GET /api/products` — Public catalog with pagination, rich details, and seller information

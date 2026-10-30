@@ -40,6 +40,11 @@
       "key": "reset_token",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "seller_id",
+      "value": "1",
+      "type": "string"
     }
   ],
   "item": [
@@ -69,8 +74,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/",
-              "host": ["{{base_url}}"],
-              "path": [""]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                ""
+              ]
             },
             "description": "Returns HTML status page confirming backend engine and available routes."
           },
@@ -107,8 +116,13 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/health",
-              "host": ["{{base_url}}"],
-              "path": ["api", "health"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "health"
+              ]
             },
             "description": "Verifies live connectivity to Hostinger MySQL database u999617803_knowlipop1."
           },
@@ -179,8 +193,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/register",
-              "host": ["{{base_url}}"],
-              "path": ["api", "register"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "register"
+              ]
             },
             "description": "Registers a new seller with dynamically generated phone. Automatically saves returned Bearer token into {{token}}."
           },
@@ -228,8 +247,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/login",
-              "host": ["{{base_url}}"],
-              "path": ["api", "login"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "login"
+              ]
             },
             "description": "Logs in the seller and saves JWT Bearer token into {{token}}."
           },
@@ -275,8 +299,13 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/me",
-              "host": ["{{base_url}}"],
-              "path": ["api", "me"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "me"
+              ]
             },
             "description": "Returns current authenticated seller profile (safe seller details without password hash)."
           },
@@ -285,7 +314,287 @@
       ]
     },
     {
-      "name": "3. Products Catalog & CRUD",
+      "name": "3. Seller Profile & Details",
+      "item": [
+        {
+          "name": "Get Authenticated Seller Profile (GET /api/seller/profile)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Returns seller profile with products count\", function () {",
+                  "    pm.expect(json.seller).to.be.an(\"object\");",
+                  "    pm.expect(json.seller.id).to.be.a(\"number\");",
+                  "    pm.expect(json.seller.seller_name).to.be.a(\"string\");",
+                  "    pm.expect(json.seller.products_count).to.be.a(\"number\");",
+                  "});",
+                  "if (json.seller && json.seller.id) {",
+                  "    pm.collectionVariables.set(\"seller_id\", String(json.seller.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "profile"
+              ]
+            },
+            "description": "Returns full profile of the currently logged-in seller, including ID, contact, address, landmark, state, country, active products count, and linked bank account info."
+          },
+          "response": []
+        },
+        {
+          "name": "Edit / Update Seller Profile (PUT /api/seller/profile)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Profile updated successfully\", function () {",
+                  "    pm.expect(json.message).to.include(\"successfully\");",
+                  "    pm.expect(json.seller.seller_name).to.eql(\"Super Deals Premium Shop\");",
+                  "    pm.expect(json.seller.landmark).to.eql(\"Opposite Central Metro Station\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_name\": \"Super Deals Premium Shop\",\n  \"address\": \"Plot 45, Commercial High Street\",\n  \"landmark\": \"Opposite Central Metro Station\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/seller/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "profile"
+              ]
+            },
+            "description": "Edits the logged-in seller profile details: shop name, address, landmark, state, country, email, phone, or password."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Seller Details by ID (GET /api/sellers/{{seller_id}})",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Returns seller details by seller ID with products catalog\", function () {",
+                  "    pm.expect(json.seller).to.be.an(\"object\");",
+                  "    pm.expect(json.seller.products).to.be.an(\"array\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/{{seller_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "{{seller_id}}"
+              ]
+            },
+            "description": "Public / catalog view of a seller profile based on seller ID, returning seller details and their active products."
+          },
+          "response": []
+        },
+        {
+          "name": "Edit Seller by ID (PUT /api/sellers/{{seller_id}})",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Updated seller profile by ID\", function () {",
+                  "    pm.expect(json.seller).to.be.an(\"object\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_name\": \"Super Deals Hub\",\n  \"landmark\": \"Near City Plaza\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/sellers/{{seller_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "{{seller_id}}"
+              ]
+            },
+            "description": "Edits a seller profile based on seller ID (authorized for the seller themselves or an administrator)."
+          },
+          "response": []
+        },
+        {
+          "name": "List All Sellers Directory (GET /api/sellers)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Returns sellers pagination list\", function () {",
+                  "    pm.expect(json.sellers.data).to.be.an(\"array\");",
+                  "    pm.expect(json.sellers.total).to.be.a(\"number\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "Returns directory of registered marketplace sellers with product counts."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Products Catalog & CRUD",
       "item": [
         {
           "name": "List Products (GET /api/products)",
@@ -317,8 +626,13 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/products?page=1",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
               "query": [
                 {
                   "key": "page",
@@ -382,8 +696,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/products",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
             },
             "description": "Creates a new product associated with the authenticated seller. Automatically captures product_id."
           },
@@ -418,8 +737,14 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             },
             "description": "Fetches a single product by ID."
           },
@@ -472,8 +797,14 @@
             },
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             },
             "description": "Updates fields of an existing product owned by the authenticated seller."
           },
@@ -518,8 +849,14 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             },
             "description": "Deletes the product."
           },
@@ -528,7 +865,7 @@
       ]
     },
     {
-      "name": "4. Seller Bank Account & Payments",
+      "name": "5. Seller Bank Account & Payments",
       "item": [
         {
           "name": "Save Bank Account Onboarding (POST /api/seller/bank-account/onboarding)",
@@ -577,8 +914,15 @@
             },
             "url": {
               "raw": "{{base_url}}/api/seller/bank-account/onboarding",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "bank-account", "onboarding"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "bank-account",
+                "onboarding"
+              ]
             },
             "description": "Stores seller payment/bank account reference for payouts."
           },
@@ -623,8 +967,15 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/seller/bank-account/status",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "bank-account", "status"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "bank-account",
+                "status"
+              ]
             },
             "description": "Retrieves the status of the seller's payment account."
           },
@@ -678,8 +1029,14 @@
             },
             "url": {
               "raw": "{{base_url}}/api/marketplace/commission-preview",
-              "host": ["{{base_url}}"],
-              "path": ["api", "marketplace", "commission-preview"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "marketplace",
+                "commission-preview"
+              ]
             },
             "description": "Calculates commission fee and net seller payout for any order amount."
           },
@@ -724,8 +1081,14 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/seller/payouts",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "payouts"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "payouts"
+              ]
             },
             "description": "Lists seller payouts."
           },
@@ -734,7 +1097,7 @@
       ]
     },
     {
-      "name": "5. Password Reset Flow (OTP)",
+      "name": "6. Password Reset Flow (OTP)",
       "item": [
         {
           "name": "1. Request OTP (POST /api/forgot-password)",
@@ -774,8 +1137,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/forgot-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "forgot-password"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "forgot-password"
+              ]
             },
             "description": "Sends password reset OTP. In dev/testing mode, the response also includes dev_otp, which is automatically saved to {{otp_code}}!"
           },
@@ -822,8 +1190,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/verify-otp",
-              "host": ["{{base_url}}"],
-              "path": ["api", "verify-otp"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "verify-otp"
+              ]
             },
             "description": "Verifies OTP code and returns reset_token, saving it to {{reset_token}}."
           },
@@ -866,8 +1239,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/reset-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "reset-password"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reset-password"
+              ]
             },
             "description": "Sets new password using verified reset_token."
           },
@@ -876,7 +1254,7 @@
       ]
     },
     {
-      "name": "6. Admin Panel",
+      "name": "7. Admin Panel",
       "item": [
         {
           "name": "Admin Login UI (GET /admin/login)",
@@ -901,8 +1279,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/admin/login",
-              "host": ["{{base_url}}"],
-              "path": ["admin", "login"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "admin",
+                "login"
+              ]
             },
             "description": "Returns HTML login page for Administrator."
           },
@@ -948,8 +1331,13 @@
             },
             "url": {
               "raw": "{{base_url}}/admin/login",
-              "host": ["{{base_url}}"],
-              "path": ["admin", "login"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "admin",
+                "login"
+              ]
             },
             "description": "Submits admin credentials and redirects (302) to /admin."
           },
@@ -978,8 +1366,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/admin",
-              "host": ["{{base_url}}"],
-              "path": ["admin"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "admin"
+              ]
             },
             "description": "Displays Vendor Administrator Dashboard with seller count, product metrics, and settings."
           },
@@ -988,7 +1380,7 @@
       ]
     },
     {
-      "name": "7. Session Cleanup",
+      "name": "8. Session Cleanup",
       "item": [
         {
           "name": "Logout (POST /api/logout)",
@@ -1029,8 +1421,13 @@
             ],
             "url": {
               "raw": "{{base_url}}/api/logout",
-              "host": ["{{base_url}}"],
-              "path": ["api", "logout"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "logout"
+              ]
             },
             "description": "Invalidates seller session."
           },

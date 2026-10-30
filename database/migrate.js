@@ -52,6 +52,17 @@ async function runMigration() {
     // ignore
   }
 
+  // Ensure users table has avatar_url column
+  try {
+    const [cols] = await conn.query('SHOW COLUMNS FROM users LIKE "avatar_url"');
+    if (cols.length === 0) {
+      await conn.query('ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER country');
+      console.log('✅ Added missing column avatar_url to users');
+    }
+  } catch (e) {
+    // ignore
+  }
+
   // Ensure admin user password matches Admin123!
   const adminHash = await bcrypt.hash('Admin123!', 10);
   await conn.query(

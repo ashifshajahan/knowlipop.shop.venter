@@ -74,12 +74,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// Handle edit seller
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'edit_seller') {
+    $sellerId = (int) ($_POST['seller_id'] ?? 0);
+    $name = trim($_POST['seller_name'] ?? '');
+    $phone = trim($_POST['phone'] ?? '');
+    $email = trim($_POST['email'] ?? '');
+    $address = trim($_POST['address'] ?? '');
+    $landmark = trim($_POST['landmark'] ?? '');
+    $state = trim($_POST['state'] ?? '');
+    $country = trim($_POST['country'] ?? 'India');
+    $password = $_POST['password'] ?? '';
+
+    if (empty($sellerId) || empty($name) || empty($phone) || empty($address) || empty($state)) {
+        $error = 'Seller ID, name, phone, address, and state are required.';
+    } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+        $error = 'Phone must be in international format with country code (e.g. +919876543210).';
+    } else {
+        $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone AND id != :id LIMIT 1");
+        $chk->execute([':phone' => $phone, ':id' => $sellerId]);
+        if ($chk->fetch()) {
+            $error = 'This phone number is already registered to another account.';
+        } else {
+            $sql = "UPDATE users SET name = :name, seller_name = :seller_name, phone = :phone, address = :address, landmark = :landmark, state = :state, country = :country";
+            $params = [
+                ':id' => $sellerId,
+                ':name' => $name,
+                ':seller_name' => $name,
+                ':phone' => $phone,
+                ':address' => $address,
+                ':landmark' => $landmark,
+                ':state' => $state,
+                ':country' => $country,
+            ];
+            if (!empty($email) && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $sql .= ", email = :email";
+                $params[':email'] = $email;
+            }
+            if (!empty($password) && strlen($password) >= 8) {
+                $sql .= ", password = :password";
+                $params[':password'] = hashPassword($password);
+            }
+            $sql .= ", updated_at = NOW() WHERE id = :id";
+            $upd = $pdo->prepare($sql);
+            $upd->execute($params);
+
+            $success = "Seller #{$sellerId} profile updated successfully!";
+        }
+    }
+}
+
 // Stats
 $sellerCountStmt = $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'");
 $sellerCount = (int) $sellerCountStmt->fetchColumn();
 
-// Sellers list
-$sellersStmt = $pdo->query("SELECT id, name, seller_name, phone, state, created_at FROM users WHERE role = 'seller' ORDER BY id DESC LIMIT 50");
+// Sellers list with product counts
+$sellersStmt = $pdo->query("
+    SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
+           (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
+    FROM users u
+    WHERE u.role = 'seller'
+    ORDER BY u.id DESC
+    LIMIT 50
+");
 $sellers = $sellersStmt->fetchAll();
 ?>
 <!doctype html>
@@ -111,6 +168,21 @@ $sellers = $sellersStmt->fetchAll();
         .success { background: #ecfdf5; color: #047857; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
         .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
         .logout-btn:hover { background: rgba(255,255,255,0.25); }
+        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-sm:hover { background: #4f46e5; }
+        .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        /* Modal Styles */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal-box { background: #fff; width: 92%; max-width: 650px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
+        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
+        .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
+        .modal-close:hover { color: #0f172a; }
+        .modal-body { padding: 24px; }
+        .info-pill { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+        .info-pill-item { font-size: 12px; color: #64748b; }
+        .info-pill-item strong { display: block; font-size: 14px; color: #1e293b; margin-top: 2px; }
     </style>
 </head>
 <body>
@@ -192,20 +264,31 @@ $sellers = $sellersStmt->fetchAll();
                         <th>Seller Name</th>
                         <th>Phone</th>
                         <th>State</th>
+                        <th>Products</th>
                         <th>Created</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if (empty($sellers)): ?>
-                        <tr><td colspan="5" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
+                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
                     <?php else: ?>
                         <?php foreach ($sellers as $s): ?>
                             <tr>
                                 <td>#<?= $s['id'] ?></td>
-                                <td><strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong></td>
+                                <td>
+                                    <strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong>
+                                    <?php if (!empty($s['email'])): ?>
+                                        <div style="font-size:12px; color:#64748b;"><?= htmlspecialchars($s['email']) ?></div>
+                                    <?php endif; ?>
+                                </td>
                                 <td><?= htmlspecialchars($s['phone'] ?? '—') ?></td>
                                 <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
+                                <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
                                 <td><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
+                                <td>
+                                    <button type="button" class="btn-sm" onclick='openSellerModal(<?= htmlspecialchars(json_encode($s, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>View / Edit</button>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                     <?php endif; ?>
@@ -213,5 +296,97 @@ $sellers = $sellersStmt->fetchAll();
             </table>
         </section>
     </main>
+
+    <!-- Seller Profile & Edit Modal -->
+    <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h3 id="modalTitle">Seller Profile</h3>
+                <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="info-pill">
+                    <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
+                    <div class="info-pill-item">Active Products<strong id="viewProductsCount">—</strong></div>
+                    <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
+                </div>
+
+                <form method="POST" action="/admin">
+                    <input type="hidden" name="action" value="edit_seller">
+                    <input type="hidden" name="seller_id" id="formSellerId">
+                    
+                    <div class="grid">
+                        <div>
+                            <label>Seller / Shop Name</label>
+                            <input name="seller_name" id="formSellerName" required maxlength="120">
+                        </div>
+                        <div>
+                            <label>Phone (+country code)</label>
+                            <input name="phone" id="formPhone" required placeholder="+919876543210">
+                        </div>
+                        <div>
+                            <label>Email Address</label>
+                            <input type="email" name="email" id="formEmail" placeholder="seller@phone.vendor.local">
+                        </div>
+                        <div>
+                            <label>State</label>
+                            <input name="state" id="formState" required>
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Address</label>
+                            <input name="address" id="formAddress" required>
+                        </div>
+                        <div>
+                            <label>Landmark</label>
+                            <input name="landmark" id="formLandmark" required>
+                        </div>
+                        <div>
+                            <label>Country</label>
+                            <input name="country" id="formCountry" required>
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>New Password (leave blank to keep current password)</label>
+                            <input type="password" name="password" minlength="8" placeholder="••••••••" autocomplete="new-password">
+                        </div>
+                    </div>
+                    <br>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <button type="submit">Save Changes</button>
+                        <button type="button" onclick="closeSellerModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function openSellerModal(seller) {
+            document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
+            document.getElementById('viewSellerId').innerText = '#' + seller.id;
+            document.getElementById('viewProductsCount').innerText = (seller.products_count || 0) + ' items';
+            document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
+
+            document.getElementById('formSellerId').value = seller.id;
+            document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
+            document.getElementById('formPhone').value = seller.phone || '';
+            document.getElementById('formEmail').value = seller.email || '';
+            document.getElementById('formAddress').value = seller.address || '';
+            document.getElementById('formLandmark').value = seller.landmark || '';
+            document.getElementById('formState').value = seller.state || '';
+            document.getElementById('formCountry').value = seller.country || 'India';
+
+            document.getElementById('sellerModal').classList.add('active');
+        }
+
+        function closeSellerModal() {
+            document.getElementById('sellerModal').classList.remove('active');
+        }
+
+        function handleOverlayClick(e) {
+            if (e.target.id === 'sellerModal') {
+                closeSellerModal();
+            }
+        }
+    </script>
 </body>
 </html>

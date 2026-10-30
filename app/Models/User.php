@@ -19,7 +19,10 @@ class User
     public ?string $landmark = null;
     public ?string $state = null;
     public ?string $country = null;
+    public ?string $avatar_url = null;
     public string $role = 'seller';
+    public ?string $created_at = null;
+    public ?string $updated_at = null;
 
     public function __construct(array $attributes = [])
     {
@@ -59,12 +62,17 @@ class User
         return [
             'id' => $this->id ?? null,
             'seller_name' => $this->seller_name ?? $this->name ?? null,
+            'name' => $this->name ?? $this->seller_name ?? null,
+            'email' => $this->email ?? null,
             'phone' => $this->phone,
             'address' => $this->address,
             'landmark' => $this->landmark,
             'state' => $this->state,
             'country' => $this->country,
             'role' => $this->role,
+            'avatar_url' => $this->avatar_url ?? null,
+            'created_at' => $this->created_at ?? null,
+            'updated_at' => $this->updated_at ?? null,
         ];
     }
 }

@@ -176,11 +176,17 @@ function safeSeller(array $user): array
     return [
         'id' => (int) $user['id'],
         'seller_name' => $user['seller_name'] ?? $user['name'] ?? '',
+        'name' => $user['name'] ?? $user['seller_name'] ?? '',
+        'email' => $user['email'] ?? null,
         'phone' => $user['phone'] ?? null,
         'address' => $user['address'] ?? null,
         'landmark' => $user['landmark'] ?? null,
         'state' => $user['state'] ?? null,
         'country' => $user['country'] ?? null,
+        'role' => $user['role'] ?? 'seller',
+        'avatar_url' => $user['avatar_url'] ?? null,
+        'created_at' => $user['created_at'] ?? null,
+        'updated_at' => $user['updated_at'] ?? null,
     ];
 }
 

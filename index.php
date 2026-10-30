@@ -89,6 +89,9 @@ if ($requestUri === '/' || $requestUri === '') {
                 • GET /api/health<br>
                 • POST /api/register<br>
                 • POST /api/login<br>
+                • GET /api/seller/profile<br>
+                • PUT /api/seller/profile<br>
+                • GET /api/sellers/{id}<br>
                 • GET /api/products<br>
                 • GET /admin/login
             </div>
@@ -126,6 +129,7 @@ if ($requestUri === '/admin/logout') {
 require_once __DIR__ . '/api/auth.php';
 require_once __DIR__ . '/api/products.php';
 require_once __DIR__ . '/api/payment.php';
+require_once __DIR__ . '/api/seller.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
@@ -162,10 +166,13 @@ if ($requestUri === '/api/login') {
 }
 
 if ($requestUri === '/api/me') {
-    if ($method !== 'GET') {
+    if ($method === 'GET') {
+        apiGetSellerProfile($pdo);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateSellerProfile($pdo);
+    } else {
         errorResponse('Method Not Allowed', [], 405);
     }
-    apiMe($pdo);
 }
 
 if ($requestUri === '/api/logout') {
@@ -222,6 +229,46 @@ if (preg_match('#^/api/products/(\d+)$#', $requestUri, $matches)) {
         apiUpdateProduct($pdo, $productId);
     } elseif ($method === 'DELETE') {
         apiDeleteProduct($pdo, $productId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Profile & Edit (Authenticated Seller)
+if ($requestUri === '/api/seller/profile') {
+    if ($method === 'GET') {
+        apiGetSellerProfile($pdo);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateSellerProfile($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/profile/update') {
+    if ($method === 'POST' || $method === 'PUT' || $method === 'PATCH') {
+        apiUpdateSellerProfile($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Sellers Directory
+if ($requestUri === '/api/sellers') {
+    if ($method === 'GET') {
+        apiGetSellersList($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller details by ID: /api/sellers/{id} or /api/seller/{id} or /api/seller/profile/{id}
+if (preg_match('#^/(?:api/sellers?|api/seller/profile)/(\d+)$#', $requestUri, $matches)) {
+    $sellerId = (int) $matches[1];
+    if ($method === 'GET') {
+        apiGetSellerById($pdo, $sellerId);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateSellerProfile($pdo, $sellerId);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }

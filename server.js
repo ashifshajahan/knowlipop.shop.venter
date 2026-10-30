@@ -141,6 +141,52 @@ function resolveProductImage(req) {
   return null;
 }
 
+// Avatar File Upload & Image Storage Configuration
+const avatarUploadDir = path.resolve(__dirname, 'uploads', 'avatars');
+if (!fs.existsSync(avatarUploadDir)) {
+  fs.mkdirSync(avatarUploadDir, { recursive: true });
+}
+
+const avatarStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, avatarUploadDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+    cb(null, `avatar_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+  }
+});
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+function resolveAvatarImage(req) {
+  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
+  if (req.file) {
+    return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${req.file.filename}`;
+  }
+  if (req.files && req.files.length > 0) {
+    return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${req.files[0].filename}`;
+  }
+  const body = req.body || {};
+  const base64Candidate = body.avatar || body.image || body.profile_image || body.avatar_base64;
+  if (base64Candidate && typeof base64Candidate === 'string' && base64Candidate.startsWith('data:image/')) {
+    const matches = base64Candidate.match(/^data:image\/(\w+);base64,(.+)$/);
+    if (matches) {
+      let ext = matches[1].toLowerCase();
+      if (ext === 'jpeg') ext = 'jpg';
+      if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
+      const buffer = Buffer.from(matches[2], 'base64');
+      const filename = `avatar_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+      fs.writeFileSync(path.join(avatarUploadDir, filename), buffer);
+      return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${filename}`;
+    }
+  }
+  if (body.avatar_url && typeof body.avatar_url === 'string' && (body.avatar_url.startsWith('http://') || body.avatar_url.startsWith('https://'))) {
+    return body.avatar_url.trim();
+  }
+  return null;
+}
+
 // Database Connection Pool
 let pool = mysql.createPool({
   host: dbHost,
@@ -186,6 +232,16 @@ async function autoMigrateIfEmpty(p) {
       await p.query('ALTER TABLE products MODIFY COLUMN image_url LONGTEXT NULL DEFAULT NULL');
     } catch (e) {
       // Already LONGTEXT or modified
+    }
+    // Ensure avatar_url column exists in users
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM users LIKE "avatar_url"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER country');
+        console.log('✅ [Vendor DB] Added avatar_url column to users table');
+      }
+    } catch (e) {
+      // Already exists or ignore
     }
   } catch (err) {
     console.error('[Vendor DB] Auto-migration check:', err.message);
@@ -233,12 +289,18 @@ async function autoMigrateIfEmpty(p) {
 function safeSeller(user) {
   return {
     id: user.id,
-    seller_name: user.seller_name || user.name,
+    seller_name: user.seller_name || user.name || '',
+    name: user.name || user.seller_name || '',
+    email: user.email || null,
     phone: user.phone || null,
     address: user.address || null,
     landmark: user.landmark || null,
     state: user.state || null,
-    country: user.country || null
+    country: user.country || null,
+    role: user.role || 'seller',
+    avatar_url: user.avatar_url || null,
+    created_at: user.created_at || null,
+    updated_at: user.updated_at || null
   };
 }
 
@@ -608,8 +670,269 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.get('/api/me', authenticateToken, (req, res) => {
-  res.json({ user: safeSeller(req.user) });
+// Profile Update Logic
+async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
+  const currentUser = req.user;
+  const sellerId = targetSellerId !== null ? parseInt(targetSellerId, 10) : currentUser.id;
+
+  if (targetSellerId !== null && currentUser.id !== sellerId && currentUser.role !== 'admin') {
+    return res.status(403).json({ message: 'Unauthorized. You can only edit your own seller profile.' });
+  }
+
+  const [existingRows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+  if (existingRows.length === 0) {
+    return res.status(404).json({ message: 'Seller not found.' });
+  }
+  const existing = existingRows[0];
+
+  const body = req.body || {};
+  const sellerName = extractField(body, ['seller_name', 'sellerName', 'business_name', 'shop_name', 'store_name']);
+  const name = extractField(body, ['name', 'fullname', 'full_name', 'owner_name']);
+  const address = extractField(body, ['address', 'shop_address', 'business_address', 'street', 'location']);
+  const landmark = extractField(body, ['landmark', 'land_mark', 'nearby']);
+  const state = extractField(body, ['state', 'province', 'region']);
+  const country = extractField(body, ['country', 'nation']);
+  const rawPhone = extractPhone(body);
+  const email = (extractField(body, ['email', 'email_address']) || '').trim();
+  const password = extractPassword(body);
+  const confirmPassword = extractConfirmPassword(body, password);
+
+  const errors = {};
+
+  let phone = '';
+  if (rawPhone) {
+    phone = normalizePhone(rawPhone);
+    if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    } else {
+      const rawNoPrefix = rawPhone.replace(/^\+91|^\+/, '');
+      const [chkPhone] = await pool.query(
+        'SELECT id FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND id != ? LIMIT 1',
+        [phone, rawPhone, rawNoPrefix, sellerId]
+      );
+      if (chkPhone.length > 0) {
+        errors.phone = ['This phone number is already registered to another account.'];
+      }
+    }
+  }
+
+  if (email) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errors.email = ['The email address format is invalid.'];
+    } else {
+      const [chkEmail] = await pool.query('SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1', [email, sellerId]);
+      if (chkEmail.length > 0) {
+        errors.email = ['This email address is already in use by another account.'];
+      }
+    }
+  }
+
+  if (password) {
+    if (password.length < 8) {
+      errors.password = ['The new password must be at least 8 characters.'];
+    } else if (password !== confirmPassword) {
+      errors.password = ['The password confirmation does not match.'];
+    }
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({ message: 'Validation error occurred.', errors });
+  }
+
+  const avatarUrl = resolveAvatarImage(req) || (body.avatar_url !== undefined ? body.avatar_url : null);
+
+  const updates = [];
+  const params = [];
+
+  if (sellerName) {
+    updates.push('seller_name = ?');
+    params.push(sellerName);
+    if (!name) {
+      updates.push('name = ?');
+      params.push(sellerName);
+    }
+  }
+  if (name) {
+    updates.push('name = ?');
+    params.push(name);
+    if (!sellerName && !existing.seller_name) {
+      updates.push('seller_name = ?');
+      params.push(name);
+    }
+  }
+  if (address) {
+    updates.push('address = ?');
+    params.push(address);
+  }
+  if (landmark) {
+    updates.push('landmark = ?');
+    params.push(landmark);
+  }
+  if (state) {
+    updates.push('state = ?');
+    params.push(state);
+  }
+  if (country) {
+    updates.push('country = ?');
+    params.push(country);
+  }
+  if (phone) {
+    updates.push('phone = ?');
+    params.push(phone);
+  }
+  if (email) {
+    updates.push('email = ?');
+    params.push(email);
+  }
+  if (password) {
+    const hashed = await bcrypt.hash(password, 10);
+    updates.push('password = ?');
+    params.push(hashed);
+  }
+  if (avatarUrl) {
+    try {
+      const [cols] = await pool.query('SHOW COLUMNS FROM users LIKE "avatar_url"');
+      if (cols.length > 0) {
+        updates.push('avatar_url = ?');
+        params.push(avatarUrl);
+      }
+    } catch (e) {}
+  }
+
+  if (updates.length > 0) {
+    updates.push('updated_at = NOW()');
+    params.push(sellerId);
+    await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+  }
+
+  const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
+
+  const sellerData = safeSeller(refreshed[0]);
+  sellerData.products_count = count;
+
+  res.json({
+    message: 'Seller profile updated successfully.',
+    seller: sellerData,
+    user: sellerData
+  });
+}
+
+// GET /api/me (authenticated seller profile)
+app.get('/api/me', authenticateToken, async (req, res) => {
+  const sellerId = req.user.id;
+  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
+  const [paymentRows] = await pool.query('SELECT provider, account_reference, status, updated_at FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
+
+  const sellerData = safeSeller(req.user);
+  sellerData.products_count = count;
+  sellerData.payment_account = paymentRows.length > 0 ? paymentRows[0] : { status: 'not_linked', message: 'No payment account linked yet.' };
+
+  res.json({ status: 'success', seller: sellerData, user: sellerData });
+});
+
+app.put('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
+app.patch('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
+
+// GET /api/seller/profile
+app.get('/api/seller/profile', authenticateToken, async (req, res) => {
+  const sellerId = req.user.id;
+  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
+  const [paymentRows] = await pool.query('SELECT provider, account_reference, status, updated_at FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
+
+  const sellerData = safeSeller(req.user);
+  sellerData.products_count = count;
+  sellerData.payment_account = paymentRows.length > 0 ? paymentRows[0] : { status: 'not_linked', message: 'No payment account linked yet.' };
+
+  res.json({ status: 'success', seller: sellerData, user: sellerData });
+});
+
+// PUT / PATCH / POST /api/seller/profile and /api/seller/profile/update
+app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken, avatarUpload.any(), (req, res) => {
+  if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
+    return handleSellerProfileUpdate(req, res, null);
+  }
+  res.status(405).json({ message: 'Method Not Allowed' });
+});
+
+// GET /api/sellers (directory)
+app.get('/api/sellers', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '20', 10)));
+  const offset = (page - 1) * limit;
+  const search = (req.query.search || req.query.q || '').trim();
+
+  let where = "WHERE (role = 'seller' OR role = 'admin')";
+  const params = [];
+
+  if (search) {
+    where += " AND (seller_name LIKE ? OR name LIKE ? OR phone LIKE ? OR state LIKE ?)";
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+  }
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM users ${where}`, params);
+  const [rows] = await pool.query(
+    `SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.role, u.created_at, u.updated_at,
+            (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
+     FROM users u
+     ${where}
+     ORDER BY u.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  const sellers = rows.map(r => {
+    const data = safeSeller(r);
+    data.products_count = parseInt(r.products_count || 0, 10);
+    return data;
+  });
+
+  res.json({
+    status: 'success',
+    sellers: {
+      current_page: page,
+      data: sellers,
+      total,
+      per_page: limit,
+      last_page: Math.ceil(total / limit)
+    }
+  });
+});
+
+// GET /api/sellers/:id, /api/seller/:id, /api/seller/profile/:id (seller ID based)
+app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], async (req, res) => {
+  const sellerId = parseInt(req.params.id, 10);
+  const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+  if (rows.length === 0) {
+    return res.status(404).json({ message: 'Seller not found.' });
+  }
+
+  const [products] = await pool.query(
+    `SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at
+     FROM products
+     WHERE seller_id = ? AND is_active = 1
+     ORDER BY id DESC`,
+    [sellerId]
+  );
+
+  for (const p of products) {
+    p.price = parseFloat(p.price).toFixed(2);
+    p.is_active = Boolean(p.is_active);
+  }
+
+  const sellerData = safeSeller(rows[0]);
+  sellerData.products_count = products.length;
+  sellerData.products = products;
+
+  res.json({ status: 'success', seller: sellerData });
+});
+
+// PUT / PATCH / POST /api/sellers/:id and /api/seller/:id (edit seller by ID)
+app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, avatarUpload.any(), (req, res) => {
+  if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
+    return handleSellerProfileUpdate(req, res, req.params.id);
+  }
+  res.status(405).json({ message: 'Method Not Allowed' });
 });
 
 app.post('/api/logout', authenticateToken, (req, res) => {
@@ -1325,10 +1648,54 @@ DB_PASSWORD=Xtragclub_vendor2026</pre>
   }
 });
 
+app.post('/admin', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (body.action === 'edit_seller') {
+      const sellerId = parseInt(body.seller_id, 10);
+      const name = (body.seller_name || '').trim();
+      const phone = (body.phone || '').trim();
+      const email = (body.email || '').trim();
+      const address = (body.address || '').trim();
+      const landmark = (body.landmark || '').trim();
+      const state = (body.state || '').trim();
+      const country = (body.country || 'India').trim();
+      const password = body.password || '';
+
+      if (sellerId && name && phone && address && state) {
+        const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
+        const params = [name, name, phone, address, landmark, state, country];
+        if (email) {
+          updates.push('email = ?');
+          params.push(email);
+        }
+        if (password && password.length >= 8) {
+          const hash = await bcrypt.hash(password, 10);
+          updates.push('password = ?');
+          params.push(hash);
+        }
+        updates.push('updated_at = NOW()');
+        params.push(sellerId);
+        await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+      }
+    }
+  } catch (err) {
+    console.error('Admin edit error:', err);
+  }
+  res.redirect('/admin');
+});
+
 app.get('/admin', async (req, res) => {
   try {
     const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
-    const [sellers] = await pool.query('SELECT id, name, seller_name, phone, state, created_at FROM users WHERE role = "seller" ORDER BY id DESC LIMIT 50');
+    const [sellers] = await pool.query(`
+      SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
+             (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
+      FROM users u
+      WHERE u.role = "seller"
+      ORDER BY u.id DESC
+      LIMIT 50
+    `);
 
   res.send(`
     <!doctype html>
@@ -1347,10 +1714,28 @@ app.get('/admin', async (req, res) => {
         .stat { font-size: 32px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
         p.muted { color: #64748b; font-size: 14px; }
+        label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
+        input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
+        input:focus { border-color: #6366f1; }
+        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 12px 20px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
+        button:hover, .btn:hover { background: #4a3cb8; }
         table { width: 100%; border-collapse: collapse; margin-top: 14px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
         th { color: #64748b; font-weight: 600; }
         .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
+        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-sm:hover { background: #4f46e5; }
+        .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal-box { background: #fff; width: 92%; max-width: 650px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
+        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
+        .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
+        .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
+        .modal-body { padding: 24px; }
+        .info-pill { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+        .info-pill-item { font-size: 12px; color: #64748b; }
+        .info-pill-item strong { display: block; font-size: 14px; color: #1e293b; margin-top: 2px; }
       </style>
     </head>
     <body>
@@ -1369,13 +1754,119 @@ app.get('/admin', async (req, res) => {
         <section class="card">
           <h2>Seller Accounts</h2>
           <table>
-            <thead><tr><th>ID</th><th>Seller Name</th><th>Phone</th><th>State</th><th>Created</th></tr></thead>
+            <thead><tr><th>ID</th><th>Seller Name</th><th>Phone</th><th>State</th><th>Products</th><th>Created</th><th>Actions</th></tr></thead>
             <tbody>
-              ${sellers.map(s => `<tr><td>#${s.id}</td><td><strong>${s.seller_name || s.name}</strong></td><td>${s.phone || '—'}</td><td>${s.state || '—'}</td><td>${String(s.created_at).slice(0, 10)}</td></tr>`).join('')}
+              ${sellers.map(s => `
+                <tr>
+                  <td>#${s.id}</td>
+                  <td>
+                    <strong>${s.seller_name || s.name}</strong>
+                    ${s.email ? `<div style="font-size:12px; color:#64748b;">${s.email}</div>` : ''}
+                  </td>
+                  <td>${s.phone || '—'}</td>
+                  <td>${s.state || '—'}</td>
+                  <td><span class="badge-prod">${s.products_count || 0} items</span></td>
+                  <td>${String(s.created_at).slice(0, 10)}</td>
+                  <td>
+                    <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
+                  </td>
+                </tr>
+              `).join('')}
             </tbody>
           </table>
         </section>
       </main>
+
+      <!-- Seller Profile & Edit Modal -->
+      <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
+        <div class="modal-box">
+          <div class="modal-header">
+            <h3 id="modalTitle">Seller Profile</h3>
+            <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div class="info-pill">
+              <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
+              <div class="info-pill-item">Active Products<strong id="viewProductsCount">—</strong></div>
+              <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
+            </div>
+
+            <form method="POST" action="/admin">
+              <input type="hidden" name="action" value="edit_seller">
+              <input type="hidden" name="seller_id" id="formSellerId">
+              <div class="grid">
+                <div>
+                  <label>Seller / Shop Name</label>
+                  <input name="seller_name" id="formSellerName" required maxlength="120">
+                </div>
+                <div>
+                  <label>Phone (+country code)</label>
+                  <input name="phone" id="formPhone" required placeholder="+919876543210">
+                </div>
+                <div>
+                  <label>Email Address</label>
+                  <input type="email" name="email" id="formEmail" placeholder="seller@phone.vendor.local">
+                </div>
+                <div>
+                  <label>State</label>
+                  <input name="state" id="formState" required>
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Address</label>
+                  <input name="address" id="formAddress" required>
+                </div>
+                <div>
+                  <label>Landmark</label>
+                  <input name="landmark" id="formLandmark" required>
+                </div>
+                <div>
+                  <label>Country</label>
+                  <input name="country" id="formCountry" required>
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>New Password (leave blank to keep current password)</label>
+                  <input type="password" name="password" minlength="8" placeholder="••••••••" autocomplete="new-password">
+                </div>
+              </div>
+              <br>
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <button type="submit">Save Changes</button>
+                <button type="button" onclick="closeSellerModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <script>
+        function openSellerModal(seller) {
+          document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
+          document.getElementById('viewSellerId').innerText = '#' + seller.id;
+          document.getElementById('viewProductsCount').innerText = (seller.products_count || 0) + ' items';
+          document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
+
+          document.getElementById('formSellerId').value = seller.id;
+          document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
+          document.getElementById('formPhone').value = seller.phone || '';
+          document.getElementById('formEmail').value = seller.email || '';
+          document.getElementById('formAddress').value = seller.address || '';
+          document.getElementById('formLandmark').value = seller.landmark || '';
+          document.getElementById('formState').value = seller.state || '';
+          document.getElementById('formCountry').value = seller.country || 'India';
+
+          document.getElementById('sellerModal').classList.add('active');
+        }
+
+        function closeSellerModal() {
+          document.getElementById('sellerModal').classList.remove('active');
+        }
+
+        function handleOverlayClick(e) {
+          if (e.target.id === 'sellerModal') {
+            closeSellerModal();
+          }
+        }
+      </script>
     </body>
     </html>
   `);
