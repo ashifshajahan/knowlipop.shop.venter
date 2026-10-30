@@ -287,21 +287,24 @@ async function autoMigrateIfEmpty(p) {
 
 // Helper: safe seller output
 function safeSeller(user) {
-  return {
+  const data = {
     id: user.id,
     seller_name: user.seller_name || user.name || '',
     name: user.name || user.seller_name || '',
-    email: user.email || null,
     phone: user.phone || null,
     address: user.address || null,
     landmark: user.landmark || null,
     state: user.state || null,
     country: user.country || null,
-    role: user.role || 'seller',
-    avatar_url: user.avatar_url || null,
-    created_at: user.created_at || null,
-    updated_at: user.updated_at || null
   };
+
+  // Email is ONLY for admin users, not for regular sellers/users
+  if (user.role === 'admin') {
+    if (user.email) data.email = user.email;
+    data.role = 'admin';
+  }
+
+  return data;
 }
 
 // Middleware: Authenticate Bearer Token
@@ -686,6 +689,9 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   const existing = existingRows[0];
 
   const body = req.body || {};
+  const isAdmin = req.user && req.user.role === 'admin';
+
+  // Fields to update (id is strictly immutable)
   const sellerName = extractField(body, ['seller_name', 'sellerName', 'business_name', 'shop_name', 'store_name']);
   const name = extractField(body, ['name', 'fullname', 'full_name', 'owner_name']);
   const address = extractField(body, ['address', 'shop_address', 'business_address', 'street', 'location']);
@@ -694,8 +700,11 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   const country = extractField(body, ['country', 'nation']);
   const rawPhone = extractPhone(body);
   const email = (extractField(body, ['email', 'email_address']) || '').trim();
-  const password = extractPassword(body);
-  const confirmPassword = extractConfirmPassword(body, password);
+
+  // Separate password fields: current_password, new_password, confirm_password
+  const currentPassword = extractField(body, ['current_password', 'currentPassword', 'old_password', 'oldPassword']);
+  const newPassword = extractField(body, ['new_password', 'newPassword', 'password']);
+  const confirmPassword = extractConfirmPassword(body, newPassword);
 
   const errors = {};
 
@@ -716,7 +725,8 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     }
   }
 
-  if (email) {
+  // Email is ONLY for admin users (regular sellers do not have/change email)
+  if (isAdmin && email) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       errors.email = ['The email address format is invalid.'];
     } else {
@@ -727,11 +737,22 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     }
   }
 
-  if (password) {
-    if (password.length < 8) {
-      errors.password = ['The new password must be at least 8 characters.'];
-    } else if (password !== confirmPassword) {
-      errors.password = ['The password confirmation does not match.'];
+  // Password validation with (current_password, new_password, confirm_password)
+  if (newPassword) {
+    if (!isAdmin || req.user.id === sellerId) {
+      if (!currentPassword) {
+        errors.current_password = ['The current password field is required to change password.'];
+      } else {
+        const matches = await bcrypt.compare(currentPassword, existing.password);
+        if (!matches) {
+          errors.current_password = ['The supplied current password is incorrect.'];
+        }
+      }
+    }
+    if (newPassword.length < 8) {
+      errors.new_password = ['The new password must be at least 8 characters.'];
+    } else if (newPassword !== confirmPassword) {
+      errors.confirm_password = ['The password confirmation does not match.'];
     }
   }
 
@@ -780,12 +801,12 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     updates.push('phone = ?');
     params.push(phone);
   }
-  if (email) {
+  if (isAdmin && email) {
     updates.push('email = ?');
     params.push(email);
   }
-  if (password) {
-    const hashed = await bcrypt.hash(password, 10);
+  if (newPassword) {
+    const hashed = await bcrypt.hash(newPassword, 10);
     updates.push('password = ?');
     params.push(hashed);
   }
@@ -806,10 +827,7 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   }
 
   const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
-  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
-
   const sellerData = safeSeller(refreshed[0]);
-  sellerData.products_count = count;
 
   res.json({
     message: 'Seller profile updated successfully.',
@@ -818,32 +836,94 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   });
 }
 
+// Dedicated Change Password Handler: requires (current_password, new_password, confirm_password)
+async function handleChangePassword(req, res) {
+  const sellerId = req.user.id;
+  const [existingRows] = await pool.query('SELECT id, password FROM users WHERE id = ? LIMIT 1', [sellerId]);
+  if (existingRows.length === 0) {
+    return res.status(404).json({ message: 'User not found.' });
+  }
+  const existing = existingRows[0];
+
+  const body = req.body || {};
+  const currentPassword = extractField(body, ['current_password', 'currentPassword', 'old_password', 'oldPassword', 'current']);
+  const newPassword = extractField(body, ['new_password', 'newPassword', 'password']);
+  const confirmPassword = extractConfirmPassword(body, newPassword);
+
+  const errors = {};
+
+  if (!currentPassword) {
+    errors.current_password = ['The current password field is required.'];
+  } else {
+    const matches = await bcrypt.compare(currentPassword, existing.password);
+    if (!matches) {
+      errors.current_password = ['The supplied current password is incorrect.'];
+    }
+  }
+
+  if (!newPassword) {
+    errors.new_password = ['The new password field is required.'];
+  } else if (newPassword.length < 8) {
+    errors.new_password = ['The new password must be at least 8 characters.'];
+  }
+
+  if (!confirmPassword) {
+    errors.confirm_password = ['The confirm password field is required.'];
+  } else if (newPassword !== confirmPassword) {
+    errors.confirm_password = ['The password confirmation does not match.'];
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({ message: 'Validation error occurred.', errors });
+  }
+
+  const hashed = await bcrypt.hash(newPassword, 10);
+  await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?', [hashed, sellerId]);
+
+  res.json({ status: 'success', message: 'Password updated successfully.' });
+}
+
 // GET /api/me (authenticated seller profile)
 app.get('/api/me', authenticateToken, async (req, res) => {
-  const sellerId = req.user.id;
-  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
-  const [paymentRows] = await pool.query('SELECT provider, account_reference, status, updated_at FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
-
   const sellerData = safeSeller(req.user);
-  sellerData.products_count = count;
-  sellerData.payment_account = paymentRows.length > 0 ? paymentRows[0] : { status: 'not_linked', message: 'No payment account linked yet.' };
-
   res.json({ status: 'success', seller: sellerData, user: sellerData });
 });
 
 app.put('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
 app.patch('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
 
-// GET /api/seller/profile
-app.get('/api/seller/profile', authenticateToken, async (req, res) => {
-  const sellerId = req.user.id;
-  const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM products WHERE seller_id = ? AND is_active = 1', [sellerId]);
-  const [paymentRows] = await pool.query('SELECT provider, account_reference, status, updated_at FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
+// GET /api/seller/profile (supports ?seller_id=X or ?id=X, or Bearer token)
+app.get('/api/seller/profile', async (req, res) => {
+  const querySellerId = req.query.seller_id || req.query.id;
+  let user;
 
-  const sellerData = safeSeller(req.user);
-  sellerData.products_count = count;
-  sellerData.payment_account = paymentRows.length > 0 ? paymentRows[0] : { status: 'not_linked', message: 'No payment account linked yet.' };
+  if (querySellerId) {
+    const sellerId = parseInt(querySellerId, 10);
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Seller not found.' });
+    }
+    user = rows[0];
+  } else {
+    // Authenticate token
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
+      return res.status(401).json({ message: 'Unauthenticated.' });
+    }
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.id || decoded.sub]);
+      if (rows.length === 0) {
+        return res.status(401).json({ message: 'User not found.' });
+      }
+      user = rows[0];
+    } catch (err) {
+      return res.status(401).json({ message: 'Invalid or expired token.' });
+    }
+  }
 
+  const sellerData = safeSeller(user);
   res.json({ status: 'success', seller: sellerData, user: sellerData });
 });
 
@@ -851,6 +931,14 @@ app.get('/api/seller/profile', authenticateToken, async (req, res) => {
 app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken, avatarUpload.any(), (req, res) => {
   if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
     return handleSellerProfileUpdate(req, res, null);
+  }
+  res.status(405).json({ message: 'Method Not Allowed' });
+});
+
+// Separate Password Update: (current_password, new_password, confirm_password)
+app.all(['/api/seller/change-password', '/api/change-password', '/api/seller/password'], authenticateToken, (req, res) => {
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    return handleChangePassword(req, res);
   }
   res.status(405).json({ message: 'Method Not Allowed' });
 });
@@ -900,35 +988,30 @@ app.get('/api/sellers', async (req, res) => {
 });
 
 // GET /api/sellers/:id, /api/seller/:id, /api/seller/profile/:id (seller ID based)
-app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], async (req, res) => {
-  const sellerId = parseInt(req.params.id, 10);
-  const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
-  if (rows.length === 0) {
-    return res.status(404).json({ message: 'Seller not found.' });
+app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], async (req, res, next) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return next();
   }
+  try {
+    const sellerId = parseInt(req.params.id, 10);
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Seller not found.' });
+    }
 
-  const [products] = await pool.query(
-    `SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at
-     FROM products
-     WHERE seller_id = ? AND is_active = 1
-     ORDER BY id DESC`,
-    [sellerId]
-  );
-
-  for (const p of products) {
-    p.price = parseFloat(p.price).toFixed(2);
-    p.is_active = Boolean(p.is_active);
+    const sellerData = safeSeller(rows[0]);
+    res.json({ status: 'success', seller: sellerData });
+  } catch (err) {
+    console.error('Get Seller By ID Error:', err);
+    res.status(500).json({ error: 'Database error occurred while fetching seller.' });
   }
-
-  const sellerData = safeSeller(rows[0]);
-  sellerData.products_count = products.length;
-  sellerData.products = products;
-
-  res.json({ status: 'success', seller: sellerData });
 });
 
 // PUT / PATCH / POST /api/sellers/:id and /api/seller/:id (edit seller by ID)
-app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, avatarUpload.any(), (req, res) => {
+app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, avatarUpload.any(), (req, res, next) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return next();
+  }
   if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
     return handleSellerProfileUpdate(req, res, req.params.id);
   }
@@ -1297,19 +1380,30 @@ app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = 20;
   const offset = (page - 1) * limit;
+  const sellerId = req.query.seller_id ? parseInt(req.query.seller_id, 10) : null;
 
   try {
-    const [[{ total }]] = await pool.query('SELECT COUNT(*) as total FROM products WHERE is_active = 1');
-    const [products] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+    let countSql = 'SELECT COUNT(*) as total FROM products WHERE is_active = 1';
+    let querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.is_active = 1
-       ORDER BY p.id DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
-    );
+       WHERE p.is_active = 1`;
+    const countParams = [];
+    const queryParams = [];
+
+    if (sellerId !== null && !isNaN(sellerId)) {
+      countSql += ' AND seller_id = ?';
+      countParams.push(sellerId);
+      querySql += ' AND p.seller_id = ?';
+      queryParams.push(sellerId);
+    }
+
+    querySql += ' ORDER BY p.id DESC LIMIT ? OFFSET ?';
+    queryParams.push(limit, offset);
+
+    const [[{ total }]] = await pool.query(countSql, countParams);
+    const [products] = await pool.query(querySql, queryParams);
 
     const formatted = products.map(p => ({
       ...p,
@@ -1655,24 +1749,32 @@ app.post('/admin', async (req, res) => {
       const sellerId = parseInt(body.seller_id, 10);
       const name = (body.seller_name || '').trim();
       const phone = (body.phone || '').trim();
-      const email = (body.email || '').trim();
       const address = (body.address || '').trim();
       const landmark = (body.landmark || '').trim();
       const state = (body.state || '').trim();
       const country = (body.country || 'India').trim();
-      const password = body.password || '';
+      const currentPassword = body.current_password || '';
+      const newPassword = body.new_password || body.password || '';
+      const confirmPassword = body.confirm_password || '';
 
       if (sellerId && name && phone && address && state) {
+        let passwordToUpdate = null;
+        if (newPassword && newPassword.length >= 8 && newPassword === confirmPassword) {
+          if (currentPassword) {
+            const [rows] = await pool.query('SELECT password FROM users WHERE id = ? LIMIT 1', [sellerId]);
+            if (rows.length > 0 && (await bcrypt.compare(currentPassword, rows[0].password))) {
+              passwordToUpdate = await bcrypt.hash(newPassword, 10);
+            }
+          } else {
+            passwordToUpdate = await bcrypt.hash(newPassword, 10);
+          }
+        }
+
         const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
         const params = [name, name, phone, address, landmark, state, country];
-        if (email) {
-          updates.push('email = ?');
-          params.push(email);
-        }
-        if (password && password.length >= 8) {
-          const hash = await bcrypt.hash(password, 10);
+        if (passwordToUpdate) {
           updates.push('password = ?');
-          params.push(hash);
+          params.push(passwordToUpdate);
         }
         updates.push('updated_at = NOW()');
         params.push(sellerId);
@@ -1761,7 +1863,6 @@ app.get('/admin', async (req, res) => {
                   <td>#${s.id}</td>
                   <td>
                     <strong>${s.seller_name || s.name}</strong>
-                    ${s.email ? `<div style="font-size:12px; color:#64748b;">${s.email}</div>` : ''}
                   </td>
                   <td>${s.phone || '—'}</td>
                   <td>${s.state || '—'}</td>
@@ -1785,9 +1886,8 @@ app.get('/admin', async (req, res) => {
             <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
           </div>
           <div class="modal-body">
-            <div class="info-pill">
+            <div class="info-pill" style="grid-template-columns: repeat(2, 1fr);">
               <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
-              <div class="info-pill-item">Active Products<strong id="viewProductsCount">—</strong></div>
               <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
             </div>
 
@@ -1804,28 +1904,36 @@ app.get('/admin', async (req, res) => {
                   <input name="phone" id="formPhone" required placeholder="+919876543210">
                 </div>
                 <div>
-                  <label>Email Address</label>
-                  <input type="email" name="email" id="formEmail" placeholder="seller@phone.vendor.local">
-                </div>
-                <div>
                   <label>State</label>
                   <input name="state" id="formState" required>
-                </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Address</label>
-                  <input name="address" id="formAddress" required>
-                </div>
-                <div>
-                  <label>Landmark</label>
-                  <input name="landmark" id="formLandmark" required>
                 </div>
                 <div>
                   <label>Country</label>
                   <input name="country" id="formCountry" required>
                 </div>
                 <div style="grid-column: 1 / -1;">
-                  <label>New Password (leave blank to keep current password)</label>
-                  <input type="password" name="password" minlength="8" placeholder="••••••••" autocomplete="new-password">
+                  <label>Address</label>
+                  <input name="address" id="formAddress" required>
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Landmark</label>
+                  <input name="landmark" id="formLandmark" required>
+                </div>
+                <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
+                  <strong style="color: #334155; font-size: 13px;">Change Password</strong>
+                  <span style="font-size: 12px; color: #64748b; margin-left: 6px;">(leave blank if not changing)</span>
+                </div>
+                <div>
+                  <label>Current Password</label>
+                  <input type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
+                </div>
+                <div>
+                  <label>New Password</label>
+                  <input type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Confirm Password</label>
+                  <input type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
                 </div>
               </div>
               <br>
@@ -1842,17 +1950,19 @@ app.get('/admin', async (req, res) => {
         function openSellerModal(seller) {
           document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
           document.getElementById('viewSellerId').innerText = '#' + seller.id;
-          document.getElementById('viewProductsCount').innerText = (seller.products_count || 0) + ' items';
           document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
 
           document.getElementById('formSellerId').value = seller.id;
           document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
           document.getElementById('formPhone').value = seller.phone || '';
-          document.getElementById('formEmail').value = seller.email || '';
           document.getElementById('formAddress').value = seller.address || '';
           document.getElementById('formLandmark').value = seller.landmark || '';
           document.getElementById('formState').value = seller.state || '';
           document.getElementById('formCountry').value = seller.country || 'India';
+
+          document.getElementById('formCurrentPassword').value = '';
+          document.getElementById('formNewPassword').value = '';
+          document.getElementById('formConfirmPassword').value = '';
 
           document.getElementById('sellerModal').classList.add('active');
         }

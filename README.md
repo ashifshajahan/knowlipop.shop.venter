@@ -36,11 +36,12 @@ Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 * `POST /api/logout` — Invalidate session
 
 ### Seller Profile & Directory
-* `GET /api/seller/profile` — Authenticated seller profile with products count & payment account info (`Authorization: Bearer <token>`)
-* `PUT /api/seller/profile` — Edit authenticated seller profile (shop name, address, landmark, state, country, phone, email, password, avatar image)
-* `POST /api/seller/profile/update` — Convenient POST alias for editing profile (supports `multipart/form-data`, JSON, and Base64 avatar)
-* `GET /api/sellers/{id}` — Seller profile & active products catalog by Seller ID (e.g. `/api/sellers/1` or `/api/seller/1`)
-* `PUT /api/sellers/{id}` — Edit seller profile by Seller ID (authorized for the seller or admin)
+* `GET /api/seller/profile` — Seller profile details based on Seller ID (`?seller_id={id}` or `?id={id}`) or Bearer token (contains: `id`, `seller_name`, `phone`, `address`, `landmark`, `state`, `country`; email is for admin only)
+* `PUT /api/seller/profile` — Edit authenticated seller profile (shop name, phone, address, landmark, state, country; `id` cannot be changed)
+* `POST /api/seller/profile/update` — Convenient POST alias for editing profile
+* `POST /api/seller/change-password` — Separate password update endpoint requiring `current_password`, `new_password`, and `confirm_password`
+* `GET /api/sellers/{id}` — Seller profile based on Seller ID (e.g. `/api/sellers/1` or `/api/seller/1` or `/api/seller/profile/1`) — returns seller details only
+* `PUT /api/sellers/{id}` — Edit seller profile by Seller ID (authorized for the seller or admin; `id` cannot be changed)
 * `GET /api/sellers` — Paginated directory of marketplace sellers with search filter (`?page=1&limit=20&search=keyword`)
 
 ### Products Catalog & CRUD

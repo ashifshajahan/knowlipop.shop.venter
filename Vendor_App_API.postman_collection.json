@@ -327,11 +327,10 @@
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var json = pm.response.json();",
-                  "pm.test(\"Returns seller profile with products count\", function () {",
+                  "pm.test(\"Returns seller profile\", function () {",
                   "    pm.expect(json.seller).to.be.an(\"object\");",
                   "    pm.expect(json.seller.id).to.be.a(\"number\");",
                   "    pm.expect(json.seller.seller_name).to.be.a(\"string\");",
-                  "    pm.expect(json.seller.products_count).to.be.a(\"number\");",
                   "});",
                   "if (json.seller && json.seller.id) {",
                   "    pm.collectionVariables.set(\"seller_id\", String(json.seller.id));",
@@ -432,7 +431,71 @@
                 "profile"
               ]
             },
-            "description": "Edits the logged-in seller profile details: shop name, address, landmark, state, country, email, phone, or password."
+            "description": "Edits the logged-in seller profile details: shop name, address, landmark, state, country, or phone (id cannot be changed)."
+          },
+          "response": []
+        },
+        {
+          "name": "Change Seller Password (POST /api/seller/change-password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var json = pm.response.json();",
+                  "pm.test(\"Password changed successfully\", function () {",
+                  "    pm.expect(json.message).to.include(\"successfully\");",
+                  "});",
+                  "pm.collectionVariables.set(\"seller_password\", \"NewSecretPass123!\");",
+                  "if (pm.environment) {",
+                  "    pm.environment.set(\"seller_password\", \"NewSecretPass123!\");",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"{{seller_password}}\",\n  \"new_password\": \"NewSecretPass123!\",\n  \"confirm_password\": \"NewSecretPass123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/seller/change-password",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "change-password"
+              ]
+            },
+            "description": "Separate password update requiring current_password, new_password, and confirm_password."
           },
           "response": []
         },
@@ -447,9 +510,10 @@
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var json = pm.response.json();",
-                  "pm.test(\"Returns seller details by seller ID with products catalog\", function () {",
+                  "pm.test(\"Returns seller details by seller ID\", function () {",
                   "    pm.expect(json.seller).to.be.an(\"object\");",
-                  "    pm.expect(json.seller.products).to.be.an(\"array\");",
+                  "    pm.expect(json.seller.id).to.be.a(\"number\");",
+                  "    pm.expect(json.seller.seller_name).to.be.a(\"string\");",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -475,7 +539,7 @@
                 "{{seller_id}}"
               ]
             },
-            "description": "Public / catalog view of a seller profile based on seller ID, returning seller details and their active products."
+            "description": "Public view of a seller profile based on seller ID, returning seller details (without products or product count)."
           },
           "response": []
         },

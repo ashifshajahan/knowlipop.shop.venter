@@ -173,21 +173,26 @@ function deleteCurrentToken(PDO $pdo, int $tokenId): void
 
 function safeSeller(array $user): array
 {
-    return [
+    $data = [
         'id' => (int) $user['id'],
         'seller_name' => $user['seller_name'] ?? $user['name'] ?? '',
         'name' => $user['name'] ?? $user['seller_name'] ?? '',
-        'email' => $user['email'] ?? null,
         'phone' => $user['phone'] ?? null,
         'address' => $user['address'] ?? null,
         'landmark' => $user['landmark'] ?? null,
         'state' => $user['state'] ?? null,
         'country' => $user['country'] ?? null,
-        'role' => $user['role'] ?? 'seller',
-        'avatar_url' => $user['avatar_url'] ?? null,
-        'created_at' => $user['created_at'] ?? null,
-        'updated_at' => $user['updated_at'] ?? null,
     ];
+
+    // Email is ONLY for admin users, not for regular sellers/users
+    if (($user['role'] ?? '') === 'admin') {
+        if (!empty($user['email'])) {
+            $data['email'] = $user['email'];
+        }
+        $data['role'] = 'admin';
+    }
+
+    return $data;
 }
 
 function hashPassword(string $password): string

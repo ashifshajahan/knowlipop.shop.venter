@@ -12,8 +12,17 @@ function apiGetProducts(PDO $pdo): void
     $page = max(1, (int) ($_GET['page'] ?? 1));
     $limit = 20;
     $offset = ($page - 1) * $limit;
+    $sellerId = !empty($_GET['seller_id']) ? (int) $_GET['seller_id'] : null;
 
-    $countStmt = $pdo->query("SELECT COUNT(*) FROM products WHERE is_active = 1");
+    $where = "WHERE p.is_active = 1";
+    $params = [];
+    if ($sellerId !== null) {
+        $where .= " AND p.seller_id = :seller_id";
+        $params[':seller_id'] = $sellerId;
+    }
+
+    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
+    $countStmt->execute($params);
     $total = (int) $countStmt->fetchColumn();
 
     $stmt = $pdo->prepare("
@@ -21,10 +30,13 @@ function apiGetProducts(PDO $pdo): void
                p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
-        WHERE p.is_active = 1
+        {$where}
         ORDER BY p.id DESC
         LIMIT :limit OFFSET :offset
     ");
+    foreach ($params as $k => $v) {
+        $stmt->bindValue($k, $v, PDO::PARAM_INT);
+    }
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();

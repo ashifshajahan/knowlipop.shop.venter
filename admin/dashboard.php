@@ -79,12 +79,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $name = trim($_POST['seller_name'] ?? '');
     $phone = trim($_POST['phone'] ?? '');
-    $email = trim($_POST['email'] ?? '');
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '');
     $state = trim($_POST['state'] ?? '');
     $country = trim($_POST['country'] ?? 'India');
-    $password = $_POST['password'] ?? '';
+    $currentPassword = $_POST['current_password'] ?? '';
+    $newPassword = $_POST['new_password'] ?? $_POST['password'] ?? '';
+    $confirmPassword = $_POST['confirm_password'] ?? '';
 
     if (empty($sellerId) || empty($name) || empty($phone) || empty($address) || empty($state)) {
         $error = 'Seller ID, name, phone, address, and state are required.';
@@ -96,30 +97,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if ($chk->fetch()) {
             $error = 'This phone number is already registered to another account.';
         } else {
-            $sql = "UPDATE users SET name = :name, seller_name = :seller_name, phone = :phone, address = :address, landmark = :landmark, state = :state, country = :country";
-            $params = [
-                ':id' => $sellerId,
-                ':name' => $name,
-                ':seller_name' => $name,
-                ':phone' => $phone,
-                ':address' => $address,
-                ':landmark' => $landmark,
-                ':state' => $state,
-                ':country' => $country,
-            ];
-            if (!empty($email) && filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                $sql .= ", email = :email";
-                $params[':email'] = $email;
+            $passwordToUpdate = null;
+            if (!empty($newPassword)) {
+                if (strlen($newPassword) < 8) {
+                    $error = 'The new password must be at least 8 characters.';
+                } elseif ($newPassword !== $confirmPassword) {
+                    $error = 'The new password and confirm password do not match.';
+                } else {
+                    if (!empty($currentPassword)) {
+                        $pStmt = $pdo->prepare("SELECT password FROM users WHERE id = :id LIMIT 1");
+                        $pStmt->execute([':id' => $sellerId]);
+                        $currHash = $pStmt->fetchColumn();
+                        if ($currHash && !verifyPassword($currentPassword, $currHash)) {
+                            $error = 'The current password is incorrect.';
+                        }
+                    }
+                    if (empty($error)) {
+                        $passwordToUpdate = hashPassword($newPassword);
+                    }
+                }
             }
-            if (!empty($password) && strlen($password) >= 8) {
-                $sql .= ", password = :password";
-                $params[':password'] = hashPassword($password);
-            }
-            $sql .= ", updated_at = NOW() WHERE id = :id";
-            $upd = $pdo->prepare($sql);
-            $upd->execute($params);
 
-            $success = "Seller #{$sellerId} profile updated successfully!";
+            if (empty($error)) {
+                $sql = "UPDATE users SET name = :name, seller_name = :seller_name, phone = :phone, address = :address, landmark = :landmark, state = :state, country = :country";
+                $params = [
+                    ':id' => $sellerId,
+                    ':name' => $name,
+                    ':seller_name' => $name,
+                    ':phone' => $phone,
+                    ':address' => $address,
+                    ':landmark' => $landmark,
+                    ':state' => $state,
+                    ':country' => $country,
+                ];
+                if ($passwordToUpdate !== null) {
+                    $sql .= ", password = :password";
+                    $params[':password'] = $passwordToUpdate;
+                }
+                $sql .= ", updated_at = NOW() WHERE id = :id";
+                $upd = $pdo->prepare($sql);
+                $upd->execute($params);
+
+                $success = "Seller #{$sellerId} profile updated successfully!";
+            }
         }
     }
 }
@@ -278,9 +298,6 @@ $sellers = $sellersStmt->fetchAll();
                                 <td>#<?= $s['id'] ?></td>
                                 <td>
                                     <strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong>
-                                    <?php if (!empty($s['email'])): ?>
-                                        <div style="font-size:12px; color:#64748b;"><?= htmlspecialchars($s['email']) ?></div>
-                                    <?php endif; ?>
                                 </td>
                                 <td><?= htmlspecialchars($s['phone'] ?? '—') ?></td>
                                 <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
@@ -305,9 +322,8 @@ $sellers = $sellersStmt->fetchAll();
                 <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <div class="info-pill">
+                <div class="info-pill" style="grid-template-columns: repeat(2, 1fr);">
                     <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
-                    <div class="info-pill-item">Active Products<strong id="viewProductsCount">—</strong></div>
                     <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
                 </div>
 
@@ -325,28 +341,36 @@ $sellers = $sellersStmt->fetchAll();
                             <input name="phone" id="formPhone" required placeholder="+919876543210">
                         </div>
                         <div>
-                            <label>Email Address</label>
-                            <input type="email" name="email" id="formEmail" placeholder="seller@phone.vendor.local">
-                        </div>
-                        <div>
                             <label>State</label>
                             <input name="state" id="formState" required>
-                        </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Address</label>
-                            <input name="address" id="formAddress" required>
-                        </div>
-                        <div>
-                            <label>Landmark</label>
-                            <input name="landmark" id="formLandmark" required>
                         </div>
                         <div>
                             <label>Country</label>
                             <input name="country" id="formCountry" required>
                         </div>
                         <div style="grid-column: 1 / -1;">
-                            <label>New Password (leave blank to keep current password)</label>
-                            <input type="password" name="password" minlength="8" placeholder="••••••••" autocomplete="new-password">
+                            <label>Address</label>
+                            <input name="address" id="formAddress" required>
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Landmark</label>
+                            <input name="landmark" id="formLandmark" required>
+                        </div>
+                        <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
+                            <strong style="color: #334155; font-size: 13px;">Change Password</strong>
+                            <span style="font-size: 12px; color: #64748b; margin-left: 6px;">(leave blank if not changing)</span>
+                        </div>
+                        <div>
+                            <label>Current Password</label>
+                            <input type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
+                        </div>
+                        <div>
+                            <label>New Password</label>
+                            <input type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Confirm Password</label>
+                            <input type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
                         </div>
                     </div>
                     <br>
@@ -363,17 +387,19 @@ $sellers = $sellersStmt->fetchAll();
         function openSellerModal(seller) {
             document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
             document.getElementById('viewSellerId').innerText = '#' + seller.id;
-            document.getElementById('viewProductsCount').innerText = (seller.products_count || 0) + ' items';
             document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
 
             document.getElementById('formSellerId').value = seller.id;
             document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
             document.getElementById('formPhone').value = seller.phone || '';
-            document.getElementById('formEmail').value = seller.email || '';
             document.getElementById('formAddress').value = seller.address || '';
             document.getElementById('formLandmark').value = seller.landmark || '';
             document.getElementById('formState').value = seller.state || '';
             document.getElementById('formCountry').value = seller.country || 'India';
+
+            document.getElementById('formCurrentPassword').value = '';
+            document.getElementById('formNewPassword').value = '';
+            document.getElementById('formConfirmPassword').value = '';
 
             document.getElementById('sellerModal').classList.add('active');
         }

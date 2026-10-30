@@ -90,30 +90,33 @@ function saveUploadedAvatarImage(?string $fallback = null): ?string
 
 /**
  * GET /api/seller/profile
- * Returns authenticated seller profile with statistics and payment status
+ * Returns seller profile based on seller ID (via query param ?seller_id=X or ?id=X) or authenticated token.
+ * Does not include products catalog or product count.
  */
 function apiGetSellerProfile(PDO $pdo): void
 {
     ensureUserColumns($pdo);
-    $user = authenticateUser($pdo);
-    $sellerId = (int) $user['id'];
 
-    // Product counts
-    $stmtProducts = $pdo->prepare("SELECT COUNT(*) FROM products WHERE seller_id = :seller_id AND is_active = 1");
-    $stmtProducts->execute([':seller_id' => $sellerId]);
-    $productsCount = (int) $stmtProducts->fetchColumn();
+    $sellerId = null;
+    if (!empty($_GET['seller_id'])) {
+        $sellerId = (int) $_GET['seller_id'];
+    } elseif (!empty($_GET['id'])) {
+        $sellerId = (int) $_GET['id'];
+    }
 
-    // Payment account status
-    $stmtPayment = $pdo->prepare("SELECT provider, account_reference, status, updated_at FROM seller_payment_accounts WHERE seller_id = :seller_id LIMIT 1");
-    $stmtPayment->execute([':seller_id' => $sellerId]);
-    $paymentAccount = $stmtPayment->fetch();
+    if ($sellerId !== null) {
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => $sellerId]);
+        $user = $stmt->fetch();
+        if (!$user) {
+            errorResponse('Seller not found.', [], 404);
+        }
+    } else {
+        $user = authenticateUser($pdo);
+        $sellerId = (int) $user['id'];
+    }
 
     $sellerData = safeSeller($user);
-    $sellerData['products_count'] = $productsCount;
-    $sellerData['payment_account'] = $paymentAccount ?: [
-        'status' => 'not_linked',
-        'message' => 'No payment account linked yet.'
-    ];
 
     jsonResponse([
         'status' => 'success',
@@ -123,8 +126,8 @@ function apiGetSellerProfile(PDO $pdo): void
 }
 
 /**
- * GET /api/sellers/{id} or /api/seller/{id}
- * Returns public/detailed seller profile based on seller ID, along with their active products catalog
+ * GET /api/sellers/{id} or /api/seller/{id} or /api/seller/profile/{id}
+ * Returns seller profile based only on seller ID (without products catalog or product count)
  */
 function apiGetSellerById(PDO $pdo, int $sellerId): void
 {
@@ -138,27 +141,7 @@ function apiGetSellerById(PDO $pdo, int $sellerId): void
         errorResponse('Seller not found.', [], 404);
     }
 
-    // Fetch active products of this seller
-    $prodStmt = $pdo->prepare("
-        SELECT id, seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at
-        FROM products
-        WHERE seller_id = :seller_id AND is_active = 1
-        ORDER BY id DESC
-    ");
-    $prodStmt->execute([':seller_id' => $sellerId]);
-    $products = $prodStmt->fetchAll();
-
-    foreach ($products as &$p) {
-        $p['id'] = (int) $p['id'];
-        $p['seller_id'] = (int) $p['seller_id'];
-        $p['price'] = (string) number_format((float) $p['price'], 2, '.', '');
-        $p['stock'] = (int) $p['stock'];
-        $p['is_active'] = (bool) $p['is_active'];
-    }
-
     $sellerData = safeSeller($user);
-    $sellerData['products_count'] = count($products);
-    $sellerData['products'] = $products;
 
     jsonResponse([
         'status' => 'success',
@@ -255,8 +238,9 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
 
     $input = getJsonInput();
     $errors = [];
+    $isAdmin = ($currentUser['role'] ?? '') === 'admin';
 
-    // Fields to update
+    // Fields to update (Note: id is strictly immutable and cannot be changed)
     $sellerName = extractFieldPhp($input, ['seller_name', 'sellerName', 'business_name', 'shop_name', 'store_name']);
     $name = extractFieldPhp($input, ['name', 'fullname', 'full_name', 'owner_name']);
     $address = extractFieldPhp($input, ['address', 'shop_address', 'business_address', 'street', 'location']);
@@ -265,8 +249,11 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     $country = extractFieldPhp($input, ['country', 'nation']);
     $rawPhone = extractPhonePhp($input);
     $email = trim(extractFieldPhp($input, ['email', 'email_address']));
-    $password = extractPasswordPhp($input);
-    $confirmPassword = extractConfirmPasswordPhp($input, $password);
+
+    // Separate password fields: current_password, new_password, confirm_password
+    $currentPassword = extractFieldPhp($input, ['current_password', 'currentPassword', 'old_password', 'oldPassword']);
+    $newPassword = extractFieldPhp($input, ['new_password', 'newPassword', 'password']);
+    $confirmPassword = extractConfirmPasswordPhp($input, $newPassword);
 
     // Validate phone if provided
     $phone = '';
@@ -284,8 +271,8 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
         }
     }
 
-    // Validate email if provided
-    if (!empty($email)) {
+    // Email is ONLY for admin users (regular sellers do not have/change email)
+    if ($isAdmin && !empty($email)) {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             $errors['email'] = ['The email address format is invalid.'];
         } else {
@@ -297,12 +284,19 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
         }
     }
 
-    // Validate password if provided
-    if (!empty($password)) {
-        if (strlen($password) < 8) {
-            $errors['password'] = ['The new password must be at least 8 characters.'];
-        } elseif ($password !== $confirmPassword) {
-            $errors['password'] = ['The password confirmation does not match.'];
+    // Password validation with (current_password, new_password, confirm_password)
+    if (!empty($newPassword)) {
+        if (!$isAdmin || (int)$currentUser['id'] === $sellerId) {
+            if (empty($currentPassword)) {
+                $errors['current_password'] = ['The current password field is required to change password.'];
+            } elseif (!verifyPassword($currentPassword, $existing['password'])) {
+                $errors['current_password'] = ['The supplied current password is incorrect.'];
+            }
+        }
+        if (strlen($newPassword) < 8) {
+            $errors['new_password'] = ['The new password must be at least 8 characters.'];
+        } elseif ($newPassword !== $confirmPassword) {
+            $errors['confirm_password'] = ['The password confirmation does not match.'];
         }
     }
 
@@ -313,7 +307,7 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     // Handle avatar image if provided
     $avatarUrl = saveUploadedAvatarImage($existing['avatar_url'] ?? null);
 
-    // Build dynamic UPDATE statement
+    // Build dynamic UPDATE statement (ID is strictly immutable)
     $updates = [];
     $params = [':id' => $sellerId];
 
@@ -354,13 +348,13 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
         $updates[] = "phone = :phone";
         $params[':phone'] = $phone;
     }
-    if ($email !== '') {
+    if ($isAdmin && $email !== '') {
         $updates[] = "email = :email";
         $params[':email'] = $email;
     }
-    if (!empty($password)) {
+    if (!empty($newPassword)) {
         $updates[] = "password = :password";
-        $params[':password'] = hashPassword($password);
+        $params[':password'] = hashPassword($newPassword);
     }
     if ($avatarUrl !== null && hasUserColumn($pdo, 'avatar_url')) {
         $updates[] = "avatar_url = :avatar_url";
@@ -379,17 +373,66 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     $refreshedStmt->execute([':id' => $sellerId]);
     $updatedUser = $refreshedStmt->fetch();
 
-    // Products count
-    $stmtProducts = $pdo->prepare("SELECT COUNT(*) FROM products WHERE seller_id = :seller_id AND is_active = 1");
-    $stmtProducts->execute([':seller_id' => $sellerId]);
-    $productsCount = (int) $stmtProducts->fetchColumn();
-
     $sellerData = safeSeller($updatedUser);
-    $sellerData['products_count'] = $productsCount;
 
     jsonResponse([
         'message' => 'Seller profile updated successfully.',
         'seller' => $sellerData,
         'user' => $sellerData
+    ]);
+}
+
+/**
+ * POST or PUT /api/seller/change-password, /api/change-password, /api/seller/password
+ * Separate password update requiring (current_password, new_password, confirm_password)
+ */
+function apiChangePassword(PDO $pdo): void
+{
+    $currentUser = authenticateUser($pdo);
+    $sellerId = (int) $currentUser['id'];
+
+    $fetchStmt = $pdo->prepare("SELECT id, password FROM users WHERE id = :id LIMIT 1");
+    $fetchStmt->execute([':id' => $sellerId]);
+    $existing = $fetchStmt->fetch();
+    if (!$existing) {
+        errorResponse('User not found.', [], 404);
+    }
+
+    $input = getJsonInput();
+    $currentPassword = extractFieldPhp($input, ['current_password', 'currentPassword', 'old_password', 'oldPassword', 'current']);
+    $newPassword = extractFieldPhp($input, ['new_password', 'newPassword', 'password']);
+    $confirmPassword = extractConfirmPasswordPhp($input, $newPassword);
+
+    $errors = [];
+
+    if (empty($currentPassword)) {
+        $errors['current_password'] = ['The current password field is required.'];
+    } elseif (!verifyPassword($currentPassword, $existing['password'])) {
+        $errors['current_password'] = ['The supplied current password is incorrect.'];
+    }
+
+    if (empty($newPassword)) {
+        $errors['new_password'] = ['The new password field is required.'];
+    } elseif (strlen($newPassword) < 8) {
+        $errors['new_password'] = ['The new password must be at least 8 characters.'];
+    }
+
+    if (empty($confirmPassword)) {
+        $errors['confirm_password'] = ['The confirm password field is required.'];
+    } elseif ($newPassword !== $confirmPassword) {
+        $errors['confirm_password'] = ['The password confirmation does not match.'];
+    }
+
+    if (!empty($errors)) {
+        errorResponse('Validation error occurred.', $errors, 422);
+    }
+
+    $hashed = hashPassword($newPassword);
+    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = NOW() WHERE id = :id");
+    $upd->execute([':password' => $hashed, ':id' => $sellerId]);
+
+    jsonResponse([
+        'status' => 'success',
+        'message' => 'Password updated successfully.'
     ]);
 }

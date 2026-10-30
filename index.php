@@ -253,6 +253,14 @@ if ($requestUri === '/api/seller/profile/update') {
     }
 }
 
+// Separate Password Update: (current_password, new_password, confirm_password)
+if ($requestUri === '/api/seller/change-password' || $requestUri === '/api/change-password' || $requestUri === '/api/seller/password') {
+    if ($method !== 'POST' && $method !== 'PUT' && $method !== 'PATCH') {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+    apiChangePassword($pdo);
+}
+
 // Sellers Directory
 if ($requestUri === '/api/sellers') {
     if ($method === 'GET') {

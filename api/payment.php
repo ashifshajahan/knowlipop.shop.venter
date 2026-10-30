@@ -64,9 +64,9 @@ function apiPayouts(PDO $pdo): void
 {
     authenticateUser($pdo);
     jsonResponse([
-        'message' => 'Payout service integration is scheduled for live merchant phase.',
+        'message' => 'Payout service integration scheduled for live merchant phase.',
         'payouts' => []
-    ], 501);
+    ], 200);
 }
 
 function apiCommissionPreview(PDO $pdo): void
