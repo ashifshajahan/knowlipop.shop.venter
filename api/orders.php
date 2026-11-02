@@ -281,6 +281,12 @@ function apiCreateOrder(PDO $pdo): void
             )
         ");
 
+        $stockStmt = $pdo->prepare("
+            UPDATE `products`
+            SET `stock` = GREATEST(0, `stock` - :qty)
+            WHERE `id` = :product_id
+        ");
+
         foreach ($processedItems as &$pi) {
             $itemStmt->execute([
                 ':order_id' => $orderId,
@@ -293,6 +299,14 @@ function apiCreateOrder(PDO $pdo): void
             ]);
             $pi['id'] = (int) $pdo->lastInsertId();
             $pi['order_id'] = $orderId;
+
+            // Decrease product stock
+            if (!empty($pi['product_id'])) {
+                $stockStmt->execute([
+                    ':qty' => $pi['quantity'],
+                    ':product_id' => $pi['product_id']
+                ]);
+            }
         }
 
         $pdo->commit();
@@ -428,6 +442,18 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
         ]);
 
         if ($hasItemsUpdate) {
+            // Restore stock of old items before replacing
+            $oldItemsStmt = $pdo->prepare("SELECT product_id, quantity FROM `order_items` WHERE order_id = :order_id");
+            $oldItemsStmt->execute([':order_id' => $id]);
+            $oldItems = $oldItemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $restoreStockStmt = $pdo->prepare("UPDATE `products` SET `stock` = `stock` + :qty WHERE `id` = :product_id");
+            foreach ($oldItems as $oi) {
+                if (!empty($oi['product_id'])) {
+                    $restoreStockStmt->execute([':qty' => (int) $oi['quantity'], ':product_id' => (int) $oi['product_id']]);
+                }
+            }
+
             // Delete old items and insert fresh
             $delStmt = $pdo->prepare("DELETE FROM `order_items` WHERE order_id = :order_id");
             $delStmt->execute([':order_id' => $id]);
@@ -439,6 +465,7 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
                     :order_id, :product_id, :product_name, :product_image, :price, :quantity, :subtotal
                 )
             ");
+            $deductStockStmt = $pdo->prepare("UPDATE `products` SET `stock` = GREATEST(0, `stock` - :qty) WHERE `id` = :product_id");
 
             foreach ($processedItems as &$pi) {
                 $insStmt->execute([
@@ -452,6 +479,10 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
                 ]);
                 $pi['id'] = (int) $pdo->lastInsertId();
                 $pi['order_id'] = $id;
+
+                if (!empty($pi['product_id'])) {
+                    $deductStockStmt->execute([':qty' => $pi['quantity'], ':product_id' => $pi['product_id']]);
+                }
             }
         }
 
@@ -485,6 +516,18 @@ function apiDeleteOrder(PDO $pdo, mixed $idOrNumber): void
 
     $pdo->beginTransaction();
     try {
+        // Restore stock for deleted order items
+        $itemsStmt = $pdo->prepare("SELECT product_id, quantity FROM `order_items` WHERE order_id = :order_id");
+        $itemsStmt->execute([':order_id' => $id]);
+        $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $restoreStockStmt = $pdo->prepare("UPDATE `products` SET `stock` = `stock` + :qty WHERE `id` = :product_id");
+        foreach ($items as $it) {
+            if (!empty($it['product_id'])) {
+                $restoreStockStmt->execute([':qty' => (int) $it['quantity'], ':product_id' => (int) $it['product_id']]);
+            }
+        }
+
         $delItems = $pdo->prepare("DELETE FROM `order_items` WHERE order_id = :order_id");
         $delItems->execute([':order_id' => $id]);
 

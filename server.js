@@ -1973,6 +1973,16 @@ const handleCreateOrder = async (req, res) => {
         );
         pi.id = iRes.insertId;
         pi.order_id = newOrderId;
+
+        // Decrease stock count for the ordered product
+        if (pi.product_id) {
+          await conn.query(
+            `UPDATE products
+             SET stock = GREATEST(0, stock - ?)
+             WHERE id = ?`,
+            [pi.quantity, pi.product_id]
+          );
+        }
       }
 
       await conn.commit();
@@ -2124,6 +2134,14 @@ const handleOrderUpdate = async (req, res) => {
       );
 
       if (hasItemsUpdate) {
+        // Restore stock of previously ordered items before updating
+        const [oldItems] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+        for (const oi of oldItems) {
+          if (oi.product_id) {
+            await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
+          }
+        }
+
         await conn.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
         for (const pi of processedItems) {
           const [iRes] = await conn.query(
@@ -2133,6 +2151,14 @@ const handleOrderUpdate = async (req, res) => {
           );
           pi.id = iRes.insertId;
           pi.order_id = orderId;
+
+          // Decrease stock for new items
+          if (pi.product_id) {
+            await conn.query(
+              `UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?`,
+              [pi.quantity, pi.product_id]
+            );
+          }
         }
       }
 
@@ -2247,6 +2273,15 @@ const handleDeleteOrder = async (req, res) => {
       return res.status(404).json({ message: 'Order not found.' });
     }
     const orderId = Number(existing[0].id);
+
+    // Restore stock for deleted order items
+    const [delItems] = await pool.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+    for (const it of delItems) {
+      if (it.product_id) {
+        await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [it.quantity, it.product_id]);
+      }
+    }
+
     await pool.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
     await pool.query('DELETE FROM orders WHERE id = ?', [orderId]);
     res.json({ message: 'Order deleted successfully.', id: orderId, order_number: existing[0].order_number });

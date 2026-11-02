@@ -1668,7 +1668,11 @@
             <div class="product-desc">${escapeHtml(p.description || '')}</div>
             <div class="product-meta">
               <div class="product-price">₹${parseFloat(p.price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
-              <div class="product-stock">Stock: ${p.stock || 'Available'}</div>
+              <div class="product-stock" id="stock-display-${p.id}">
+                ${(parseInt(p.stock, 10) > 0)
+                  ? `<span style="color: var(--success); font-weight: 700;">● Stock: ${p.stock}</span>`
+                  : `<span style="color: var(--danger); font-weight: 700;">● Out of Stock (0)</span>`}
+              </div>
             </div>
 
             <div class="product-actions">
@@ -1701,6 +1705,12 @@
       const product = allProducts.find(p => p.id === productId);
       if (!product) return;
 
+      const availStock = parseInt(product.stock, 10);
+      if (!isNaN(availStock) && availStock <= 0) {
+        showToast(`Sorry, "${product.name}" is currently out of stock.`, 'error');
+        return;
+      }
+
       if (!cartDraft[productId]) {
         cartDraft[productId] = {
           product,
@@ -1708,6 +1718,10 @@
         };
         showToast(`Added 1× "${product.name}" to order list.`, 'success');
       } else {
+        if (!isNaN(availStock) && cartDraft[productId].quantity >= availStock) {
+          showToast(`Cannot add more. Only ${availStock} units in stock for "${product.name}".`, 'warning');
+          return;
+        }
         cartDraft[productId].quantity += 1;
         showToast(`Increased "${product.name}" quantity to ${cartDraft[productId].quantity}.`, 'info');
       }
@@ -1719,6 +1733,12 @@
     function incrementProductQty(productId) {
       if (!cartDraft[productId]) {
         handleInitialAdd(productId);
+        return;
+      }
+      const product = allProducts.find(p => p.id === productId);
+      const availStock = product ? parseInt(product.stock, 10) : NaN;
+      if (!isNaN(availStock) && cartDraft[productId].quantity >= availStock) {
+        showToast(`Cannot add more. Only ${availStock} units in stock for "${product.name}".`, 'warning');
         return;
       }
       cartDraft[productId].quantity += 1;
@@ -1895,6 +1915,7 @@
         if (res.ok && data.order) {
           showToast(`🎉 Order Placed: #${data.order.order_number}`, 'success');
           clearCartDraft();
+          await fetchProductsCatalog();
           await refreshOrdersList();
           viewOrderDetails(data.order.id);
         } else {
@@ -2339,6 +2360,7 @@
         if (res.ok) {
           showToast(`✅ Order #${currentlyEditingOrder.order_number} updated successfully!`, 'success');
           closeEditModal();
+          await fetchProductsCatalog();
           await refreshOrdersList();
           viewOrderDetails(currentlyEditingOrder.id);
         } else {
@@ -2357,6 +2379,7 @@
       if (tab === 'shop') {
         document.getElementById('view-shop').classList.add('active');
         document.getElementById('tab-btn-shop').classList.add('active');
+        fetchProductsCatalog();
       } else if (tab === 'orders') {
         document.getElementById('view-orders').classList.add('active');
         document.getElementById('tab-btn-orders').classList.add('active');
