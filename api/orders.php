@@ -16,6 +16,7 @@ function ensureOrdersSchema(PDO $pdo): void
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS `orders` (
             `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
             `order_number` VARCHAR(60) NOT NULL UNIQUE,
             `buyer_name` VARCHAR(150) NOT NULL,
             `buyer_phone` VARCHAR(30) NOT NULL,
@@ -35,6 +36,7 @@ function ensureOrdersSchema(PDO $pdo): void
             `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
+            INDEX `idx_orders_seller` (`seller_id`),
             INDEX `idx_orders_status` (`order_status`),
             INDEX `idx_orders_phone` (`buyer_phone`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -45,6 +47,7 @@ function ensureOrdersSchema(PDO $pdo): void
             `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             `order_id` BIGINT UNSIGNED NOT NULL,
             `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+            `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
             `product_name` VARCHAR(150) NOT NULL,
             `product_image` LONGTEXT NULL DEFAULT NULL,
             `price` DECIMAL(10,2) NOT NULL,
@@ -54,9 +57,24 @@ function ensureOrdersSchema(PDO $pdo): void
             `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             INDEX `idx_order_items_order` (`order_id`),
-            INDEX `idx_order_items_product` (`product_id`)
+            INDEX `idx_order_items_product` (`product_id`),
+            INDEX `idx_order_items_seller` (`seller_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     ");
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'seller_id'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `id`, ADD INDEX `idx_orders_seller` (`seller_id`)");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'seller_id'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `product_id`, ADD INDEX `idx_order_items_seller` (`seller_id`)");
+        }
+    } catch (Throwable $e) {}
 
     $checked = true;
 }
@@ -71,6 +89,11 @@ function apiGetOrders(PDO $pdo): void
 
     $whereClauses = [];
     $params = [];
+
+    if (!empty($_GET['seller_id'])) {
+        $whereClauses[] = "o.seller_id = :seller_id";
+        $params[':seller_id'] = (int) $_GET['seller_id'];
+    }
 
     if (!empty($_GET['status'])) {
         $whereClauses[] = "o.order_status = :status";
@@ -98,9 +121,13 @@ function apiGetOrders(PDO $pdo): void
 
     $query = "
         SELECT o.*,
+               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               u.phone AS seller_phone,
+               u.email AS seller_email,
                COUNT(i.id) AS items_count,
                COALESCE(SUM(i.quantity), 0) AS total_quantity
         FROM `orders` o
+        LEFT JOIN `users` u ON o.seller_id = u.id
         LEFT JOIN `order_items` i ON o.id = i.order_id
         {$whereSql}
         GROUP BY o.id
@@ -120,6 +147,7 @@ function apiGetOrders(PDO $pdo): void
     // Format fields
     foreach ($orders as &$order) {
         $order['id'] = (int) $order['id'];
+        $order['seller_id'] = !empty($order['seller_id']) ? (int) $order['seller_id'] : null;
         $order['items_count'] = (int) $order['items_count'];
         $order['total_quantity'] = (int) $order['total_quantity'];
         $order['subtotal'] = (float) $order['subtotal'];
@@ -144,10 +172,28 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber): void
     ensureOrdersSchema($pdo);
 
     if (is_numeric($idOrNumber)) {
-        $stmt = $pdo->prepare("SELECT * FROM `orders` WHERE id = :id OR order_number = :num LIMIT 1");
+        $stmt = $pdo->prepare("
+            SELECT o.*,
+                   COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                   u.phone AS seller_phone,
+                   u.email AS seller_email
+            FROM `orders` o
+            LEFT JOIN `users` u ON o.seller_id = u.id
+            WHERE o.id = :id OR o.order_number = :num
+            LIMIT 1
+        ");
         $stmt->execute([':id' => (int) $idOrNumber, ':num' => (string) $idOrNumber]);
     } else {
-        $stmt = $pdo->prepare("SELECT * FROM `orders` WHERE order_number = :num LIMIT 1");
+        $stmt = $pdo->prepare("
+            SELECT o.*,
+                   COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                   u.phone AS seller_phone,
+                   u.email AS seller_email
+            FROM `orders` o
+            LEFT JOIN `users` u ON o.seller_id = u.id
+            WHERE o.order_number = :num
+            LIMIT 1
+        ");
         $stmt->execute([':num' => (string) $idOrNumber]);
     }
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -158,12 +204,19 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber): void
     $id = (int) $order['id'];
 
     $order['id'] = (int) $order['id'];
+    $order['seller_id'] = !empty($order['seller_id']) ? (int) $order['seller_id'] : null;
     $order['subtotal'] = (float) $order['subtotal'];
     $order['delivery_fee'] = (float) $order['delivery_fee'];
     $order['discount'] = (float) $order['discount'];
     $order['total_amount'] = (float) $order['total_amount'];
 
-    $itemStmt = $pdo->prepare("SELECT * FROM `order_items` WHERE order_id = :order_id ORDER BY id ASC");
+    $itemStmt = $pdo->prepare("
+        SELECT i.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        FROM `order_items` i
+        LEFT JOIN `users` u ON i.seller_id = u.id
+        WHERE i.order_id = :order_id
+        ORDER BY i.id ASC
+    ");
     $itemStmt->execute([':order_id' => $id]);
     $items = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -171,6 +224,7 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber): void
         $item['id'] = (int) $item['id'];
         $item['order_id'] = (int) $item['order_id'];
         $item['product_id'] = $item['product_id'] ? (int) $item['product_id'] : null;
+        $item['seller_id'] = !empty($item['seller_id']) ? (int) $item['seller_id'] : null;
         $item['price'] = (float) $item['price'];
         $item['quantity'] = (int) $item['quantity'];
         $item['subtotal'] = (float) $item['subtotal'];
@@ -217,18 +271,50 @@ function apiCreateOrder(PDO $pdo): void
         $price = max(0, (float) ($item['price'] ?? 0));
         $qty = max(1, (int) ($item['quantity'] ?? $item['qty'] ?? 1));
         $productId = !empty($item['product_id']) ? (int) $item['product_id'] : (!empty($item['id']) ? (int) $item['id'] : null);
+        $itemSellerId = !empty($item['seller_id']) ? (int) $item['seller_id'] : null;
         $image = $item['product_image'] ?? $item['image_url'] ?? $item['image'] ?? null;
         $lineSubtotal = round($price * $qty, 2);
 
         $subtotal += $lineSubtotal;
         $processedItems[] = [
             'product_id' => $productId,
+            'seller_id' => $itemSellerId,
             'product_name' => $name,
             'product_image' => $image,
             'price' => $price,
             'quantity' => $qty,
             'subtotal' => $lineSubtotal,
         ];
+    }
+
+    // Resolve seller_id from database products table
+    $productIds = array_values(array_filter(array_column($processedItems, 'product_id')));
+    $productSellerMap = [];
+    if (!empty($productIds)) {
+        $inPlaceholders = implode(',', array_fill(0, count($productIds), '?'));
+        try {
+            $pStmt = $pdo->prepare("SELECT id, seller_id FROM `products` WHERE id IN ($inPlaceholders)");
+            $pStmt->execute($productIds);
+            while ($row = $pStmt->fetch(PDO::FETCH_ASSOC)) {
+                $productSellerMap[(int)$row['id']] = !empty($row['seller_id']) ? (int)$row['seller_id'] : null;
+            }
+        } catch (Throwable $e) {}
+    }
+
+    $primarySellerId = !empty($input['seller_id']) ? (int)$input['seller_id'] : null;
+    foreach ($processedItems as &$pi) {
+        if (empty($pi['seller_id']) && !empty($pi['product_id']) && isset($productSellerMap[$pi['product_id']])) {
+            $pi['seller_id'] = $productSellerMap[$pi['product_id']];
+        } elseif (empty($pi['seller_id']) && !empty($input['seller_id'])) {
+            $pi['seller_id'] = (int)$input['seller_id'];
+        }
+        if (!$primarySellerId && !empty($pi['seller_id'])) {
+            $primarySellerId = $pi['seller_id'];
+        }
+    }
+    unset($pi);
+    if (!$primarySellerId) {
+        $primarySellerId = 1;
     }
 
     $deliveryFee = isset($input['delivery_fee']) ? max(0, (float) $input['delivery_fee']) : ($subtotal >= 1000 ? 0.00 : 50.00);
@@ -242,12 +328,12 @@ function apiCreateOrder(PDO $pdo): void
     try {
         $stmt = $pdo->prepare("
             INSERT INTO `orders` (
-                order_number, buyer_name, buyer_phone,
+                seller_id, order_number, buyer_name, buyer_phone,
                 shipping_address, landmark, city, state, pincode,
                 order_status, payment_method, payment_status,
                 subtotal, delivery_fee, discount, total_amount, notes
             ) VALUES (
-                :order_number, :buyer_name, :buyer_phone,
+                :seller_id, :order_number, :buyer_name, :buyer_phone,
                 :shipping_address, :landmark, :city, :state, :pincode,
                 'pending', :payment_method, 'unpaid',
                 :subtotal, :delivery_fee, :discount, :total_amount, :notes
@@ -255,6 +341,7 @@ function apiCreateOrder(PDO $pdo): void
         ");
 
         $stmt->execute([
+            ':seller_id' => $primarySellerId,
             ':order_number' => $orderNumber,
             ':buyer_name' => $buyerName,
             ':buyer_phone' => $buyerPhone,
@@ -275,9 +362,9 @@ function apiCreateOrder(PDO $pdo): void
 
         $itemStmt = $pdo->prepare("
             INSERT INTO `order_items` (
-                order_id, product_id, product_name, product_image, price, quantity, subtotal
+                order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal
             ) VALUES (
-                :order_id, :product_id, :product_name, :product_image, :price, :quantity, :subtotal
+                :order_id, :product_id, :seller_id, :product_name, :product_image, :price, :quantity, :subtotal
             )
         ");
 
@@ -288,9 +375,11 @@ function apiCreateOrder(PDO $pdo): void
         ");
 
         foreach ($processedItems as &$pi) {
+            $itemSellerId = !empty($pi['seller_id']) ? $pi['seller_id'] : $primarySellerId;
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':product_id' => $pi['product_id'],
+                ':seller_id' => $itemSellerId,
                 ':product_name' => $pi['product_name'],
                 ':product_image' => $pi['product_image'],
                 ':price' => $pi['price'],
@@ -299,6 +388,7 @@ function apiCreateOrder(PDO $pdo): void
             ]);
             $pi['id'] = (int) $pdo->lastInsertId();
             $pi['order_id'] = $orderId;
+            $pi['seller_id'] = $itemSellerId;
 
             // Decrease product stock
             if (!empty($pi['product_id'])) {
@@ -311,10 +401,22 @@ function apiCreateOrder(PDO $pdo): void
 
         $pdo->commit();
 
+        $sellerName = 'Verified Seller';
+        try {
+            $sStmt = $pdo->prepare("SELECT seller_name, name FROM `users` WHERE id = :sid LIMIT 1");
+            $sStmt->execute([':sid' => $primarySellerId]);
+            $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+            if ($sRow) {
+                $sellerName = $sRow['seller_name'] ?: ($sRow['name'] ?: 'Verified Seller');
+            }
+        } catch (Throwable $e) {}
+
         jsonResponse([
             'message' => 'Order created successfully.',
             'order' => [
                 'id' => $orderId,
+                'seller_id' => $primarySellerId,
+                'seller_name' => $sellerName,
                 'order_number' => $orderNumber,
                 'buyer_name' => $buyerName,
                 'buyer_phone' => $buyerPhone,
@@ -354,6 +456,7 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
     }
     $id = (int) $existing['id'];
 
+    $primarySellerId = isset($input['seller_id']) ? (int)$input['seller_id'] : (!empty($existing['seller_id']) ? (int)$existing['seller_id'] : 1);
     $buyerName = isset($input['buyer_name']) ? trim($input['buyer_name']) : $existing['buyer_name'];
     $buyerPhone = isset($input['buyer_phone']) ? trim($input['buyer_phone']) : $existing['buyer_phone'];
     $shippingAddress = isset($input['shipping_address']) ? trim($input['shipping_address']) : $existing['shipping_address'];
@@ -383,18 +486,40 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
             $price = max(0, (float) ($item['price'] ?? 0));
             $qty = max(1, (int) ($item['quantity'] ?? $item['qty'] ?? 1));
             $productId = !empty($item['product_id']) ? (int) $item['product_id'] : (!empty($item['id']) ? (int) $item['id'] : null);
+            $itemSellerId = !empty($item['seller_id']) ? (int) $item['seller_id'] : null;
             $image = $item['product_image'] ?? $item['image_url'] ?? $item['image'] ?? null;
             $lineSubtotal = round($price * $qty, 2);
 
             $subtotal += $lineSubtotal;
             $processedItems[] = [
                 'product_id' => $productId,
+                'seller_id' => $itemSellerId,
                 'product_name' => $name,
                 'product_image' => $image,
                 'price' => $price,
                 'quantity' => $qty,
                 'subtotal' => $lineSubtotal,
             ];
+        }
+
+        // Fill missing seller_ids from database products
+        $productIds = array_values(array_filter(array_column($processedItems, 'product_id')));
+        if (!empty($productIds)) {
+            $inPlaceholders = implode(',', array_fill(0, count($productIds), '?'));
+            try {
+                $pStmt = $pdo->prepare("SELECT id, seller_id FROM `products` WHERE id IN ($inPlaceholders)");
+                $pStmt->execute($productIds);
+                $pMap = [];
+                while ($row = $pStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $pMap[(int)$row['id']] = !empty($row['seller_id']) ? (int)$row['seller_id'] : null;
+                }
+                foreach ($processedItems as &$pi) {
+                    if (empty($pi['seller_id']) && !empty($pi['product_id']) && isset($pMap[$pi['product_id']])) {
+                        $pi['seller_id'] = $pMap[$pi['product_id']];
+                    }
+                }
+                unset($pi);
+            } catch (Throwable $e) {}
         }
     }
 
@@ -404,7 +529,8 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
     try {
         $updateStmt = $pdo->prepare("
             UPDATE `orders`
-            SET buyer_name = :buyer_name,
+            SET seller_id = :seller_id,
+                buyer_name = :buyer_name,
                 buyer_phone = :buyer_phone,
                 shipping_address = :shipping_address,
                 landmark = :landmark,
@@ -423,6 +549,7 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
         ");
 
         $updateStmt->execute([
+            ':seller_id' => $primarySellerId,
             ':buyer_name' => $buyerName,
             ':buyer_phone' => $buyerPhone,
             ':shipping_address' => $shippingAddress,
@@ -460,17 +587,19 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
 
             $insStmt = $pdo->prepare("
                 INSERT INTO `order_items` (
-                    order_id, product_id, product_name, product_image, price, quantity, subtotal
+                    order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal
                 ) VALUES (
-                    :order_id, :product_id, :product_name, :product_image, :price, :quantity, :subtotal
+                    :order_id, :product_id, :seller_id, :product_name, :product_image, :price, :quantity, :subtotal
                 )
             ");
             $deductStockStmt = $pdo->prepare("UPDATE `products` SET `stock` = GREATEST(0, `stock` - :qty) WHERE `id` = :product_id");
 
             foreach ($processedItems as &$pi) {
+                $itemSellerId = !empty($pi['seller_id']) ? $pi['seller_id'] : $primarySellerId;
                 $insStmt->execute([
                     ':order_id' => $id,
                     ':product_id' => $pi['product_id'],
+                    ':seller_id' => $itemSellerId,
                     ':product_name' => $pi['product_name'],
                     ':product_image' => $pi['product_image'],
                     ':price' => $pi['price'],
@@ -479,6 +608,7 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber): void
                 ]);
                 $pi['id'] = (int) $pdo->lastInsertId();
                 $pi['order_id'] = $id;
+                $pi['seller_id'] = $itemSellerId;
 
                 if (!empty($pi['product_id'])) {
                     $deductStockStmt->execute([':qty' => $pi['quantity'], ':product_id' => $pi['product_id']]);

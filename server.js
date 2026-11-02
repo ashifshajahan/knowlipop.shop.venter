@@ -1708,6 +1708,7 @@ async function ensureOrdersTables(p) {
     await p.query(`
       CREATE TABLE IF NOT EXISTS orders (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        seller_id BIGINT UNSIGNED NULL DEFAULT NULL,
         order_number VARCHAR(60) NOT NULL UNIQUE,
         buyer_name VARCHAR(150) NOT NULL,
         buyer_phone VARCHAR(30) NOT NULL,
@@ -1727,6 +1728,7 @@ async function ensureOrdersTables(p) {
         created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
+        INDEX idx_orders_seller (seller_id),
         INDEX idx_orders_status (order_status),
         INDEX idx_orders_phone (buyer_phone)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -1737,6 +1739,7 @@ async function ensureOrdersTables(p) {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         order_id BIGINT UNSIGNED NOT NULL,
         product_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        seller_id BIGINT UNSIGNED NULL DEFAULT NULL,
         product_name VARCHAR(150) NOT NULL,
         product_image LONGTEXT NULL DEFAULT NULL,
         price DECIMAL(10,2) NOT NULL,
@@ -1746,9 +1749,24 @@ async function ensureOrdersTables(p) {
         updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         INDEX idx_order_items_order (order_id),
-        INDEX idx_order_items_product (product_id)
+        INDEX idx_order_items_product (product_id),
+        INDEX idx_order_items_seller (seller_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    try {
+      const [orderCols] = await p.query('SHOW COLUMNS FROM orders LIKE "seller_id"');
+      if (orderCols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN seller_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER id, ADD INDEX idx_orders_seller (seller_id)');
+      }
+    } catch (e) {}
+
+    try {
+      const [itemCols] = await p.query('SHOW COLUMNS FROM order_items LIKE "seller_id"');
+      if (itemCols.length === 0) {
+        await p.query('ALTER TABLE order_items ADD COLUMN seller_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER product_id, ADD INDEX idx_order_items_seller (seller_id)');
+      }
+    } catch (e) {}
   } catch (err) {
     // ignore
   }
@@ -1766,6 +1784,10 @@ const handleGetOrders = async (req, res) => {
     const params = [];
     const whereClauses = [];
 
+    if (req.query.seller_id) {
+      whereClauses.push('o.seller_id = ?');
+      params.push(parseInt(req.query.seller_id, 10));
+    }
     if (req.query.status) {
       whereClauses.push('o.order_status = ?');
       params.push(req.query.status.toLowerCase().trim());
@@ -1788,9 +1810,11 @@ const handleGetOrders = async (req, res) => {
 
     const querySql = `
       SELECT o.*,
+             COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name,
              COUNT(i.id) AS items_count,
              COALESCE(SUM(i.quantity), 0) AS total_quantity
       FROM orders o
+      LEFT JOIN users u ON o.seller_id = u.id
       LEFT JOIN order_items i ON o.id = i.order_id
       ${whereSql}
       GROUP BY o.id
@@ -1802,6 +1826,8 @@ const handleGetOrders = async (req, res) => {
     const formatted = rows.map(r => ({
       ...r,
       id: Number(r.id),
+      seller_id: r.seller_id ? Number(r.seller_id) : null,
+      seller_name: r.seller_name || 'Direct Marketplace',
       subtotal: parseFloat(r.subtotal),
       delivery_fee: parseFloat(r.delivery_fee),
       discount: parseFloat(r.discount),
@@ -1853,9 +1879,21 @@ const handleGetOrderDetail = async (req, res) => {
     await ensureOrdersTables(pool);
     let orders;
     if (isNumeric) {
-      [orders] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+      [orders] = await pool.query(
+        `SELECT o.*, COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name, u.phone AS seller_phone
+         FROM orders o
+         LEFT JOIN users u ON o.seller_id = u.id
+         WHERE o.id = ? OR o.order_number = ? LIMIT 1`,
+        [numId, rawParam]
+      );
     } else {
-      [orders] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+      [orders] = await pool.query(
+        `SELECT o.*, COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name, u.phone AS seller_phone
+         FROM orders o
+         LEFT JOIN users u ON o.seller_id = u.id
+         WHERE o.order_number = ? LIMIT 1`,
+        [rawParam]
+      );
     }
 
     if (orders.length === 0) {
@@ -1863,13 +1901,21 @@ const handleGetOrderDetail = async (req, res) => {
     }
     const order = orders[0];
     const realOrderId = Number(order.id);
-    const [items] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [realOrderId]);
+    const [items] = await pool.query(
+      `SELECT oi.*, COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name
+       FROM order_items oi
+       LEFT JOIN users u ON oi.seller_id = u.id
+       WHERE oi.order_id = ? ORDER BY oi.id ASC`,
+      [realOrderId]
+    );
 
     const formattedItems = items.map(i => ({
       ...i,
       id: Number(i.id),
       order_id: Number(i.order_id),
       product_id: i.product_id ? Number(i.product_id) : null,
+      seller_id: i.seller_id ? Number(i.seller_id) : (order.seller_id ? Number(order.seller_id) : null),
+      seller_name: i.seller_name || order.seller_name || 'Direct Marketplace',
       price: parseFloat(i.price),
       quantity: Number(i.quantity),
       subtotal: parseFloat(i.subtotal)
@@ -1879,6 +1925,8 @@ const handleGetOrderDetail = async (req, res) => {
       order: {
         ...order,
         id: Number(order.id),
+        seller_id: order.seller_id ? Number(order.seller_id) : null,
+        seller_name: order.seller_name || 'Direct Marketplace',
         subtotal: parseFloat(order.subtotal),
         delivery_fee: parseFloat(order.delivery_fee),
         discount: parseFloat(order.discount),
@@ -1945,6 +1993,29 @@ const handleCreateOrder = async (req, res) => {
   const randSuffix = Math.floor(1000 + Math.random() * 9000);
   const orderNumber = `ORD-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randSuffix}`;
 
+  // Resolve seller_id from items or database products table
+  const productIds = processedItems.map(i => i.product_id).filter(Boolean);
+  const productSellerMap = {};
+  if (productIds.length > 0) {
+    try {
+      const [pRows] = await pool.query('SELECT id, seller_id FROM products WHERE id IN (?)', [productIds]);
+      for (const pr of pRows) {
+        productSellerMap[pr.id] = pr.seller_id ? Number(pr.seller_id) : null;
+      }
+    } catch (e) {}
+  }
+
+  for (const pi of processedItems) {
+    if (!pi.seller_id && pi.product_id && productSellerMap[pi.product_id]) {
+      pi.seller_id = productSellerMap[pi.product_id];
+    } else if (!pi.seller_id && body.seller_id) {
+      pi.seller_id = parseInt(body.seller_id, 10);
+    }
+  }
+
+  const primarySellerId = (body.seller_id ? parseInt(body.seller_id, 10) : null) ||
+                          processedItems.find(i => i.seller_id)?.seller_id || 1;
+
   try {
     await ensureOrdersTables(pool);
     const conn = await pool.getConnection();
@@ -1952,13 +2023,13 @@ const handleCreateOrder = async (req, res) => {
       await conn.beginTransaction();
       const [orderRes] = await conn.query(
         `INSERT INTO orders (
-           order_number, buyer_name, buyer_phone,
+           seller_id, order_number, buyer_name, buyer_phone,
            shipping_address, landmark, city, state, pincode,
            order_status, payment_method, payment_status,
            subtotal, delivery_fee, discount, total_amount, notes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'unpaid', ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'unpaid', ?, ?, ?, ?, ?)`,
         [
-          orderNumber, buyerName, buyerPhone,
+          primarySellerId, orderNumber, buyerName, buyerPhone,
           shippingAddress, landmark || null, city || null, state || null, pincode || null,
           paymentMethod, subtotal, deliveryFee, discount, totalAmount, notes || null
         ]
@@ -1966,13 +2037,15 @@ const handleCreateOrder = async (req, res) => {
       const newOrderId = orderRes.insertId;
 
       for (const pi of processedItems) {
+        const itemSellerId = pi.seller_id || primarySellerId;
         const [iRes] = await conn.query(
-          `INSERT INTO order_items (order_id, product_id, product_name, product_image, price, quantity, subtotal)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [newOrderId, pi.product_id, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+          `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [newOrderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
         );
         pi.id = iRes.insertId;
         pi.order_id = newOrderId;
+        pi.seller_id = itemSellerId;
 
         // Decrease stock count for the ordered product
         if (pi.product_id) {
@@ -1988,10 +2061,20 @@ const handleCreateOrder = async (req, res) => {
       await conn.commit();
       conn.release();
 
+      let sellerName = 'Verified Seller';
+      try {
+        const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
+        if (sRows.length > 0) {
+          sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
+        }
+      } catch (e) {}
+
       return res.status(201).json({
         message: 'Order created successfully.',
         order: {
           id: newOrderId,
+          seller_id: primarySellerId,
+          seller_name: sellerName,
           order_number: orderNumber,
           buyer_name: buyerName,
           buyer_phone: buyerPhone,
@@ -2110,8 +2193,24 @@ const handleOrderUpdate = async (req, res) => {
           subtotal: lineSubtotal
         };
       });
+      const pIds = processedItems.map(i => i.product_id).filter(Boolean);
+      if (pIds.length > 0) {
+        try {
+          const [pRows] = await pool.query('SELECT id, seller_id FROM products WHERE id IN (?)', [pIds]);
+          const pMap = {};
+          for (const pr of pRows) {
+            pMap[pr.id] = pr.seller_id ? Number(pr.seller_id) : null;
+          }
+          for (const pi of processedItems) {
+            if (!pi.seller_id && pi.product_id && pMap[pi.product_id]) {
+              pi.seller_id = pMap[pi.product_id];
+            }
+          }
+        } catch (e) {}
+      }
     }
 
+    const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (existing.seller_id || (processedItems.find(i => i.seller_id)?.seller_id || 1));
     const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
 
     const conn = await pool.getConnection();
@@ -2119,12 +2218,13 @@ const handleOrderUpdate = async (req, res) => {
       await conn.beginTransaction();
       await conn.query(
         `UPDATE orders
-         SET buyer_name = ?, buyer_phone = ?,
+         SET seller_id = ?, buyer_name = ?, buyer_phone = ?,
              shipping_address = ?, landmark = ?, city = ?, state = ?, pincode = ?,
              order_status = ?, payment_method = ?, payment_status = ?,
              subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?
          WHERE id = ?`,
         [
+          primarySellerId,
           buyerName, buyerPhone,
           shippingAddress, landmark || null, city || null, state || null, pincode || null,
           orderStatus, paymentMethod, paymentStatus,
@@ -2144,13 +2244,15 @@ const handleOrderUpdate = async (req, res) => {
 
         await conn.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
         for (const pi of processedItems) {
+          const itemSellerId = pi.seller_id || primarySellerId;
           const [iRes] = await conn.query(
-            `INSERT INTO order_items (order_id, product_id, product_name, product_image, price, quantity, subtotal)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [orderId, pi.product_id, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+            `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [orderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
           );
           pi.id = iRes.insertId;
           pi.order_id = orderId;
+          pi.seller_id = itemSellerId;
 
           // Decrease stock for new items
           if (pi.product_id) {
@@ -2165,6 +2267,14 @@ const handleOrderUpdate = async (req, res) => {
       await conn.commit();
       conn.release();
 
+      let sellerName = 'Verified Seller';
+      try {
+        const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
+        if (sRows.length > 0) {
+          sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
+        }
+      } catch (e) {}
+
       // Return updated
       const [updatedOrders] = await pool.query('SELECT * FROM orders WHERE id = ? LIMIT 1', [orderId]);
       const [updatedItems] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [orderId]);
@@ -2174,11 +2284,13 @@ const handleOrderUpdate = async (req, res) => {
         order: {
           ...updatedOrders[0],
           id: orderId,
+          seller_id: primarySellerId,
+          seller_name: sellerName,
           subtotal,
           delivery_fee: deliveryFee,
           discount,
           total_amount: totalAmount,
-          items: updatedItems.map(i => ({ ...i, price: parseFloat(i.price), subtotal: parseFloat(i.subtotal) })),
+          items: updatedItems.map(i => ({ ...i, seller_id: i.seller_id ? Number(i.seller_id) : primarySellerId, price: parseFloat(i.price), subtotal: parseFloat(i.subtotal) })),
           items_count: updatedItems.length,
           total_quantity: updatedItems.reduce((acc, cur) => acc + Number(cur.quantity), 0)
         }
@@ -2614,8 +2726,27 @@ const handleGetInvoice = async (req, res) => {
       const [itms] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [realOrderId]);
       items = itms;
 
-      // Attempt to resolve seller info
-      if (items.length > 0 && items[0].product_id) {
+      // Resolve provider from order's seller_id
+      const sellerId = order.seller_id || (items.length > 0 ? items[0].seller_id : null);
+      if (sellerId) {
+        const [sellers] = await pool.query(
+          `SELECT u.name, u.seller_name, u.phone, u.email, u.address, u.landmark, u.state, u.country
+           FROM users u
+           WHERE u.id = ? LIMIT 1`,
+          [sellerId]
+        );
+        if (sellers.length > 0) {
+          const s = sellers[0];
+          provider.name = s.seller_name || s.name;
+          provider.shop_name = s.seller_name || (s.name + ' Store');
+          if (s.phone) provider.phone = s.phone;
+          if (s.email) provider.email = s.email;
+          if (s.address) provider.address = s.address;
+          if (s.landmark) provider.landmark = s.landmark;
+          if (s.state) provider.state = s.state;
+          if (s.country) provider.country = s.country;
+        }
+      } else if (items.length > 0 && items[0].product_id) {
         const [sellers] = await pool.query(
           `SELECT u.name, u.seller_name, u.phone, u.email, u.address, u.landmark, u.state, u.country
            FROM products p

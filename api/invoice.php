@@ -123,7 +123,32 @@ function apiGenerateOrderInvoice(PDO $pdo, mixed $idOrNumber): void
         'cin' => 'U72900KA2026PTC109821'
     ];
 
-    if (!empty($items)) {
+    // Resolve Provider / Seller details directly from order's seller_id or products
+    $sellerId = !empty($order['seller_id']) ? (int)$order['seller_id'] : null;
+    if (!$sellerId && !empty($items)) {
+        $sellerId = !empty($items[0]['seller_id']) ? (int)$items[0]['seller_id'] : null;
+    }
+
+    if ($sellerId) {
+        $uStmt = $pdo->prepare("
+            SELECT name, seller_name, phone, email, address, landmark, state, country
+            FROM users
+            WHERE id = :uid
+            LIMIT 1
+        ");
+        $uStmt->execute([':uid' => $sellerId]);
+        $sellerRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+        if ($sellerRow) {
+            $provider['name'] = $sellerRow['seller_name'] ?: $sellerRow['name'];
+            $provider['shop_name'] = $sellerRow['seller_name'] ?: ($sellerRow['name'] . ' Store');
+            if (!empty($sellerRow['phone'])) $provider['phone'] = $sellerRow['phone'];
+            if (!empty($sellerRow['email'])) $provider['email'] = $sellerRow['email'];
+            if (!empty($sellerRow['address'])) $provider['address'] = $sellerRow['address'];
+            if (!empty($sellerRow['landmark'])) $provider['landmark'] = $sellerRow['landmark'];
+            if (!empty($sellerRow['state'])) $provider['state'] = $sellerRow['state'];
+            if (!empty($sellerRow['country'])) $provider['country'] = $sellerRow['country'];
+        }
+    } elseif (!empty($items)) {
         $firstProdId = $items[0]['product_id'] ?? null;
         if ($firstProdId) {
             $pStmt = $pdo->prepare("

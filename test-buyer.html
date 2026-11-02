@@ -1664,6 +1664,10 @@
           <div class="product-badge-qty" id="card-badge-${p.id}">In List: ×${currentQty}</div>
           <img src="${p.image_url || 'https://via.placeholder.com/300?text=Product'}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.src='https://via.placeholder.com/300?text=Product'">
           <div class="product-body">
+            <div style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.12); padding: 2px 8px; border-radius: 6px; margin-bottom: 6px;">
+              <span>🏪</span>
+              <span>Seller #${p.seller_id || 1}: ${escapeHtml(p.seller_name || 'Verified Provider')}</span>
+            </div>
             <div class="product-title">${escapeHtml(p.name)}</div>
             <div class="product-desc">${escapeHtml(p.description || '')}</div>
             <div class="product-meta">
@@ -1824,6 +1828,7 @@
           <img src="${product.image_url || 'https://via.placeholder.com/60'}" class="cart-item-img" alt="${escapeHtml(product.name)}">
           <div class="cart-item-details">
             <div class="cart-item-name">${escapeHtml(product.name)}</div>
+            <div style="font-size: 11px; color: var(--accent); margin-top: 2px;">🏪 Seller #${product.seller_id || 1}: ${escapeHtml(product.seller_name || 'Verified Provider')}</div>
             <div class="cart-item-price">₹${parseFloat(product.price).toFixed(2)} each</div>
           </div>
           <div class="cart-item-stepper">
@@ -1878,6 +1883,7 @@
 
       const items = Object.values(cartDraft).map(({ product, quantity }) => ({
         product_id: product.id,
+        seller_id: product.seller_id || 1,
         product_name: product.name,
         product_image: product.image_url,
         price: parseFloat(product.price),
@@ -1889,7 +1895,10 @@
         return;
       }
 
+      const primarySellerId = (items.length > 0 && items[0].seller_id) ? items[0].seller_id : 1;
+
       const payload = {
+        seller_id: primarySellerId,
         buyer_name: document.getElementById('buyer-name').value.trim(),
         buyer_phone: document.getElementById('buyer-phone').value.trim(),
         shipping_address: document.getElementById('buyer-address').value.trim(),
@@ -2006,6 +2015,11 @@
             </div>
           </div>
 
+          <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.2); padding: 5px 10px; border-radius: 8px; margin: 8px 0;">
+            <span>🏪 Seller: ${escapeHtml(o.seller_name || 'Verified Provider')}</span>
+            <span style="font-family: var(--font-mono); color: #cbd5e1;">Seller ID: #${o.seller_id || 1}</span>
+          </div>
+
           <div class="order-items-preview">
             <div class="preview-item-row" style="font-weight: 700; color: #fff; margin-bottom: 4px;">
               <span>Products Ordered</span>
@@ -2080,6 +2094,18 @@
             </div>
           </div>
 
+          <!-- Seller Fulfillment Profile -->
+          <div style="background: rgba(99, 102, 241, 0.1); padding: 14px 16px; border-radius: var(--radius-md); border: 1px solid rgba(99, 102, 241, 0.3); display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+            <div>
+              <div style="font-size: 11px; font-weight: 700; color: #a5b4fc; text-transform: uppercase;">Fulfilled by Seller</div>
+              <div style="font-size: 15px; font-weight: 800; color: #fff; margin-top: 2px;">🏪 ${escapeHtml(order.seller_name || 'Verified Provider')} <span style="font-family: var(--font-mono); font-size: 12px; color: var(--accent);">(Seller ID: #${order.seller_id || 1})</span></div>
+              ${order.seller_phone ? `<div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">📞 ${escapeHtml(order.seller_phone)}</div>` : ''}
+            </div>
+            <div style="background: rgba(99, 102, 241, 0.25); border: 1px solid rgba(99, 102, 241, 0.4); border-radius: 8px; padding: 6px 12px; font-size: 12px; font-weight: 700; color: #e0e7ff;">
+              Seller ID: #${order.seller_id || 1}
+            </div>
+          </div>
+
           <!-- Customer Delivery Info -->
           <div style="background: var(--surface-light); padding: 16px; border-radius: var(--radius-md); border: 1px solid var(--border);">
             <div style="font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; margin-bottom: 6px;">Buyer & Shipping Details</div>
@@ -2110,6 +2136,7 @@
                         <img src="${i.product_image || 'https://via.placeholder.com/40'}" class="item-cell-thumb" onerror="this.src='https://via.placeholder.com/40'">
                         <div>
                           <div style="font-weight: 700; color: #fff;">${escapeHtml(i.product_name)}</div>
+                          <div style="font-size: 11px; color: var(--accent); margin-top: 2px;">🏪 Seller #${i.seller_id || order.seller_id || 1}</div>
                         </div>
                       </div>
                     </td>
@@ -2317,6 +2344,7 @@
       } else {
         currentlyEditingItems.push({
           product_id: prod.id,
+          seller_id: prod.seller_id || 1,
           product_name: prod.name,
           product_image: prod.image_url,
           price: parseFloat(prod.price),
@@ -2339,7 +2367,10 @@
         return;
       }
 
+      const primarySellerId = currentlyEditingOrder.seller_id || (currentlyEditingItems[0]?.seller_id || 1);
+
       const payload = {
+        seller_id: primarySellerId,
         buyer_name: document.getElementById('edit-buyer-name').value.trim(),
         buyer_phone: document.getElementById('edit-buyer-phone').value.trim(),
         shipping_address: document.getElementById('edit-buyer-address').value.trim(),
