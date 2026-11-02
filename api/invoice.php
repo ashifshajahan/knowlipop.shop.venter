@@ -123,6 +123,22 @@ function apiGenerateOrderInvoice(PDO $pdo, mixed $idOrNumber): void
         'cin' => 'U72900KA2026PTC109821'
     ];
 
+    // Multi-Vendor & Seller Authorization check
+    $authUser = getAuthenticatedUserOptional($pdo);
+    if ($authUser && ($authUser['role'] ?? '') === 'seller') {
+        $authSellerId = (int)$authUser['id'];
+        $sellerItems = array_values(array_filter($items, fn($i) => !empty($i['seller_id']) && (int)$i['seller_id'] === $authSellerId));
+        if (empty($sellerItems)) {
+            errorResponse('Access denied. You do not own any products in this order.', [], 403);
+        }
+        $items = $sellerItems;
+        $order['seller_id'] = $authSellerId;
+        $order['subtotal'] = array_sum(array_column($sellerItems, 'subtotal'));
+        $order['delivery_fee'] = 0.00;
+        $order['discount'] = 0.00;
+        $order['total_amount'] = $order['subtotal'];
+    }
+
     // Resolve Provider / Seller details directly from order's seller_id or products
     $sellerId = !empty($order['seller_id']) ? (int)$order['seller_id'] : null;
     if (!$sellerId && !empty($items)) {

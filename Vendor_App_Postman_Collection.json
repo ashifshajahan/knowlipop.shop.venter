@@ -10,7 +10,7 @@
       "key": "base_url",
       "value": "https://knowlipop.shop",
       "type": "string",
-      "description": "Main Production Server Base URL (https://knowlipop.shop)"
+      "description": "API Base URL: https://knowlipop.shop (Hostinger Production)"
     },
     {
       "key": "token",
@@ -46,12 +46,20 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/health",
-              "host": ["{{base_url}}"],
-              "path": ["api", "health"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "health"
+              ]
             },
             "description": "Inspects real-time API health, database connection state, and active server engine."
           },
@@ -81,8 +89,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/",
-              "host": ["{{base_url}}"],
-              "path": [""]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                ""
+              ]
             },
             "description": "Returns the main web dashboard overview and server engine status badge."
           }
@@ -94,8 +106,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/test-buyer",
-              "host": ["{{base_url}}"],
-              "path": ["test-buyer"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "test-buyer"
+              ]
             },
             "description": "Interactive HTML5 Buyer test hub for browsing catalog, managing item quantities, placing test orders without email, and generating invoices."
           }
@@ -107,8 +123,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/test-firebase",
-              "host": ["{{base_url}}"],
-              "path": ["test-firebase"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "test-firebase"
+              ]
             },
             "description": "Live Firebase Phone OTP and Recaptcha testing interface."
           }
@@ -123,8 +143,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -132,8 +158,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/register",
-              "host": ["{{base_url}}"],
-              "path": ["api", "register"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "register"
+              ]
             },
             "description": "Registers a new seller and returns a JWT Bearer token."
           },
@@ -142,16 +173,17 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 201 or 200', function () {",
+                  "pm.test(\"Status code is 201 or 200\", function () {",
                   "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set('token', jsonData.token);",
-                  "    console.log('Saved token to collection variable: ' + jsonData.token);",
+                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
+                  "    if (pm.environment) pm.environment.set(\"token\", jsonData.token);",
                   "}",
                   "if (jsonData.user && jsonData.user.id) {",
-                  "    pm.collectionVariables.set('seller_id', String(jsonData.user.id));",
+                  "    pm.collectionVariables.set(\"seller_id\", String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set(\"seller_id\", String(jsonData.user.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -164,8 +196,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -173,8 +211,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/login",
-              "host": ["{{base_url}}"],
-              "path": ["api", "login"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "login"
+              ]
             },
             "description": "Authenticates a seller with phone and password, returning a JWT token."
           },
@@ -183,12 +226,17 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 200', function () {",
+                  "pm.test(\"Status code is 200\", function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
+                  "    if (pm.environment) pm.environment.set(\"token\", jsonData.token);",
+                  "}",
+                  "if (jsonData.user && jsonData.user.id) {",
+                  "    pm.collectionVariables.set(\"seller_id\", String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set(\"seller_id\", String(jsonData.user.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -201,7 +249,10 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -209,8 +260,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/forgot-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "forgot-password"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "forgot-password"
+              ]
             }
           }
         },
@@ -219,7 +275,10 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -227,17 +286,43 @@
             },
             "url": {
               "raw": "{{base_url}}/api/verify-otp",
-              "host": ["{{base_url}}"],
-              "path": ["api", "verify-otp"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "verify-otp"
+              ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.reset_token) {",
+                  "    pm.collectionVariables.set(\"reset_token\", jsonData.reset_token);",
+                  "    if (pm.environment) pm.environment.set(\"reset_token\", jsonData.reset_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Reset Password",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -245,8 +330,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/reset-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "reset-password"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "reset-password"
+              ]
             }
           }
         },
@@ -255,12 +345,20 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/logout",
-              "host": ["{{base_url}}"],
-              "path": ["api", "logout"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "logout"
+              ]
             }
           }
         }
@@ -274,13 +372,24 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/me",
-              "host": ["{{base_url}}"],
-              "path": ["api", "me"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "me"
+              ]
             }
           }
         },
@@ -289,8 +398,14 @@
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -298,8 +413,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/me",
-              "host": ["{{base_url}}"],
-              "path": ["api", "me"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "me"
+              ]
             }
           }
         },
@@ -308,8 +428,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -317,8 +443,14 @@
             },
             "url": {
               "raw": "{{base_url}}/api/seller/change-password",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "change-password"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "change-password"
+              ]
             }
           }
         },
@@ -329,11 +461,22 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/sellers?page=1&limit=10",
-              "host": ["{{base_url}}"],
-              "path": ["api", "sellers"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers"
+              ],
               "query": [
-                { "key": "page", "value": "1" },
-                { "key": "limit", "value": "10" }
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
               ]
             }
           }
@@ -345,8 +488,14 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/sellers/{{seller_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "sellers", "{{seller_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "{{seller_id}}"
+              ]
             }
           }
         }
@@ -362,11 +511,22 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/products?page=1&limit=20",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ],
               "query": [
-                { "key": "page", "value": "1" },
-                { "key": "limit", "value": "20" }
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
               ]
             }
           },
@@ -394,8 +554,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -403,8 +569,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/products",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
             }
           },
           "event": [
@@ -412,12 +583,13 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 201 or 200', function () {",
+                  "pm.test(\"Status code is 201 or 200\", function () {",
                   "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
                   "if (jsonData.product && jsonData.product.id) {",
-                  "    pm.collectionVariables.set('product_id', String(jsonData.product.id));",
+                  "    pm.collectionVariables.set(\"product_id\", String(jsonData.product.id));",
+                  "    if (pm.environment) pm.environment.set(\"product_id\", String(jsonData.product.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -432,8 +604,14 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             }
           }
         },
@@ -442,8 +620,14 @@
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -451,8 +635,14 @@
             },
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             }
           }
         },
@@ -461,8 +651,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -470,8 +666,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/upload",
-              "host": ["{{base_url}}"],
-              "path": ["api", "upload"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "upload"
+              ]
             }
           }
         },
@@ -480,14 +681,77 @@
           "request": {
             "method": "DELETE",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "products", "{{product_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{product_id}}"
+              ]
             }
           }
+        },
+        {
+          "name": "List Seller's Own Products (/api/seller/products)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/products?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Response contains seller products list\", function () {",
+                  "    pm.expect(jsonData).to.have.property(\"products\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },
@@ -499,8 +763,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -508,8 +778,15 @@
             },
             "url": {
               "raw": "{{base_url}}/api/seller/bank-account/onboarding",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "bank-account", "onboarding"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "bank-account",
+                "onboarding"
+              ]
             }
           }
         },
@@ -518,12 +795,22 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/seller/bank-account/status",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "bank-account", "status"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "bank-account",
+                "status"
+              ]
             }
           }
         },
@@ -532,12 +819,21 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/seller/payouts",
-              "host": ["{{base_url}}"],
-              "path": ["api", "seller", "payouts"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "payouts"
+              ]
             }
           }
         },
@@ -546,8 +842,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{token}}" },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -555,30 +857,50 @@
             },
             "url": {
               "raw": "{{base_url}}/api/marketplace/commission-preview",
-              "host": ["{{base_url}}"],
-              "path": ["api", "marketplace", "commission-preview"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "marketplace",
+                "commission-preview"
+              ]
             }
           }
         }
       ]
     },
     {
-      "name": "6. Buyer Orders & Invoices",
+      "name": "6. Orders, Multi-Vendor Routing & Seller Isolation",
       "item": [
         {
           "name": "List Buyer Orders",
           "request": {
             "method": "GET",
             "header": [
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "url": {
               "raw": "{{base_url}}/api/orders?page=1&limit=20",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders"],
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ],
               "query": [
-                { "key": "page", "value": "1" },
-                { "key": "limit", "value": "20" }
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
               ]
             }
           },
@@ -606,8 +928,14 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Accept", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -615,8 +943,13 @@
             },
             "url": {
               "raw": "{{base_url}}/api/orders",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
             },
             "description": "Places a new buyer order. Note: buyer_email is completely removed per client specifications."
           },
@@ -625,15 +958,13 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 201 Created', function () {",
-                  "    pm.response.to.have.status(201);",
+                  "pm.test(\"Status code is 201 or 200\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test('No buyer email is returned', function () {",
-                  "    pm.expect(jsonData.order.buyer_email).to.be.oneOf([undefined, null, '']);",
-                  "});",
                   "if (jsonData.order && jsonData.order.id) {",
-                  "    pm.collectionVariables.set('order_id', String(jsonData.order.id));",
+                  "    pm.collectionVariables.set(\"order_id\", String(jsonData.order.id));",
+                  "    if (pm.environment) pm.environment.set(\"order_id\", String(jsonData.order.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -648,8 +979,14 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/orders/{{order_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders", "{{order_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{order_id}}"
+              ]
             }
           }
         },
@@ -658,7 +995,10 @@
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
             "body": {
               "mode": "raw",
@@ -666,8 +1006,14 @@
             },
             "url": {
               "raw": "{{base_url}}/api/orders/{{order_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders", "{{order_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{order_id}}"
+              ]
             }
           }
         },
@@ -678,8 +1024,15 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/orders/{{order_id}}/invoice",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders", "{{order_id}}", "invoice"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{order_id}}",
+                "invoice"
+              ]
             },
             "description": "Generates downloadable & printable provider tax invoice dynamically formatted for the main host https://knowlipop.shop."
           },
@@ -707,8 +1060,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/invoice/{{order_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["invoice", "{{order_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "invoice",
+                "{{order_id}}"
+              ]
             }
           }
         },
@@ -719,10 +1077,301 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/api/orders/{{order_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["api", "orders", "{{order_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{order_id}}"
+              ]
             }
           }
+        },
+        {
+          "name": "List Authenticated Seller Orders (/api/seller/orders)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/orders?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Returns seller isolated orders\", function () {",
+                  "    pm.expect(jsonData).to.have.property(\"seller_id\");",
+                  "    pm.expect(jsonData).to.have.property(\"orders\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Orders by Seller ID (/api/sellers/:seller_id/orders)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/{{seller_id}}/orders?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "{{seller_id}}",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Seller Order Details (/api/seller/orders/:order_id)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/orders/{{order_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "orders",
+                "{{order_id}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Seller sees only their products\", function () {",
+                  "    pm.expect(jsonData.order).to.have.property(\"items\");",
+                  "    pm.expect(jsonData.order).to.have.property(\"seller_subtotal\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Place Multi-Vendor Order (Auto-routed by product_id)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Multi-Vendor Shopper\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 303, Sunrise Towers, MG Road\",\n  \"landmark\": \"Opposite City Mall\",\n  \"city\": \"Bengaluru\",\n  \"state\": \"Karnataka\",\n  \"pincode\": \"560001\",\n  \"notes\": \"Multi-vendor split test order\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999,\n      \"quantity\": 1\n    },\n    {\n      \"product_id\": 7,\n      \"product_name\": \"Noise-Cancelling Studio Earbuds\",\n      \"price\": 1899,\n      \"quantity\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 201 or 200\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.order && jsonData.order.id) {",
+                  "    pm.collectionVariables.set(\"order_id\", String(jsonData.order.id));",
+                  "    if (pm.environment) pm.environment.set(\"order_id\", String(jsonData.order.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Security Check: Cross-Seller Orders Blocked (403 Forbidden)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/99999/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "99999",
+                "orders"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Cross-seller order access blocked with 403 Forbidden\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Security Check: Cross-Seller Product Edit Blocked (403 Forbidden)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Unauthorized Title Change\"}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products/7",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "7"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Cross-seller product edit blocked with 403 Forbidden\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     }

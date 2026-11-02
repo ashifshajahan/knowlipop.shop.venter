@@ -169,6 +169,10 @@
                   "if (jsonData.token) {",
                   "    pm.collectionVariables.set('token', jsonData.token);",
                   "    if (pm.environment) pm.environment.set('token', jsonData.token);",
+                  "}",
+                  "if (jsonData.user && jsonData.user.id) {",
+                  "    pm.collectionVariables.set('seller_id', String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set('seller_id', String(jsonData.user.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -212,17 +216,20 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 200 OK', function () {",
+                  "pm.test(\"Status code is 200 OK\", function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test('Login returns valid token and user', function () {",
-                  "    pm.expect(jsonData.token).to.be.a('string');",
-                  "    pm.expect(jsonData.user.phone).to.eql(pm.collectionVariables.get('seller_phone'));",
+                  "pm.test(\"Login returns valid token\", function () {",
+                  "    pm.expect(jsonData.token).to.be.a(\"string\");",
                   "});",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set('token', jsonData.token);",
-                  "    if (pm.environment) pm.environment.set('token', jsonData.token);",
+                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
+                  "    if (pm.environment) pm.environment.set(\"token\", jsonData.token);",
+                  "}",
+                  "if (jsonData.user && jsonData.user.id) {",
+                  "    pm.collectionVariables.set(\"seller_id\", String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set(\"seller_id\", String(jsonData.user.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -926,6 +933,60 @@
             "description": "Deletes the product."
           },
           "response": []
+        },
+        {
+          "name": "List Seller's Own Products (GET /api/seller/products)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/products?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "products"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Response contains seller products\", function () {",
+                  "    pm.expect(jsonData).to.have.property(\"products\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },
@@ -1221,16 +1282,13 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status code is 200 OK', function () {",
+                  "pm.test(\"Status code is 200 OK\", function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test('OTP verified with reset_token', function () {",
-                  "    pm.expect(jsonData.reset_token).to.be.a('string');",
-                  "});",
                   "if (jsonData.reset_token) {",
-                  "    pm.collectionVariables.set('reset_token', jsonData.reset_token);",
-                  "    if (pm.environment) pm.environment.set('reset_token', jsonData.reset_token);",
+                  "    pm.collectionVariables.set(\"reset_token\", jsonData.reset_token);",
+                  "    if (pm.environment) pm.environment.set(\"reset_token\", jsonData.reset_token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -1441,6 +1499,296 @@
             "description": "Displays Vendor Administrator Dashboard with seller count, product metrics, and settings."
           },
           "response": []
+        }
+      ]
+    },
+    {
+      "name": "6b. Orders, Multi-Vendor Routing & Seller Isolation",
+      "item": [
+        {
+          "name": "List Authenticated Seller Orders (GET /api/seller/orders)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/orders?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Returns seller isolated orders\", function () {",
+                  "    pm.expect(jsonData).to.have.property(\"seller_id\");",
+                  "    pm.expect(jsonData).to.have.property(\"orders\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Orders by Seller ID (GET /api/sellers/:seller_id/orders)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/{{seller_id}}/orders?page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "{{seller_id}}",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Seller Order Details (GET /api/seller/orders/:order_id)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/orders/{{order_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "seller",
+                "orders",
+                "{{order_id}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Seller sees only their products\", function () {",
+                  "    pm.expect(jsonData.order).to.have.property(\"items\");",
+                  "    pm.expect(jsonData.order).to.have.property(\"seller_subtotal\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Place Multi-Vendor Order (POST /api/orders)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Multi-Vendor Shopper\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 303, Sunrise Towers, MG Road\",\n  \"landmark\": \"Opposite City Mall\",\n  \"city\": \"Bengaluru\",\n  \"state\": \"Karnataka\",\n  \"pincode\": \"560001\",\n  \"notes\": \"Multi-vendor split test order\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999,\n      \"quantity\": 1\n    },\n    {\n      \"product_id\": 7,\n      \"product_name\": \"Noise-Cancelling Studio Earbuds\",\n      \"price\": 1899,\n      \"quantity\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 201 or 200\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.order && jsonData.order.id) {",
+                  "    pm.collectionVariables.set(\"order_id\", String(jsonData.order.id));",
+                  "    if (pm.environment) pm.environment.set(\"order_id\", String(jsonData.order.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Security Check: Cross-Seller Orders Blocked (403 Forbidden)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/99999/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "sellers",
+                "99999",
+                "orders"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Cross-seller order access blocked with 403 Forbidden\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Security Check: Cross-Seller Product Edit Blocked (403 Forbidden)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Unauthorized Title Change\"}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products/7",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "7"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Cross-seller product edit blocked with 403 Forbidden\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },

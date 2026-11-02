@@ -118,22 +118,33 @@ function createToken(PDO $pdo, int $userId, string $phone = '', string $name = '
     return $jwtToken;
 }
 
-function authenticateUser(PDO $pdo): array
+function getAuthenticatedUserOptional(PDO $pdo): ?array
 {
     $token = getBearerToken();
     if (!$token) {
-        errorResponse('Unauthenticated.', [], 401);
+        return null;
     }
 
     // 1. Verify standard JWT token (shared with Node.js)
     $jwtPayload = verifyJwtToken($token, getJwtSecret());
     if ($jwtPayload && isset($jwtPayload['id'])) {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
-        $stmt->execute([':id' => $jwtPayload['id']]);
-        $user = $stmt->fetch();
-        if ($user) {
-            $user['token_id'] = 0;
-            return $user;
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+            $stmt->execute([':id' => $jwtPayload['id']]);
+            $user = $stmt->fetch();
+            if ($user) {
+                $user['token_id'] = 0;
+                return $user;
+            }
+        } catch (Throwable $e) {
+            return [
+                'id' => (int)$jwtPayload['id'],
+                'role' => $jwtPayload['role'] ?? ((int)$jwtPayload['id'] === 1 ? 'admin' : 'seller'),
+                'phone' => $jwtPayload['phone'] ?? null,
+                'name' => $jwtPayload['name'] ?? 'Verified Seller',
+                'seller_name' => $jwtPayload['seller_name'] ?? 'Verified Seller',
+                'token_id' => 0
+            ];
         }
     }
 
@@ -143,24 +154,37 @@ function authenticateUser(PDO $pdo): array
         [$id, $plain] = $parts;
         $hash = hash('sha256', $plain);
 
-        $stmt = $pdo->prepare("
-            SELECT pat.id as token_id, pat.tokenable_id as user_id, u.*
-            FROM personal_access_tokens pat
-            JOIN users u ON pat.tokenable_id = u.id
-            WHERE pat.id = :id AND pat.token = :hash
-            LIMIT 1
-        ");
-        $stmt->execute([':id' => $id, ':hash' => $hash]);
-        $user = $stmt->fetch();
+        try {
+            $stmt = $pdo->prepare("
+                SELECT pat.id as token_id, pat.tokenable_id as user_id, u.*
+                FROM personal_access_tokens pat
+                JOIN users u ON pat.tokenable_id = u.id
+                WHERE pat.id = :id AND pat.token = :hash
+                LIMIT 1
+            ");
+            $stmt->execute([':id' => $id, ':hash' => $hash]);
+            $user = $stmt->fetch();
 
-        if ($user) {
-            $updateStmt = $pdo->prepare("UPDATE personal_access_tokens SET last_used_at = NOW() WHERE id = :id");
-            $updateStmt->execute([':id' => $id]);
-            return $user;
-        }
+            if ($user) {
+                try {
+                    $updateStmt = $pdo->prepare("UPDATE personal_access_tokens SET last_used_at = NOW() WHERE id = :id");
+                    $updateStmt->execute([':id' => $id]);
+                } catch (Throwable $e) {}
+                return $user;
+            }
+        } catch (Throwable $e) {}
     }
 
-    errorResponse('Unauthenticated.', [], 401);
+    return null;
+}
+
+function authenticateUser(PDO $pdo): array
+{
+    $user = getAuthenticatedUserOptional($pdo);
+    if (!$user) {
+        errorResponse('Unauthenticated.', [], 401);
+    }
+    return $user;
 }
 
 function deleteCurrentToken(PDO $pdo, int $tokenId): void

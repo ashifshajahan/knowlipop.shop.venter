@@ -277,6 +277,69 @@ if ($requestUri === '/api/seller/change-password' || $requestUri === '/api/chang
     apiChangePassword($pdo);
 }
 
+// Seller Products Catalog: /api/seller/products or /api/sellers/products
+if ($requestUri === '/api/seller/products' || $requestUri === '/api/sellers/products') {
+    if ($method === 'GET') {
+        apiGetSellerProducts($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Products by Seller ID: /api/sellers/{id}/products or /api/seller/{id}/products
+if (preg_match('#^/(?:api/sellers?)/(\d+)/products$#', $requestUri, $matches)) {
+    $sellerId = (int)$matches[1];
+    if ($method === 'GET') {
+        apiGetSellerProducts($pdo, $sellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Orders List: /api/seller/orders or /api/sellers/orders
+if ($requestUri === '/api/seller/orders' || $requestUri === '/api/sellers/orders') {
+    if ($method === 'GET') {
+        apiGetSellerOrders($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Orders List by Seller ID: /api/sellers/{id}/orders or /api/seller/{id}/orders
+if (preg_match('#^/(?:api/sellers?)/(\d+)/orders$#', $requestUri, $matches)) {
+    $sellerId = (int)$matches[1];
+    if ($method === 'GET') {
+        apiGetSellerOrders($pdo, $sellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Single Order Detail by Order ID: /api/seller/orders/{order_id}
+if (preg_match('#^/api/seller/orders/([^/]+)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'GET') {
+        apiGetOrder($pdo, $orderParam);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateOrder($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Single Order Detail by Seller ID & Order ID: /api/sellers/{seller_id}/orders/{order_id}
+if (preg_match('#^/(?:api/sellers?)/(\d+)/orders/([^/]+)$#', $requestUri, $matches)) {
+    $sellerId = (int)$matches[1];
+    $orderParam = trim($matches[2]);
+    if ($method === 'GET') {
+        apiGetOrder($pdo, $orderParam, $sellerId);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateOrder($pdo, $orderParam, $sellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 // Sellers Directory
 if ($requestUri === '/api/sellers') {
     if ($method === 'GET') {

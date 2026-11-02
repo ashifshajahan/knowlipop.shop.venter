@@ -89,8 +89,10 @@ VALUES
 (3, 1, 'Vintage Leather Travel Backpack', 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', 3299.00, 20, 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', 1),
 (4, 1, 'Air Cushion Running Sneakers', 'Lightweight breathable sports shoes designed for marathon running and daily training.', 2499.00, 60, 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', 1),
 (5, 1, 'Polarized Aviator Sunglasses', 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', 1299.00, 100, 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', 1),
-(6, 1, 'RGB Mechanical Gaming Keyboard', 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', 3999.00, 25, 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', 1)
-ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `price` = VALUES(`price`), `stock` = VALUES(`stock`), `image_url` = VALUES(`image_url`);
+(6, 1, 'RGB Mechanical Gaming Keyboard', 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', 3999.00, 25, 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', 1),
+(7, 2, 'Noise-Cancelling Studio Earbuds', 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', 1899.00, 45, 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', 1),
+(8, 2, 'Ergonomic Vertical Mouse Pro', 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', 1499.00, 30, 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', 1)
+ON DUPLICATE KEY UPDATE `seller_id` = VALUES(`seller_id`), `name` = VALUES(`name`), `price` = VALUES(`price`), `stock` = VALUES(`stock`), `image_url` = VALUES(`image_url`);
 
 -- ======================================================
 -- Buyer Orders & Order Items Tables

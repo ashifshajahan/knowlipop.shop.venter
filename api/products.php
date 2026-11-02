@@ -218,15 +218,88 @@ function apiCreateProduct(PDO $pdo): void
     jsonResponse(['message' => 'Product created.', 'product' => $product], 201);
 }
 
+function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
+{
+    $user = authenticateUser($pdo);
+    $targetSellerId = $routeSellerId ?: (!empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : (int)$user['id']);
+
+    if (($user['role'] ?? '') !== 'admin' && (int)$user['id'] !== $targetSellerId) {
+        errorResponse('Access denied. You can only access your own products.', [], 403);
+    }
+
+    $page = max(1, (int)($_GET['page'] ?? 1));
+    $limit = min(100, max(1, (int)($_GET['limit'] ?? 20)));
+    $offset = ($page - 1) * $limit;
+
+    $where = "WHERE p.seller_id = :seller_id";
+    $params = [':seller_id' => $targetSellerId];
+
+    if (isset($_GET['is_active']) && $_GET['is_active'] !== '') {
+        $where .= " AND p.is_active = :is_active";
+        $params[':is_active'] = (int)$_GET['is_active'];
+    }
+
+    if (!empty($_GET['search'])) {
+        $where .= " AND (p.name LIKE :s1 OR p.description LIKE :s2)";
+        $params[':s1'] = '%' . trim($_GET['search']) . '%';
+        $params[':s2'] = '%' . trim($_GET['search']) . '%';
+    }
+
+    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetchColumn();
+
+    $stmt = $pdo->prepare("
+        SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        {$where}
+        ORDER BY p.id DESC
+        LIMIT :limit OFFSET :offset
+    ");
+    foreach ($params as $k => $v) {
+        $stmt->bindValue($k, $v);
+    }
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($products as &$p) {
+        $p['id'] = (int)$p['id'];
+        $p['seller_id'] = (int)$p['seller_id'];
+        $p['price'] = (string)number_format((float)$p['price'], 2, '.', '');
+        $p['stock'] = (int)$p['stock'];
+        $p['is_active'] = (bool)$p['is_active'];
+    }
+    unset($p);
+
+    jsonResponse([
+        'seller_id' => $targetSellerId,
+        'products' => [
+            'current_page' => $page,
+            'data' => $products,
+            'total' => $total,
+            'per_page' => $limit,
+            'last_page' => (int)ceil($total / $limit) ?: 1,
+        ]
+    ]);
+}
+
 function apiUpdateProduct(PDO $pdo, int $id): void
 {
     $user = authenticateUser($pdo);
-    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id AND seller_id = :seller_id LIMIT 1");
-    $stmt->execute([':id' => $id, ':seller_id' => $user['id']]);
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $id]);
     $product = $stmt->fetch();
 
     if (!$product) {
-        errorResponse('Product not found or access denied.', [], 404);
+        errorResponse('Product not found.', [], 404);
+    }
+
+    if (($user['role'] ?? '') !== 'admin' && (int)$product['seller_id'] !== (int)$user['id']) {
+        errorResponse('Access denied. You do not own this product.', [], 403);
     }
 
     $input = getJsonInput();
@@ -291,10 +364,16 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 function apiDeleteProduct(PDO $pdo, int $id): void
 {
     $user = authenticateUser($pdo);
-    $stmt = $pdo->prepare("SELECT id FROM products WHERE id = :id AND seller_id = :seller_id LIMIT 1");
-    $stmt->execute([':id' => $id, ':seller_id' => $user['id']]);
-    if (!$stmt->fetch()) {
-        errorResponse('Product not found or access denied.', [], 404);
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $id]);
+    $product = $stmt->fetch();
+
+    if (!$product) {
+        errorResponse('Product not found.', [], 404);
+    }
+
+    if (($user['role'] ?? '') !== 'admin' && (int)$product['seller_id'] !== (int)$user['id']) {
+        errorResponse('Access denied. You do not own this product.', [], 403);
     }
 
     $delStmt = $pdo->prepare("DELETE FROM products WHERE id = :id");
