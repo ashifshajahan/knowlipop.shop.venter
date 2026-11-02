@@ -496,7 +496,7 @@ function apiCreateOrder(PDO $pdo): void
 
     $buyerName = trim($input['buyer_name'] ?? '');
     $buyerPhone = trim($input['buyer_phone'] ?? '');
-    $shippingAddress = trim($input['shipping_address'] ?? '');
+    $shippingAddress = trim($input['shipping_address'] ?? $input['delivery_address'] ?? $input['address'] ?? '');
     $landmark = trim($input['landmark'] ?? '');
     $city = trim($input['city'] ?? '');
     $state = trim($input['state'] ?? '');

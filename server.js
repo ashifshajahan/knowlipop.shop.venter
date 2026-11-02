@@ -2458,7 +2458,7 @@ const handleCreateOrder = async (req, res) => {
   const body = req.body || {};
   const buyerName = (body.buyer_name || '').trim();
   const buyerPhone = (body.buyer_phone || '').trim();
-  const shippingAddress = (body.shipping_address || '').trim();
+  const shippingAddress = (body.shipping_address || body.delivery_address || body.address || '').trim();
   const landmark = (body.landmark || '').trim();
   const city = (body.city || '').trim();
   const state = (body.state || '').trim();
