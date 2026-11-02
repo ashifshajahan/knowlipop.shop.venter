@@ -2,7 +2,7 @@
 
 /**
  * Vendor App Configuration
- * Reads from .env if available, with fallbacks for your server (e.g. Hostinger / cPanel / Localhost)
+ * Reads from .env if available, with fallbacks for your main production server (https://knowlipop.shop)
  */
 
 $envFile = __DIR__ . '/.env';

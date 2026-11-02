@@ -1,7 +1,7 @@
 # Vendor App Backend (Pure PHP & Node.js Dual Engine)
 
 A high-performance REST API and Admin Dashboard designed specifically for **Hostinger Production** (`https://knowlipop.shop`).
-Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
+Configured exclusively for the main production host https://knowlipop.shop without any external framework dependencies.
 
 ---
 
@@ -57,6 +57,15 @@ Completely free of Laravel framework dependencies, XAMPP, or localhost setups.
 * `POST /api/forgot-password` — Request 6-digit OTP via Firebase Gateway / Fast2SMS
 * `POST /api/verify-otp` — Verify OTP (supports Firebase test code `000000`, client-side Firebase `id_token`, and local OTP)
 * `POST /api/reset-password` — Set new password using reset token
+
+### Buyer Module, Order Details & Provider Invoice Hub
+* `GET /test-buyer` or `GET /buyer` — Interactive Buyer Checkout, Quantity Increments, Order Details & Order Editing Hub
+* `GET /invoice/{id}` or `GET /api/orders/{id}/invoice` — Downloadable Provider Tax Invoice (supports print-to-PDF, `?download=1` attachment download, and `?format=json`)
+* `GET /api/orders` — List buyer orders (supports pagination, search by phone/name/order_id, filter by status)
+* `POST /api/orders` — Place new order with items array, buyer info, delivery address, live subtotal & grand total
+* `GET /api/orders/{id}` — Single order details with complete order items list and financial breakdown
+* `PUT /api/orders/{id}` — Edit order (update items list, modify quantities, add new products, update delivery address & status)
+* `DELETE /api/orders/{id}` — Cancel / remove order
 
 ### Seller Bank & Commission
 * `POST /api/seller/bank-account/onboarding` — Store seller payment account reference

@@ -1,0 +1,730 @@
+{
+  "info": {
+    "_postman_id": "c1f7a83d-9472-4b36-a971-897db6743912",
+    "name": "Vendor App API — Complete Postman Collection (2026)",
+    "description": "Comprehensive Postman Collection for the Vendor App Dual Engine (Pure PHP + Node.js) REST API on https://knowlipop.shop. Contains all endpoints for Authentication, Seller Profiles, Products Catalog, Banking/Payouts, Buyer Orders (without buyer email), and Provider Invoices (main production host https://knowlipop.shop).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://knowlipop.shop",
+      "type": "string",
+      "description": "Main Production Server Base URL (https://knowlipop.shop)"
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string",
+      "description": "Bearer JWT Authentication Token auto-set on Login / Register"
+    },
+    {
+      "key": "product_id",
+      "value": "1",
+      "type": "string",
+      "description": "Sample Product ID"
+    },
+    {
+      "key": "order_id",
+      "value": "1",
+      "type": "string",
+      "description": "Sample Order ID"
+    },
+    {
+      "key": "seller_id",
+      "value": "1",
+      "type": "string",
+      "description": "Sample Seller ID"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. System & Web Hubs",
+      "item": [
+        {
+          "name": "Health Check & Database Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Inspects real-time API health, database connection state, and active server engine."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Database is connected', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.status).to.eql('ok');",
+                  "    pm.expect(jsonData.database.status).to.eql('connected');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Landing Web Portal",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": ["{{base_url}}"],
+              "path": [""]
+            },
+            "description": "Returns the main web dashboard overview and server engine status badge."
+          }
+        },
+        {
+          "name": "Buyer Module Hub (Interactive Order Studio)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/test-buyer",
+              "host": ["{{base_url}}"],
+              "path": ["test-buyer"]
+            },
+            "description": "Interactive HTML5 Buyer test hub for browsing catalog, managing item quantities, placing test orders without email, and generating invoices."
+          }
+        },
+        {
+          "name": "Firebase OTP Tester Hub",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/test-firebase",
+              "host": ["{{base_url}}"],
+              "path": ["test-firebase"]
+            },
+            "description": "Live Firebase Phone OTP and Recaptcha testing interface."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Authentication & Session",
+      "item": [
+        {
+          "name": "Seller Registration",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions\",\n  \"phone\": \"+919876543210\",\n  \"address\": \"402 Cyber Heights, MG Road\",\n  \"landmark\": \"Near Trinity Metro\",\n  \"state\": \"Karnataka\",\n  \"country\": \"India\",\n  \"password\": \"Password123!\",\n  \"password_confirmation\": \"Password123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/register",
+              "host": ["{{base_url}}"],
+              "path": ["api", "register"]
+            },
+            "description": "Registers a new seller and returns a JWT Bearer token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 or 200', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    console.log('Saved token to collection variable: ' + jsonData.token);",
+                  "}",
+                  "if (jsonData.user && jsonData.user.id) {",
+                  "    pm.collectionVariables.set('seller_id', String(jsonData.user.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Seller Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"password\": \"Password123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/login",
+              "host": ["{{base_url}}"],
+              "path": ["api", "login"]
+            },
+            "description": "Authenticates a seller with phone and password, returning a JWT token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Forgot Password (Request OTP)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919876543210\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/forgot-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "forgot-password"]
+            }
+          }
+        },
+        {
+          "name": "Verify OTP",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"otp\": \"000000\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/verify-otp",
+              "host": ["{{base_url}}"],
+              "path": ["api", "verify-otp"]
+            }
+          }
+        },
+        {
+          "name": "Reset Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"otp\": \"000000\",\n  \"new_password\": \"NewPassword2026!\",\n  \"confirm_password\": \"NewPassword2026!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/reset-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "reset-password"]
+            }
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/logout",
+              "host": ["{{base_url}}"],
+              "path": ["api", "logout"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Seller Profile & Directory",
+      "item": [
+        {
+          "name": "Get Authenticated Profile (/api/me)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/me",
+              "host": ["{{base_url}}"],
+              "path": ["api", "me"]
+            }
+          }
+        },
+        {
+          "name": "Update Profile Details (/api/me)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions Pvt Ltd\",\n  \"address\": \"Floor 4, Tower C, Koramangala\",\n  \"landmark\": \"Near Sony World Signal\",\n  \"state\": \"Karnataka\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/me",
+              "host": ["{{base_url}}"],
+              "path": ["api", "me"]
+            }
+          }
+        },
+        {
+          "name": "Change Password (Authenticated)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"Password123!\",\n  \"new_password\": \"UpdatedPass2026!\",\n  \"confirm_password\": \"UpdatedPass2026!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/seller/change-password",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "change-password"]
+            }
+          }
+        },
+        {
+          "name": "Get Public Sellers Directory",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/sellers?page=1&limit=10",
+              "host": ["{{base_url}}"],
+              "path": ["api", "sellers"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "10" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Seller Details by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/sellers/{{seller_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "sellers", "{{seller_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Products Catalog & Media",
+      "item": [
+        {
+          "name": "List All Products",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/products?page=1&limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "20" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "var items = jsonData.products && jsonData.products.data ? jsonData.products.data : [];",
+                  "if (items.length > 0) {",
+                  "    pm.collectionVariables.set('product_id', String(items[0].id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Product",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 2999.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 or 200', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.product && jsonData.product.id) {",
+                  "    pm.collectionVariables.set('product_id', String(jsonData.product.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Product Details by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Product by ID",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (Special Edition)\",\n  \"price\": 3199.00,\n  \"stock\": 65\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Upload Image (Base64)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"image\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/upload",
+              "host": ["{{base_url}}"],
+              "path": ["api", "upload"]
+            }
+          }
+        },
+        {
+          "name": "Delete Product by ID",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "products", "{{product_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Seller Banking & Payouts",
+      "item": [
+        {
+          "name": "Bank Account Onboarding",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_holder_name\": \"Apex Tech Solutions Pvt Ltd\",\n  \"account_number\": \"987654321012\",\n  \"ifsc_code\": \"HDFC0000123\",\n  \"bank_name\": \"HDFC Bank\",\n  \"branch_name\": \"MG Road Branch\",\n  \"upi_id\": \"apextech@hdfcbank\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/seller/bank-account/onboarding",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "bank-account", "onboarding"]
+            }
+          }
+        },
+        {
+          "name": "Get Bank Verification Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/bank-account/status",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "bank-account", "status"]
+            }
+          }
+        },
+        {
+          "name": "List Seller Payouts",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/seller/payouts",
+              "host": ["{{base_url}}"],
+              "path": ["api", "seller", "payouts"]
+            }
+          }
+        },
+        {
+          "name": "Calculate Commission Preview",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 10000,\n  \"category\": \"Electronics\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/marketplace/commission-preview",
+              "host": ["{{base_url}}"],
+              "path": ["api", "marketplace", "commission-preview"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Buyer Orders & Invoices",
+      "item": [
+        {
+          "name": "List Buyer Orders",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/orders?page=1&limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "limit", "value": "20" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "var orders = jsonData.orders && jsonData.orders.data ? jsonData.orders.data : (Array.isArray(jsonData.orders) ? jsonData.orders : []);",
+                  "if (orders.length > 0) {",
+                  "    pm.collectionVariables.set('order_id', String(orders[0].id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Place New Order (NO Buyer Email Required)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Rahul Sharma\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"landmark\": \"Near Metro Station Gate 2\",\n  \"city\": \"Bengaluru - 560001\",\n  \"payment_method\": \"cod\",\n  \"notes\": \"Please ring doorbell twice.\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999.00,\n      \"quantity\": 2\n    },\n    {\n      \"product_id\": 2,\n      \"product_name\": \"Ultra HD 4K Smart Watch\",\n      \"price\": 4499.00,\n      \"quantity\": 1\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders"]
+            },
+            "description": "Places a new buyer order. Note: buyer_email is completely removed per client specifications."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 Created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('No buyer email is returned', function () {",
+                  "    pm.expect(jsonData.order.buyer_email).to.be.oneOf([undefined, null, '']);",
+                  "});",
+                  "if (jsonData.order && jsonData.order.id) {",
+                  "    pm.collectionVariables.set('order_id', String(jsonData.order.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Order Details by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Order (Status / Items / Quantities)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Rahul Sharma (Updated)\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"order_status\": \"confirmed\",\n  \"payment_status\": \"paid\",\n  \"notes\": \"Address confirmed by customer.\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999.00,\n      \"quantity\": 3\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Generate Provider Tax Invoice (HTML / PDF)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}/invoice",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}", "invoice"]
+            },
+            "description": "Generates downloadable & printable provider tax invoice dynamically formatted for the main host https://knowlipop.shop."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Invoice uses main host domain', function () {",
+                  "    pm.expect(pm.response.text()).to.include('knowlipop.shop');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Direct Download Invoice Route (/invoice/:id)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/invoice/{{order_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["invoice", "{{order_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Delete / Cancel Order",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

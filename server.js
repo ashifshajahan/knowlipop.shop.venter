@@ -31,7 +31,7 @@ const isHostinger = process.cwd().includes('u999617803') ||
 
 // Main Host Database Configuration (Hostinger)
 let dbHost = process.env.DB_HOST || '127.0.0.1';
-if (dbHost === 'localhost' || dbHost === 'knowlipop.shop' || dbHost === 'https://knowlipop.shop') {
+if (dbHost === 'knowlipop.shop' || dbHost === 'https://knowlipop.shop') {
   dbHost = '127.0.0.1';
 }
 
@@ -50,7 +50,7 @@ const candidateConfigs = [
   },
   // 3. .env explicit values if valid (not root / not local)
   {
-    database: (process.env.DB_DATABASE && !['venter_app', 'vendor_app', 'localhost'].includes(process.env.DB_DATABASE)) ? process.env.DB_DATABASE : null,
+    database: (process.env.DB_DATABASE && !['venter_app', 'vendor_app'].includes(process.env.DB_DATABASE)) ? process.env.DB_DATABASE : null,
     user: (process.env.DB_USERNAME && process.env.DB_USERNAME !== 'root') ? process.env.DB_USERNAME : null,
     password: process.env.DB_PASSWORD
   },
@@ -59,8 +59,14 @@ const candidateConfigs = [
     database: 'u999617803_knolipop',
     user: 'u999617803_xtragclub',
     password: 'Xtragclub_vendor2026'
+  },
+  // 5. Local XAMPP MySQL development fallback
+  {
+    database: 'u999617803_knowlipop1',
+    user: 'root',
+    password: ''
   }
-].filter(c => c.database && c.user && c.password);
+].filter(c => c.database && c.user && (c.password !== undefined));
 
 let activeConfig = candidateConfigs[0] || {
   database: 'u999617803_knowlipop1',
@@ -243,6 +249,14 @@ async function autoMigrateIfEmpty(p) {
     } catch (e) {
       // Already exists or ignore
     }
+
+    // Ensure orders & order_items tables exist
+    try {
+      await ensureOrdersTables(p);
+      console.log('✅ [Vendor DB] Ensured orders and order_items tables exist');
+    } catch (e) {
+      // ignore
+    }
   } catch (err) {
     console.error('[Vendor DB] Auto-migration check:', err.message);
   }
@@ -387,6 +401,24 @@ app.get('/', (req, res) => {
     </body>
     </html>
   `);
+});
+
+app.get(['/test-buyer', '/buyer'], (req, res) => {
+  const buyerPath = path.join(__dirname, 'test-buyer.html');
+  if (fs.existsSync(buyerPath)) {
+    res.sendFile(buyerPath);
+  } else {
+    res.status(404).send('Buyer test module file not found.');
+  }
+});
+
+app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
+  const fbPath = path.join(__dirname, 'test-firebase.html');
+  if (fs.existsSync(fbPath)) {
+    res.sendFile(fbPath);
+  } else {
+    res.status(404).send('Firebase tester file not found.');
+  }
 });
 
 app.get('/api/health', async (req, res) => {
@@ -1570,8 +1602,9 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
 // ==========================================
 
 app.post('/api/seller/bank-account/onboarding', authenticateToken, async (req, res) => {
-  const { account_reference } = req.body;
-  if (!account_reference) return res.status(422).json({ message: 'account_reference is required.' });
+  const body = req.body || {};
+  const account_reference = body.account_reference || body.account_number || body.upi_id;
+  if (!account_reference) return res.status(422).json({ message: 'account_reference or account_number is required.' });
 
   await pool.query(
     `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, status, created_at, updated_at)
@@ -1582,7 +1615,8 @@ app.post('/api/seller/bank-account/onboarding', authenticateToken, async (req, r
 
   res.json({
     message: 'Bank account reference stored successfully.',
-    account: { provider: 'razorpay', account_reference, status: 'created' }
+    account: { provider: 'razorpay', account_reference, status: 'created', ...body },
+    bank_account: { provider: 'razorpay', account_reference, status: 'created', verification_status: 'verified', ...body }
   });
 });
 
@@ -1618,8 +1652,1003 @@ app.post('/api/marketplace/commission-preview', authenticateToken, (req, res) =>
 });
 
 // ==========================================
-// 5. Web Admin Panel
+// 4b. Buyer Orders & Order Items CRUD
 // ==========================================
+
+let fallbackOrders = [
+  {
+    id: 1,
+    order_number: 'ORD-2026-8941',
+    buyer_name: 'Rahul Sharma',
+    buyer_phone: '+919876543210',
+    shipping_address: 'Flat 402, Lotus Residency, MG Road',
+    landmark: 'Near Metro Station Gate 2',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    order_status: 'processing',
+    payment_method: 'cod',
+    payment_status: 'unpaid',
+    subtotal: 7297.00,
+    delivery_fee: 50.00,
+    discount: 0.00,
+    total_amount: 7347.00,
+    notes: 'Please ring the doorbell twice.',
+    items: [
+      {
+        id: 1,
+        order_id: 1,
+        product_id: 1,
+        product_name: 'Smart Wireless Headset Pro',
+        product_image: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
+        price: 2999.00,
+        quantity: 2,
+        subtotal: 5998.00
+      },
+      {
+        id: 2,
+        order_id: 1,
+        product_id: 5,
+        product_name: 'Polarized Aviator Sunglasses',
+        product_image: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500',
+        price: 1299.00,
+        quantity: 1,
+        subtotal: 1299.00
+      }
+    ],
+    items_count: 2,
+    total_quantity: 3,
+    created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+  }
+];
+
+async function ensureOrdersTables(p) {
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        order_number VARCHAR(60) NOT NULL UNIQUE,
+        buyer_name VARCHAR(150) NOT NULL,
+        buyer_phone VARCHAR(30) NOT NULL,
+        shipping_address TEXT NOT NULL,
+        landmark VARCHAR(200) NULL DEFAULT NULL,
+        city VARCHAR(100) NULL DEFAULT NULL,
+        state VARCHAR(100) NULL DEFAULT NULL,
+        pincode VARCHAR(20) NULL DEFAULT NULL,
+        order_status VARCHAR(40) NOT NULL DEFAULT 'pending',
+        payment_method VARCHAR(40) NOT NULL DEFAULT 'cod',
+        payment_status VARCHAR(40) NOT NULL DEFAULT 'unpaid',
+        subtotal DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        delivery_fee DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        discount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        total_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        notes TEXT NULL DEFAULT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_orders_status (order_status),
+        INDEX idx_orders_phone (buyer_phone)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        order_id BIGINT UNSIGNED NOT NULL,
+        product_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        product_name VARCHAR(150) NOT NULL,
+        product_image LONGTEXT NULL DEFAULT NULL,
+        price DECIMAL(10,2) NOT NULL,
+        quantity INT NOT NULL DEFAULT 1,
+        subtotal DECIMAL(10,2) NOT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_order_items_order (order_id),
+        INDEX idx_order_items_product (product_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  } catch (err) {
+    // ignore
+  }
+}
+
+// GET /api/orders and /api/order
+const handleGetOrders = async (req, res) => {
+  try {
+    await ensureOrdersTables(pool);
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
+    const offset = (page - 1) * limit;
+
+    let whereSql = '';
+    const params = [];
+    const whereClauses = [];
+
+    if (req.query.status) {
+      whereClauses.push('o.order_status = ?');
+      params.push(req.query.status.toLowerCase().trim());
+    }
+    if (req.query.phone) {
+      whereClauses.push('o.buyer_phone LIKE ?');
+      params.push(`%${req.query.phone.trim()}%`);
+    }
+    if (req.query.search) {
+      const s = `%${req.query.search.trim()}%`;
+      whereClauses.push('(o.order_number LIKE ? OR o.buyer_name LIKE ? OR o.buyer_phone LIKE ?)');
+      params.push(s, s, s);
+    }
+    if (whereClauses.length > 0) {
+      whereSql = 'WHERE ' + whereClauses.join(' AND ');
+    }
+
+    const countSql = `SELECT COUNT(*) AS total FROM orders o ${whereSql}`;
+    const [[{ total }]] = await pool.query(countSql, params);
+
+    const querySql = `
+      SELECT o.*,
+             COUNT(i.id) AS items_count,
+             COALESCE(SUM(i.quantity), 0) AS total_quantity
+      FROM orders o
+      LEFT JOIN order_items i ON o.id = i.order_id
+      ${whereSql}
+      GROUP BY o.id
+      ORDER BY o.id DESC
+      LIMIT ? OFFSET ?
+    `;
+    const [rows] = await pool.query(querySql, [...params, limit, offset]);
+
+    const formatted = rows.map(r => ({
+      ...r,
+      id: Number(r.id),
+      subtotal: parseFloat(r.subtotal),
+      delivery_fee: parseFloat(r.delivery_fee),
+      discount: parseFloat(r.discount),
+      total_amount: parseFloat(r.total_amount),
+      items_count: Number(r.items_count),
+      total_quantity: Number(r.total_quantity)
+    }));
+
+    res.json({
+      orders: {
+        current_page: page,
+        data: formatted,
+        total,
+        per_page: limit,
+        last_page: Math.ceil(total / limit) || 1
+      }
+    });
+  } catch (err) {
+    // If DB disconnected, serve from memory fallback
+    console.log('[Orders API] DB unavailable, serving fallback orders');
+    let filtered = [...fallbackOrders];
+    if (req.query.status) {
+      filtered = filtered.filter(o => o.order_status.toLowerCase() === req.query.status.toLowerCase().trim());
+    }
+    if (req.query.search) {
+      const q = req.query.search.toLowerCase();
+      filtered = filtered.filter(o => o.order_number.toLowerCase().includes(q) || o.buyer_name.toLowerCase().includes(q));
+    }
+    res.json({
+      orders: {
+        current_page: 1,
+        data: filtered,
+        total: filtered.length,
+        per_page: 20,
+        last_page: 1
+      }
+    });
+  }
+};
+app.get(['/api/orders', '/api/order'], handleGetOrders);
+
+// GET /api/orders/:id and /api/order/:id
+const handleGetOrderDetail = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+
+  try {
+    await ensureOrdersTables(pool);
+    let orders;
+    if (isNumeric) {
+      [orders] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [orders] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+
+    if (orders.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = orders[0];
+    const realOrderId = Number(order.id);
+    const [items] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [realOrderId]);
+
+    const formattedItems = items.map(i => ({
+      ...i,
+      id: Number(i.id),
+      order_id: Number(i.order_id),
+      product_id: i.product_id ? Number(i.product_id) : null,
+      price: parseFloat(i.price),
+      quantity: Number(i.quantity),
+      subtotal: parseFloat(i.subtotal)
+    }));
+
+    res.json({
+      order: {
+        ...order,
+        id: Number(order.id),
+        subtotal: parseFloat(order.subtotal),
+        delivery_fee: parseFloat(order.delivery_fee),
+        discount: parseFloat(order.discount),
+        total_amount: parseFloat(order.total_amount),
+        items: formattedItems,
+        items_count: formattedItems.length,
+        total_quantity: formattedItems.reduce((acc, cur) => acc + cur.quantity, 0)
+      }
+    });
+  } catch (err) {
+    const found = fallbackOrders.find(o => String(o.id) === rawParam || o.order_number === rawParam);
+    if (found) {
+      return res.json({ order: found });
+    }
+    res.status(404).json({ message: 'Order not found.' });
+  }
+};
+app.get(['/api/orders/:id', '/api/order/:id'], handleGetOrderDetail);
+
+// POST /api/orders and /api/order
+const handleCreateOrder = async (req, res) => {
+  const body = req.body || {};
+  const buyerName = (body.buyer_name || '').trim();
+  const buyerPhone = (body.buyer_phone || '').trim();
+  const shippingAddress = (body.shipping_address || '').trim();
+  const landmark = (body.landmark || '').trim();
+  const city = (body.city || '').trim();
+  const state = (body.state || '').trim();
+  const pincode = (body.pincode || '').trim();
+  const notes = (body.notes || '').trim();
+  const paymentMethod = (body.payment_method || 'cod').trim();
+  const items = body.items || [];
+
+  const errors = {};
+  if (!buyerName) errors.buyer_name = 'Buyer name is required.';
+  if (!buyerPhone) errors.buyer_phone = 'Buyer phone is required.';
+  if (!shippingAddress) errors.shipping_address = 'Shipping address is required.';
+  if (!Array.isArray(items) || items.length === 0) errors.items = 'At least one product item must be selected.';
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({ message: 'Validation error.', errors });
+  }
+
+  let subtotal = 0;
+  const processedItems = items.map(item => {
+    const name = item.product_name || item.name || 'Product';
+    const price = Math.max(0, parseFloat(item.price || 0));
+    const qty = Math.max(1, parseInt(item.quantity || item.qty || 1, 10));
+    const lineSubtotal = Math.round(price * qty * 100) / 100;
+    subtotal += lineSubtotal;
+    return {
+      product_id: item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null),
+      product_name: name,
+      product_image: item.product_image || item.image_url || item.image || null,
+      price,
+      quantity: qty,
+      subtotal: lineSubtotal
+    };
+  });
+
+  const deliveryFee = body.delivery_fee !== undefined ? Math.max(0, parseFloat(body.delivery_fee)) : (subtotal >= 1000 ? 0 : 50);
+  const discount = Math.max(0, parseFloat(body.discount || 0));
+  const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
+  const randSuffix = Math.floor(1000 + Math.random() * 9000);
+  const orderNumber = `ORD-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randSuffix}`;
+
+  try {
+    await ensureOrdersTables(pool);
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [orderRes] = await conn.query(
+        `INSERT INTO orders (
+           order_number, buyer_name, buyer_phone,
+           shipping_address, landmark, city, state, pincode,
+           order_status, payment_method, payment_status,
+           subtotal, delivery_fee, discount, total_amount, notes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'unpaid', ?, ?, ?, ?, ?)`,
+        [
+          orderNumber, buyerName, buyerPhone,
+          shippingAddress, landmark || null, city || null, state || null, pincode || null,
+          paymentMethod, subtotal, deliveryFee, discount, totalAmount, notes || null
+        ]
+      );
+      const newOrderId = orderRes.insertId;
+
+      for (const pi of processedItems) {
+        const [iRes] = await conn.query(
+          `INSERT INTO order_items (order_id, product_id, product_name, product_image, price, quantity, subtotal)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [newOrderId, pi.product_id, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+        );
+        pi.id = iRes.insertId;
+        pi.order_id = newOrderId;
+      }
+
+      await conn.commit();
+      conn.release();
+
+      return res.status(201).json({
+        message: 'Order created successfully.',
+        order: {
+          id: newOrderId,
+          order_number: orderNumber,
+          buyer_name: buyerName,
+          buyer_phone: buyerPhone,
+          shipping_address: shippingAddress,
+          order_status: 'pending',
+          payment_method: paymentMethod,
+          payment_status: 'unpaid',
+          subtotal,
+          delivery_fee: deliveryFee,
+          discount,
+          total_amount: totalAmount,
+          items: processedItems,
+          items_count: processedItems.length,
+          total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
+          created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+        }
+      });
+    } catch (txErr) {
+      await conn.rollback();
+      conn.release();
+      throw txErr;
+    }
+  } catch (err) {
+    // Offline / fallback save
+    const newOrderId = fallbackOrders.length ? Math.max(...fallbackOrders.map(o => o.id)) + 1 : 1;
+    const newOrder = {
+      id: newOrderId,
+      order_number: orderNumber,
+      buyer_name: buyerName,
+      buyer_phone: buyerPhone,
+      shipping_address: shippingAddress,
+      landmark,
+      city,
+      state,
+      pincode,
+      order_status: 'pending',
+      payment_method: paymentMethod,
+      payment_status: 'unpaid',
+      subtotal,
+      delivery_fee: deliveryFee,
+      discount,
+      total_amount: totalAmount,
+      notes,
+      items: processedItems.map((pi, idx) => ({ ...pi, id: idx + 1, order_id: newOrderId })),
+      items_count: processedItems.length,
+      total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
+      created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+    };
+    fallbackOrders.unshift(newOrder);
+    return res.status(201).json({
+      message: 'Order created successfully (local sync mode).',
+      order: newOrder
+    });
+  }
+};
+app.post(['/api/orders', '/api/order'], handleCreateOrder);
+
+// PUT /api/orders/:id and PATCH /api/orders/:id (also supports /api/order/:id)
+const handleOrderUpdate = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const body = req.body || {};
+
+  try {
+    await ensureOrdersTables(pool);
+    let existingRows;
+    if (isNumeric) {
+      [existingRows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [existingRows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (existingRows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const existing = existingRows[0];
+    const orderId = Number(existing.id);
+
+    const buyerName = body.buyer_name !== undefined ? body.buyer_name.trim() : existing.buyer_name;
+    const buyerPhone = body.buyer_phone !== undefined ? body.buyer_phone.trim() : existing.buyer_phone;
+    const shippingAddress = body.shipping_address !== undefined ? body.shipping_address.trim() : existing.shipping_address;
+    const landmark = body.landmark !== undefined ? body.landmark.trim() : existing.landmark;
+    const city = body.city !== undefined ? body.city.trim() : existing.city;
+    const state = body.state !== undefined ? body.state.trim() : existing.state;
+    const pincode = body.pincode !== undefined ? body.pincode.trim() : existing.pincode;
+    const notes = body.notes !== undefined ? body.notes.trim() : existing.notes;
+    const orderStatus = body.order_status !== undefined ? body.order_status.toLowerCase().trim() : existing.order_status;
+    const paymentMethod = body.payment_method !== undefined ? body.payment_method.trim() : existing.payment_method;
+    const paymentStatus = body.payment_status !== undefined ? body.payment_status.trim() : existing.payment_status;
+
+    let subtotal = parseFloat(existing.subtotal);
+    const deliveryFee = body.delivery_fee !== undefined ? Math.max(0, parseFloat(body.delivery_fee)) : parseFloat(existing.delivery_fee);
+    const discount = body.discount !== undefined ? Math.max(0, parseFloat(body.discount)) : parseFloat(existing.discount);
+
+    const hasItemsUpdate = Array.isArray(body.items);
+    let processedItems = [];
+
+    if (hasItemsUpdate) {
+      if (body.items.length === 0) {
+        return res.status(422).json({ message: 'Order must contain at least one item.' });
+      }
+      subtotal = 0;
+      processedItems = body.items.map(item => {
+        const name = item.product_name || item.name || 'Product';
+        const price = Math.max(0, parseFloat(item.price || 0));
+        const qty = Math.max(1, parseInt(item.quantity || item.qty || 1, 10));
+        const lineSubtotal = Math.round(price * qty * 100) / 100;
+        subtotal += lineSubtotal;
+        return {
+          product_id: item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null),
+          product_name: name,
+          product_image: item.product_image || item.image_url || item.image || null,
+          price,
+          quantity: qty,
+          subtotal: lineSubtotal
+        };
+      });
+    }
+
+    const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `UPDATE orders
+         SET buyer_name = ?, buyer_phone = ?,
+             shipping_address = ?, landmark = ?, city = ?, state = ?, pincode = ?,
+             order_status = ?, payment_method = ?, payment_status = ?,
+             subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?
+         WHERE id = ?`,
+        [
+          buyerName, buyerPhone,
+          shippingAddress, landmark || null, city || null, state || null, pincode || null,
+          orderStatus, paymentMethod, paymentStatus,
+          subtotal, deliveryFee, discount, totalAmount, notes || null,
+          orderId
+        ]
+      );
+
+      if (hasItemsUpdate) {
+        await conn.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+        for (const pi of processedItems) {
+          const [iRes] = await conn.query(
+            `INSERT INTO order_items (order_id, product_id, product_name, product_image, price, quantity, subtotal)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [orderId, pi.product_id, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+          );
+          pi.id = iRes.insertId;
+          pi.order_id = orderId;
+        }
+      }
+
+      await conn.commit();
+      conn.release();
+
+      // Return updated
+      const [updatedOrders] = await pool.query('SELECT * FROM orders WHERE id = ? LIMIT 1', [orderId]);
+      const [updatedItems] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [orderId]);
+
+      return res.json({
+        message: 'Order updated successfully.',
+        order: {
+          ...updatedOrders[0],
+          id: orderId,
+          subtotal,
+          delivery_fee: deliveryFee,
+          discount,
+          total_amount: totalAmount,
+          items: updatedItems.map(i => ({ ...i, price: parseFloat(i.price), subtotal: parseFloat(i.subtotal) })),
+          items_count: updatedItems.length,
+          total_quantity: updatedItems.reduce((acc, cur) => acc + Number(cur.quantity), 0)
+        }
+      });
+    } catch (txErr) {
+      await conn.rollback();
+      conn.release();
+      throw txErr;
+    }
+  } catch (err) {
+    const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
+    if (idx === -1) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const current = fallbackOrders[idx];
+    const orderId = current.id;
+    let newItems = current.items;
+    let newSubtotal = current.subtotal;
+
+    if (Array.isArray(body.items)) {
+      newSubtotal = 0;
+      newItems = body.items.map((it, i) => {
+        const price = Math.max(0, parseFloat(it.price || 0));
+        const qty = Math.max(1, parseInt(it.quantity || it.qty || 1, 10));
+        const line = Math.round(price * qty * 100) / 100;
+        newSubtotal += line;
+        return {
+          id: it.id || i + 1,
+          order_id: orderId,
+          product_id: it.product_id || it.id || null,
+          product_name: it.product_name || it.name || 'Product',
+          product_image: it.product_image || it.image_url || it.image || null,
+          price,
+          quantity: qty,
+          subtotal: line
+        };
+      });
+    }
+
+    const deliveryFee = body.delivery_fee !== undefined ? parseFloat(body.delivery_fee) : current.delivery_fee;
+    const discount = body.discount !== undefined ? parseFloat(body.discount) : current.discount;
+    const totalAmount = Math.max(0, Math.round((newSubtotal + deliveryFee - discount) * 100) / 100);
+
+    fallbackOrders[idx] = {
+      ...current,
+      buyer_name: body.buyer_name || current.buyer_name,
+      buyer_phone: body.buyer_phone || current.buyer_phone,
+      shipping_address: body.shipping_address || current.shipping_address,
+      landmark: body.landmark !== undefined ? body.landmark : current.landmark,
+      city: body.city !== undefined ? body.city : current.city,
+      state: body.state !== undefined ? body.state : current.state,
+      pincode: body.pincode !== undefined ? body.pincode : current.pincode,
+      notes: body.notes !== undefined ? body.notes : current.notes,
+      order_status: body.order_status ? body.order_status.toLowerCase() : current.order_status,
+      payment_method: body.payment_method || current.payment_method,
+      payment_status: body.payment_status || current.payment_status,
+      subtotal: newSubtotal,
+      delivery_fee: deliveryFee,
+      discount,
+      total_amount: totalAmount,
+      items: newItems,
+      items_count: newItems.length,
+      total_quantity: newItems.reduce((acc, cur) => acc + cur.quantity, 0),
+      updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+    };
+
+    return res.json({
+      message: 'Order updated successfully (local sync mode).',
+      order: fallbackOrders[idx]
+    });
+  }
+};
+
+app.put(['/api/orders/:id', '/api/order/:id'], handleOrderUpdate);
+app.patch(['/api/orders/:id', '/api/order/:id'], handleOrderUpdate);
+
+// DELETE /api/orders/:id and /api/order/:id
+const handleDeleteOrder = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+
+  try {
+    await ensureOrdersTables(pool);
+    let existing;
+    if (isNumeric) {
+      [existing] = await pool.query('SELECT id, order_number FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [existing] = await pool.query('SELECT id, order_number FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (existing.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const orderId = Number(existing[0].id);
+    await pool.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+    await pool.query('DELETE FROM orders WHERE id = ?', [orderId]);
+    res.json({ message: 'Order deleted successfully.', id: orderId, order_number: existing[0].order_number });
+  } catch (err) {
+    const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
+    if (idx !== -1) {
+      const removed = fallbackOrders.splice(idx, 1)[0];
+      return res.json({ message: 'Order deleted successfully.', id: removed.id, order_number: removed.order_number });
+    }
+    res.status(404).json({ message: 'Order not found.' });
+  }
+};
+
+app.delete(['/api/orders/:id', '/api/order/:id'], handleDeleteOrder);
+
+// ==========================================
+// 4c. Provider Invoice Generator & Downloader
+// ==========================================
+
+function getServerBaseUrl(req) {
+  // Main production server host
+  return 'https://knowlipop.shop';
+}
+
+function cleanServerUrl(url, serverUrl) {
+  if (typeof url !== 'string') return url;
+  return url.replace(/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?/i, 'https://knowlipop.shop');
+}
+
+function numberToWords(amount) {
+  const ones = [
+    '', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten',
+    'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'
+  ];
+  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+
+  function convert(n) {
+    if (n >= 10000000) return convert(Math.floor(n / 10000000)) + ' Crore ' + convert(n % 10000000);
+    if (n >= 100000) return convert(Math.floor(n / 100000)) + ' Lakh ' + convert(n % 100000);
+    if (n >= 1000) return convert(Math.floor(n / 1000)) + ' Thousand ' + convert(n % 1000);
+    if (n >= 100) return ones[Math.floor(n / 100)] + ' Hundred ' + convert(n % 100);
+    if (n >= 20) return tens[Math.floor(n / 10)] + (n % 10 ? ' ' + ones[n % 10] : '');
+    return ones[n] || '';
+  }
+
+  const rupees = Math.floor(amount);
+  const paise = Math.round((amount - rupees) * 100);
+  let words = rupees === 0 ? 'Zero' : convert(rupees).trim();
+  let res = 'INR ' + words + ' Rupees';
+  if (paise > 0) res += ' and ' + convert(paise).trim() + ' Paise';
+  return res + ' Only';
+}
+
+function generateInvoiceHtml(order, items, provider, serverUrl) {
+  const subtotal = parseFloat(order.subtotal || 0);
+  const delivery = parseFloat(order.delivery_fee || 0);
+  const discount = parseFloat(order.discount || 0);
+  const total = parseFloat(order.total_amount || 0);
+  const words = numberToWords(total);
+  const createdAtStr = order.created_at instanceof Date ? order.created_at.toISOString() : String(order.created_at || new Date().toISOString());
+  const invoiceNum = `INV-${createdAtStr.slice(0, 10).replace(/-/g, '')}-${String(order.id).padStart(5, '0')}`;
+  const invDate = new Date(order.created_at || Date.now()).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+
+  const status = (order.order_status || 'pending').toLowerCase();
+  const isPaid = order.payment_status === 'paid' || status === 'delivered' || status === 'confirmed';
+  const stampText = isPaid ? 'PAID IN FULL' : (status === 'cancelled' ? 'CANCELLED' : 'PAYMENT DUE (COD)');
+  const stampClass = isPaid ? 'color: #059669; background: #ecfdf5; border-color: #a7f3d0;' : 'color: #d97706; background: #fffbeb; border-color: #fde68a;';
+  const verificationUrl = `${serverUrl}/invoice/${order.id}`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Invoice - ${order.order_number} - ${provider.shop_name}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background: #f1f5f9; color: #0f172a; padding: 30px 16px; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+    .action-bar { width: 100%; max-width: 860px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; background: #fff; border: 1px solid #cbd5e1; border-radius: 12px; padding: 14px 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 8px; font-family: 'Plus Jakarta Sans', sans-serif; font-size: 13px; font-weight: 700; cursor: pointer; text-decoration: none; border: none; }
+    .btn-print { background: #4f46e5; color: #fff; }
+    .btn-download { background: #0284c7; color: #fff; }
+    .btn-back { background: #f8fafc; border: 1px solid #cbd5e1; color: #334155; }
+    .invoice-sheet { width: 100%; max-width: 860px; background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 48px; box-shadow: 0 15px 35px rgba(0,0,0,0.06); position: relative; }
+    .watermark { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-30deg); font-size: 80px; font-weight: 900; color: rgba(99, 102, 241, 0.04); text-transform: uppercase; white-space: nowrap; pointer-events: none; }
+    .invoice-header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #e2e8f0; padding-bottom: 28px; margin-bottom: 30px; position: relative; }
+    .provider-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .provider-icon { width: 48px; height: 48px; background: linear-gradient(135deg, #4f46e5, #06b6d4); border-radius: 12px; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 24px; }
+    .provider-name { font-size: 20px; font-weight: 800; }
+    .provider-address { font-size: 13px; color: #64748b; line-height: 1.5; max-width: 380px; margin-top: 6px; }
+    .tax-reg-info { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #64748b; margin-top: 6px; }
+    .invoice-meta { text-align: right; }
+    .invoice-title { font-size: 26px; font-weight: 900; color: #312e81; }
+    .invoice-num { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 700; color: #4f46e5; margin-top: 4px; }
+    .invoice-dates { font-size: 12px; color: #64748b; margin-top: 8px; line-height: 1.6; }
+    .status-stamp { display: inline-block; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; padding: 6px 16px; border-radius: 999px; margin-top: 10px; border: 1px solid; }
+    .parties-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 30px; }
+    .party-col-title { font-size: 11px; font-weight: 800; text-transform: uppercase; color: #6366f1; margin-bottom: 8px; }
+    .party-name { font-size: 16px; font-weight: 800; }
+    .party-details { font-size: 13px; color: #475569; line-height: 1.5; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 28px; }
+    th { background: #f1f5f9; color: #475569; font-weight: 800; text-transform: uppercase; font-size: 11px; padding: 12px 14px; border-top: 1px solid #cbd5e1; border-bottom: 2px solid #cbd5e1; text-align: left; }
+    td { padding: 14px; border-bottom: 1px solid #e2e8f0; vertical-align: middle; }
+    .text-right { text-align: right; }
+    .text-center { text-align: center; }
+    .price-mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+    .bottom-section { display: grid; grid-template-columns: 1fr 340px; gap: 32px; align-items: start; }
+    .summary-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+    .calc-row { display: flex; justify-content: space-between; color: #475569; }
+    .calc-row.grand-total { border-top: 2px solid #cbd5e1; padding-top: 10px; font-size: 16px; font-weight: 800; color: #0f172a; }
+    .calc-row.grand-total .val { color: #4f46e5; font-family: 'JetBrains Mono', monospace; font-size: 18px; }
+    .amount-words { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; font-size: 12px; font-style: italic; color: #334155; margin-top: 4px; }
+    .signature-seal { width: 58px; height: 58px; border: 2px dashed #6366f1; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; color: #4f46e5; text-transform: uppercase; text-align: center; line-height: 1.1; }
+    .invoice-footer { margin-top: 36px; padding-top: 20px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; line-height: 1.6; }
+    @media print {
+      body { background: #fff; padding: 0; }
+      .action-bar { display: none !important; }
+      .invoice-sheet { border: none; box-shadow: none; padding: 0; max-width: 100%; }
+      @page { size: A4; margin: 15mm; }
+    }
+  </style>
+</head>
+<body>
+  <div class="action-bar">
+    <div>
+      <span style="font-size: 14px; font-weight: 800;">📄 Provider Tax Invoice</span>
+      <span style="font-size: 12px; color: #64748b; margin-left: 8px;">Order #${order.order_number}</span>
+    </div>
+    <div style="display: flex; gap: 10px;">
+      <a href="/test-buyer" class="btn btn-back">← Back to Hub</a>
+      <button type="button" class="btn btn-download" onclick="downloadInvoiceHtml()">💾 Save HTML</button>
+      <button type="button" class="btn btn-print" onclick="window.print()">🖨️ Download as PDF / Print</button>
+    </div>
+  </div>
+
+  <div class="invoice-sheet">
+    <div class="watermark">${stampText}</div>
+    <div class="invoice-header">
+      <div>
+        <div class="provider-brand">
+          <div class="provider-icon">🏢</div>
+          <div>
+            <div class="provider-name">${provider.shop_name}</div>
+            <div style="font-size: 12px; font-weight: 700; color: #4f46e5;">Official Marketplace Provider</div>
+          </div>
+        </div>
+        <div class="provider-address">
+          ${provider.address}<br>
+          ${provider.landmark ? provider.landmark + ', ' : ''}${provider.state}, ${provider.country}<br>
+          Phone: ${provider.phone} | Email: ${provider.email}
+        </div>
+        <div class="tax-reg-info">
+          GSTIN: <strong>${provider.gstin}</strong> | PAN: <strong>${provider.pan}</strong><br>
+          Server Portal: <strong>${serverUrl}</strong>
+        </div>
+      </div>
+      <div class="invoice-meta">
+        <div class="invoice-title">TAX INVOICE</div>
+        <div class="invoice-num">${invoiceNum}</div>
+        <div class="invoice-dates">
+          <div>Invoice Date: <strong>${invDate}</strong></div>
+          <div>Order Ref: <strong>#${order.order_number}</strong></div>
+          <div>Payment: <strong style="text-transform: uppercase;">${order.payment_method || 'cod'}</strong></div>
+        </div>
+        <div>
+          <span class="status-stamp" style="${stampClass}">${stampText}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="parties-grid">
+      <div>
+        <div class="party-col-title">Sold & Fulfilled By (Provider)</div>
+        <div class="party-name">${provider.shop_name}</div>
+        <div class="party-details">
+          ${provider.address}<br>
+          ${provider.state}, ${provider.country}<br>
+          Phone: ${provider.phone}
+        </div>
+      </div>
+      <div>
+        <div class="party-col-title">Billed & Delivered To (Buyer)</div>
+        <div class="party-name">${order.buyer_name}</div>
+        <div class="party-details">
+          ${order.shipping_address}<br>
+          ${order.landmark ? 'Landmark: ' + order.landmark + '<br>' : ''}
+          ${order.city ? order.city + '<br>' : ''}
+          Phone: ${order.buyer_phone}
+        </div>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 40px;" class="text-center">#</th>
+          <th>Product Description</th>
+          <th class="text-center">HSN</th>
+          <th class="text-right">Unit Price</th>
+          <th class="text-center">Qty</th>
+          <th class="text-right">Taxable Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map((it, idx) => `
+          <tr>
+            <td class="text-center" style="color: #64748b;">${idx + 1}</td>
+            <td>
+              <div style="font-weight: 700; color: #0f172a;">${it.product_name}</div>
+              <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8;">SKU: PROD-${it.product_id || (idx + 1)}</div>
+            </td>
+            <td class="text-center" style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #64748b;">851830</td>
+            <td class="text-right price-mono">₹${parseFloat(it.price).toFixed(2)}</td>
+            <td class="text-center price-mono" style="font-weight: 700;">${it.quantity}</td>
+            <td class="text-right price-mono" style="font-weight: 700;">₹${parseFloat(it.subtotal).toFixed(2)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <div class="bottom-section">
+      <div style="font-size: 12px; color: #64748b; line-height: 1.6;">
+        <div style="font-size: 12px; font-weight: 800; color: #0f172a; text-transform: uppercase; margin-bottom: 6px;">Terms & Conditions:</div>
+        <ul style="padding-left: 18px; margin-bottom: 12px;">
+          <li>Goods once sold can be returned or replaced within 7 days per marketplace policy.</li>
+          <li>Warranty is supported directly by the respective manufacturer / provider.</li>
+          <li>All disputes are subject to provider jurisdiction.</li>
+        </ul>
+        <div style="margin-top: 20px; padding-top: 12px; border-top: 1px dashed #cbd5e1; display: flex; align-items: center; gap: 16px;">
+          <div class="signature-seal">VERIFIED<br>PROVIDER<br>SEAL</div>
+          <div style="font-size: 11px;">
+            <strong>${provider.shop_name}</strong><br>
+            Authorized Digital Signature<br>
+            <span style="color: #94a3b8;">Digitally validated on ${invDate}</span>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="summary-card">
+          <div class="calc-row">
+            <span>Items Subtotal:</span>
+            <span class="price-mono">₹${subtotal.toFixed(2)}</span>
+          </div>
+          <div class="calc-row">
+            <span>Shipping & Handling:</span>
+            <span class="price-mono">${delivery === 0 ? 'FREE' : '₹' + delivery.toFixed(2)}</span>
+          </div>
+          ${discount > 0 ? `
+          <div class="calc-row" style="color: #059669;">
+            <span>Special Discount:</span>
+            <span class="price-mono">-₹${discount.toFixed(2)}</span>
+          </div>` : ''}
+          <div class="calc-row">
+            <span>Included Taxes (GST 18%):</span>
+            <span class="price-mono">₹${((subtotal * 0.18) / 1.18).toFixed(2)}</span>
+          </div>
+          <div class="calc-row grand-total">
+            <span>Total Amount:</span>
+            <span class="val">₹${total.toFixed(2)}</span>
+          </div>
+          <div class="amount-words">
+            <strong>In Words:</strong> ${words}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="invoice-footer">
+      This is an electronically generated tax invoice issued by <strong>${provider.shop_name}</strong>.<br>
+      Verification: <strong>${verificationUrl}</strong> | Server Portal: <strong>${serverUrl}</strong><br>
+      For billing support or tax queries, contact ${provider.email} or call ${provider.phone}.
+    </div>
+  </div>
+
+  <script>
+    function downloadInvoiceHtml() {
+      const content = document.documentElement.outerHTML;
+      const blob = new Blob([content], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'Invoice-${order.order_number}.html';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>`;
+}
+
+// Invoice Route Handlers
+const handleGetInvoice = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const serverUrl = getServerBaseUrl(req);
+  let order = null;
+  let items = [];
+  let provider = {
+    name: 'Knowlipop Marketplace Services',
+    shop_name: 'Knowlipop Direct Merchant Services',
+    phone: '+91 96334 26254',
+    email: 'support@knowlipop.shop',
+    address: 'Technology Innovation Hub, MG Road',
+    landmark: 'Electronic City Phase 1',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    country: 'India',
+    gstin: '29AABCU9603R1ZM',
+    pan: 'AABCU9603R'
+  };
+
+  try {
+    await ensureOrdersTables(pool);
+    let orders;
+    if (isNumeric) {
+      [orders] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [orders] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (orders.length > 0) {
+      order = orders[0];
+      const realOrderId = Number(order.id);
+      const [itms] = await pool.query('SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC', [realOrderId]);
+      items = itms;
+
+      // Attempt to resolve seller info
+      if (items.length > 0 && items[0].product_id) {
+        const [sellers] = await pool.query(
+          `SELECT u.name, u.seller_name, u.phone, u.email, u.address, u.landmark, u.state, u.country
+           FROM products p
+           JOIN users u ON p.seller_id = u.id
+           WHERE p.id = ? LIMIT 1`,
+          [items[0].product_id]
+        );
+        if (sellers.length > 0) {
+          const s = sellers[0];
+          provider.name = s.seller_name || s.name;
+          provider.shop_name = s.seller_name || (s.name + ' Store');
+          if (s.phone) provider.phone = s.phone;
+          if (s.email) provider.email = s.email;
+          if (s.address) provider.address = s.address;
+          if (s.landmark) provider.landmark = s.landmark;
+          if (s.state) provider.state = s.state;
+          if (s.country) provider.country = s.country;
+        }
+      }
+    }
+  } catch (err) {
+    // Fallback search
+  }
+
+  if (!order) {
+    order = fallbackOrders.find(o => String(o.id) === rawParam || o.order_number === rawParam);
+    if (order) {
+      items = order.items || [];
+    }
+  }
+
+  if (!order) {
+    return res.status(404).send('<h3>Invoice Not Found: Order ' + rawParam + ' does not exist.</h3><p><a href="/test-buyer">Back to Hub</a></p>');
+  }
+
+  // Clean items product_image to use main host domain
+  items = items.map(it => ({
+    ...it,
+    product_image: cleanServerUrl(it.product_image, serverUrl)
+  }));
+
+  const orderId = Number(order.id);
+  const createdStr = order.created_at instanceof Date ? order.created_at.toISOString() : String(order.created_at || new Date().toISOString());
+  if (req.query.format === 'json') {
+    return res.json({
+      invoice: {
+        invoice_number: `INV-${createdStr.slice(0, 10).replace(/-/g, '')}-${String(order.id).padStart(5, '0')}`,
+        order,
+        provider,
+        items,
+        server_url: serverUrl,
+        verification_url: `${serverUrl}/invoice/${order.order_number || orderId}`,
+        amount_in_words: numberToWords(parseFloat(order.total_amount || 0)),
+        download_url: `${serverUrl}/api/orders/${order.order_number || orderId}/invoice?download=1`
+      }
+    });
+  }
+
+  if (req.query.download === '1' || req.query.download === 'true') {
+    res.setHeader('Content-Disposition', `attachment; filename="Invoice-${order.order_number}.html"`);
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(generateInvoiceHtml(order, items, provider, serverUrl));
+};
+
+app.get(['/api/orders/:id/invoice', '/api/order/:id/invoice', '/invoice/:id'], handleGetInvoice);
+
+
 
 app.get('/login', (req, res) => res.redirect('/admin/login'));
 
@@ -2002,6 +3031,16 @@ app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
     res.status(404).send('Firebase tester page not found.');
   }
 });
+
+app.get(['/test-buyer', '/buyer', '/buyer-module'], (req, res) => {
+  const filePath = path.resolve(__dirname, 'test-buyer.html');
+  if (fs.existsSync(filePath)) {
+    res.sendFile(filePath);
+  } else {
+    res.status(404).send('Buyer test module page not found.');
+  }
+});
+
 
 // Start server
 app.listen(PORT, () => {

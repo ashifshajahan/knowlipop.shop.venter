@@ -56,19 +56,29 @@ function getDatabaseConnection(): PDO
         PDO::ATTR_TIMEOUT => 10,
     ];
 
-    try {
-        $pdo = new PDO($dsn, $config['user'], $config['pass'], $options);
-        return $pdo;
-    } catch (PDOException $e) {
-        if (!headers_sent()) {
-            http_response_code(500);
-            header('Content-Type: application/json; charset=utf-8');
+    $candidates = [
+        ['user' => $config['user'], 'pass' => $config['pass']],
+        ['user' => 'root', 'pass' => ''],
+    ];
+
+    $lastError = null;
+    foreach ($candidates as $cand) {
+        try {
+            $pdo = new PDO($dsn, $cand['user'], $cand['pass'], $options);
+            return $pdo;
+        } catch (PDOException $e) {
+            $lastError = $e;
         }
-        echo json_encode([
-            'error' => 'Database connection failed',
-            'message' => $e->getMessage(),
-            'hint' => 'Please check your database credentials in config.php or .env'
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        exit;
     }
+
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+    }
+    echo json_encode([
+        'error' => 'Database connection failed',
+        'message' => $lastError ? $lastError->getMessage() : 'Could not connect to database',
+        'hint' => 'Please check your database credentials in config.php or .env'
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit;
 }

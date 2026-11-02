@@ -92,3 +92,62 @@ VALUES
 (6, 1, 'RGB Mechanical Gaming Keyboard', 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', 3999.00, 25, 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', 1)
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `price` = VALUES(`price`), `stock` = VALUES(`stock`), `image_url` = VALUES(`image_url`);
 
+-- ======================================================
+-- Buyer Orders & Order Items Tables
+-- ======================================================
+
+CREATE TABLE IF NOT EXISTS `orders` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `order_number` VARCHAR(60) NOT NULL UNIQUE,
+  `buyer_name` VARCHAR(150) NOT NULL,
+  `buyer_phone` VARCHAR(30) NOT NULL,
+  `shipping_address` TEXT NOT NULL,
+  `landmark` VARCHAR(200) NULL DEFAULT NULL,
+  `city` VARCHAR(100) NULL DEFAULT NULL,
+  `state` VARCHAR(100) NULL DEFAULT NULL,
+  `pincode` VARCHAR(20) NULL DEFAULT NULL,
+  `order_status` VARCHAR(40) NOT NULL DEFAULT 'pending',
+  `payment_method` VARCHAR(40) NOT NULL DEFAULT 'cod',
+  `payment_status` VARCHAR(40) NOT NULL DEFAULT 'unpaid',
+  `subtotal` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `delivery_fee` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `discount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `notes` TEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_orders_status` (`order_status`),
+  INDEX `idx_orders_phone` (`buyer_phone`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `order_items` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `order_id` BIGINT UNSIGNED NOT NULL,
+  `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `product_name` VARCHAR(150) NOT NULL,
+  `product_image` LONGTEXT NULL DEFAULT NULL,
+  `price` DECIMAL(10,2) NOT NULL,
+  `quantity` INT NOT NULL DEFAULT 1,
+  `subtotal` DECIMAL(10,2) NOT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_order_items_order` (`order_id`),
+  INDEX `idx_order_items_product` (`product_id`),
+  CONSTRAINT `fk_order_items_order` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Sample Starter Order for Buyer Module Testing
+INSERT INTO `orders` (`id`, `order_number`, `buyer_name`, `buyer_phone`, `shipping_address`, `landmark`, `city`, `state`, `pincode`, `order_status`, `payment_method`, `payment_status`, `subtotal`, `delivery_fee`, `discount`, `total_amount`, `notes`)
+VALUES
+(1, 'ORD-2026-8941', 'Rahul Sharma', '+919876543210', 'Flat 402, Lotus Residency, MG Road', 'Near Metro Station Gate 2', 'Bengaluru', 'Karnataka', '560001', 'processing', 'cod', 'unpaid', 7297.00, 50.00, 0.00, 7347.00, 'Please ring the doorbell twice.')
+ON DUPLICATE KEY UPDATE `buyer_name` = VALUES(`buyer_name`), `total_amount` = VALUES(`total_amount`);
+
+INSERT INTO `order_items` (`id`, `order_id`, `product_id`, `product_name`, `product_image`, `price`, `quantity`, `subtotal`)
+VALUES
+(1, 1, 1, 'Smart Wireless Headset Pro', 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 2999.00, 2, 5998.00),
+(2, 1, 5, 'Polarized Aviator Sunglasses', 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', 1299.00, 1, 1299.00)
+ON DUPLICATE KEY UPDATE `quantity` = VALUES(`quantity`), `subtotal` = VALUES(`subtotal`);
+
+

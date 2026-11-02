@@ -40,6 +40,16 @@ if ($requestUri === '/test-firebase' || $requestUri === '/firebase-otp') {
     exit;
 }
 
+if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
+    header('Content-Type: text/html; charset=utf-8');
+    if (file_exists(__DIR__ . '/test-buyer.html')) {
+        readfile(__DIR__ . '/test-buyer.html');
+    } else {
+        echo 'Buyer test module file not found.';
+    }
+    exit;
+}
+
 // Static uploaded files handler (/uploads/products/...)
 if (str_starts_with($requestUri, '/uploads/')) {
     $filePath = __DIR__ . $requestUri;
@@ -83,15 +93,19 @@ if ($requestUri === '/' || $requestUri === '') {
             <span class="badge">● Pure Native PHP Online</span>
             <h1>Vendor App Backend</h1>
             <p>High-performance, zero-dependency REST API for Vendor marketplace.</p>
-            <a href="/admin/login" class="btn">Go to Admin Dashboard</a>
+            <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+                <a href="/admin/login" class="btn">Admin Dashboard</a>
+                <a href="/test-buyer" class="btn" style="background: #0284c7;">Buyer Test Module</a>
+            </div>
             <div class="endpoints">
                 <strong>Available Endpoints:</strong><br>
-                • GET /api/health<br>
-                • POST /api/register<br>
-                • POST /api/login<br>
-                • GET /api/seller/profile<br>
-                • PUT /api/seller/profile<br>
-                • GET /api/sellers/{id}<br>
+                • GET /test-buyer (Interactive Buyer Hub & Order Editor)<br>
+                • GET /invoice/{id} (Downloadable Provider Tax Invoice)<br>
+                • GET /api/orders<br>
+                • POST /api/orders<br>
+                • GET /api/orders/{id}<br>
+                • PUT /api/orders/{id}<br>
+                • DELETE /api/orders/{id}<br>
                 • GET /api/products<br>
                 • GET /admin/login
             </div>
@@ -130,6 +144,8 @@ require_once __DIR__ . '/api/auth.php';
 require_once __DIR__ . '/api/products.php';
 require_once __DIR__ . '/api/payment.php';
 require_once __DIR__ . '/api/seller.php';
+require_once __DIR__ . '/api/orders.php';
+require_once __DIR__ . '/api/invoice.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
@@ -301,6 +317,41 @@ if ($requestUri === '/api/seller/payouts') {
 if ($requestUri === '/api/marketplace/commission-preview') {
     if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
     apiCommissionPreview($pdo);
+}
+
+// Buyer Orders & Order Items CRUD (supports /api/orders and /api/order)
+if ($requestUri === '/api/orders' || $requestUri === '/api/order') {
+    if ($method === 'GET') {
+        apiGetOrders($pdo);
+    } elseif ($method === 'POST') {
+        apiCreateOrder($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Provider Invoice Generator & Download: /api/orders/{id}/invoice, /api/order/{id}/invoice, /invoice/{id}
+if (preg_match('#^(?:/api/orders?/([^/]+)/invoice|/invoice/([^/]+))$#', $requestUri, $matches)) {
+    $orderParam = trim(!empty($matches[1]) ? $matches[1] : $matches[2]);
+    if ($method === 'GET') {
+        apiGenerateOrderInvoice($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Order Detail / Update / Delete: /api/orders/{id} or /api/order/{id}
+if (preg_match('#^/api/orders?/([^/]+)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'GET') {
+        apiGetOrder($pdo, $orderParam);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateOrder($pdo, $orderParam);
+    } elseif ($method === 'DELETE') {
+        apiDeleteOrder($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
 // Route Not Found fallback
