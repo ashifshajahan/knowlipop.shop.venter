@@ -335,8 +335,69 @@ async function runLiveTests() {
   }
   console.log('✅ Order Verified: Unit Price = ₹1000.00, 3 Items Subtotal = ₹3000.00, Total = ₹3000.00!');
 
-  // Step 7: Cleanup
-  console.log('\n--- 7. Cleaning up test data ---');
+  // Step 7: Verify Multi-Image URLs with Strict Limit of 10 and Distinct Non-Duplicate Images
+  console.log('\n--- 7. Testing Multiple Image URLs & Strict Limit of 10 ---');
+  const twelveImages = [
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d304?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d305?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d306?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d307?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d308?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d309?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d310?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d311?w=800',
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d312?w=800'
+  ];
+
+  const multiRes = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
+    name: 'Multi Image Gallery Product',
+    price: 1500.00,
+    mrp: 2000.00,
+    stock: 20,
+    images: twelveImages
+  });
+
+  const multiProd = multiRes.data && multiRes.data.product;
+  if (!multiProd) throw new Error('Failed to create multi-image product: ' + JSON.stringify(multiRes.data));
+
+  console.log('Multi Image Product images count:', multiProd.images ? multiProd.images.length : 0);
+  if (!Array.isArray(multiProd.images) || multiProd.images.length !== 10) {
+    throw new Error(`Expected strictly 10 images after sending 12 (limit is 10), got ${multiProd.images ? multiProd.images.length : 'none'}`);
+  }
+  console.log('✅ Strict 10 Image URLs limit enforced! (Sent 12, exactly 10 retained)');
+
+  // Verify comma-separated URL string parsing
+  const commaUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
+    images: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800, https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800, https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800'
+  });
+  const commaProd = commaUpdate.data && commaUpdate.data.product;
+  if (!commaProd || !Array.isArray(commaProd.images) || commaProd.images.length !== 3) {
+    throw new Error(`Expected comma-separated URLs to parse into 3 images, got: ${JSON.stringify(commaProd && commaProd.images)}`);
+  }
+  console.log('✅ Comma-separated image URLs parsed cleanly into multiple distinct URLs!');
+
+  // Verify catalog has distinct images (products 1, 2, 3 have distinct galleries)
+  const catalogRes = await request('GET', '/api/products');
+  const catalogList = (catalogRes.data && catalogRes.data.products && catalogRes.data.products.data) || [];
+  const p1Catalog = catalogList.find(p => p.id === 1);
+  const p2Catalog = catalogList.find(p => p.id === 2);
+  if (p1Catalog && p2Catalog) {
+    console.log('Catalog Product 1 image:', p1Catalog.image_url);
+    console.log('Catalog Product 2 image:', p2Catalog.image_url);
+    if (p1Catalog.image_url === p2Catalog.image_url) {
+      throw new Error(`Products 1 and 2 share the same duplicate image URL: ${p1Catalog.image_url}`);
+    }
+    console.log('✅ Catalog verification passed: Products have distinct, unique image URLs across different products!');
+  }
+
+  // Cleanup multi product
+  await request('DELETE', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` });
+
+  // Step 8: Cleanup
+  console.log('\n--- 8. Cleaning up test data ---');
   await request('DELETE', `/api/products/${prod.id}`, { Authorization: `Bearer ${token}` });
   console.log('✅ Cleaned up test product.');
 

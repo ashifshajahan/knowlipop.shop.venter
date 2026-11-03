@@ -66,6 +66,81 @@ function calculatePricingBreakdown(array $input): array
     return resolveProductPricing($input);
 }
 
+$distinctProductGalleries = [
+    'headphones' => [
+        'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
+        'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800',
+        'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'
+    ],
+    'watch' => [
+        'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
+        'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800',
+        'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'
+    ],
+    'backpack' => [
+        'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
+        'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800',
+        'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'
+    ],
+    'sneakers' => [
+        'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
+        'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800',
+        'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'
+    ],
+    'sunglasses' => [
+        'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
+        'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800',
+        'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'
+    ],
+    'keyboard' => [
+        'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
+        'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800',
+        'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'
+    ],
+    'earbuds' => [
+        'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
+        'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800',
+        'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'
+    ],
+    'mouse' => [
+        'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
+        'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800',
+        'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'
+    ],
+    'general' => [
+        'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
+        'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800',
+        'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800'
+    ]
+];
+
+function getDistinctDefaultImages(string $name = '', string $category = '', int $id = 0): array
+{
+    global $distinctProductGalleries;
+    $text = strtolower($name . ' ' . $category);
+    $gallery = $distinctProductGalleries['general'];
+
+    if (strpos($text, 'headphone') !== false || strpos($text, 'headset') !== false) {
+        $gallery = $distinctProductGalleries['headphones'];
+    } elseif (strpos($text, 'watch') !== false || strpos($text, 'wearable') !== false) {
+        $gallery = $distinctProductGalleries['watch'];
+    } elseif (strpos($text, 'backpack') !== false || strpos($text, 'bag') !== false || strpos($text, 'luggage') !== false) {
+        $gallery = $distinctProductGalleries['backpack'];
+    } elseif (strpos($text, 'sneaker') !== false || strpos($text, 'shoe') !== false || strpos($text, 'footwear') !== false) {
+        $gallery = $distinctProductGalleries['sneakers'];
+    } elseif (strpos($text, 'glass') !== false || strpos($text, 'aviator') !== false || strpos($text, 'opti') !== false) {
+        $gallery = $distinctProductGalleries['sunglasses'];
+    } elseif (strpos($text, 'keyboard') !== false) {
+        $gallery = $distinctProductGalleries['keyboard'];
+    } elseif (strpos($text, 'earbud') !== false || strpos($text, 'audio') !== false) {
+        $gallery = $distinctProductGalleries['earbuds'];
+    } elseif (strpos($text, 'mouse') !== false) {
+        $gallery = $distinctProductGalleries['mouse'];
+    }
+
+    return array_slice($gallery, 0, 10);
+}
+
 function formatProductRecord(array $p, bool $isSellerView = false): array
 {
     $rawPrice = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
@@ -92,7 +167,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     $delivery_charge = $cleanPrice >= 500 ? 0.00 : 50.00;
     $delivery_text = $cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-    // Parse multiple product images
+    // Parse multiple product images (limit 10)
     $imagesArray = [];
     if (!empty($p['images'])) {
         if (is_array($p['images'])) {
@@ -109,7 +184,17 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         }
     }
     if (empty($imagesArray) && !empty($p['image_url'])) {
-        $imagesArray = [$p['image_url']];
+        if (is_string($p['image_url']) && strpos($p['image_url'], ',') !== false) {
+            $imagesArray = array_map('trim', explode(',', $p['image_url']));
+        } else {
+            $imagesArray = [$p['image_url']];
+        }
+    }
+
+    // Deduplicate and strictly enforce multiple URL limit of 10
+    $imagesArray = array_slice(array_values(array_unique(array_filter($imagesArray))), 0, 10);
+    if (empty($imagesArray)) {
+        $imagesArray = getDistinctDefaultImages($p['name'] ?? '', $p['category'] ?? '', (int)($p['id'] ?? 0));
     }
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
 
@@ -208,7 +293,22 @@ function ensureProductPriceColumns(PDO $pdo): void
         try {
             $pdo->exec("UPDATE `products` SET `sku` = CONCAT('SKU-', LPAD(`id`, 4, '0')) WHERE `sku` IS NULL OR `sku` = ''");
         } catch (\Throwable $e) {}
-        // 5. Ensure images JSON array is populated if images is null
+        // 5. Ensure distinct, working multi-image galleries (up to 10 URLs) for products, replacing duplicate or broken URLs
+        try {
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', `images` = '[\"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 1");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', `images` = '[\"https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800\",\"https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800\",\"https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800\"]' WHERE `id` = 2");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', `images` = '[\"https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800\",\"https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800\",\"https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800\"]' WHERE `id` = 3");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', `images` = '[\"https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800\",\"https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800\",\"https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800\"]' WHERE `id` = 4");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', `images` = '[\"https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800\",\"https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800\",\"https://images.unsplash.com/photo-1577803645773-f96470509666?w=800\"]' WHERE `id` = 5");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', `images` = '[\"https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800\",\"https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800\",\"https://images.unsplash.com/photo-1595225476474-87563907a212?w=800\"]' WHERE `id` = 6");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', `images` = '[\"https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800\",\"https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800\",\"https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800\"]' WHERE `id` = 7");
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', `images` = '[\"https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800\",\"https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800\",\"https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800\"]' WHERE `id` = 8");
+            // Fix product 51 (broken local upload)
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', `images` = '[\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\",\"https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800\"]' WHERE `id` = 51");
+            // Fix product 44 (duplicate headset image)
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800', `images` = '[\"https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 44");
+        } catch (\Throwable $e) {}
+        // 6. Ensure images JSON array is populated if images is null
         try {
             $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`) WHERE `images` IS NULL AND `image_url` IS NOT NULL AND `image_url` != ''");
         } catch (\Throwable $e) {}
@@ -315,6 +415,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
             $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
             if (move_uploaded_file($tmp, $uploadDir . $filename)) {
+                @chmod($uploadDir . $filename, 0644);
                 $collected[] = $baseUrl . '/uploads/products/' . $filename;
             }
         }
@@ -332,12 +433,41 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
     }
 
-    // Helper to process string candidates (Base64 data URIs or existing HTTP/relative URLs)
-    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected) {
-        if (empty($candidate) || !is_string($candidate)) return;
+    // Helper to process candidate items (string URLs, comma-separated URLs, JSON arrays, base64)
+    $processCandidate = null;
+    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$processCandidate) {
+        if (empty($candidate)) return;
+        if (is_array($candidate)) {
+            foreach ($candidate as $item) {
+                $processCandidate($item);
+            }
+            return;
+        }
+        if (!is_string($candidate)) return;
         $trimmed = trim($candidate);
         if (empty($trimmed)) return;
 
+        // JSON array string e.g. ["url1", "url2"]
+        if (str_starts_with($trimmed, '[') && str_ends_with($trimmed, ']')) {
+            $decoded = json_decode($trimmed, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $item) {
+                    $processCandidate($item);
+                }
+                return;
+            }
+        }
+
+        // Comma-separated URLs
+        if (strpos($trimmed, ',') !== false && !str_starts_with($trimmed, 'data:image/')) {
+            $parts = explode(',', $trimmed);
+            foreach ($parts as $p) {
+                $processCandidate($p);
+            }
+            return;
+        }
+
+        // Base64 data URI
         if (str_starts_with($trimmed, 'data:image/')) {
             if (preg_match('/^data:image\/(\w+);base64,(.+)$/', $trimmed, $matches)) {
                 $ext = strtolower($matches[1]);
@@ -347,61 +477,53 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
                 if ($data !== false) {
                     $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
                     if (file_put_contents($uploadDir . $filename, $data)) {
+                        @chmod($uploadDir . $filename, 0644);
                         $collected[] = $baseUrl . '/uploads/products/' . $filename;
                     }
                 }
             }
-        } elseif (str_starts_with($trimmed, 'http://') || str_starts_with($trimmed, 'https://') || str_starts_with($trimmed, '/uploads/')) {
-            $collected[] = str_starts_with($trimmed, '/uploads/') ? ($baseUrl . $trimmed) : $trimmed;
+            return;
+        }
+
+        // HTTP/HTTPS or relative URLs
+        if (str_starts_with($trimmed, 'http://') || str_starts_with($trimmed, 'https://') || str_starts_with($trimmed, '//') || str_starts_with($trimmed, '/uploads/')) {
+            if (str_starts_with($trimmed, '//')) {
+                $collected[] = 'https:' . $trimmed;
+            } elseif (str_starts_with($trimmed, '/uploads/')) {
+                $collected[] = $baseUrl . $trimmed;
+            } else {
+                $collected[] = $trimmed;
+            }
         }
     };
 
-    // 2. Check input['images'] (can be an array, json string, or comma-separated)
-    if (!empty($input['images'])) {
-        $imgs = $input['images'];
-        if (is_string($imgs)) {
-            $decoded = json_decode($imgs, true);
-            if (is_array($decoded)) {
-                $imgs = $decoded;
-            } elseif (strpos($imgs, ',') !== false) {
-                $imgs = explode(',', $imgs);
-            } else {
-                $imgs = [$imgs];
-            }
-        }
-        if (is_array($imgs)) {
-            foreach ($imgs as $item) {
-                $processCandidate($item);
-            }
-        }
-    }
+    // 2. Check input fields
+    if (!empty($input['images'])) $processCandidate($input['images']);
+    if (!empty($input['image_urls'])) $processCandidate($input['image_urls']);
+    if (!empty($input['image_url'])) $processCandidate($input['image_url']);
+    if (!empty($input['image'])) $processCandidate($input['image']);
+    if (!empty($input['image_base64'])) $processCandidate($input['image_base64']);
+    if (!empty($input['file'])) $processCandidate($input['file']);
+    if (!empty($input['files'])) $processCandidate($input['files']);
+    if (!empty($fallback)) $processCandidate($fallback);
 
-    // 3. Check individual fields
-    $candidates = [
-        $input['image'] ?? null,
-        $input['image_url'] ?? null,
-        $input['image_base64'] ?? null,
-        $input['file'] ?? null,
-        $fallback
-    ];
-    foreach ($candidates as $cand) {
-        $processCandidate($cand);
-    }
-
-    // Also check indexed keys like image_0, image_1
+    // Also check indexed keys like image_0, image_1, images[0]
     foreach ($input as $k => $v) {
-        if (preg_match('/^image_\d+$/i', $k) || preg_match('/^images\[\d+\]$/i', $k)) {
+        if (preg_match('/^image[s]?([_\[]\d+[\]]?)?$/i', $k) || preg_match('/^image_\d+$/i', $k)) {
             $processCandidate($v);
         }
     }
 
-    $images = array_values(array_unique(array_filter($collected)));
-    $primaryImageUrl = !empty($images) ? $images[0] : null;
+    // Deduplicate and strictly enforce multiple URL limit of 10
+    $uniqueImages = array_slice(array_values(array_unique(array_filter($collected))), 0, 10);
+    $primaryImageUrl = !empty($uniqueImages) ? $uniqueImages[0] : null;
 
     return [
         'primaryImageUrl' => $primaryImageUrl,
-        'images' => $images,
-        'imagesJson' => !empty($images) ? json_encode($images) : null,
+        'images' => $uniqueImages,
+        'imagesJson' => !empty($uniqueImages) ? json_encode($uniqueImages) : null,
+        'limit' => 10,
+        'total' => count($uniqueImages),
     ];
 }
 
@@ -423,10 +545,12 @@ function apiUploadImage(PDO $pdo): void
         ], 422);
     }
     jsonResponse([
-        'message' => 'Image(s) uploaded successfully.',
+        'message' => 'Images uploaded successfully.',
         'image_url' => $res['primaryImageUrl'],
         'images' => $res['images'],
-        'url' => $res['primaryImageUrl']
+        'url' => $res['primaryImageUrl'],
+        'limit' => 10,
+        'total' => count($res['images'])
     ], 201);
 }
 

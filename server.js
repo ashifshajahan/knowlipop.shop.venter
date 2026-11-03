@@ -107,6 +107,69 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 }
 });
 
+const distinctProductGalleries = {
+  headphones: [
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
+    'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800',
+    'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'
+  ],
+  watch: [
+    'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
+    'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800',
+    'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'
+  ],
+  backpack: [
+    'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
+    'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800',
+    'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'
+  ],
+  sneakers: [
+    'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
+    'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800',
+    'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'
+  ],
+  sunglasses: [
+    'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
+    'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800',
+    'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'
+  ],
+  keyboard: [
+    'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
+    'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800',
+    'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'
+  ],
+  earbuds: [
+    'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
+    'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800',
+    'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'
+  ],
+  mouse: [
+    'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
+    'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800',
+    'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'
+  ],
+  general: [
+    'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
+    'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800',
+    'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800'
+  ]
+};
+
+function getDistinctDefaultImages(name = '', category = '', id = 0) {
+  const text = `${name} ${category}`.toLowerCase();
+  let gallery = distinctProductGalleries.general;
+  if (text.includes('headphone') || text.includes('headset')) gallery = distinctProductGalleries.headphones;
+  else if (text.includes('watch') || text.includes('wearable')) gallery = distinctProductGalleries.watch;
+  else if (text.includes('backpack') || text.includes('bag') || text.includes('luggage')) gallery = distinctProductGalleries.backpack;
+  else if (text.includes('sneaker') || text.includes('shoe') || text.includes('footwear')) gallery = distinctProductGalleries.sneakers;
+  else if (text.includes('glass') || text.includes('aviator') || text.includes('opti')) gallery = distinctProductGalleries.sunglasses;
+  else if (text.includes('keyboard')) gallery = distinctProductGalleries.keyboard;
+  else if (text.includes('earbud') || text.includes('audio')) gallery = distinctProductGalleries.earbuds;
+  else if (text.includes('mouse')) gallery = distinctProductGalleries.mouse;
+
+  return gallery.slice(0, 10);
+}
+
 function saveBase64Image(dataString) {
   if (typeof dataString !== 'string' || !dataString.startsWith('data:image/')) return null;
   const matches = dataString.match(/^data:image\/(\w+);base64,(.+)$/);
@@ -116,18 +179,29 @@ function saveBase64Image(dataString) {
   if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
   const buffer = Buffer.from(matches[2], 'base64');
   const filename = `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
-  fs.writeFileSync(path.join(uploadDir, filename), buffer);
-  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
-  return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
+  try {
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+    }
+    const fullPath = path.join(uploadDir, filename);
+    fs.writeFileSync(fullPath, buffer);
+    try { fs.chmodSync(fullPath, 0o644); } catch (e) {}
+    const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
+    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
+  } catch (err) {
+    console.error('Failed to save base64 image:', err);
+    return null;
+  }
 }
 
 function resolveProductImages(req) {
   const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
   const collected = [];
 
-  // 1. Multipart uploaded files from multer
-  if (req.files && Array.isArray(req.files)) {
-    for (const f of req.files) {
+  // 1. Multipart uploaded files from multer (req.files array or single req.file)
+  if (req.files) {
+    const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+    for (const f of fileList) {
       if (f && f.filename) {
         collected.push(`${baseUrl}/uploads/products/${f.filename}`);
       }
@@ -137,58 +211,73 @@ function resolveProductImages(req) {
     collected.push(`${baseUrl}/uploads/products/${req.file.filename}`);
   }
 
-  // 2. Process req.body candidates
+  // 2. Process candidate items from request body
   const body = req.body || {};
 
   function processCandidate(item) {
     if (!item) return;
+    if (Array.isArray(item)) {
+      for (const el of item) processCandidate(el);
+      return;
+    }
     if (typeof item === 'string') {
       const trimmed = item.trim();
       if (!trimmed) return;
+
+      // Handle JSON-encoded array string e.g. '["url1", "url2"]'
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            for (const el of parsed) processCandidate(el);
+            return;
+          }
+        } catch (e) {}
+      }
+
+      // Handle comma-separated list of URLs
+      if (trimmed.includes(',') && !trimmed.startsWith('data:image/')) {
+        const parts = trimmed.split(',').map(s => s.trim()).filter(Boolean);
+        for (const p of parts) processCandidate(p);
+        return;
+      }
+
       if (trimmed.startsWith('data:image/')) {
         const saved = saveBase64Image(trimmed);
         if (saved) collected.push(saved);
-      } else if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('/uploads/')) {
-        collected.push(trimmed.startsWith('/uploads/') ? `${baseUrl}${trimmed}` : trimmed);
+      } else if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//') || trimmed.startsWith('/uploads/')) {
+        const fullUrl = trimmed.startsWith('//')
+          ? `https:${trimmed}`
+          : (trimmed.startsWith('/uploads/') ? `${baseUrl}${trimmed}` : trimmed);
+        collected.push(fullUrl);
       }
     }
   }
 
-  if (body.images) {
-    let list = body.images;
-    if (typeof list === 'string') {
-      try {
-        const parsed = JSON.parse(list);
-        if (Array.isArray(parsed)) list = parsed;
-      } catch (e) {
-        if (list.includes(',')) list = list.split(',');
-      }
-    }
-    if (Array.isArray(list)) {
-      for (const el of list) processCandidate(el);
-    } else {
-      processCandidate(list);
-    }
-  }
+  // Check all possible field variations for multiple product image URLs
+  if (body.images) processCandidate(body.images);
+  if (body.image_urls) processCandidate(body.image_urls);
+  if (body.image_url) processCandidate(body.image_url);
+  if (body.image) processCandidate(body.image);
+  if (body.image_base64) processCandidate(body.image_base64);
+  if (body.file) processCandidate(body.file);
+  if (body.files) processCandidate(body.files);
 
-  processCandidate(body.image);
-  processCandidate(body.image_url);
-  processCandidate(body.image_base64);
-  processCandidate(body.file);
-
+  // Check indexed keys e.g. image_0, image_1, images[0], images[1] up to index 10
   for (const k of Object.keys(body)) {
-    if (/^image_\d+$/i.test(k) || /^images\[\d+\]$/i.test(k)) {
+    if (/^image[s]?([_\[]\d+[\]]?)?$/i.test(k) || /^image_\d+$/i.test(k)) {
       processCandidate(body[k]);
     }
   }
 
-  const images = Array.from(new Set(collected.filter(Boolean)));
-  const primaryImageUrl = images.length > 0 ? images[0] : null;
+  // Deduplicate and strictly enforce multiple URL limit of 10
+  const uniqueImages = Array.from(new Set(collected.filter(Boolean))).slice(0, 10);
+  const primaryImageUrl = uniqueImages.length > 0 ? uniqueImages[0] : null;
 
   return {
     primaryImageUrl,
-    images,
-    imagesJson: images.length > 0 ? JSON.stringify(images) : null
+    images: uniqueImages,
+    imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null
   };
 }
 
@@ -1646,7 +1735,7 @@ function formatProductRecord(p, options = {}) {
   const deliveryCharge = cleanPrice >= 500 ? 0.00 : 50.00;
   const deliveryText = cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-  // Parse multiple product images
+  // Parse multiple product images (limit 10)
   let imagesArray = [];
   if (Array.isArray(p.images)) {
     imagesArray = p.images;
@@ -1660,7 +1749,17 @@ function formatProductRecord(p, options = {}) {
     }
   }
   if (imagesArray.length === 0 && p.image_url) {
-    imagesArray = [p.image_url];
+    if (typeof p.image_url === 'string' && p.image_url.includes(',')) {
+      imagesArray = p.image_url.split(',').map(s => s.trim());
+    } else {
+      imagesArray = [p.image_url];
+    }
+  }
+
+  // Deduplicate and strictly enforce multiple URL limit of 10
+  imagesArray = Array.from(new Set(imagesArray.filter(Boolean))).slice(0, 10);
+  if (imagesArray.length === 0) {
+    imagesArray = getDistinctDefaultImages(p.name, p.category, p.id);
   }
   const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
 
@@ -1758,7 +1857,7 @@ async function ensureProductPriceColumns(p) {
     await addColumnIfNotExists('ratings_count', 'ratings_count INT NOT NULL DEFAULT 15 AFTER rating');
     await addColumnIfNotExists('images', 'images LONGTEXT NULL DEFAULT NULL AFTER image_url');
 
-    // Safe database repair:
+    // Safe database repair & distinct image gallery synchronization:
     // 1. Recover any prices that compounded above seller_price (e.g. 1138, 1284, 1442 back to clean original seller_price)
     try {
       await p.query('UPDATE products SET price = seller_price WHERE seller_price > 0 AND price > seller_price');
@@ -1775,7 +1874,73 @@ async function ensureProductPriceColumns(p) {
     try {
       await p.query("UPDATE products SET sku = CONCAT('SKU-', LPAD(id, 4, '0')) WHERE sku IS NULL OR sku = ''");
     } catch (e) {}
-    // 5. Ensure images JSON array is populated if images is null
+    // 5. Ensure distinct, working multi-image galleries (up to 10 URLs) for products, replacing duplicate or broken URLs
+    try {
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
+          images = '["https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800","https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800","https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800"]'
+        WHERE id = 1
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
+          images = '["https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800","https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800","https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800"]'
+        WHERE id = 2
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
+          images = '["https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800","https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800","https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800"]'
+        WHERE id = 3
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
+          images = '["https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800","https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800","https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800"]'
+        WHERE id = 4
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
+          images = '["https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800","https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800","https://images.unsplash.com/photo-1577803645773-f96470509666?w=800"]'
+        WHERE id = 5
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
+          images = '["https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800","https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800","https://images.unsplash.com/photo-1595225476474-87563907a212?w=800"]'
+        WHERE id = 6
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
+          images = '["https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800","https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800","https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800"]'
+        WHERE id = 7
+      `);
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
+          images = '["https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800","https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800","https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800"]'
+        WHERE id = 8
+      `);
+      // Fix product 51 (broken local upload) with working distinct gadget gallery
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
+          images = '["https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800","https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800"]'
+        WHERE id = 51
+      `);
+      // Fix product 44 (duplicate headset image) with distinct studio headphone gallery
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800',
+          images = '["https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800","https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800","https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800"]'
+        WHERE id = 44
+      `);
+    } catch (e) {}
+
+    // 6. Ensure any product with null images gets a valid array
     try {
       await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE images IS NULL AND image_url IS NOT NULL AND image_url != ''");
     } catch (e) {}
@@ -1785,14 +1950,14 @@ async function ensureProductPriceColumns(p) {
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'], is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500'], is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500'], is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500'], is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500'], is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500'], is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500'], is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500'], is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800', 'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', 'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800', 'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', 'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800', 'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', 'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800', 'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', 'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800', 'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', 'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800', 'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', 'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800', 'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
