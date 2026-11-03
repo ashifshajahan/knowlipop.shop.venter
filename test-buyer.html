@@ -1713,11 +1713,21 @@
         seller_name: 'TechHub Direct',
         name: 'Smart Wireless Headset Pro',
         description: 'Active noise cancelling over-ear headphones with 40-hour battery life.',
+        seller_price: '2999.00',
+        commission: '149.95',
+        delivery_charge: '50.00',
+        gst: '35.99',
+        other_charges: '20.00',
         price: '3254.94',
         presentation_price: '3254.94',
         selling_price: '3254.94',
         stock: 50,
         image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
+          'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500',
+          'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'
+        ],
         is_active: 1
       },
       {
@@ -1726,11 +1736,20 @@
         seller_name: 'TechHub Direct',
         name: 'Ultra HD 4K Smart Watch',
         description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.',
+        seller_price: '4499.00',
+        commission: '224.95',
+        delivery_charge: '50.00',
+        gst: '49.49',
+        other_charges: '20.00',
         price: '4843.44',
         presentation_price: '4843.44',
         selling_price: '4843.44',
         stock: 35,
         image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500',
+          'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500'
+        ],
         is_active: 1
       },
       {
@@ -1739,11 +1758,19 @@
         seller_name: 'Urban Leather Works',
         name: 'Vintage Leather Travel Backpack',
         description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.',
+        seller_price: '3299.00',
+        commission: '164.95',
+        delivery_charge: '50.00',
+        gst: '38.69',
+        other_charges: '20.00',
         price: '3572.64',
         presentation_price: '3572.64',
         selling_price: '3572.64',
         stock: 20,
         image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500'
+        ],
         is_active: 1
       },
       {
@@ -1752,11 +1779,19 @@
         seller_name: 'Stride Pro Athletics',
         name: 'Air Cushion Running Sneakers',
         description: 'Lightweight breathable sports shoes designed for marathon running and daily training.',
+        seller_price: '2499.00',
+        commission: '124.95',
+        delivery_charge: '50.00',
+        gst: '31.49',
+        other_charges: '20.00',
         price: '2725.44',
         presentation_price: '2725.44',
         selling_price: '2725.44',
         stock: 60,
         image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500'
+        ],
         is_active: 1
       },
       {
@@ -1765,11 +1800,19 @@
         seller_name: 'Optics Club',
         name: 'Polarized Aviator Sunglasses',
         description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.',
+        seller_price: '1299.00',
+        commission: '64.95',
+        delivery_charge: '50.00',
+        gst: '20.69',
+        other_charges: '20.00',
         price: '1454.64',
         presentation_price: '1454.64',
         selling_price: '1454.64',
         stock: 100,
         image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500'
+        ],
         is_active: 1
       },
       {
@@ -1778,11 +1821,19 @@
         seller_name: 'GamerGear Pro',
         name: 'RGB Mechanical Gaming Keyboard',
         description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.',
+        seller_price: '3999.00',
+        commission: '199.95',
+        delivery_charge: '50.00',
+        gst: '44.99',
+        other_charges: '20.00',
         price: '4313.94',
         presentation_price: '4313.94',
         selling_price: '4313.94',
         stock: 25,
         image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500',
+        images: [
+          'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500'
+        ],
         is_active: 1
       }
     ];
@@ -1839,6 +1890,19 @@
       populateCatalogPickerSelect();
     }
 
+    // Helper: switch main card image when thumbnail is clicked
+    window.switchMainImage = function(productId, src, el) {
+      const mainImg = document.getElementById(`main-img-${productId}`);
+      if (mainImg) mainImg.src = src;
+      const gallery = el ? el.closest('.product-gallery-thumbs') : null;
+      if (gallery) {
+        gallery.querySelectorAll('.gallery-thumb-item').forEach(th => {
+          th.style.borderColor = 'rgba(255, 255, 255, 0.15)';
+        });
+        el.style.borderColor = 'var(--primary)';
+      }
+    };
+
     // 3. Render Catalog
     function renderProductsGrid(products) {
       const grid = document.getElementById('products-grid');
@@ -1853,13 +1917,42 @@
         const currentQty = cartDraft[p.id] ? cartDraft[p.id].quantity : 0;
         const inOrderClass = currentQty > 0 ? 'in-order' : '';
 
+        // Product Images List
+        let imgList = [];
+        if (Array.isArray(p.images) && p.images.length > 0) {
+          imgList = p.images;
+        } else if (p.image_url) {
+          imgList = [p.image_url];
+        }
+        const primaryImg = imgList[0] || 'https://via.placeholder.com/300?text=Product';
+
+        // Transparent Commission Detail for Buyer
+        const commVal = p.commission ? parseFloat(p.commission).toFixed(2) : '50.00';
+        const delivVal = p.delivery_charge ? parseFloat(p.delivery_charge).toFixed(2) : '50.00';
+        const gstVal = p.gst ? parseFloat(p.gst).toFixed(2) : '18.00';
+        const otherVal = p.other_charges ? parseFloat(p.other_charges).toFixed(2) : '20.00';
+        const taxesAndFees = (parseFloat(gstVal) + parseFloat(otherVal)).toFixed(2);
+        const baseVal = p.seller_price || p.base_price || (parseFloat(p.price) - parseFloat(commVal) - parseFloat(delivVal) - parseFloat(taxesAndFees)).toFixed(2);
+
         const card = document.createElement('div');
         card.className = `product-card ${inOrderClass}`;
         card.id = `product-card-${p.id}`;
 
+        const galleryThumbsHtml = imgList.length > 1 ? `
+          <div class="product-gallery-thumbs" style="display: flex; gap: 6px; padding: 6px 12px; background: rgba(15, 23, 42, 0.6); overflow-x: auto; border-bottom: 1px solid var(--border);">
+            ${imgList.map((img, idx) => `
+              <img src="${img}" class="gallery-thumb-item" alt="Thumbnail ${idx + 1}"
+                   style="width: 36px; height: 36px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 2px solid ${idx === 0 ? 'var(--primary)' : 'rgba(255,255,255,0.15)'}; transition: all 0.2s;"
+                   onclick="switchMainImage(${p.id}, '${img}', this)"
+                   onerror="this.src='https://via.placeholder.com/36?text=Thumb'">
+            `).join('')}
+          </div>
+        ` : '';
+
         card.innerHTML = `
           <div class="product-badge-qty" id="card-badge-${p.id}">In List: ×${currentQty}</div>
-          <img src="${p.image_url || 'https://via.placeholder.com/300?text=Product'}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.src='https://via.placeholder.com/300?text=Product'">
+          <img id="main-img-${p.id}" src="${primaryImg}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.src='https://via.placeholder.com/300?text=Product'">
+          ${galleryThumbsHtml}
           <div class="product-body">
             <div style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.12); padding: 2px 8px; border-radius: 6px; margin-bottom: 6px;">
               <span>🏪</span>
@@ -1868,7 +1961,12 @@
             <div class="product-title">${escapeHtml(p.name)}</div>
             <div class="product-desc">${escapeHtml(p.description || '')}</div>
             <div class="product-meta">
-              <div class="product-price">₹${parseFloat(p.price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
+              <div>
+                <div class="product-price">₹${parseFloat(p.price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
+                <div class="product-commission-breakdown" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; background: rgba(99, 102, 241, 0.08); padding: 4px 8px; border-radius: 6px; border: 1px dashed rgba(99, 102, 241, 0.25); line-height: 1.4;">
+                  <span style="font-weight: 700; color: var(--accent);">Commission Detail:</span> ₹${commVal} | Base: ₹${baseVal} | Del: ₹${delivVal} | Tax: ₹${taxesAndFees}
+                </div>
+              </div>
               <div class="product-stock" id="stock-display-${p.id}">
                 ${(parseInt(p.stock, 10) > 0)
             ? `<span style="color: var(--success); font-weight: 700;">● Stock: ${p.stock}</span>`

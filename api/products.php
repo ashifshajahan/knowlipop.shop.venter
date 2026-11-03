@@ -60,7 +60,7 @@ function calculatePricingBreakdown(array $input): array
     ];
 }
 
-function formatProductRecord(array $p, bool $isPublicUser = false): array
+function formatProductRecord(array $p, bool $isSellerView = false): array
 {
     $rawSeller = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
         ? (float) $p['seller_price']
@@ -92,27 +92,55 @@ function formatProductRecord(array $p, bool $isPublicUser = false): array
         $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
     }
 
+    // Parse multiple product images
+    $imagesArray = [];
+    if (!empty($p['images'])) {
+        if (is_array($p['images'])) {
+            $imagesArray = $p['images'];
+        } elseif (is_string($p['images'])) {
+            $decoded = json_decode($p['images'], true);
+            if (is_array($decoded)) {
+                $imagesArray = $decoded;
+            } elseif (strpos($p['images'], ',') !== false) {
+                $imagesArray = array_map('trim', explode(',', $p['images']));
+            } else {
+                $imagesArray = [trim($p['images'])];
+            }
+        }
+    }
+    if (empty($imagesArray) && !empty($p['image_url'])) {
+        $imagesArray = [$p['image_url']];
+    }
+    $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
+
     $result = array_merge($p, [
         'id' => (int) $p['id'],
         'seller_id' => (int) $p['seller_id'],
         'name' => (string) ($p['name'] ?? ''),
         'description' => $p['description'] ?? null,
-        'price' => number_format($presentation_price, 2, '.', ''),
-        'presentation_price' => number_format($presentation_price, 2, '.', ''),
-        'selling_price' => number_format($presentation_price, 2, '.', ''),
         'stock' => (int) ($p['stock'] ?? 0),
-        'image_url' => $p['image_url'] ?? null,
+        'image_url' => $primaryImageUrl,
+        'images' => $imagesArray,
         'is_active' => (bool) ($p['is_active'] ?? true),
     ]);
 
-    if (!$isPublicUser) {
+    if ($isSellerView) {
+        // SELLER FIELD: Commission feature is completely DELETED from seller view!
+        // Seller only sees their own price (₹1000.00). No commission, delivery charge, gst, other charges.
+        $result['price'] = number_format($seller_price, 2, '.', '');
         $result['seller_price'] = number_format($seller_price, 2, '.', '');
+        unset($result['commission'], $result['delivery_charge'], $result['gst'], $result['other_charges']);
+    } else {
+        // BUYER FIELD: Buyer sees presentation price (₹1138.00) AND the transparent commission breakdown!
+        $result['price'] = number_format($presentation_price, 2, '.', '');
+        $result['presentation_price'] = number_format($presentation_price, 2, '.', '');
+        $result['selling_price'] = number_format($presentation_price, 2, '.', '');
+        $result['seller_price'] = number_format($seller_price, 2, '.', '');
+        $result['base_price'] = number_format($seller_price, 2, '.', '');
         $result['commission'] = number_format($commission, 2, '.', '');
         $result['delivery_charge'] = number_format($delivery_charge, 2, '.', '');
         $result['gst'] = number_format($gst, 2, '.', '');
         $result['other_charges'] = number_format($other_charges, 2, '.', '');
-    } else {
-        unset($result['seller_price'], $result['commission'], $result['other_charges']);
     }
 
     return $result;
@@ -157,6 +185,15 @@ function ensureProductPriceColumns(PDO $pdo): void
                 ");
             } catch (\Throwable $e) {}
         }
+
+        // Ensure images LONGTEXT column exists for multiple product images
+        try {
+            $imgCols = $pdo->query("SHOW COLUMNS FROM `products` LIKE 'images'")->fetchAll();
+            if (empty($imgCols)) {
+                $pdo->exec("ALTER TABLE `products` ADD COLUMN `images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`");
+                $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`) WHERE `images` IS NULL AND `image_url` IS NOT NULL AND `image_url` != ''");
+            }
+        } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
     }
@@ -184,7 +221,7 @@ function apiGetProducts(PDO $pdo): void
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         {$where}
@@ -199,10 +236,9 @@ function apiGetProducts(PDO $pdo): void
     $stmt->execute();
     $rawProducts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $optUser = getAuthenticatedUserOptional($pdo);
-    $isSellerOrAdmin = $optUser && ((($optUser['role'] ?? '') === 'admin') || ($sellerId && (int)$optUser['id'] === $sellerId));
-    $products = array_map(function($p) use ($isSellerOrAdmin) {
-        return formatProductRecord($p, !$isSellerOrAdmin);
+    // Buyer / Public Catalog: Buyer sees presentation price, commission detail, and multiple images!
+    $products = array_map(function($p) {
+        return formatProductRecord($p, false);
     }, $rawProducts);
 
     jsonResponse([
@@ -222,7 +258,7 @@ function apiGetProduct(PDO $pdo, int $id): void
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id AND p.is_active = 1
@@ -235,13 +271,12 @@ function apiGetProduct(PDO $pdo, int $id): void
         errorResponse('Product not found.', [], 404);
     }
 
-    $optUser = getAuthenticatedUserOptional($pdo);
-    $isOwner = $optUser && ((($optUser['role'] ?? '') === 'admin') || ((int)$optUser['id'] === (int)$product['seller_id']));
-    $formatted = formatProductRecord($product, !$isOwner);
+    $isSellerView = (isset($_GET['seller_view']) && ($_GET['seller_view'] === '1' || $_GET['seller_view'] === 'true'));
+    $formatted = formatProductRecord($product, $isSellerView);
     jsonResponse(['product' => $formatted]);
 }
 
-function saveUploadedProductImage(?string $fallback = null): ?string
+function saveUploadedProductImages(array $input = [], ?string $fallback = null): array
 {
     $uploadDir = __DIR__ . '/../uploads/products/';
     if (!is_dir($uploadDir)) {
@@ -249,31 +284,42 @@ function saveUploadedProductImage(?string $fallback = null): ?string
     }
 
     $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    $collected = [];
 
-    // 1. Check $_FILES for multipart/form-data upload
-    $fileFields = ['image', 'file', 'product_image', 'photo', 'picture', 'img'];
-    foreach ($fileFields as $field) {
-        if (!empty($_FILES[$field]['tmp_name']) && is_uploaded_file($_FILES[$field]['tmp_name'])) {
-            $tmp = $_FILES[$field]['tmp_name'];
-            $origName = $_FILES[$field]['name'] ?? 'product.jpg';
-            $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
+    // Helper to process uploaded file
+    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, &$collected) {
+        if (!empty($tmp) && is_uploaded_file($tmp)) {
+            $ext = strtolower(pathinfo($origName ?: 'product.jpg', PATHINFO_EXTENSION));
             if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'])) {
                 $ext = 'jpg';
             }
             $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
-            $destination = $uploadDir . $filename;
-            if (move_uploaded_file($tmp, $destination)) {
-                return $baseUrl . '/uploads/products/' . $filename;
+            if (move_uploaded_file($tmp, $uploadDir . $filename)) {
+                $collected[] = $baseUrl . '/uploads/products/' . $filename;
             }
+        }
+    };
+
+    // 1. Process $_FILES (both single fields and multiple file array uploads)
+    foreach ($_FILES as $field => $fileData) {
+        if (is_array($fileData['tmp_name'])) {
+            foreach ($fileData['tmp_name'] as $idx => $tmp) {
+                $name = $fileData['name'][$idx] ?? 'product.jpg';
+                $processUploadedFile($tmp, $name);
+            }
+        } else {
+            $processUploadedFile($fileData['tmp_name'], $fileData['name'] ?? 'product.jpg');
         }
     }
 
-    // 2. Check for Base64 encoded image string in input
-    $input = getJsonInput();
-    $base64Candidates = [$input['image'] ?? null, $input['image_base64'] ?? null, $input['file'] ?? null, $fallback];
-    foreach ($base64Candidates as $candidate) {
-        if (is_string($candidate) && str_starts_with($candidate, 'data:image/')) {
-            if (preg_match('/^data:image\/(\w+);base64,(.+)$/', $candidate, $matches)) {
+    // Helper to process string candidates (Base64 data URIs or existing HTTP/relative URLs)
+    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected) {
+        if (empty($candidate) || !is_string($candidate)) return;
+        $trimmed = trim($candidate);
+        if (empty($trimmed)) return;
+
+        if (str_starts_with($trimmed, 'data:image/')) {
+            if (preg_match('/^data:image\/(\w+);base64,(.+)$/', $trimmed, $matches)) {
                 $ext = strtolower($matches[1]);
                 if ($ext === 'jpeg') $ext = 'jpg';
                 if (!in_array($ext, ['jpg', 'png', 'webp', 'gif', 'svg'])) $ext = 'png';
@@ -281,34 +327,86 @@ function saveUploadedProductImage(?string $fallback = null): ?string
                 if ($data !== false) {
                     $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
                     if (file_put_contents($uploadDir . $filename, $data)) {
-                        return $baseUrl . '/uploads/products/' . $filename;
+                        $collected[] = $baseUrl . '/uploads/products/' . $filename;
                     }
                 }
+            }
+        } elseif (str_starts_with($trimmed, 'http://') || str_starts_with($trimmed, 'https://') || str_starts_with($trimmed, '/uploads/')) {
+            $collected[] = str_starts_with($trimmed, '/uploads/') ? ($baseUrl . $trimmed) : $trimmed;
+        }
+    };
+
+    // 2. Check input['images'] (can be an array, json string, or comma-separated)
+    if (!empty($input['images'])) {
+        $imgs = $input['images'];
+        if (is_string($imgs)) {
+            $decoded = json_decode($imgs, true);
+            if (is_array($decoded)) {
+                $imgs = $decoded;
+            } elseif (strpos($imgs, ',') !== false) {
+                $imgs = explode(',', $imgs);
+            } else {
+                $imgs = [$imgs];
+            }
+        }
+        if (is_array($imgs)) {
+            foreach ($imgs as $item) {
+                $processCandidate($item);
             }
         }
     }
 
-    // 3. Fallback: if user supplied an already hosted URL (e.g. https://...), keep it
-    if (!empty($fallback) && (str_starts_with($fallback, 'http://') || str_starts_with($fallback, 'https://') || str_starts_with($fallback, '/uploads/'))) {
-        return $fallback;
+    // 3. Check individual fields
+    $candidates = [
+        $input['image'] ?? null,
+        $input['image_url'] ?? null,
+        $input['image_base64'] ?? null,
+        $input['file'] ?? null,
+        $fallback
+    ];
+    foreach ($candidates as $cand) {
+        $processCandidate($cand);
     }
 
-    return null;
+    // Also check indexed keys like image_0, image_1
+    foreach ($input as $k => $v) {
+        if (preg_match('/^image_\d+$/i', $k) || preg_match('/^images\[\d+\]$/i', $k)) {
+            $processCandidate($v);
+        }
+    }
+
+    $images = array_values(array_unique(array_filter($collected)));
+    $primaryImageUrl = !empty($images) ? $images[0] : null;
+
+    return [
+        'primaryImageUrl' => $primaryImageUrl,
+        'images' => $images,
+        'imagesJson' => !empty($images) ? json_encode($images) : null,
+    ];
+}
+
+function saveUploadedProductImage(?string $fallback = null): ?string
+{
+    $input = getJsonInput();
+    $res = saveUploadedProductImages($input, $fallback);
+    return $res['primaryImageUrl'];
 }
 
 function apiUploadImage(PDO $pdo): void
 {
     authenticateUser($pdo);
-    $imageUrl = saveUploadedProductImage();
-    if (!$imageUrl) {
+    $input = getJsonInput();
+    $res = saveUploadedProductImages($input);
+    if (empty($res['images'])) {
         errorResponse('No image uploaded or invalid format.', [
-            'image' => ['Please upload an image file (jpg, png, webp) or provide base64 image data.']
+            'image' => ['Please upload an image file (jpg, png, webp) or provide image data/URLs.']
         ], 422);
     }
     jsonResponse([
-        'message' => 'Image uploaded successfully.',
-        'image_url' => $imageUrl,
-        'url' => $imageUrl
+        'message' => 'Image(s) uploaded successfully.',
+        'image_url' => $res['primaryImageUrl'],
+        'images' => $res['images'],
+        'url' => $res['primaryImageUrl']
     ], 201);
 }
 
@@ -337,14 +435,14 @@ function apiCreateProduct(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
-    // Process image file upload, base64, or fallback URL
-    $imageUrl = saveUploadedProductImage($input['image_url'] ?? $input['image'] ?? null);
+    // Process image file uploads, base64, or multiple images
+    $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
 
     $pricing = calculatePricingBreakdown($input);
 
     $stmt = $pdo->prepare("
-        INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, 1, NOW(), NOW())
+        INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+        VALUES (:seller_id, :name, :description, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
@@ -357,14 +455,15 @@ function apiCreateProduct(PDO $pdo): void
         ':other_charges' => number_format($pricing['other_charges'], 2, '.', ''),
         ':price' => number_format($pricing['price'], 2, '.', ''),
         ':stock' => (int) $stock,
-        ':image_url' => $imageUrl,
+        ':image_url' => $imgResult['primaryImageUrl'],
+        ':images' => $imgResult['imagesJson'],
     ]);
 
     $id = (int) $pdo->lastInsertId();
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id
@@ -372,7 +471,8 @@ function apiCreateProduct(PDO $pdo): void
     $fetchStmt->execute([':id' => $id]);
     $product = $fetchStmt->fetch(PDO::FETCH_ASSOC);
 
-    $formatted = formatProductRecord($product);
+    // Seller created product: Seller view has NO commission feature!
+    $formatted = formatProductRecord($product, true);
     jsonResponse(['message' => 'Product created.', 'product' => $formatted], 201);
 }
 
@@ -411,7 +511,7 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         {$where}
@@ -426,7 +526,10 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
     $stmt->execute();
     $rawProducts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $products = array_map('formatProductRecord', $rawProducts);
+    // Seller view: Commission feature is deleted from seller field!
+    $products = array_map(function($p) {
+        return formatProductRecord($p, true);
+    }, $rawProducts);
 
     jsonResponse([
         'seller_id' => $targetSellerId,
@@ -508,11 +611,13 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $params[':stock'] = (int) $input['stock'];
     }
 
-    // Process uploaded file or base64 or fallback URL
-    $newImageUrl = saveUploadedProductImage($input['image_url'] ?? $input['image'] ?? null);
-    if (!empty($newImageUrl)) {
+    // Process uploaded file(s) or base64 or fallback URL
+    $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
+    if (!empty($imgResult['images'])) {
         $updates[] = "image_url = :image_url";
-        $params[':image_url'] = $newImageUrl;
+        $params[':image_url'] = $imgResult['primaryImageUrl'];
+        $updates[] = "images = :images";
+        $params[':images'] = $imgResult['imagesJson'];
     }
 
     if (isset($input['is_active'])) {
@@ -530,7 +635,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id
@@ -538,7 +643,8 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     $fetchStmt->execute([':id' => $id]);
     $updated = $fetchStmt->fetch(PDO::FETCH_ASSOC);
 
-    $formatted = formatProductRecord($updated);
+    // Seller updated product: Seller view has NO commission feature!
+    $formatted = formatProductRecord($updated, true);
     jsonResponse(['message' => 'Product updated.', 'product' => $formatted]);
 }
 

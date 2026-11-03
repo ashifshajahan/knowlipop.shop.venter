@@ -121,30 +121,80 @@ function saveBase64Image(dataString) {
   return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
 }
 
-function resolveProductImage(req) {
-  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
-  // 1. Multipart uploaded file
-  if (req.files && req.files.length > 0) {
-    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${req.files[0].filename}`;
+function resolveProductImages(req) {
+  const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+  const collected = [];
+
+  // 1. Multipart uploaded files from multer
+  if (req.files && Array.isArray(req.files)) {
+    for (const f of req.files) {
+      if (f && f.filename) {
+        collected.push(`${baseUrl}/uploads/products/${f.filename}`);
+      }
+    }
   }
-  if (req.file) {
-    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${req.file.filename}`;
+  if (req.file && req.file.filename) {
+    collected.push(`${baseUrl}/uploads/products/${req.file.filename}`);
   }
-  // 2. Base64 encoded image
+
+  // 2. Process req.body candidates
   const body = req.body || {};
-  const base64Candidate = body.image || body.image_base64 || body.file;
-  if (base64Candidate && typeof base64Candidate === 'string' && base64Candidate.startsWith('data:image/')) {
-    const saved = saveBase64Image(base64Candidate);
-    if (saved) return saved;
+
+  function processCandidate(item) {
+    if (!item) return;
+    if (typeof item === 'string') {
+      const trimmed = item.trim();
+      if (!trimmed) return;
+      if (trimmed.startsWith('data:image/')) {
+        const saved = saveBase64Image(trimmed);
+        if (saved) collected.push(saved);
+      } else if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('/uploads/')) {
+        collected.push(trimmed.startsWith('/uploads/') ? `${baseUrl}${trimmed}` : trimmed);
+      }
+    }
   }
-  // 3. Fallback to existing URL string
-  if (body.image_url && typeof body.image_url === 'string') {
-    return body.image_url;
+
+  if (body.images) {
+    let list = body.images;
+    if (typeof list === 'string') {
+      try {
+        const parsed = JSON.parse(list);
+        if (Array.isArray(parsed)) list = parsed;
+      } catch (e) {
+        if (list.includes(',')) list = list.split(',');
+      }
+    }
+    if (Array.isArray(list)) {
+      for (const el of list) processCandidate(el);
+    } else {
+      processCandidate(list);
+    }
   }
-  if (body.image && typeof body.image === 'string' && (body.image.startsWith('http://') || body.image.startsWith('https://') || body.image.startsWith('/uploads/'))) {
-    return body.image;
+
+  processCandidate(body.image);
+  processCandidate(body.image_url);
+  processCandidate(body.image_base64);
+  processCandidate(body.file);
+
+  for (const k of Object.keys(body)) {
+    if (/^image_\d+$/i.test(k) || /^images\[\d+\]$/i.test(k)) {
+      processCandidate(body[k]);
+    }
   }
-  return null;
+
+  const images = Array.from(new Set(collected.filter(Boolean)));
+  const primaryImageUrl = images.length > 0 ? images[0] : null;
+
+  return {
+    primaryImageUrl,
+    images,
+    imagesJson: images.length > 0 ? JSON.stringify(images) : null
+  };
+}
+
+function resolveProductImage(req) {
+  const result = resolveProductImages(req);
+  return result.primaryImageUrl;
 }
 
 // Avatar File Upload & Image Storage Configuration
@@ -1601,25 +1651,52 @@ function formatProductRecord(p, options = {}) {
     presentation_price = Math.round((seller_price + commission + delivery_charge + gst + other_charges) * 100) / 100;
   }
 
+  // Parse multiple product images
+  let imagesArray = [];
+  if (Array.isArray(p.images)) {
+    imagesArray = p.images;
+  } else if (typeof p.images === 'string' && p.images.trim()) {
+    try {
+      const parsed = JSON.parse(p.images);
+      if (Array.isArray(parsed)) imagesArray = parsed;
+    } catch (e) {
+      if (p.images.includes(',')) imagesArray = p.images.split(',').map(s => s.trim());
+      else imagesArray = [p.images.trim()];
+    }
+  }
+  if (imagesArray.length === 0 && p.image_url) {
+    imagesArray = [p.image_url];
+  }
+  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
+
+  const isSellerView = Boolean(options.isSellerView);
+
   const record = {
     id: Number(p.id),
     seller_id: Number(p.seller_id),
     seller_name: p.seller_name || 'Verified Seller',
     name: p.name || '',
     description: p.description || null,
-    price: presentation_price.toFixed(2),
-    presentation_price: presentation_price.toFixed(2),
-    selling_price: presentation_price.toFixed(2),
     stock: Number(p.stock || 0),
-    image_url: p.image_url || null,
+    image_url: primaryImageUrl,
+    images: imagesArray,
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
     updated_at: p.updated_at || null
   };
 
-  // On the user field (public user view), commission and internal fee margins must NOT be shown
-  if (!options.isPublicUser) {
+  if (isSellerView) {
+    // SELLER FIELD: Commission feature is completely DELETED from seller view!
+    // Seller only sees their own price (₹1000.00). No commission, delivery charge, gst, other charges.
+    record.price = seller_price.toFixed(2);
     record.seller_price = seller_price.toFixed(2);
+  } else {
+    // BUYER FIELD: Buyer sees presentation price (₹1138.00) AND the transparent commission breakdown!
+    record.price = presentation_price.toFixed(2);
+    record.presentation_price = presentation_price.toFixed(2);
+    record.selling_price = presentation_price.toFixed(2);
+    record.seller_price = seller_price.toFixed(2);
+    record.base_price = seller_price.toFixed(2);
     record.commission = commission.toFixed(2);
     record.delivery_charge = delivery_charge.toFixed(2);
     record.gst = gst.toFixed(2);
@@ -1689,20 +1766,32 @@ async function ensureProductPriceColumns(p) {
         `);
       } catch (e) {}
     }
+
+    // Ensure images LONGTEXT column exists for multiple product images
+    try {
+      const [imgCols] = await p.query('SHOW COLUMNS FROM products LIKE "images"');
+      if (imgCols.length === 0) {
+        await p.query('ALTER TABLE products ADD COLUMN images LONGTEXT NULL DEFAULT NULL AFTER image_url');
+        console.log('✅ [Vendor DB] Added images column to products table');
+        await p.query('UPDATE products SET images = JSON_ARRAY(image_url) WHERE images IS NULL AND image_url IS NOT NULL AND image_url != ""');
+      }
+    } catch (imgErr) {
+      // Column may already exist
+    }
   } catch (err) {
     // ignore
   }
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', seller_price: '2999.00', commission: '149.95', delivery_charge: '50.00', gst: '35.99', other_charges: '20.00', price: '3254.94', presentation_price: '3254.94', selling_price: '3254.94', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', seller_price: '4499.00', commission: '224.95', delivery_charge: '50.00', gst: '49.49', other_charges: '20.00', price: '4843.44', presentation_price: '4843.44', selling_price: '4843.44', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', seller_price: '3299.00', commission: '164.95', delivery_charge: '50.00', gst: '38.69', other_charges: '20.00', price: '3572.64', presentation_price: '3572.64', selling_price: '3572.64', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', seller_price: '2499.00', commission: '124.95', delivery_charge: '50.00', gst: '31.49', other_charges: '20.00', price: '2725.44', presentation_price: '2725.44', selling_price: '2725.44', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', seller_price: '1299.00', commission: '64.95', delivery_charge: '50.00', gst: '20.69', other_charges: '20.00', price: '1454.64', presentation_price: '1454.64', selling_price: '1454.64', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', seller_price: '3999.00', commission: '199.95', delivery_charge: '50.00', gst: '44.99', other_charges: '20.00', price: '4313.94', presentation_price: '4313.94', selling_price: '4313.94', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', seller_price: '1899.00', commission: '94.95', delivery_charge: '50.00', gst: '26.09', other_charges: '20.00', price: '2090.04', presentation_price: '2090.04', selling_price: '2090.04', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', seller_price: '1499.00', commission: '74.95', delivery_charge: '50.00', gst: '22.49', other_charges: '20.00', price: '1666.44', presentation_price: '1666.44', selling_price: '1666.44', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', seller_price: '2999.00', commission: '149.95', delivery_charge: '50.00', gst: '35.99', other_charges: '20.00', price: '3254.94', presentation_price: '3254.94', selling_price: '3254.94', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', seller_price: '4499.00', commission: '224.95', delivery_charge: '50.00', gst: '49.49', other_charges: '20.00', price: '4843.44', presentation_price: '4843.44', selling_price: '4843.44', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500'], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', seller_price: '3299.00', commission: '164.95', delivery_charge: '50.00', gst: '38.69', other_charges: '20.00', price: '3572.64', presentation_price: '3572.64', selling_price: '3572.64', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500'], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', seller_price: '2499.00', commission: '124.95', delivery_charge: '50.00', gst: '31.49', other_charges: '20.00', price: '2725.44', presentation_price: '2725.44', selling_price: '2725.44', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500'], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', seller_price: '1299.00', commission: '64.95', delivery_charge: '50.00', gst: '20.69', other_charges: '20.00', price: '1454.64', presentation_price: '1454.64', selling_price: '1454.64', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500'], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', seller_price: '3999.00', commission: '199.95', delivery_charge: '50.00', gst: '44.99', other_charges: '20.00', price: '4313.94', presentation_price: '4313.94', selling_price: '4313.94', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500'], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', seller_price: '1899.00', commission: '94.95', delivery_charge: '50.00', gst: '26.09', other_charges: '20.00', price: '2090.04', presentation_price: '2090.04', selling_price: '2090.04', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500'], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', seller_price: '1499.00', commission: '74.95', delivery_charge: '50.00', gst: '22.49', other_charges: '20.00', price: '1666.44', presentation_price: '1666.44', selling_price: '1666.44', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500'], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
@@ -1716,7 +1805,7 @@ app.get('/api/products', async (req, res) => {
     let countSql = 'SELECT COUNT(*) as total FROM products WHERE is_active = 1';
     let querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
        WHERE p.is_active = 1`;
@@ -1736,9 +1825,8 @@ app.get('/api/products', async (req, res) => {
     const [[{ total }]] = await pool.query(countSql, countParams);
     const [products] = await pool.query(querySql, queryParams);
 
-    const optUser = getOptionalAuthUser(req);
-    const isSeller = optUser && (optUser.role === 'admin' || (sellerId && Number(optUser.id) === Number(sellerId)));
-    const formatted = products.map(p => formatProductRecord(p, { isPublicUser: !isSeller }));
+    // Public / Buyer field: Buyers see presentation price, commission detail, and multiple images
+    const formatted = products.map(p => formatProductRecord(p, { isSellerView: false }));
 
     res.json({
       products: {
@@ -1750,9 +1838,7 @@ app.get('/api/products', async (req, res) => {
       }
     });
   } catch (err) {
-    const optUser = getOptionalAuthUser(req);
-    const isSeller = optUser && (optUser.role === 'admin' || (sellerId && Number(optUser.id) === Number(sellerId)));
-    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isPublicUser: !isSeller }));
+    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isSellerView: false }));
     res.json({
       products: {
         current_page: 1,
@@ -1771,7 +1857,7 @@ app.get('/api/products/:id', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
        WHERE p.id = ? AND p.is_active = 1
@@ -1781,34 +1867,33 @@ app.get('/api/products/:id', async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Product not found.' });
     }
-    const optUser = getOptionalAuthUser(req);
-    const isOwner = optUser && (optUser.role === 'admin' || Number(optUser.id) === Number(rows[0].seller_id));
-    const product = formatProductRecord(rows[0], { isPublicUser: !isOwner });
+    const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
+    const product = formatProductRecord(rows[0], { isSellerView });
     res.json({ product });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
     if (found) {
-      const optUser = getOptionalAuthUser(req);
-      const isOwner = optUser && (optUser.role === 'admin' || Number(optUser.id) === Number(found.seller_id));
-      return res.json({ product: formatProductRecord(found, { isPublicUser: !isOwner }) });
+      const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
+      return res.json({ product: formatProductRecord(found, { isSellerView }) });
     }
     res.status(404).json({ message: 'Product not found.' });
   }
 });
 
-// Dedicated Image Upload Endpoint
+// Dedicated Image Upload Endpoint (Supports single or multiple images)
 app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), (req, res) => {
-  const imageUrl = resolveProductImage(req);
-  if (!imageUrl) {
+  const imgResult = resolveProductImages(req);
+  if (imgResult.images.length === 0) {
     return res.status(422).json({
       message: 'No image uploaded or invalid format.',
-      errors: { image: ['Please upload an image file (jpg, png, webp) or provide base64 image data.'] }
+      errors: { image: ['Please upload image file(s) (jpg, png, webp) or provide image data/URLs.'] }
     });
   }
   res.status(201).json({
-    message: 'Image uploaded successfully.',
-    image_url: imageUrl,
-    url: imageUrl
+    message: 'Images uploaded successfully.',
+    image_url: imgResult.primaryImageUrl,
+    images: imgResult.images,
+    url: imgResult.primaryImageUrl
   });
 });
 
@@ -1818,7 +1903,7 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const description = body.description || null;
   const rawPrice = body.seller_price !== undefined ? body.seller_price : body.price;
   const stock = body.stock;
-  const imageUrl = resolveProductImage(req);
+  const imgResult = resolveProductImages(req);
 
   if (!name || rawPrice === undefined || stock === undefined) {
     return res.status(422).json({ message: 'Name, price and stock are required.' });
@@ -1829,20 +1914,21 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   try {
     await ensureProductPriceColumns(pool);
     const [result] = await pool.query(
-      `INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-      [req.user.id, name, description, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), imageUrl]
+      `INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+      [req.user.id, name, description, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), imgResult.primaryImageUrl, imgResult.imagesJson]
     );
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
        WHERE p.id = ?`,
       [result.insertId]
     );
-    const product = formatProductRecord(rows[0]);
+    // Seller created product: Seller view has NO commission feature!
+    const product = formatProductRecord(rows[0], { isSellerView: true });
     res.status(201).json({ message: 'Product created.', product });
   } catch (err) {
     const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => p.id)) + 1 : 9;
@@ -1859,9 +1945,10 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       other_charges: pricing.other_charges,
       price: pricing.price,
       stock: parseInt(stock, 10),
-      image_url: imageUrl,
+      image_url: imgResult.primaryImageUrl,
+      images: imgResult.images,
       is_active: true
-    });
+    }, { isSellerView: true });
     fallbackProducts.unshift(newProduct);
     return res.status(201).json({ message: 'Product created.', product: newProduct });
   }
@@ -1898,7 +1985,7 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
        ${where}
@@ -1907,7 +1994,8 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       [...params, limit, offset]
     );
 
-    const formatted = rows.map(p => formatProductRecord(p));
+    // Seller view: Commission feature is deleted from seller field!
+    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true }));
 
     res.json({
       seller_id: targetSellerId,
@@ -1920,7 +2008,7 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       }
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p));
+    const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p, { isSellerView: true }));
     res.json({
       seller_id: targetSellerId,
       products: {
@@ -1993,11 +2081,11 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
     params.push(parseInt(body.stock, 10));
   }
 
-  // Resolve newly uploaded image file or base64 if provided
-  const newImageUrl = resolveProductImage(req);
-  if (newImageUrl) {
-    updates.push('image_url = ?');
-    params.push(newImageUrl);
+  // Resolve newly uploaded image files or base64 if provided
+  const imgResult = resolveProductImages(req);
+  if (imgResult.images.length > 0) {
+    updates.push('image_url = ?', 'images = ?');
+    params.push(imgResult.primaryImageUrl, imgResult.imagesJson);
   }
 
   if (body.is_active !== undefined) {
@@ -2015,13 +2103,14 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
     const [updated] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
        WHERE p.id = ?`,
       [req.params.id]
     );
-    const product = formatProductRecord(updated[0]);
+    // Seller updated product: Seller view has NO commission feature!
+    const product = formatProductRecord(updated[0], { isSellerView: true });
 
     res.json({ message: 'Product updated.', product });
   } catch (err) {
@@ -2047,9 +2136,13 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
         fallbackProducts[idx].selling_price = pcalc.selling_price.toFixed(2);
       }
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
-      return res.json({ message: 'Product updated.', product: formatProductRecord(fallbackProducts[idx]) });
+      if (imgResult.images.length > 0) {
+        fallbackProducts[idx].image_url = imgResult.primaryImageUrl;
+        fallbackProducts[idx].images = imgResult.images;
+      }
+      return res.json({ message: 'Product updated.', product: formatProductRecord(fallbackProducts[idx], { isSellerView: true }) });
     }
-    res.status(500).json({ error: 'Failed to update product.' });
+    res.status(500).json({ message: 'Update failed.' });
   }
 });
 

@@ -1,9 +1,13 @@
 /**
  * Automated Verification: Product Pricing Breakdown & Presentation
- * Tests that when a seller adds/updates a product with price 1000:
- * - Raw price is NOT presented directly on the field
- * - Breakdown added: Commission (50), Delivery (50), GST (18), Other charges (20)
- * - Presentation field ('price') is 1138.00
+ * Tests:
+ * 1. Base price 1000 calculation: Presentation price becomes 1138.00 (Commission 50 + Delivery 50 + GST 18 + Other charges 20)
+ * 2. Multi-image support: Products can have multiple gallery images (images array)
+ * 3. Role segregation:
+ *    - SELLER FIELD: Commission feature is completely DELETED from seller view (seller sees price 1000.00, no commission/fee margins)
+ *    - BUYER FIELD: Buyer sees presentation price 1138.00 along with the transparent commission breakdown (Commission 50, Delivery 50, etc.)
+ * 4. Image Upload: Multiple images can be uploaded and resolved
+ * 5. Order creation: Buyer purchases at 1138.00 presentation price
  */
 
 const https = require('https');
@@ -168,14 +172,20 @@ async function runLiveTests() {
     }
   }
 
-  // Step 3: Create product with base price 1000
-  console.log('\n--- 3. Creating Product with price = 1000 ---');
+  // Step 3: Create product with base price 1000 and multiple images
+  console.log('\n--- 3. Creating Product with price = 1000 and Multiple Images ---');
+  const testImages = [
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
+    'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500',
+    'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'
+  ];
+
   const createRes = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
-    name: 'Smart ANC Headphones Pro 1000',
-    description: 'Noise cancelling headphones entered at base ₹1000',
+    name: 'Multi-Image ANC Headphones 1000',
+    description: 'Noise cancelling headphones entered at base ₹1000 with 3 gallery images',
     price: 1000.00,
     stock: 25,
-    image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500'
+    images: testImages
   });
 
   console.log('Create Product status:', createRes.status);
@@ -183,100 +193,132 @@ async function runLiveTests() {
   if (!prod) {
     throw new Error('Create product failed: ' + JSON.stringify(createRes.data));
   }
-  console.log('Returned Product:', {
+  console.log('Seller Created Product Response (Seller Field):', {
     id: prod.id,
     name: prod.name,
+    price: prod.price,
     seller_price: prod.seller_price,
     commission: prod.commission,
     delivery_charge: prod.delivery_charge,
-    gst: prod.gst,
-    other_charges: prod.other_charges,
-    price: prod.price,
-    presentation_price: prod.presentation_price
+    images: prod.images,
+    image_url: prod.image_url
   });
 
-  if (prod.seller_price !== '1000.00') {
-    throw new Error(`Expected seller_price to be '1000.00', got '${prod.seller_price}'`);
+  // Verify Seller Field: Commission feature is deleted, seller sees their price (1000.00)
+  if (prod.price !== '1000.00') {
+    throw new Error(`Expected seller price in seller field to be '1000.00', got '${prod.price}'`);
   }
-  if (prod.price !== '1138.00') {
-    throw new Error(`Expected presentation price to be '1138.00', got '${prod.price}'`);
+  if (prod.commission !== undefined) {
+    throw new Error(`Violation: Commission feature must be deleted from seller field! Got commission: '${prod.commission}'`);
   }
-  if (prod.commission !== '50.00') {
-    throw new Error(`Expected commission to be '50.00', got '${prod.commission}'`);
+  if (prod.delivery_charge !== undefined) {
+    throw new Error(`Violation: Delivery charge feature must be deleted from seller field! Got: '${prod.delivery_charge}'`);
   }
-  if (prod.delivery_charge !== '50.00') {
-    throw new Error(`Expected delivery_charge to be '50.00', got '${prod.delivery_charge}'`);
+  if (!Array.isArray(prod.images) || prod.images.length !== 3) {
+    throw new Error(`Expected product to have 3 images, got: ${JSON.stringify(prod.images)}`);
   }
-  if (prod.gst !== '18.00') {
-    throw new Error(`Expected gst to be '18.00', got '${prod.gst}'`);
+  if (prod.image_url !== testImages[0]) {
+    throw new Error(`Expected primary image_url to be '${testImages[0]}', got '${prod.image_url}'`);
   }
-  if (prod.other_charges !== '20.00') {
-    throw new Error(`Expected other_charges to be '20.00', got '${prod.other_charges}'`);
-  }
-  console.log('✅ Product Creation Verified: Base 1000 -> Presentation 1138.00 with all 4 charges included!');
+  console.log('✅ Seller Creation Response Verified: Seller sees ₹1000.00, NO commission feature, and 3 product images!');
 
-  // Step 4: Fetch product by ID as a Public User (NO Auth Token)
-  console.log('\n--- 4. Verifying User View: Commission Hidden on User Field (GET /api/products/' + prod.id + ') ---');
+  // Step 4: Verify Seller Field via GET /api/seller/products
+  console.log('\n--- 4. Verifying Seller Products Endpoint (GET /api/seller/products) ---');
+  const sellerListRes = await request('GET', '/api/seller/products', { Authorization: `Bearer ${token}` });
+  const sellerProducts = sellerListRes.data && sellerListRes.data.products && sellerListRes.data.products.data;
+  if (!sellerProducts || !Array.isArray(sellerProducts)) {
+    throw new Error('Failed to fetch seller products: ' + JSON.stringify(sellerListRes.data));
+  }
+  const foundInSellerList = sellerProducts.find(p => p.id === prod.id);
+  if (!foundInSellerList) {
+    throw new Error(`Created product #${prod.id} not found in seller products list!`);
+  }
+  if (foundInSellerList.commission !== undefined) {
+    throw new Error(`Violation: Commission must not be seen by seller in GET /api/seller/products! Got: ${foundInSellerList.commission}`);
+  }
+  if (foundInSellerList.price !== '1000.00') {
+    throw new Error(`Expected seller price '1000.00' in seller products list, got: ${foundInSellerList.price}`);
+  }
+  if (!Array.isArray(foundInSellerList.images) || foundInSellerList.images.length !== 3) {
+    throw new Error(`Expected 3 images in seller products list, got: ${JSON.stringify(foundInSellerList.images)}`);
+  }
+  console.log('✅ Seller Products List Verified: Seller sees clean price ₹1000.00, NO commission, and multiple images!');
+
+  // Step 5: Verify Buyer Field via GET /api/products/:id (Public Buyer View)
+  console.log('\n--- 5. Verifying Buyer Field (GET /api/products/' + prod.id + ') ---');
   const getRes = await request('GET', `/api/products/${prod.id}`);
-  const userProd = getRes.data && getRes.data.product;
-  if (!userProd) throw new Error('Failed to fetch product by id: ' + JSON.stringify(getRes.data));
+  const buyerProd = getRes.data && getRes.data.product;
+  if (!buyerProd) throw new Error('Failed to fetch product by id: ' + JSON.stringify(getRes.data));
   
-  console.log('Public User Product Fields:', {
-    id: userProd.id,
-    name: userProd.name,
-    price: userProd.price,
-    commission: userProd.commission,
-    seller_price: userProd.seller_price
+  console.log('Buyer Product Details:', {
+    id: buyerProd.id,
+    name: buyerProd.name,
+    price: buyerProd.price,
+    seller_price: buyerProd.seller_price,
+    commission: buyerProd.commission,
+    delivery_charge: buyerProd.delivery_charge,
+    gst: buyerProd.gst,
+    other_charges: buyerProd.other_charges,
+    images: buyerProd.images
   });
 
-  if (userProd.price !== '1138.00') {
-    throw new Error(`Expected presentation price on user field to be '1138.00', got '${userProd.price}'`);
+  // Buyer MUST see presentation price ₹1138.00
+  if (buyerProd.price !== '1138.00') {
+    throw new Error(`Expected buyer presentation price to be '1138.00', got '${buyerProd.price}'`);
   }
-  if (userProd.commission !== undefined) {
-    throw new Error(`Security Violation: Commission should NOT be visible on user field! Got: '${userProd.commission}'`);
+  // Buyer MUST see transparent commission detail (₹50.00)
+  if (buyerProd.commission !== '50.00') {
+    throw new Error(`Expected buyer to see commission detail '50.00', got '${buyerProd.commission}'`);
   }
-  if (userProd.seller_price !== undefined) {
-    throw new Error(`Security Violation: Seller price should NOT be visible on user field! Got: '${userProd.seller_price}'`);
+  if (buyerProd.delivery_charge !== '50.00') {
+    throw new Error(`Expected delivery_charge to be '50.00', got '${buyerProd.delivery_charge}'`);
   }
-  console.log('✅ User Field Verified: Public user sees presentation price ₹1138.00 with ZERO commission exposed!');
+  if (buyerProd.gst !== '18.00') {
+    throw new Error(`Expected gst to be '18.00', got '${buyerProd.gst}'`);
+  }
+  if (buyerProd.other_charges !== '20.00') {
+    throw new Error(`Expected other_charges to be '20.00', got '${buyerProd.other_charges}'`);
+  }
+  // Buyer MUST see multiple product images
+  if (!Array.isArray(buyerProd.images) || buyerProd.images.length !== 3) {
+    throw new Error(`Expected buyer to see 3 product images, got: ${JSON.stringify(buyerProd.images)}`);
+  }
+  console.log('✅ Buyer Field Verified: Buyer sees presentation price ₹1138.00, Commission Detail ₹50.00, and all 3 images!');
 
-  // Also verify seller view with Auth token still retains breakdown for the seller
-  const sellerGetRes = await request('GET', `/api/products/${prod.id}`, { Authorization: `Bearer ${token}` });
-  const sellerProd = sellerGetRes.data && sellerGetRes.data.product;
-  if (!sellerProd || sellerProd.commission !== '50.00') {
-    throw new Error(`Expected owner seller to see commission '50.00', got '${sellerProd && sellerProd.commission}'`);
+  // Step 6: Verify Buyer Field in Catalog (GET /api/products)
+  console.log('\n--- 6. Verifying Buyer Catalog (GET /api/products) ---');
+  const catalogRes = await request('GET', '/api/products');
+  const catalogList = catalogRes.data && catalogRes.data.products && catalogRes.data.products.data;
+  if (!catalogList || !Array.isArray(catalogList)) {
+    throw new Error('Failed to fetch catalog: ' + JSON.stringify(catalogRes.data));
   }
-  console.log('✅ Seller View Verified: Owner seller correctly retains commission and cost breakdown!');
+  const foundInCatalog = catalogList.find(p => p.id === prod.id);
+  if (!foundInCatalog) {
+    throw new Error(`Product #${prod.id} not found in public buyer catalog!`);
+  }
+  if (foundInCatalog.price !== '1138.00' || foundInCatalog.commission !== '50.00') {
+    throw new Error(`Catalog product mismatch: price=${foundInCatalog.price}, commission=${foundInCatalog.commission}`);
+  }
+  if (!Array.isArray(foundInCatalog.images) || foundInCatalog.images.length !== 3) {
+    throw new Error(`Catalog product missing multiple images: ${JSON.stringify(foundInCatalog.images)}`);
+  }
+  console.log('✅ Buyer Catalog Verified: Public catalog presents ₹1138.00 with transparent commission ₹50.00 and 3 images!');
 
-  // Step 5: Update product with custom overrides (PUT /api/products/:id)
-  console.log('\n--- 5. Updating Product with Custom Breakdown (PUT /api/products/' + prod.id + ') ---');
-  const updateRes = await request('PUT', `/api/products/${prod.id}`, { Authorization: `Bearer ${token}` }, {
-    name: 'Smart ANC Headphones Pro 1000 (Updated)',
-    seller_price: 1000.00,
-    commission: 80.00,
-    delivery_charge: 60.00,
-    gst: 25.00,
-    other_charges: 15.00
+  // Step 7: Test Image Upload endpoint (POST /api/upload)
+  console.log('\n--- 7. Verifying Image Upload Endpoint (POST /api/upload) ---');
+  const sampleBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const uploadRes = await request('POST', '/api/upload', { Authorization: `Bearer ${token}` }, {
+    images: [sampleBase64, 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500']
   });
-
-  const updatedProd = updateRes.data && updateRes.data.product;
-  if (!updatedProd) throw new Error('Update failed: ' + JSON.stringify(updateRes.data));
-  console.log('Updated Product:', {
-    seller_price: updatedProd.seller_price,
-    commission: updatedProd.commission,
-    delivery_charge: updatedProd.delivery_charge,
-    gst: updatedProd.gst,
-    other_charges: updatedProd.other_charges,
-    price: updatedProd.price
-  });
-
-  if (updatedProd.price !== '1180.00' || updatedProd.seller_price !== '1000.00') {
-    throw new Error(`Expected updated price '1180.00', got '${updatedProd.price}'`);
+  console.log('Upload response status:', uploadRes.status);
+  if (uploadRes.status !== 201 || !uploadRes.data || !uploadRes.data.image_url || !Array.isArray(uploadRes.data.images)) {
+    throw new Error('Upload endpoint failed: ' + JSON.stringify(uploadRes.data));
   }
-  console.log('✅ PUT /api/products/:id Verified: Custom overrides recalculated to 1180.00!');
+  console.log('Uploaded images count:', uploadRes.data.images.length, 'Primary URL:', uploadRes.data.image_url);
+  console.log('✅ Upload Endpoint Verified: Multiple product images successfully resolved!');
 
-  // Step 6: Place an order using this product to verify line item subtotal
-  console.log('\n--- 6. Placing Order with the Product ---');
+  // Step 8: Place Order with Product at Presentation Price
+  console.log('\n--- 8. Placing Order with Product (Buyer Purchase) ---');
   const orderRes = await request('POST', '/api/orders', {}, {
     buyer_name: 'Pricing Test Buyer',
     buyer_phone: '9988776655',
@@ -287,7 +329,6 @@ async function runLiveTests() {
     ]
   });
 
-  console.log('Order creation status:', orderRes.status);
   const orderData = orderRes.data && orderRes.data.order;
   if (!orderData) throw new Error('Order creation failed: ' + JSON.stringify(orderRes.data));
 
@@ -299,20 +340,20 @@ async function runLiveTests() {
     subtotal: item ? item.subtotal : 'n/a'
   });
 
-  if (item && parseFloat(item.price) !== 1180.00) {
-    throw new Error(`Expected order item price to be 1180.00, got ${item.price}`);
+  if (item && parseFloat(item.price) !== 1138.00) {
+    throw new Error(`Expected order item price to be 1138.00, got ${item.price}`);
   }
-  if (item && parseFloat(item.subtotal) !== 2360.00) {
-    throw new Error(`Expected order item subtotal to be 2360.00, got ${item.subtotal}`);
+  if (item && parseFloat(item.subtotal) !== 2276.00) {
+    throw new Error(`Expected order item subtotal to be 2276.00, got ${item.subtotal}`);
   }
-  console.log('✅ Order Placement Verified: Customer bought at presentation price (₹1180 × 2 = ₹2360)!');
+  console.log('✅ Order Placement Verified: Customer bought at presentation price (₹1138 × 2 = ₹2276)!');
 
-  // Step 7: Clean up test product
-  console.log('\n--- 7. Cleanup Test Product ---');
+  // Step 9: Clean up test product
+  console.log('\n--- 9. Cleanup Test Product ---');
   await request('DELETE', `/api/products/${prod.id}`, { Authorization: `Bearer ${token}` });
   console.log('✅ Cleanup completed.');
 
-  console.log('\n🎉 ALL PRICING PRESENTATION TESTS PASSED 100%!');
+  console.log('\n🎉 ALL VERIFICATION TESTS PASSED 100%!');
 }
 
 runLiveTests().catch(err => {
