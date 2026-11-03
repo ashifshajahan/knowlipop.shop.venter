@@ -184,20 +184,15 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
 
     // Parse multiple product images across all supported formats and aliases
     $imagesArray = [];
-    $rawSources = [
+    $gallerySources = [
         $p['images'] ?? null,
         $p['image_urls'] ?? null,
         $p['product_images'] ?? null,
         $p['gallery'] ?? null,
         $p['photos'] ?? null,
-        $p['image_url'] ?? null,
-        $p['image'] ?? null,
-        $p['product_image'] ?? null,
-        $p['photo'] ?? null,
-        $p['thumbnail'] ?? null,
     ];
 
-    foreach ($rawSources as $src) {
+    foreach ($gallerySources as $src) {
         if (empty($src)) continue;
         if (is_array($src)) {
             foreach ($src as $item) {
@@ -215,6 +210,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
                         if ($norm) $imagesArray[] = $norm;
                     }
                 }
+                if (!empty($imagesArray)) break;
                 continue;
             }
             if (preg_match('/[,;\n\r|]/', $src)) {
@@ -225,6 +221,27 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             } else {
                 $norm = $normalizeUrl($src);
                 if ($norm) $imagesArray[] = $norm;
+            }
+        }
+        if (!empty($imagesArray)) break;
+    }
+
+    // If no multi-image gallery found, fall back to single image fields
+    if (empty($imagesArray)) {
+        $singleSources = [
+            $p['image_url'] ?? null,
+            $p['image'] ?? null,
+            $p['product_image'] ?? null,
+            $p['photo'] ?? null,
+            $p['thumbnail'] ?? null,
+        ];
+        foreach ($singleSources as $src) {
+            if (is_string($src)) {
+                $norm = $normalizeUrl($src);
+                if ($norm) {
+                    $imagesArray[] = $norm;
+                    break;
+                }
             }
         }
     }
@@ -547,7 +564,8 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
 
         // Base64 data URI or raw base64 string
-        if (str_starts_with($trimmed, 'data:image/') || (strlen($trimmed) > 50 && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', $trimmed))) {
+        $isB64 = str_starts_with($trimmed, 'data:image/') || (strlen($trimmed) > 50 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/', $trimmed) && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', $trimmed));
+        if ($isB64) {
             $rawB64 = '';
             $ext = 'jpg';
             if (preg_match('/^data:image\/(\w+);base64,(.+)$/is', $trimmed, $matches)) {
@@ -606,7 +624,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             preg_match('/^file\d+$/i', $k)
         ) {
             $processCandidate($v);
-        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/') || (strlen(trim($v)) > 50 && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', trim($v))))) {
+        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/') || (strlen(trim($v)) > 50 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/', trim($v))))) {
             $processCandidate($v);
         }
     }
@@ -614,9 +632,6 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
     if (!empty($fallback)) {
         $processCandidate($fallback);
     }
-
-    // Deduplicate
-    $uniqueImages = array_values(array_unique(array_filter($collected)));
 
     // Deduplicate
     $uniqueImages = array_values(array_unique(array_filter($collected)));

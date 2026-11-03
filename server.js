@@ -207,10 +207,21 @@ function getDistinctDefaultImages(name = '', category = '', id = 0) {
   return gallery.slice(0, 4);
 }
 
+function isBase64Image(str) {
+  if (typeof str !== 'string') return false;
+  const t = str.trim();
+  if (t.startsWith('data:image/')) return true;
+  // Raw base64 check: must start with standard magic bytes for jpeg, png, gif, or webp
+  if (/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/.test(t) && t.length > 50 && /^[A-Za-z0-9+/=\r\n]+$/.test(t.replace(/\s+/g, ''))) {
+    return true;
+  }
+  return false;
+}
+
 function saveBase64Image(dataString) {
   if (typeof dataString !== 'string') return null;
   const trimmed = dataString.trim();
-  if (trimmed.length < 20) return null;
+  if (!isBase64Image(trimmed)) return null;
 
   let ext = 'jpg';
   let rawB64 = '';
@@ -221,15 +232,13 @@ function saveBase64Image(dataString) {
     if (ext === 'jpeg') ext = 'jpg';
     if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
     rawB64 = matches[2].replace(/\s+/g, '');
-  } else if (/^[A-Za-z0-9+/=\s\r\n]+$/.test(trimmed) && trimmed.length > 50) {
+  } else {
     rawB64 = trimmed.replace(/\s+/g, '');
     if (rawB64.startsWith('/9j/')) ext = 'jpg';
     else if (rawB64.startsWith('iVBORw0KGgo')) ext = 'png';
     else if (rawB64.startsWith('R0lGOD')) ext = 'gif';
     else if (rawB64.startsWith('UklGR')) ext = 'webp';
     else ext = 'jpg';
-  } else {
-    return null;
   }
 
   try {
@@ -339,7 +348,7 @@ function resolveProductImages(req) {
       }
 
       // Base64 data URI or raw base64 string
-      if (trimmed.startsWith('data:image/') || (/^[A-Za-z0-9+/=\s\r\n]+$/.test(trimmed) && trimmed.length > 50)) {
+      if (isBase64Image(trimmed)) {
         const saved = saveBase64Image(trimmed);
         if (saved) {
           collected.push(saved);
@@ -378,7 +387,7 @@ function resolveProductImages(req) {
       /^file\d+$/i.test(k)
     ) {
       processCandidate(v);
-    } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || v.startsWith('data:image/') || (/^[A-Za-z0-9+/=\s\r\n]+$/.test(v.trim()) && v.trim().length > 50))) {
+    } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || isBase64Image(v))) {
       processCandidate(v);
     }
   }
@@ -1866,11 +1875,8 @@ function formatProductRecord(p, options = {}) {
 
   // Parse multiple product images across all supported formats and aliases
   let imagesArray = [];
-  const rawSources = [
-    p.images, p.image_urls, p.product_images, p.gallery, p.photos,
-    p.image_url, p.image, p.product_image, p.photo, p.thumbnail
-  ];
-  for (const src of rawSources) {
+  const gallerySources = [p.images, p.image_urls, p.product_images, p.gallery, p.photos];
+  for (const src of gallerySources) {
     if (!src) continue;
     if (Array.isArray(src)) {
       for (const item of src) {
@@ -1885,7 +1891,7 @@ function formatProductRecord(p, options = {}) {
             const norm = normalizeUrl(item);
             if (norm) imagesArray.push(norm);
           }
-          continue;
+          if (imagesArray.length > 0) break;
         }
       } catch (e) {}
       if (/[,;\n\r|]/.test(src)) {
@@ -1896,6 +1902,19 @@ function formatProductRecord(p, options = {}) {
       } else {
         const norm = normalizeUrl(src);
         if (norm) imagesArray.push(norm);
+      }
+    }
+    if (imagesArray.length > 0) break;
+  }
+
+  // If no multi-image gallery found, fall back to single image fields
+  if (imagesArray.length === 0) {
+    const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail];
+    for (const src of singleSources) {
+      const norm = normalizeUrl(src);
+      if (norm) {
+        imagesArray.push(norm);
+        break;
       }
     }
   }
