@@ -7,90 +7,90 @@
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
 
-function calculatePricingBreakdown(array $input): array
+function resolveProductPricing(array $input, ?array $existingRow = null): array
 {
-    $rawPrice = isset($input['seller_price']) && $input['seller_price'] !== ''
-        ? (float) $input['seller_price']
-        : (isset($input['price']) && $input['price'] !== '' ? (float) $input['price'] : 0.0);
-
-    $seller_price = max(0.0, round($rawPrice, 2));
-
-    if (isset($input['commission']) && $input['commission'] !== '' && is_numeric($input['commission'])) {
-        $commission = max(0.0, round((float) $input['commission'], 2));
-    } else {
-        $commission = round($seller_price * 0.05, 2);
+    $rawPrice = 0.0;
+    if (isset($input['price']) && $input['price'] !== '' && is_numeric($input['price'])) {
+        $rawPrice = (float) $input['price'];
+    } elseif (isset($input['seller_price']) && $input['seller_price'] !== '' && is_numeric($input['seller_price'])) {
+        $rawPrice = (float) $input['seller_price'];
+    } elseif ($existingRow) {
+        $rawPrice = (float) ($existingRow['seller_price'] ?? ($existingRow['price'] ?? 0.0));
     }
+    $cleanPrice = max(0.0, round($rawPrice, 2));
 
-    $rawDel = $input['delivery_charge'] ?? $input['shipping_charge'] ?? $input['delivery_fee'] ?? null;
-    if ($rawDel !== null && $rawDel !== '' && is_numeric($rawDel)) {
-        $delivery_charge = max(0.0, round((float) $rawDel, 2));
-    } else {
-        $delivery_charge = 50.00;
+    // Maximum Retail Price (MRP)
+    $rawMrp = null;
+    if (isset($input['mrp']) && $input['mrp'] !== '' && is_numeric($input['mrp'])) {
+        $rawMrp = (float) $input['mrp'];
+    } elseif ($existingRow && isset($existingRow['mrp']) && is_numeric($existingRow['mrp'])) {
+        $rawMrp = (float) $existingRow['mrp'];
     }
+    $mrp = ($rawMrp !== null && $rawMrp >= $cleanPrice)
+        ? round($rawMrp, 2)
+        : ($cleanPrice > 0 ? round($cleanPrice * 1.30, 2) : 0.0);
 
-    $rawGst = $input['gst'] ?? $input['tax'] ?? $input['tax_amount'] ?? null;
-    if ($rawGst !== null && $rawGst !== '' && is_numeric($rawGst)) {
-        $gst = max(0.0, round((float) $rawGst, 2));
-    } else {
-        $feeBase = $commission + $delivery_charge;
-        $gst = round($feeBase * 0.18, 2);
-        if ($gst == 0.0 && $seller_price > 0) {
-            $gst = 18.00;
-        }
-    }
+    // Discount percentage
+    $discount_percent = ($mrp > $cleanPrice && $mrp > 0)
+        ? (int) round((($mrp - $cleanPrice) / $mrp) * 100)
+        : 0;
 
-    $rawOther = $input['other_charges'] ?? $input['handling_fee'] ?? $input['platform_fee'] ?? null;
-    if ($rawOther !== null && $rawOther !== '' && is_numeric($rawOther)) {
-        $other_charges = max(0.0, round((float) $rawOther, 2));
-    } else {
-        $other_charges = 20.00;
-    }
+    // Amazon/Flipkart referral fee preview (5% deduction preview from payout)
+    $commission = round($cleanPrice * 0.05, 2);
+    $estimated_payout = max(0.0, round($cleanPrice - $commission, 2));
 
-    $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
+    // Delivery rules
+    $delivery_charge = $cleanPrice >= 500 ? 0.00 : 50.00;
+    $delivery_text = $cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
     return [
-        'seller_price' => $seller_price,
+        'price' => $cleanPrice,
+        'seller_price' => $cleanPrice,
+        'selling_price' => $cleanPrice,
+        'presentation_price' => $cleanPrice,
+        'mrp' => $mrp,
+        'discount_percent' => $discount_percent,
+        'commission_rate' => '5%',
         'commission' => $commission,
+        'estimated_fee' => $commission,
+        'estimated_payout' => $estimated_payout,
         'delivery_charge' => $delivery_charge,
-        'gst' => $gst,
-        'other_charges' => $other_charges,
-        'price' => $presentation_price,
-        'presentation_price' => $presentation_price,
-        'selling_price' => $presentation_price,
+        'delivery_text' => $delivery_text,
+        'gst' => 0.00,
+        'other_charges' => 0.00,
     ];
+}
+
+function calculatePricingBreakdown(array $input): array
+{
+    return resolveProductPricing($input);
 }
 
 function formatProductRecord(array $p, bool $isSellerView = false): array
 {
-    $rawSeller = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
+    $rawPrice = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
         ? (float) $p['seller_price']
         : (isset($p['price']) && is_numeric($p['price']) ? (float) $p['price'] : 0.0);
+    $cleanPrice = max(0.0, round($rawPrice, 2));
 
-    $seller_price = round($rawSeller, 2);
+    // Maximum Retail Price (MRP)
+    $rawMrp = isset($p['mrp']) && is_numeric($p['mrp']) && (float) $p['mrp'] > 0
+        ? (float) $p['mrp']
+        : ($cleanPrice > 0 ? round($cleanPrice * 1.30, 2) : 0.0);
+    $mrp = max($cleanPrice, round($rawMrp, 2));
 
-    $commission = isset($p['commission']) && is_numeric($p['commission']) && (float) $p['commission'] > 0
-        ? round((float) $p['commission'], 2)
-        : round($seller_price * 0.05, 2);
+    // Discount percentage
+    $discount_percent = ($mrp > $cleanPrice && $mrp > 0)
+        ? (int) round((($mrp - $cleanPrice) / $mrp) * 100)
+        : 0;
 
-    $delivery_charge = isset($p['delivery_charge']) && is_numeric($p['delivery_charge']) && (float) $p['delivery_charge'] > 0
-        ? round((float) $p['delivery_charge'], 2)
-        : 50.00;
+    // Amazon/Flipkart referral fee preview
+    $commission = round($cleanPrice * 0.05, 2);
+    $estimated_payout = max(0.0, round($cleanPrice - $commission, 2));
 
-    $gst = isset($p['gst']) && is_numeric($p['gst']) && (float) $p['gst'] > 0
-        ? round((float) $p['gst'], 2)
-        : round(($commission + $delivery_charge) * 0.18, 2);
-
-    $other_charges = isset($p['other_charges']) && is_numeric($p['other_charges']) && (float) $p['other_charges'] > 0
-        ? round((float) $p['other_charges'], 2)
-        : 20.00;
-
-    $presentation_price = isset($p['price']) && is_numeric($p['price'])
-        ? round((float) $p['price'], 2)
-        : round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
-
-    if (abs($presentation_price - $seller_price) < 0.001 && $seller_price > 0) {
-        $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
-    }
+    // Delivery
+    $delivery_charge = $cleanPrice >= 500 ? 0.00 : 50.00;
+    $delivery_text = $cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
     // Parse multiple product images
     $imagesArray = [];
@@ -113,34 +113,54 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     }
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
 
-    $result = array_merge($p, [
+    $stock = (int) ($p['stock'] ?? 0);
+    $rating = isset($p['rating']) && is_numeric($p['rating']) ? (float) $p['rating'] : 4.5;
+    $ratingsCount = isset($p['ratings_count']) && is_numeric($p['ratings_count']) ? (int) $p['ratings_count'] : 15;
+    $sku = !empty($p['sku']) ? $p['sku'] : ('SKU-' . str_pad((string)($p['id'] ?? 1), 4, '0', STR_PAD_LEFT));
+    $category = !empty($p['category']) ? $p['category'] : 'General';
+    $brand = !empty($p['brand']) ? $p['brand'] : 'Generic';
+
+    $result = [
         'id' => (int) $p['id'],
         'seller_id' => (int) $p['seller_id'],
+        'seller_name' => $p['seller_name'] ?? 'Verified Seller',
         'name' => (string) ($p['name'] ?? ''),
         'description' => $p['description'] ?? null,
-        'stock' => (int) ($p['stock'] ?? 0),
+        'sku' => $sku,
+        'category' => $category,
+        'brand' => $brand,
+        'stock' => $stock,
+        'in_stock' => $stock > 0,
+        'rating' => $rating,
+        'ratings_count' => $ratingsCount,
         'image_url' => $primaryImageUrl,
         'images' => $imagesArray,
         'is_active' => (bool) ($p['is_active'] ?? true),
-    ]);
+        'created_at' => $p['created_at'] ?? null,
+        'updated_at' => $p['updated_at'] ?? null,
+    ];
 
     if ($isSellerView) {
-        // SELLER FIELD: Commission feature is completely DELETED from seller view!
-        // Seller only sees their own price (₹1000.00). No commission, delivery charge, gst, other charges.
-        $result['price'] = number_format($seller_price, 2, '.', '');
-        $result['seller_price'] = number_format($seller_price, 2, '.', '');
-        unset($result['commission'], $result['delivery_charge'], $result['gst'], $result['other_charges']);
+        // SELLER FIELD: Amazon / Flipkart Seller Central model
+        // Seller sets price (₹1000.00). Strictly ₹1000.00 with ZERO compounding!
+        $result['price'] = number_format($cleanPrice, 2, '.', '');
+        $result['seller_price'] = number_format($cleanPrice, 2, '.', '');
+        $result['selling_price'] = number_format($cleanPrice, 2, '.', '');
+        $result['mrp'] = number_format($mrp, 2, '.', '');
+        $result['discount_percent'] = $discount_percent;
+        $result['commission_rate'] = '5%';
+        $result['estimated_fee'] = number_format($commission, 2, '.', '');
+        $result['estimated_payout'] = number_format($estimated_payout, 2, '.', '');
     } else {
-        // BUYER FIELD: Buyer sees presentation price (₹1138.00) AND the transparent commission breakdown!
-        $result['price'] = number_format($presentation_price, 2, '.', '');
-        $result['presentation_price'] = number_format($presentation_price, 2, '.', '');
-        $result['selling_price'] = number_format($presentation_price, 2, '.', '');
-        $result['seller_price'] = number_format($seller_price, 2, '.', '');
-        $result['base_price'] = number_format($seller_price, 2, '.', '');
-        $result['commission'] = number_format($commission, 2, '.', '');
+        // BUYER FIELD: Amazon / Flipkart Marketplace store model
+        $result['price'] = number_format($cleanPrice, 2, '.', '');
+        $result['selling_price'] = number_format($cleanPrice, 2, '.', '');
+        $result['presentation_price'] = number_format($cleanPrice, 2, '.', '');
+        $result['seller_price'] = number_format($cleanPrice, 2, '.', '');
+        $result['mrp'] = number_format($mrp, 2, '.', '');
+        $result['discount_percent'] = $discount_percent;
         $result['delivery_charge'] = number_format($delivery_charge, 2, '.', '');
-        $result['gst'] = number_format($gst, 2, '.', '');
-        $result['other_charges'] = number_format($other_charges, 2, '.', '');
+        $result['delivery_text'] = $delivery_text;
     }
 
     return $result;
@@ -149,50 +169,48 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
 function ensureProductPriceColumns(PDO $pdo): void
 {
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `products` LIKE 'seller_price'")->fetchAll();
-        if (empty($cols)) {
-            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `description`"); } catch (\Throwable $e) {}
-            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `seller_price`"); } catch (\Throwable $e) {}
-            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission`"); } catch (\Throwable $e) {}
-            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `delivery_charge`"); } catch (\Throwable $e) {}
-            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `gst`"); } catch (\Throwable $e) {}
-
+        $addColumnIfNotExists = function(string $colName, string $colDef) use ($pdo) {
             try {
-                $pdo->exec("
-                    UPDATE `products`
-                    SET
-                      `seller_price` = `price`,
-                      `commission` = ROUND(`price` * 0.05, 2),
-                      `delivery_charge` = 50.00,
-                      `gst` = ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2),
-                      `other_charges` = 20.00,
-                      `price` = ROUND(`price` + ROUND(`price` * 0.05, 2) + 50.00 + ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
-                    WHERE `seller_price` = 0.00 OR `seller_price` IS NULL
-                ");
+                $cols = $pdo->query("SHOW COLUMNS FROM `products` LIKE '{$colName}'")->fetchAll();
+                if (empty($cols)) {
+                    $pdo->exec("ALTER TABLE `products` ADD COLUMN {$colDef}");
+                }
             } catch (\Throwable $e) {}
-        } else {
-            try {
-                $pdo->exec("
-                    UPDATE `products`
-                    SET
-                      `seller_price` = `price`,
-                      `commission` = ROUND(`price` * 0.05, 2),
-                      `delivery_charge` = 50.00,
-                      `gst` = ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2),
-                      `other_charges` = 20.00,
-                      `price` = ROUND(`price` + ROUND(`price` * 0.05, 2) + 50.00 + ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
-                    WHERE (`seller_price` = 0.00 OR `seller_price` IS NULL) AND `price` > 0
-                ");
-            } catch (\Throwable $e) {}
-        }
+        };
 
-        // Ensure images LONGTEXT column exists for multiple product images
+        $addColumnIfNotExists('seller_price', '`seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `description`');
+        $addColumnIfNotExists('commission', '`commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `seller_price`');
+        $addColumnIfNotExists('delivery_charge', '`delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission`');
+        $addColumnIfNotExists('gst', '`gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `delivery_charge`');
+        $addColumnIfNotExists('other_charges', '`other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `gst`');
+        $addColumnIfNotExists('mrp', '`mrp` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `price`');
+        $addColumnIfNotExists('sku', '`sku` VARCHAR(100) NULL AFTER `mrp`');
+        $addColumnIfNotExists('category', '`category` VARCHAR(100) NULL AFTER `sku`');
+        $addColumnIfNotExists('brand', '`brand` VARCHAR(100) NULL AFTER `category`');
+        $addColumnIfNotExists('rating', '`rating` DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER `brand`');
+        $addColumnIfNotExists('ratings_count', '`ratings_count` INT NOT NULL DEFAULT 15 AFTER `rating`');
+        $addColumnIfNotExists('images', '`images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`');
+
+        // Safe database repair:
+        // 1. Recover any prices that compounded above seller_price
         try {
-            $imgCols = $pdo->query("SHOW COLUMNS FROM `products` LIKE 'images'")->fetchAll();
-            if (empty($imgCols)) {
-                $pdo->exec("ALTER TABLE `products` ADD COLUMN `images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`");
-                $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`) WHERE `images` IS NULL AND `image_url` IS NOT NULL AND `image_url` != ''");
-            }
+            $pdo->exec("UPDATE `products` SET `price` = `seller_price` WHERE `seller_price` > 0 AND `price` > `seller_price`");
+        } catch (\Throwable $e) {}
+        // 2. Ensure seller_price is set
+        try {
+            $pdo->exec("UPDATE `products` SET `seller_price` = `price` WHERE (`seller_price` = 0.00 OR `seller_price` IS NULL) AND `price` > 0");
+        } catch (\Throwable $e) {}
+        // 3. Ensure MRP is populated
+        try {
+            $pdo->exec("UPDATE `products` SET `mrp` = ROUND(`price` * 1.30, 2) WHERE (`mrp` IS NULL OR `mrp` = 0.00) AND `price` > 0");
+        } catch (\Throwable $e) {}
+        // 4. Ensure SKU is set
+        try {
+            $pdo->exec("UPDATE `products` SET `sku` = CONCAT('SKU-', LPAD(`id`, 4, '0')) WHERE `sku` IS NULL OR `sku` = ''");
+        } catch (\Throwable $e) {}
+        // 5. Ensure images JSON array is populated if images is null
+        try {
+            $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`) WHERE `images` IS NULL AND `image_url` IS NOT NULL AND `image_url` != ''");
         } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
@@ -220,7 +238,8 @@ function apiGetProducts(PDO $pdo): void
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
@@ -257,7 +276,8 @@ function apiGetProduct(PDO $pdo, int $id): void
     ensureProductPriceColumns($pdo);
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
@@ -438,16 +458,24 @@ function apiCreateProduct(PDO $pdo): void
     // Process image file uploads, base64, or multiple images
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
 
-    $pricing = calculatePricingBreakdown($input);
+    $pricing = resolveProductPricing($input);
+    $sku = trim((string)($input['sku'] ?? '')) ?: null;
+    $category = trim((string)($input['category'] ?? '')) ?: 'General';
+    $brand = trim((string)($input['brand'] ?? '')) ?: 'Generic';
+    $mrp = (float) $pricing['mrp'];
 
     $stmt = $pdo->prepare("
-        INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
+        INSERT INTO products (seller_id, name, description, sku, category, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+        VALUES (:seller_id, :name, :description, :sku, :category, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
         ':name' => $name,
         ':description' => $input['description'] ?? null,
+        ':sku' => $sku,
+        ':category' => $category,
+        ':brand' => $brand,
+        ':mrp' => number_format($mrp, 2, '.', ''),
         ':seller_price' => number_format($pricing['seller_price'], 2, '.', ''),
         ':commission' => number_format($pricing['commission'], 2, '.', ''),
         ':delivery_charge' => number_format($pricing['delivery_charge'], 2, '.', ''),
@@ -462,7 +490,8 @@ function apiCreateProduct(PDO $pdo): void
     $id = (int) $pdo->lastInsertId();
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
@@ -510,7 +539,8 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
@@ -573,37 +603,36 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     }
 
     $pricingModified = (
-        isset($input['seller_price']) ||
-        isset($input['price']) ||
-        isset($input['commission']) ||
-        isset($input['delivery_charge']) ||
-        isset($input['shipping_charge']) ||
-        isset($input['gst']) ||
-        isset($input['tax']) ||
-        isset($input['other_charges'])
+        (isset($input['price']) && $input['price'] !== '' && is_numeric($input['price'])) ||
+        (isset($input['seller_price']) && $input['seller_price'] !== '' && is_numeric($input['seller_price']))
     );
 
     if ($pricingModified) {
-        $mergedPricingInput = [
-            'seller_price' => $input['seller_price'] ?? ($input['price'] ?? ($product['seller_price'] ?? $product['price'])),
-            'commission' => $input['commission'] ?? ($product['commission'] ?? null),
-            'delivery_charge' => $input['delivery_charge'] ?? ($input['shipping_charge'] ?? ($product['delivery_charge'] ?? null)),
-            'gst' => $input['gst'] ?? ($input['tax'] ?? ($product['gst'] ?? null)),
-            'other_charges' => $input['other_charges'] ?? ($product['other_charges'] ?? null),
-        ];
-        $newPricing = calculatePricingBreakdown($mergedPricingInput);
-        $updates[] = "seller_price = :seller_price";
-        $params[':seller_price'] = number_format($newPricing['seller_price'], 2, '.', '');
-        $updates[] = "commission = :commission";
-        $params[':commission'] = number_format($newPricing['commission'], 2, '.', '');
-        $updates[] = "delivery_charge = :delivery_charge";
-        $params[':delivery_charge'] = number_format($newPricing['delivery_charge'], 2, '.', '');
-        $updates[] = "gst = :gst";
-        $params[':gst'] = number_format($newPricing['gst'], 2, '.', '');
-        $updates[] = "other_charges = :other_charges";
-        $params[':other_charges'] = number_format($newPricing['other_charges'], 2, '.', '');
+        $rawVal = isset($input['price']) && $input['price'] !== ''
+            ? (float) $input['price']
+            : (float) $input['seller_price'];
+        $cleanPrice = max(0.0, round($rawVal, 2));
         $updates[] = "price = :price";
-        $params[':price'] = number_format($newPricing['price'], 2, '.', '');
+        $params[':price'] = number_format($cleanPrice, 2, '.', '');
+        $updates[] = "seller_price = :seller_price";
+        $params[':seller_price'] = number_format($cleanPrice, 2, '.', '');
+    }
+
+    if (isset($input['mrp']) && $input['mrp'] !== '' && is_numeric($input['mrp'])) {
+        $updates[] = "mrp = :mrp";
+        $params[':mrp'] = number_format(max(0.0, round((float)$input['mrp'], 2)), 2, '.', '');
+    }
+    if (isset($input['sku'])) {
+        $updates[] = "sku = :sku";
+        $params[':sku'] = trim((string)$input['sku']);
+    }
+    if (isset($input['category'])) {
+        $updates[] = "category = :category";
+        $params[':category'] = trim((string)$input['category']);
+    }
+    if (isset($input['brand'])) {
+        $updates[] = "brand = :brand";
+        $params[':brand'] = trim((string)$input['brand']);
     }
 
     if (isset($input['stock']) && is_numeric($input['stock'])) {
@@ -634,7 +663,8 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id

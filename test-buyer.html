@@ -1705,7 +1705,7 @@
   <!-- Application Logic                          -->
   <!-- ========================================== -->
   <script>
-    // 1. Initial State & Starter Catalog
+    // 1. Initial State & Starter Catalog (Amazon / Flipkart standard model)
     const starterProducts = [
       {
         id: 1,
@@ -1713,14 +1713,18 @@
         seller_name: 'TechHub Direct',
         name: 'Smart Wireless Headset Pro',
         description: 'Active noise cancelling over-ear headphones with 40-hour battery life.',
+        price: '2999.00',
         seller_price: '2999.00',
-        commission: '149.95',
-        delivery_charge: '50.00',
-        gst: '35.99',
-        other_charges: '20.00',
-        price: '3254.94',
-        presentation_price: '3254.94',
-        selling_price: '3254.94',
+        selling_price: '2999.00',
+        mrp: '3999.00',
+        discount_percent: 25,
+        sku: 'SKU-0001',
+        category: 'Electronics',
+        brand: 'SoundMaster',
+        rating: 4.8,
+        ratings_count: 248,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 50,
         image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
         images: [
@@ -1736,14 +1740,18 @@
         seller_name: 'TechHub Direct',
         name: 'Ultra HD 4K Smart Watch',
         description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.',
+        price: '4499.00',
         seller_price: '4499.00',
-        commission: '224.95',
-        delivery_charge: '50.00',
-        gst: '49.49',
-        other_charges: '20.00',
-        price: '4843.44',
-        presentation_price: '4843.44',
-        selling_price: '4843.44',
+        selling_price: '4499.00',
+        mrp: '5999.00',
+        discount_percent: 25,
+        sku: 'SKU-0002',
+        category: 'Wearables',
+        brand: 'Chronos',
+        rating: 4.7,
+        ratings_count: 182,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 35,
         image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500',
         images: [
@@ -1758,14 +1766,18 @@
         seller_name: 'Urban Leather Works',
         name: 'Vintage Leather Travel Backpack',
         description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.',
+        price: '3299.00',
         seller_price: '3299.00',
-        commission: '164.95',
-        delivery_charge: '50.00',
-        gst: '38.69',
-        other_charges: '20.00',
-        price: '3572.64',
-        presentation_price: '3572.64',
-        selling_price: '3572.64',
+        selling_price: '3299.00',
+        mrp: '4999.00',
+        discount_percent: 34,
+        sku: 'SKU-0003',
+        category: 'Luggage',
+        brand: 'UrbanCraft',
+        rating: 4.6,
+        ratings_count: 94,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 20,
         image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500',
         images: [
@@ -1779,14 +1791,18 @@
         seller_name: 'Stride Pro Athletics',
         name: 'Air Cushion Running Sneakers',
         description: 'Lightweight breathable sports shoes designed for marathon running and daily training.',
+        price: '2499.00',
         seller_price: '2499.00',
-        commission: '124.95',
-        delivery_charge: '50.00',
-        gst: '31.49',
-        other_charges: '20.00',
-        price: '2725.44',
-        presentation_price: '2725.44',
-        selling_price: '2725.44',
+        selling_price: '2499.00',
+        mrp: '3499.00',
+        discount_percent: 29,
+        sku: 'SKU-0004',
+        category: 'Footwear',
+        brand: 'AeroStep',
+        rating: 4.5,
+        ratings_count: 312,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 60,
         image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500',
         images: [
@@ -1800,14 +1816,18 @@
         seller_name: 'Optics Club',
         name: 'Polarized Aviator Sunglasses',
         description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.',
+        price: '1299.00',
         seller_price: '1299.00',
-        commission: '64.95',
-        delivery_charge: '50.00',
-        gst: '20.69',
-        other_charges: '20.00',
-        price: '1454.64',
-        presentation_price: '1454.64',
-        selling_price: '1454.64',
+        selling_price: '1299.00',
+        mrp: '1999.00',
+        discount_percent: 35,
+        sku: 'SKU-0005',
+        category: 'Accessories',
+        brand: 'OptiShield',
+        rating: 4.4,
+        ratings_count: 76,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 100,
         image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500',
         images: [
@@ -1821,14 +1841,18 @@
         seller_name: 'GamerGear Pro',
         name: 'RGB Mechanical Gaming Keyboard',
         description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.',
+        price: '3999.00',
         seller_price: '3999.00',
-        commission: '199.95',
-        delivery_charge: '50.00',
-        gst: '44.99',
-        other_charges: '20.00',
-        price: '4313.94',
-        presentation_price: '4313.94',
-        selling_price: '4313.94',
+        selling_price: '3999.00',
+        mrp: '5499.00',
+        discount_percent: 27,
+        sku: 'SKU-0006',
+        category: 'Computers',
+        brand: 'VortexKey',
+        rating: 4.9,
+        ratings_count: 420,
+        delivery_charge: '0.00',
+        delivery_text: 'FREE Delivery',
         stock: 25,
         image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500',
         images: [
@@ -1926,13 +1950,13 @@
         }
         const primaryImg = imgList[0] || 'https://via.placeholder.com/300?text=Product';
 
-        // Transparent Commission Detail for Buyer
-        const commVal = p.commission ? parseFloat(p.commission).toFixed(2) : '50.00';
-        const delivVal = p.delivery_charge ? parseFloat(p.delivery_charge).toFixed(2) : '50.00';
-        const gstVal = p.gst ? parseFloat(p.gst).toFixed(2) : '18.00';
-        const otherVal = p.other_charges ? parseFloat(p.other_charges).toFixed(2) : '20.00';
-        const taxesAndFees = (parseFloat(gstVal) + parseFloat(otherVal)).toFixed(2);
-        const baseVal = p.seller_price || p.base_price || (parseFloat(p.price) - parseFloat(commVal) - parseFloat(delivVal) - parseFloat(taxesAndFees)).toFixed(2);
+        // Clean pricing and presentation according to Amazon / Flipkart standards
+        const cleanPrice = parseFloat(p.price || p.seller_price || 0);
+        const cleanMrp = parseFloat(p.mrp || 0) || Math.round(cleanPrice * 1.30 * 100) / 100;
+        const discountPercent = p.discount_percent || (cleanMrp > cleanPrice ? Math.round(((cleanMrp - cleanPrice) / cleanMrp) * 100) : 0);
+        const ratingVal = p.rating || 4.5;
+        const ratingsCountVal = p.ratings_count || 42;
+        const deliveryTextVal = p.delivery_text || (cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)');
 
         const card = document.createElement('div');
         card.className = `product-card ${inOrderClass}`;
@@ -1954,23 +1978,34 @@
           <img id="main-img-${p.id}" src="${primaryImg}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.src='https://via.placeholder.com/300?text=Product'">
           ${galleryThumbsHtml}
           <div class="product-body">
-            <div style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.12); padding: 2px 8px; border-radius: 6px; margin-bottom: 6px;">
-              <span>🏪</span>
-              <span>Seller #${p.seller_id || 1}: ${escapeHtml(p.seller_name || 'Verified Provider')}</span>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <div style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(56, 189, 248, 0.12); padding: 2px 8px; border-radius: 6px;">
+                <span>🏪</span>
+                <span>${escapeHtml(p.seller_name || 'Verified Seller')}</span>
+              </div>
+              <div style="font-size: 11px; font-weight: 700; color: #f59e0b; display: flex; align-items: center; gap: 2px;">
+                <span>★</span> <span>${ratingVal}</span> <span style="color: var(--text-muted); font-size: 10px;">(${ratingsCountVal})</span>
+              </div>
             </div>
             <div class="product-title">${escapeHtml(p.name)}</div>
             <div class="product-desc">${escapeHtml(p.description || '')}</div>
-            <div class="product-meta">
+            <div class="product-meta" style="margin-top: 8px;">
               <div>
-                <div class="product-price">₹${parseFloat(p.price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
-                <div class="product-commission-breakdown" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; background: rgba(99, 102, 241, 0.08); padding: 4px 8px; border-radius: 6px; border: 1px dashed rgba(99, 102, 241, 0.25); line-height: 1.4;">
-                  <span style="font-weight: 700; color: var(--accent);">Commission Detail:</span> ₹${commVal} | Base: ₹${baseVal} | Del: ₹${delivVal} | Tax: ₹${taxesAndFees}
+                <div style="display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;">
+                  <span class="product-price" style="font-size: 20px; font-weight: 800; color: #fff;">₹${cleanPrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span>
+                  ${cleanMrp > cleanPrice ? `
+                    <span style="text-decoration: line-through; color: var(--text-muted); font-size: 12px;">M.R.P.: ₹${cleanMrp.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span>
+                    <span style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 4px;">${discountPercent}% off</span>
+                  ` : ''}
+                </div>
+                <div style="font-size: 11px; color: var(--accent); margin-top: 3px; display: flex; align-items: center; gap: 4px;">
+                  <span>🚚</span> <span>${deliveryTextVal}</span>
                 </div>
               </div>
               <div class="product-stock" id="stock-display-${p.id}">
                 ${(parseInt(p.stock, 10) > 0)
-            ? `<span style="color: var(--success); font-weight: 700;">● Stock: ${p.stock}</span>`
-            : `<span style="color: var(--danger); font-weight: 700;">● Out of Stock (0)</span>`}
+            ? `<span style="color: var(--success); font-weight: 700;">● In Stock (${p.stock})</span>`
+            : `<span style="color: var(--danger); font-weight: 700;">● Out of Stock</span>`}
               </div>
             </div>
 

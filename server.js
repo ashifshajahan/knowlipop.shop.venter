@@ -1558,98 +1558,93 @@ app.post('/api/reset-password', async (req, res) => {
 // 3. Products Catalog, Pricing Breakdown & CRUD
 // ==========================================
 
-function calculatePricingBreakdown(body = {}) {
-  // If seller_price is explicitly provided, use it. Otherwise, if price is provided, that is the base seller input.
-  const rawPrice = (body.seller_price !== undefined && body.seller_price !== null && body.seller_price !== '')
-    ? parseFloat(body.seller_price)
-    : ((body.price !== undefined && body.price !== null && body.price !== '') ? parseFloat(body.price) : 0);
-
-  const seller_price = isNaN(rawPrice) ? 0 : Math.max(0, Math.round(rawPrice * 100) / 100);
-
-  // Commission: custom or default 5% of seller_price
-  let commission;
-  if (body.commission !== undefined && body.commission !== null && body.commission !== '' && !isNaN(body.commission)) {
-    commission = Math.max(0, Math.round(parseFloat(body.commission) * 100) / 100);
-  } else {
-    commission = Math.round(seller_price * 0.05 * 100) / 100;
+function resolveProductPricing(body = {}, existingRow = null) {
+  // Extract clean input price from price or seller_price
+  let rawPrice = 0;
+  if (body.price !== undefined && body.price !== null && body.price !== '' && !isNaN(parseFloat(body.price))) {
+    rawPrice = parseFloat(body.price);
+  } else if (body.seller_price !== undefined && body.seller_price !== null && body.seller_price !== '' && !isNaN(parseFloat(body.seller_price))) {
+    rawPrice = parseFloat(body.seller_price);
+  } else if (existingRow) {
+    rawPrice = parseFloat(existingRow.seller_price || existingRow.price || 0);
   }
+  const cleanPrice = Math.max(0, Math.round(rawPrice * 100) / 100);
 
-  // Delivery charge: custom or standard 50.00
-  let delivery_charge;
-  const rawDelivery = body.delivery_charge !== undefined ? body.delivery_charge : (body.shipping_charge !== undefined ? body.shipping_charge : body.delivery_fee);
-  if (rawDelivery !== undefined && rawDelivery !== null && rawDelivery !== '' && !isNaN(rawDelivery)) {
-    delivery_charge = Math.max(0, Math.round(parseFloat(rawDelivery) * 100) / 100);
-  } else {
-    delivery_charge = 50.00;
+  // Maximum Retail Price (MRP)
+  let rawMrp = null;
+  if (body.mrp !== undefined && body.mrp !== null && body.mrp !== '' && !isNaN(parseFloat(body.mrp))) {
+    rawMrp = parseFloat(body.mrp);
+  } else if (existingRow && existingRow.mrp !== undefined && existingRow.mrp !== null && !isNaN(parseFloat(existingRow.mrp))) {
+    rawMrp = parseFloat(existingRow.mrp);
   }
+  const mrp = (rawMrp !== null && rawMrp >= cleanPrice)
+    ? Math.round(rawMrp * 100) / 100
+    : (cleanPrice > 0 ? Math.round(cleanPrice * 1.30 * 100) / 100 : 0);
 
-  // GST: custom or 18% of platform fees/services (commission + delivery_charge), minimum 18.00 if seller_price >= 1000
-  let gst;
-  const rawGst = body.gst !== undefined ? body.gst : (body.tax !== undefined ? body.tax : body.tax_amount);
-  if (rawGst !== undefined && rawGst !== null && rawGst !== '' && !isNaN(rawGst)) {
-    gst = Math.max(0, Math.round(parseFloat(rawGst) * 100) / 100);
-  } else {
-    const feeBase = commission + delivery_charge;
-    gst = Math.round(feeBase * 0.18 * 100) / 100;
-    if (gst === 0 && seller_price > 0) gst = 18.00;
-  }
+  // Discount percentage (Amazon/Flipkart style)
+  const discount_percent = (mrp > cleanPrice && mrp > 0)
+    ? Math.round(((mrp - cleanPrice) / mrp) * 100)
+    : 0;
 
-  // Other charges: handling / platform fee, default 20.00
-  let other_charges;
-  const rawOther = body.other_charges !== undefined ? body.other_charges : (body.handling_fee !== undefined ? body.handling_fee : body.platform_fee);
-  if (rawOther !== undefined && rawOther !== null && rawOther !== '' && !isNaN(rawOther)) {
-    other_charges = Math.max(0, Math.round(parseFloat(rawOther) * 100) / 100);
-  } else {
-    other_charges = 20.00;
-  }
+  // Amazon/Flipkart referral fee preview (5%) - DEDUCTED from seller payout preview, NEVER added to price!
+  const commission_rate = '5%';
+  const commission = Math.round(cleanPrice * 0.05 * 100) / 100;
+  const estimated_payout = Math.max(0, Math.round((cleanPrice - commission) * 100) / 100);
 
-  // Final presentation price = seller_price + commission + delivery_charge + gst + other_charges
-  const presentation_price = Math.round((seller_price + commission + delivery_charge + gst + other_charges) * 100) / 100;
+  // Delivery rules: Free delivery on orders >= ₹500, standard ₹50 otherwise
+  const delivery_charge = cleanPrice >= 500 ? 0.00 : 50.00;
+  const delivery_text = cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
   return {
-    seller_price,
+    price: cleanPrice,
+    seller_price: cleanPrice,
+    selling_price: cleanPrice,
+    presentation_price: cleanPrice,
+    mrp,
+    discount_percent,
+    commission_rate,
     commission,
+    estimated_fee: commission,
+    estimated_payout,
     delivery_charge,
-    gst,
-    other_charges,
-    price: presentation_price,
-    presentation_price,
-    selling_price: presentation_price
+    delivery_text,
+    gst: 0.00,
+    other_charges: 0.00
   };
+}
+
+// Backward compatibility alias: pricing breakdown is clean selling price, no compounding!
+function calculatePricingBreakdown(body = {}) {
+  return resolveProductPricing(body);
 }
 
 function formatProductRecord(p, options = {}) {
   if (!p) return null;
-  const rawSellerPrice = (p.seller_price !== undefined && p.seller_price !== null && !isNaN(parseFloat(p.seller_price)) && parseFloat(p.seller_price) > 0)
+
+  // Clean selling price: NEVER compounded or inflated by fees!
+  const rawPrice = (p.seller_price !== undefined && p.seller_price !== null && !isNaN(parseFloat(p.seller_price)) && parseFloat(p.seller_price) > 0)
     ? parseFloat(p.seller_price)
-    : (p.price !== undefined && p.price !== null ? parseFloat(p.price) : 0);
+    : (p.price !== undefined && p.price !== null && !isNaN(parseFloat(p.price)) ? parseFloat(p.price) : 0);
+  const cleanPrice = Math.max(0, Math.round(rawPrice * 100) / 100);
 
-  const seller_price = Math.round(rawSellerPrice * 100) / 100;
+  // Maximum Retail Price (MRP)
+  const rawMrp = (p.mrp !== undefined && p.mrp !== null && !isNaN(parseFloat(p.mrp)) && parseFloat(p.mrp) > 0)
+    ? parseFloat(p.mrp)
+    : (cleanPrice > 0 ? Math.round(cleanPrice * 1.30 * 100) / 100 : 0);
+  const mrp = Math.max(cleanPrice, Math.round(rawMrp * 100) / 100);
 
-  const commission = (p.commission !== undefined && p.commission !== null && !isNaN(parseFloat(p.commission)) && parseFloat(p.commission) > 0)
-    ? Math.round(parseFloat(p.commission) * 100) / 100
-    : Math.round(seller_price * 0.05 * 100) / 100;
+  // Discount percentage (Amazon/Flipkart style)
+  const discountPercent = (mrp > cleanPrice && mrp > 0)
+    ? Math.round(((mrp - cleanPrice) / mrp) * 100)
+    : 0;
 
-  const delivery_charge = (p.delivery_charge !== undefined && p.delivery_charge !== null && !isNaN(parseFloat(p.delivery_charge)) && parseFloat(p.delivery_charge) > 0)
-    ? Math.round(parseFloat(p.delivery_charge) * 100) / 100
-    : 50.00;
+  // Amazon/Flipkart referral fee preview (5% deduction preview from payout)
+  const commission = Math.round(cleanPrice * 0.05 * 100) / 100;
+  const estimatedPayout = Math.max(0, Math.round((cleanPrice - commission) * 100) / 100);
 
-  const gst = (p.gst !== undefined && p.gst !== null && !isNaN(parseFloat(p.gst)) && parseFloat(p.gst) > 0)
-    ? Math.round(parseFloat(p.gst) * 100) / 100
-    : Math.round((commission + delivery_charge) * 0.18 * 100) / 100;
-
-  const other_charges = (p.other_charges !== undefined && p.other_charges !== null && !isNaN(parseFloat(p.other_charges)) && parseFloat(p.other_charges) > 0)
-    ? Math.round(parseFloat(p.other_charges) * 100) / 100
-    : 20.00;
-
-  let presentation_price = (p.price !== undefined && p.price !== null && !isNaN(parseFloat(p.price)))
-    ? Math.round(parseFloat(p.price) * 100) / 100
-    : Math.round((seller_price + commission + delivery_charge + gst + other_charges) * 100) / 100;
-
-  // If price is identical to seller_price (legacy row), compute full presentation price
-  if (Math.abs(presentation_price - seller_price) < 0.001 && seller_price > 0) {
-    presentation_price = Math.round((seller_price + commission + delivery_charge + gst + other_charges) * 100) / 100;
-  }
+  // Delivery rules
+  const deliveryCharge = cleanPrice >= 500 ? 0.00 : 50.00;
+  const deliveryText = cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
   // Parse multiple product images
   let imagesArray = [];
@@ -1670,6 +1665,12 @@ function formatProductRecord(p, options = {}) {
   const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
 
   const isSellerView = Boolean(options.isSellerView);
+  const stock = parseInt(p.stock || 0, 10);
+  const rating = (p.rating !== undefined && p.rating !== null && !isNaN(parseFloat(p.rating))) ? parseFloat(p.rating) : 4.5;
+  const ratingsCount = (p.ratings_count !== undefined && p.ratings_count !== null && !isNaN(parseInt(p.ratings_count, 10))) ? parseInt(p.ratings_count, 10) : 15;
+  const sku = p.sku || `SKU-${String(p.id || 1).padStart(4, '0')}`;
+  const category = p.category || 'General';
+  const brand = p.brand || 'Generic';
 
   const record = {
     id: Number(p.id),
@@ -1677,7 +1678,13 @@ function formatProductRecord(p, options = {}) {
     seller_name: p.seller_name || 'Verified Seller',
     name: p.name || '',
     description: p.description || null,
-    stock: Number(p.stock || 0),
+    sku,
+    category,
+    brand,
+    stock,
+    in_stock: stock > 0,
+    rating,
+    ratings_count: ratingsCount,
     image_url: primaryImageUrl,
     images: imagesArray,
     is_active: Boolean(p.is_active),
@@ -1686,21 +1693,29 @@ function formatProductRecord(p, options = {}) {
   };
 
   if (isSellerView) {
-    // SELLER FIELD: Commission feature is completely DELETED from seller view!
-    // Seller only sees their own price (₹1000.00). No commission, delivery charge, gst, other charges.
-    record.price = seller_price.toFixed(2);
-    record.seller_price = seller_price.toFixed(2);
+    // SELLER FIELD: Amazon / Flipkart Seller Central model
+    // Seller sets price (₹1000.00). It is strictly ₹1000.00 with ZERO compounding!
+    // No commission or delivery charges added to bloat the seller's price!
+    record.price = cleanPrice.toFixed(2);
+    record.seller_price = cleanPrice.toFixed(2);
+    record.selling_price = cleanPrice.toFixed(2);
+    record.mrp = mrp.toFixed(2);
+    record.discount_percent = discountPercent;
+    // Amazon/Flipkart Fee preview (deducted from payout)
+    record.commission_rate = '5%';
+    record.estimated_fee = commission.toFixed(2);
+    record.estimated_payout = estimatedPayout.toFixed(2);
   } else {
-    // BUYER FIELD: Buyer sees presentation price (₹1138.00) AND the transparent commission breakdown!
-    record.price = presentation_price.toFixed(2);
-    record.presentation_price = presentation_price.toFixed(2);
-    record.selling_price = presentation_price.toFixed(2);
-    record.seller_price = seller_price.toFixed(2);
-    record.base_price = seller_price.toFixed(2);
-    record.commission = commission.toFixed(2);
-    record.delivery_charge = delivery_charge.toFixed(2);
-    record.gst = gst.toFixed(2);
-    record.other_charges = other_charges.toFixed(2);
+    // BUYER FIELD: Amazon / Flipkart Marketplace store model
+    // Clean selling price (₹1000.00), MRP with strike-through (₹1300.00), discount badge (23% OFF), delivery badge
+    record.price = cleanPrice.toFixed(2);
+    record.selling_price = cleanPrice.toFixed(2);
+    record.presentation_price = cleanPrice.toFixed(2);
+    record.seller_price = cleanPrice.toFixed(2);
+    record.mrp = mrp.toFixed(2);
+    record.discount_percent = discountPercent;
+    record.delivery_charge = deliveryCharge.toFixed(2);
+    record.delivery_text = deliveryText;
   }
 
   return record;
@@ -1720,78 +1735,64 @@ function getOptionalAuthUser(req) {
 
 async function ensureProductPriceColumns(p) {
   try {
-    const [cols] = await p.query('SHOW COLUMNS FROM products LIKE "seller_price"');
-    if (cols.length === 0) {
+    const addColumnIfNotExists = async (colName, colDef) => {
       try {
-        await p.query('ALTER TABLE products ADD COLUMN seller_price DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER description');
+        const [rows] = await p.query(`SHOW COLUMNS FROM products LIKE '${colName}'`);
+        if (rows.length === 0) {
+          await p.query(`ALTER TABLE products ADD COLUMN ${colDef}`);
+          console.log(`✅ [Vendor DB] Added ${colName} column to products table`);
+        }
       } catch (e) {}
-      try {
-        await p.query('ALTER TABLE products ADD COLUMN commission DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER seller_price');
-      } catch (e) {}
-      try {
-        await p.query('ALTER TABLE products ADD COLUMN delivery_charge DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER commission');
-      } catch (e) {}
-      try {
-        await p.query('ALTER TABLE products ADD COLUMN gst DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER delivery_charge');
-      } catch (e) {}
-      try {
-        await p.query('ALTER TABLE products ADD COLUMN other_charges DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER gst');
-      } catch (e) {}
+    };
 
-      try {
-        await p.query(`
-          UPDATE products
-          SET
-            seller_price = price,
-            commission = ROUND(price * 0.05, 2),
-            delivery_charge = 50.00,
-            gst = ROUND((ROUND(price * 0.05, 2) + 50.00) * 0.18, 2),
-            other_charges = 20.00,
-            price = ROUND(price + ROUND(price * 0.05, 2) + 50.00 + ROUND((ROUND(price * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
-          WHERE seller_price = 0.00 OR seller_price IS NULL
-        `);
-      } catch (e) {}
-    } else {
-      try {
-        await p.query(`
-          UPDATE products
-          SET
-            seller_price = price,
-            commission = ROUND(price * 0.05, 2),
-            delivery_charge = 50.00,
-            gst = ROUND((ROUND(price * 0.05, 2) + 50.00) * 0.18, 2),
-            other_charges = 20.00,
-            price = ROUND(price + ROUND(price * 0.05, 2) + 50.00 + ROUND((ROUND(price * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
-          WHERE (seller_price = 0.00 OR seller_price IS NULL) AND price > 0
-        `);
-      } catch (e) {}
-    }
+    await addColumnIfNotExists('seller_price', 'seller_price DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER description');
+    await addColumnIfNotExists('commission', 'commission DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER seller_price');
+    await addColumnIfNotExists('delivery_charge', 'delivery_charge DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER commission');
+    await addColumnIfNotExists('gst', 'gst DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER delivery_charge');
+    await addColumnIfNotExists('other_charges', 'other_charges DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER gst');
+    await addColumnIfNotExists('mrp', 'mrp DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER price');
+    await addColumnIfNotExists('sku', 'sku VARCHAR(100) NULL AFTER mrp');
+    await addColumnIfNotExists('category', 'category VARCHAR(100) NULL AFTER sku');
+    await addColumnIfNotExists('brand', 'brand VARCHAR(100) NULL AFTER category');
+    await addColumnIfNotExists('rating', 'rating DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER brand');
+    await addColumnIfNotExists('ratings_count', 'ratings_count INT NOT NULL DEFAULT 15 AFTER rating');
+    await addColumnIfNotExists('images', 'images LONGTEXT NULL DEFAULT NULL AFTER image_url');
 
-    // Ensure images LONGTEXT column exists for multiple product images
+    // Safe database repair:
+    // 1. Recover any prices that compounded above seller_price (e.g. 1138, 1284, 1442 back to clean original seller_price)
     try {
-      const [imgCols] = await p.query('SHOW COLUMNS FROM products LIKE "images"');
-      if (imgCols.length === 0) {
-        await p.query('ALTER TABLE products ADD COLUMN images LONGTEXT NULL DEFAULT NULL AFTER image_url');
-        console.log('✅ [Vendor DB] Added images column to products table');
-        await p.query('UPDATE products SET images = JSON_ARRAY(image_url) WHERE images IS NULL AND image_url IS NOT NULL AND image_url != ""');
-      }
-    } catch (imgErr) {
-      // Column may already exist
-    }
+      await p.query('UPDATE products SET price = seller_price WHERE seller_price > 0 AND price > seller_price');
+    } catch (e) {}
+    // 2. Ensure seller_price is set
+    try {
+      await p.query('UPDATE products SET seller_price = price WHERE (seller_price = 0.00 OR seller_price IS NULL) AND price > 0');
+    } catch (e) {}
+    // 3. Ensure MRP is populated
+    try {
+      await p.query('UPDATE products SET mrp = ROUND(price * 1.30, 2) WHERE (mrp IS NULL OR mrp = 0.00) AND price > 0');
+    } catch (e) {}
+    // 4. Ensure SKU is set
+    try {
+      await p.query("UPDATE products SET sku = CONCAT('SKU-', LPAD(id, 4, '0')) WHERE sku IS NULL OR sku = ''");
+    } catch (e) {}
+    // 5. Ensure images JSON array is populated if images is null
+    try {
+      await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE images IS NULL AND image_url IS NOT NULL AND image_url != ''");
+    } catch (e) {}
   } catch (err) {
     // ignore
   }
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', seller_price: '2999.00', commission: '149.95', delivery_charge: '50.00', gst: '35.99', other_charges: '20.00', price: '3254.94', presentation_price: '3254.94', selling_price: '3254.94', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'], is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', seller_price: '4499.00', commission: '224.95', delivery_charge: '50.00', gst: '49.49', other_charges: '20.00', price: '4843.44', presentation_price: '4843.44', selling_price: '4843.44', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500'], is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', seller_price: '3299.00', commission: '164.95', delivery_charge: '50.00', gst: '38.69', other_charges: '20.00', price: '3572.64', presentation_price: '3572.64', selling_price: '3572.64', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500'], is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', seller_price: '2499.00', commission: '124.95', delivery_charge: '50.00', gst: '31.49', other_charges: '20.00', price: '2725.44', presentation_price: '2725.44', selling_price: '2725.44', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500'], is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', seller_price: '1299.00', commission: '64.95', delivery_charge: '50.00', gst: '20.69', other_charges: '20.00', price: '1454.64', presentation_price: '1454.64', selling_price: '1454.64', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500'], is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', seller_price: '3999.00', commission: '199.95', delivery_charge: '50.00', gst: '44.99', other_charges: '20.00', price: '4313.94', presentation_price: '4313.94', selling_price: '4313.94', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500'], is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', seller_price: '1899.00', commission: '94.95', delivery_charge: '50.00', gst: '26.09', other_charges: '20.00', price: '2090.04', presentation_price: '2090.04', selling_price: '2090.04', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500'], is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', seller_price: '1499.00', commission: '74.95', delivery_charge: '50.00', gst: '22.49', other_charges: '20.00', price: '1666.44', presentation_price: '1666.44', selling_price: '1666.44', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500'], is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500'], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500'], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500'], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500'], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500'], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500'], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500'], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
@@ -1804,7 +1805,8 @@ app.get('/api/products', async (req, res) => {
     await ensureProductPriceColumns(pool);
     let countSql = 'SELECT COUNT(*) as total FROM products WHERE is_active = 1';
     let querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
@@ -1825,7 +1827,7 @@ app.get('/api/products', async (req, res) => {
     const [[{ total }]] = await pool.query(countSql, countParams);
     const [products] = await pool.query(querySql, queryParams);
 
-    // Public / Buyer field: Buyers see presentation price, commission detail, and multiple images
+    // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
     const formatted = products.map(p => formatProductRecord(p, { isSellerView: false }));
 
     res.json({
@@ -1856,7 +1858,8 @@ app.get('/api/products/:id', async (req, res) => {
     await ensureProductPriceColumns(pool);
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
@@ -1909,18 +1912,23 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
     return res.status(422).json({ message: 'Name, price and stock are required.' });
   }
 
-  const pricing = calculatePricingBreakdown(body);
+  const pricing = resolveProductPricing(body);
+  const sku = (body.sku || '').toString().trim() || null;
+  const category = (body.category || '').toString().trim() || 'General';
+  const brand = (body.brand || '').toString().trim() || 'Generic';
+  const mrp = pricing.mrp;
 
   try {
     await ensureProductPriceColumns(pool);
     const [result] = await pool.query(
-      `INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-      [req.user.id, name, description, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), imgResult.primaryImageUrl, imgResult.imagesJson]
+      `INSERT INTO products (seller_id, name, description, sku, category, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+      [req.user.id, name, description, sku, category, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), imgResult.primaryImageUrl, imgResult.imagesJson]
     );
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
@@ -1938,11 +1946,11 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       seller_name: req.user.seller_name || 'Verified Seller',
       name,
       description,
+      sku,
+      category,
+      brand,
+      mrp,
       seller_price: pricing.seller_price,
-      commission: pricing.commission,
-      delivery_charge: pricing.delivery_charge,
-      gst: pricing.gst,
-      other_charges: pricing.other_charges,
       price: pricing.price,
       stock: parseInt(stock, 10),
       image_url: imgResult.primaryImageUrl,
@@ -1984,7 +1992,8 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
     const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
@@ -2052,28 +2061,38 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
   }
 
   const pricingModified = (
-    body.seller_price !== undefined ||
-    body.price !== undefined ||
-    body.commission !== undefined ||
-    body.delivery_charge !== undefined ||
-    body.shipping_charge !== undefined ||
-    body.gst !== undefined ||
-    body.tax !== undefined ||
-    body.other_charges !== undefined
+    (body.price !== undefined && body.price !== null && body.price !== '' && !isNaN(parseFloat(body.price))) ||
+    (body.seller_price !== undefined && body.seller_price !== null && body.seller_price !== '' && !isNaN(parseFloat(body.seller_price)))
   );
 
+  let newCleanPrice = null;
   if (pricingModified) {
-    const existingRow = existing[0] || {};
-    const mergedPricingInput = {
-      seller_price: body.seller_price !== undefined ? body.seller_price : (body.price !== undefined ? body.price : existingRow.seller_price || existingRow.price),
-      commission: body.commission !== undefined ? body.commission : existingRow.commission,
-      delivery_charge: body.delivery_charge !== undefined ? body.delivery_charge : (body.shipping_charge !== undefined ? body.shipping_charge : existingRow.delivery_charge),
-      gst: body.gst !== undefined ? body.gst : (body.tax !== undefined ? body.tax : existingRow.gst),
-      other_charges: body.other_charges !== undefined ? body.other_charges : existingRow.other_charges
-    };
-    const newPricing = calculatePricingBreakdown(mergedPricingInput);
-    updates.push('seller_price = ?', 'commission = ?', 'delivery_charge = ?', 'gst = ?', 'other_charges = ?', 'price = ?');
-    params.push(newPricing.seller_price, newPricing.commission, newPricing.delivery_charge, newPricing.gst, newPricing.other_charges, newPricing.price);
+    const rawVal = body.price !== undefined && body.price !== null && body.price !== ''
+      ? parseFloat(body.price)
+      : parseFloat(body.seller_price);
+    newCleanPrice = Math.max(0, Math.round(rawVal * 100) / 100);
+    // Amazon/Flipkart standard: price and seller_price are strictly identical (clean listed price)
+    updates.push('price = ?', 'seller_price = ?');
+    params.push(newCleanPrice, newCleanPrice);
+  }
+
+  if (body.mrp !== undefined && body.mrp !== null && body.mrp !== '' && !isNaN(parseFloat(body.mrp))) {
+    const newMrp = Math.max(0, Math.round(parseFloat(body.mrp) * 100) / 100);
+    updates.push('mrp = ?');
+    params.push(newMrp);
+  }
+
+  if (body.sku !== undefined) {
+    updates.push('sku = ?');
+    params.push(body.sku.toString().trim());
+  }
+  if (body.category !== undefined) {
+    updates.push('category = ?');
+    params.push(body.category.toString().trim());
+  }
+  if (body.brand !== undefined) {
+    updates.push('brand = ?');
+    params.push(body.brand.toString().trim());
   }
 
   if (body.stock !== undefined && !isNaN(body.stock)) {
@@ -2102,7 +2121,8 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
 
     const [updated] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
@@ -2117,24 +2137,19 @@ app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) =
     const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
     if (idx !== -1) {
       if (body.name) fallbackProducts[idx].name = body.name.toString().trim();
-      if (pricingModified) {
-        const mergedPricingInput = {
-          seller_price: body.seller_price !== undefined ? body.seller_price : (body.price !== undefined ? body.price : fallbackProducts[idx].seller_price || fallbackProducts[idx].price),
-          commission: body.commission !== undefined ? body.commission : fallbackProducts[idx].commission,
-          delivery_charge: body.delivery_charge !== undefined ? body.delivery_charge : fallbackProducts[idx].delivery_charge,
-          gst: body.gst !== undefined ? body.gst : fallbackProducts[idx].gst,
-          other_charges: body.other_charges !== undefined ? body.other_charges : fallbackProducts[idx].other_charges
-        };
-        const pcalc = calculatePricingBreakdown(mergedPricingInput);
-        fallbackProducts[idx].seller_price = pcalc.seller_price.toFixed(2);
-        fallbackProducts[idx].commission = pcalc.commission.toFixed(2);
-        fallbackProducts[idx].delivery_charge = pcalc.delivery_charge.toFixed(2);
-        fallbackProducts[idx].gst = pcalc.gst.toFixed(2);
-        fallbackProducts[idx].other_charges = pcalc.other_charges.toFixed(2);
-        fallbackProducts[idx].price = pcalc.price.toFixed(2);
-        fallbackProducts[idx].presentation_price = pcalc.presentation_price.toFixed(2);
-        fallbackProducts[idx].selling_price = pcalc.selling_price.toFixed(2);
+      if (body.description !== undefined) fallbackProducts[idx].description = body.description;
+      if (pricingModified && newCleanPrice !== null) {
+        fallbackProducts[idx].price = newCleanPrice.toFixed(2);
+        fallbackProducts[idx].seller_price = newCleanPrice.toFixed(2);
+        fallbackProducts[idx].selling_price = newCleanPrice.toFixed(2);
+        fallbackProducts[idx].presentation_price = newCleanPrice.toFixed(2);
       }
+      if (body.mrp !== undefined && !isNaN(parseFloat(body.mrp))) {
+        fallbackProducts[idx].mrp = parseFloat(body.mrp).toFixed(2);
+      }
+      if (body.sku !== undefined) fallbackProducts[idx].sku = body.sku.toString().trim();
+      if (body.category !== undefined) fallbackProducts[idx].category = body.category.toString().trim();
+      if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
       if (imgResult.images.length > 0) {
         fallbackProducts[idx].image_url = imgResult.primaryImageUrl;
