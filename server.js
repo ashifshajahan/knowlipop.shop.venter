@@ -167,7 +167,7 @@ function getDistinctDefaultImages(name = '', category = '', id = 0) {
   else if (text.includes('earbud') || text.includes('audio')) gallery = distinctProductGalleries.earbuds;
   else if (text.includes('mouse')) gallery = distinctProductGalleries.mouse;
 
-  return gallery.slice(0, 10);
+  return gallery.slice(0, 4);
 }
 
 function saveBase64Image(dataString) {
@@ -326,27 +326,14 @@ function resolveProductImages(req) {
 
   // Deduplicate
   let uniqueImages = Array.from(new Set(collected.filter(Boolean)));
+  const hasImages = uniqueImages.length > 0;
 
-  // If user provided at least 1 image but fewer than 3, complement it with matching default gallery views
-  // so that the product always has a complete multiple-image gallery (at least 3 images)
-  const productName = (body.name || '').toString();
-  const productCategory = (body.category || '').toString();
-  if (uniqueImages.length > 0 && uniqueImages.length < 3) {
-    const defaults = getDistinctDefaultImages(productName, productCategory);
-    for (const d of defaults) {
-      if (!uniqueImages.includes(d) && uniqueImages.length < 3) {
-        uniqueImages.push(d);
-      }
-    }
-  } else if (uniqueImages.length === 0) {
-    uniqueImages = getDistinctDefaultImages(productName, productCategory);
-  }
-
-  // Strictly enforce multiple URL limit of 10
-  uniqueImages = uniqueImages.slice(0, 10);
+  // Strictly enforce seller multiple URL limit of 4 images
+  uniqueImages = uniqueImages.slice(0, 4);
   const primaryImageUrl = uniqueImages.length > 0 ? uniqueImages[0] : null;
 
   return {
+    hasImages,
     primaryImageUrl,
     images: uniqueImages,
     imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null
@@ -1834,20 +1821,14 @@ function formatProductRecord(p, options = {}) {
   // Deduplicate
   imagesArray = Array.from(new Set(imagesArray.filter(Boolean)));
 
-  // Minimum 3-image gallery guarantee so multiple images ALWAYS work
-  if (imagesArray.length > 0 && imagesArray.length < 3) {
-    const defaults = getDistinctDefaultImages(p.name, p.category, p.id);
-    for (const d of defaults) {
-      if (!imagesArray.includes(d) && imagesArray.length < 3) {
-        imagesArray.push(d);
-      }
-    }
-  } else if (imagesArray.length === 0) {
+  // If product has no images, provide default images for category.
+  // NEVER auto-inject default images into seller's uploaded images!
+  if (imagesArray.length === 0) {
     imagesArray = getDistinctDefaultImages(p.name, p.category, p.id);
   }
 
-  // Strictly enforce multiple URL limit of 10
-  imagesArray = imagesArray.slice(0, 10);
+  // Strictly enforce seller multiple URL limit of 4 images
+  imagesArray = imagesArray.slice(0, 4);
   const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
 
   const isSellerView = Boolean(options.isSellerView);
@@ -2023,11 +2004,11 @@ async function ensureProductPriceColumns(p) {
           images = '["https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800","https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800"]'
         WHERE id = 51
       `);
-      // Fix product 54 (Rty from user screenshot) with multi-image gallery
+      // Clean product 54 (Rty from user screenshot) to strictly have its seller uploaded image
       await p.query(`
         UPDATE products SET
           image_url = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg',
-          images = '["https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg","https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800"]'
+          images = '["https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg"]'
         WHERE id = 54
       `);
       // Fix product 44 (duplicate headset image) with distinct studio headphone gallery
@@ -2037,11 +2018,6 @@ async function ensureProductPriceColumns(p) {
           images = '["https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800","https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800","https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800"]'
         WHERE id = 44
       `);
-    } catch (e) {}
-
-    // 6. Ensure any product with null or single image gets a complete multi-image gallery
-    try {
-      await p.query("UPDATE products SET images = JSON_ARRAY(image_url, 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', 'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800') WHERE (images IS NULL OR images = '[]' OR JSON_LENGTH(images) <= 1) AND image_url IS NOT NULL AND image_url != ''");
     } catch (e) {}
   } catch (err) {
     // ignore
@@ -2160,7 +2136,9 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
     message: 'Images uploaded successfully.',
     image_url: imgResult.primaryImageUrl,
     images: imgResult.images,
-    url: imgResult.primaryImageUrl
+    url: imgResult.primaryImageUrl,
+    limit: 4,
+    count: imgResult.images.length
   });
 });
 
@@ -2182,12 +2160,17 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
 
+  // Use seller's uploaded/provided images (up to 4 max). Only fall back to default gallery if seller provided zero images.
+  const finalImages = imgResult.hasImages ? imgResult.images : getDistinctDefaultImages(name, category, 0).slice(0, 4);
+  const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
+  const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
+
   try {
     await ensureProductPriceColumns(pool);
     const [result] = await pool.query(
       `INSERT INTO products (seller_id, name, description, sku, category, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-      [req.user.id, name, description, sku, category, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), imgResult.primaryImageUrl, imgResult.imagesJson]
+      [req.user.id, name, description, sku, category, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson]
     );
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
@@ -2217,8 +2200,8 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       seller_price: pricing.seller_price,
       price: pricing.price,
       stock: parseInt(stock, 10),
-      image_url: imgResult.primaryImageUrl,
-      images: imgResult.images,
+      image_url: finalPrimaryUrl,
+      images: finalImages,
       is_active: true
     }, { isSellerView: true });
     fallbackProducts.unshift(newProduct);
@@ -2365,9 +2348,9 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
     params.push(parseInt(body.stock, 10));
   }
 
-  // Resolve newly uploaded image files or base64 if provided
+  // Resolve newly uploaded image files, base64, or image URLs if provided (limit 4)
   const imgResult = resolveProductImages(req);
-  if (imgResult.images.length > 0) {
+  if (imgResult.hasImages && imgResult.images.length > 0) {
     updates.push('image_url = ?', 'images = ?');
     params.push(imgResult.primaryImageUrl, imgResult.imagesJson);
   }
@@ -2416,7 +2399,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       if (body.category !== undefined) fallbackProducts[idx].category = body.category.toString().trim();
       if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
-      if (imgResult.images.length > 0) {
+      if (imgResult.hasImages && imgResult.images.length > 0) {
         fallbackProducts[idx].image_url = imgResult.primaryImageUrl;
         fallbackProducts[idx].images = imgResult.images;
       }

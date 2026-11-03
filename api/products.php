@@ -138,7 +138,7 @@ function getDistinctDefaultImages(string $name = '', string $category = '', int 
         $gallery = $distinctProductGalleries['mouse'];
     }
 
-    return array_slice($gallery, 0, 10);
+    return array_slice($gallery, 0, 4);
 }
 
 function formatProductRecord(array $p, bool $isSellerView = false): array
@@ -194,23 +194,17 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     // Deduplicate
     $imagesArray = array_values(array_unique(array_filter($imagesArray)));
 
-    // Minimum 3-image gallery guarantee so multiple images ALWAYS work
+    // If product has no images, provide default images for category.
+    // NEVER auto-inject default images into seller's uploaded images!
     $prodName = (string)($p['name'] ?? '');
     $prodCat = (string)($p['category'] ?? '');
     $prodId = (int)($p['id'] ?? 0);
-    if (count($imagesArray) > 0 && count($imagesArray) < 3) {
-        $defaults = getDistinctDefaultImages($prodName, $prodCat, $prodId);
-        foreach ($defaults as $d) {
-            if (!in_array($d, $imagesArray, true) && count($imagesArray) < 3) {
-                $imagesArray[] = $d;
-            }
-        }
-    } elseif (empty($imagesArray)) {
+    if (empty($imagesArray)) {
         $imagesArray = getDistinctDefaultImages($prodName, $prodCat, $prodId);
     }
 
-    // Strictly enforce multiple URL limit of 10
-    $imagesArray = array_slice($imagesArray, 0, 10);
+    // Strictly enforce seller multiple URL limit of 4 images
+    $imagesArray = array_slice($imagesArray, 0, 4);
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
 
     $stock = (int) ($p['stock'] ?? 0);
@@ -325,14 +319,10 @@ function ensureProductPriceColumns(PDO $pdo): void
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', `images` = '[\"https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800\",\"https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800\",\"https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800\"]' WHERE `id` = 8");
             // Fix product 51 (broken local upload)
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', `images` = '[\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\",\"https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800\"]' WHERE `id` = 51");
-            // Fix product 54 (Rty from user screenshot) with multi-image gallery
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg', `images` = '[\"https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg\",\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\"]' WHERE `id` = 54");
+            // Clean product 54 (Rty from user screenshot) to strictly have its seller uploaded image
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg', `images` = '[\"https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg\"]' WHERE `id` = 54");
             // Fix product 44 (duplicate headset image)
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800', `images` = '[\"https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 44");
-        } catch (\Throwable $e) {}
-        // 6. Ensure any product with null or single image gets a complete multi-image gallery
-        try {
-            $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`, 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', 'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800') WHERE (`images` IS NULL OR `images` = '[]' OR JSON_LENGTH(`images`) <= 1) AND `image_url` IS NOT NULL AND `image_url` != ''");
         } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
@@ -578,25 +568,16 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
     // Deduplicate
     $uniqueImages = array_values(array_unique(array_filter($collected)));
 
-    // Minimum 3-image gallery guarantee so multiple images ALWAYS work
-    $productName = (string)($input['name'] ?? '');
-    $productCategory = (string)($input['category'] ?? '');
-    if (count($uniqueImages) > 0 && count($uniqueImages) < 3) {
-        $defaults = getDistinctDefaultImages($productName, $productCategory);
-        foreach ($defaults as $d) {
-            if (!in_array($d, $uniqueImages, true) && count($uniqueImages) < 3) {
-                $uniqueImages[] = $d;
-            }
-        }
-    } elseif (empty($uniqueImages)) {
-        $uniqueImages = getDistinctDefaultImages($productName, $productCategory);
-    }
+    // Deduplicate
+    $uniqueImages = array_values(array_unique(array_filter($collected)));
+    $hasImages = count($uniqueImages) > 0;
 
-    // Strictly enforce multiple URL limit of 10
-    $uniqueImages = array_slice($uniqueImages, 0, 10);
+    // Strictly enforce seller multiple URL limit of 4 images
+    $uniqueImages = array_slice($uniqueImages, 0, 4);
     $primaryImageUrl = !empty($uniqueImages) ? $uniqueImages[0] : null;
 
     return [
+        'hasImages' => $hasImages,
         'primaryImageUrl' => $primaryImageUrl,
         'image' => $primaryImageUrl,
         'images' => $uniqueImages,
@@ -605,7 +586,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         'gallery' => $uniqueImages,
         'photos' => $uniqueImages,
         'imagesJson' => !empty($uniqueImages) ? json_encode($uniqueImages) : null,
-        'limit' => 10,
+        'limit' => 4,
         'total' => count($uniqueImages),
     ];
 }
@@ -632,7 +613,7 @@ function apiUploadImage(PDO $pdo): void
         'image_url' => $res['primaryImageUrl'],
         'images' => $res['images'],
         'url' => $res['primaryImageUrl'],
-        'limit' => 10,
+        'limit' => 4,
         'total' => count($res['images'])
     ], 201);
 }
@@ -662,8 +643,11 @@ function apiCreateProduct(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
-    // Process image file uploads, base64, or multiple images
+    // Process image file uploads, base64, or multiple images (up to 4 max)
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
+    $finalImages = $imgResult['hasImages'] ? $imgResult['images'] : array_slice(getDistinctDefaultImages($name, $category, 0), 0, 4);
+    $finalPrimaryUrl = !empty($finalImages) ? $finalImages[0] : null;
+    $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
 
     $pricing = resolveProductPricing($input);
     $sku = trim((string)($input['sku'] ?? '')) ?: null;
@@ -690,8 +674,8 @@ function apiCreateProduct(PDO $pdo): void
         ':other_charges' => number_format($pricing['other_charges'], 2, '.', ''),
         ':price' => number_format($pricing['price'], 2, '.', ''),
         ':stock' => (int) $stock,
-        ':image_url' => $imgResult['primaryImageUrl'],
-        ':images' => $imgResult['imagesJson'],
+        ':image_url' => $finalPrimaryUrl,
+        ':images' => $finalImagesJson,
     ]);
 
     $id = (int) $pdo->lastInsertId();
@@ -847,9 +831,9 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $params[':stock'] = (int) $input['stock'];
     }
 
-    // Process uploaded file(s) or base64 or fallback URL
+    // Process uploaded file(s), base64, or image URLs if provided (up to 4 max)
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
-    if (!empty($imgResult['images'])) {
+    if (!empty($imgResult['hasImages']) && !empty($imgResult['images'])) {
         $updates[] = "image_url = :image_url";
         $params[':image_url'] = $imgResult['primaryImageUrl'];
         $updates[] = "images = :images";

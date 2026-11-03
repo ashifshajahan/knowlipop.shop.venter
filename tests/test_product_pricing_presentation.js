@@ -335,39 +335,60 @@ async function runLiveTests() {
   }
   console.log('✅ Order Verified: Unit Price = ₹1000.00, 3 Items Subtotal = ₹3000.00, Total = ₹3000.00!');
 
-  // Step 7: Verify Multi-Image URLs with Strict Limit of 10 and Distinct Non-Duplicate Images
-  console.log('\n--- 7. Testing Multiple Image URLs & Strict Limit of 10 ---');
-  const twelveImages = [
+  // Step 7: Verify Multi-Image URLs with Strict Limit of 4 and Image Editing / Preservation
+  console.log('\n--- 7. Testing Multiple Image URLs (Limit 4) & Image Editing / Preservation ---');
+  const sixImages = [
     'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
     'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
     'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800',
     'https://images.unsplash.com/photo-1505740420928-5e560c06d304?w=800',
     'https://images.unsplash.com/photo-1505740420928-5e560c06d305?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d306?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d307?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d308?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d309?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d310?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d311?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d312?w=800'
+    'https://images.unsplash.com/photo-1505740420928-5e560c06d306?w=800'
   ];
 
   const multiRes = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
-    name: 'Multi Image Gallery Product',
+    name: 'Multi Image Gallery Product (4 Max)',
     price: 1500.00,
     mrp: 2000.00,
     stock: 20,
-    images: twelveImages
+    images: sixImages
   });
 
   const multiProd = multiRes.data && multiRes.data.product;
   if (!multiProd) throw new Error('Failed to create multi-image product: ' + JSON.stringify(multiRes.data));
 
   console.log('Multi Image Product images count:', multiProd.images ? multiProd.images.length : 0);
-  if (!Array.isArray(multiProd.images) || multiProd.images.length !== 10) {
-    throw new Error(`Expected strictly 10 images after sending 12 (limit is 10), got ${multiProd.images ? multiProd.images.length : 'none'}`);
+  if (!Array.isArray(multiProd.images) || multiProd.images.length !== 4) {
+    throw new Error(`Expected strictly 4 images after sending 6 (limit is 4), got ${multiProd.images ? multiProd.images.length : 'none'}`);
   }
-  console.log('✅ Strict 10 Image URLs limit enforced! (Sent 12, exactly 10 retained)');
+  console.log('✅ Strict 4 Image URLs limit enforced! (Sent 6, exactly 4 retained)');
+
+  // Verify non-image update preserves existing images (does not overwrite or revert to stock photos)
+  const noImageUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
+    name: 'Multi Image Gallery Product Renamed'
+  });
+  const noImageProd = noImageUpdate.data && noImageUpdate.data.product;
+  if (!noImageProd || !Array.isArray(noImageProd.images) || noImageProd.images.length !== 4) {
+    throw new Error(`Non-image edit failed to preserve 4 images: got ${noImageProd ? JSON.stringify(noImageProd.images) : 'null'}`);
+  }
+  console.log('✅ Editing product name/price without images preserves existing images cleanly!');
+
+  // Verify updating product with new images replaces them cleanly
+  const newImages = [
+    'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
+    'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800'
+  ];
+  const editImagesUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
+    images: newImages
+  });
+  const editImagesProd = editImagesUpdate.data && editImagesUpdate.data.product;
+  if (!editImagesProd || !Array.isArray(editImagesProd.images) || editImagesProd.images.length !== 2) {
+    throw new Error(`Updating with 2 new images failed: got ${editImagesProd ? JSON.stringify(editImagesProd.images) : 'null'}`);
+  }
+  if (editImagesProd.images[0] !== newImages[0] || editImagesProd.images[1] !== newImages[1]) {
+    throw new Error(`Images do not match updated images: ${JSON.stringify(editImagesProd.images)}`);
+  }
+  console.log('✅ Editing/replacing product with new images updates cleanly without fixed old images!');
 
   // Verify comma-separated URL string parsing
   const commaUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
@@ -393,17 +414,18 @@ async function runLiveTests() {
   }
   console.log('✅ Array of image objects ([{url:...}]) parsed cleanly into multiple distinct URLs!');
 
-  // Verify numbered keys (image1, image2, image3)
+  // Verify numbered keys (image1, image2, image3, image4)
   const numUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
     image1: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
     image2: 'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
-    image3: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800'
+    image3: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800',
+    image4: 'https://images.unsplash.com/photo-1505740420928-5e560c06d304?w=800'
   });
   const numProd = numUpdate.data && numUpdate.data.product;
-  if (!numProd || !Array.isArray(numProd.images) || numProd.images.length !== 3) {
-    throw new Error(`Expected numbered keys (image1, image2, image3) to parse into 3 images, got: ${JSON.stringify(numProd && numProd.images)}`);
+  if (!numProd || !Array.isArray(numProd.images) || numProd.images.length !== 4) {
+    throw new Error(`Expected numbered keys (image1..image4) to parse into 4 images, got: ${JSON.stringify(numProd && numProd.images)}`);
   }
-  console.log('✅ Numbered image keys (image1, image2, image3) parsed cleanly into multiple distinct URLs!');
+  console.log('✅ Numbered image keys (image1..image4) parsed cleanly into multiple distinct URLs!');
 
   // Verify catalog has distinct images (products 1, 2, 3 have distinct galleries)
   const catalogRes = await request('GET', '/api/products');
@@ -421,10 +443,14 @@ async function runLiveTests() {
   }
   if (p54Catalog) {
     console.log('Catalog Product 54 (Rty from screenshot) images count:', p54Catalog.images ? p54Catalog.images.length : 0);
-    if (!Array.isArray(p54Catalog.images) || p54Catalog.images.length < 3) {
-      throw new Error(`Expected Product 54 to have at least 3 images, got: ${JSON.stringify(p54Catalog.images)}`);
+    console.log('Catalog Product 54 images:', p54Catalog.images);
+    if (!Array.isArray(p54Catalog.images) || p54Catalog.images.length === 0) {
+      throw new Error(`Expected Product 54 to have seller image, got: ${JSON.stringify(p54Catalog.images)}`);
     }
-    console.log('✅ Product 54 (Row 11 in DB) verified: Has multiple working images in database and API!');
+    if (p54Catalog.images.some(img => img.includes('photo-1526170375885') || img.includes('photo-1560343090'))) {
+      throw new Error(`Product 54 still contains forced unsplash stock photos! Images: ${JSON.stringify(p54Catalog.images)}`);
+    }
+    console.log('✅ Product 54 (Row 11 in DB) verified: Forced stock photos removed, seller uploaded image preserved!');
   }
 
   // Cleanup multi product
