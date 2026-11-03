@@ -730,6 +730,16 @@
                   "pm.test('Product created with ID', function () {",
                   "    pm.expect(jsonData.product.id).to.be.a('number');",
                   "});",
+                  "pm.test('Seller price is 1000 and presentation price includes commission, delivery, gst, other charges', function () {",
+                  "    var p = jsonData.product;",
+                  "    pm.expect(p.seller_price).to.eql('1000.00');",
+                  "    pm.expect(p.commission).to.eql('50.00');",
+                  "    pm.expect(p.delivery_charge).to.eql('50.00');",
+                  "    pm.expect(p.gst).to.eql('18.00');",
+                  "    pm.expect(p.other_charges).to.eql('20.00');",
+                  "    pm.expect(p.price).to.eql('1138.00');",
+                  "    pm.expect(p.presentation_price).to.eql('1138.00');",
+                  "});",
                   "if (jsonData.product && jsonData.product.id) {",
                   "    var idStr = jsonData.product.id.toString();",
                   "    pm.collectionVariables.set('product_id', idStr);",
@@ -764,7 +774,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 2999.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products",
@@ -832,9 +842,10 @@
                   "pm.test('Status code is 200 OK', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
-                  "pm.test('Product price and name updated', function () {",
+                  "pm.test('Product seller price and presentation price updated', function () {",
                   "    var json = pm.response.json();",
-                  "    pm.expect(json.product.price).to.eql('3499.00');",
+                  "    pm.expect(json.product.seller_price).to.eql('1000.00');",
+                  "    pm.expect(json.product.price).to.eql('1138.00');",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -865,7 +876,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset (Pro Edition)\",\n  \"price\": 3499.00,\n  \"stock\": 75,\n  \"description\": \"Updated upgraded sound with Spatial Audio.\"\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset (Pro Edition)\",\n  \"price\": 1000.00,\n  \"stock\": 75,\n  \"description\": \"Updated upgraded sound with Spatial Audio.\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",

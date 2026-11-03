@@ -565,7 +565,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 2999.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products",
@@ -587,6 +587,15 @@
                   "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test(\"Product presentation price computed from base 1000\", function () {",
+                  "    var p = jsonData.product;",
+                  "    pm.expect(p.seller_price).to.eql('1000.00');",
+                  "    pm.expect(p.commission).to.eql('50.00');",
+                  "    pm.expect(p.delivery_charge).to.eql('50.00');",
+                  "    pm.expect(p.gst).to.eql('18.00');",
+                  "    pm.expect(p.other_charges).to.eql('20.00');",
+                  "    pm.expect(p.price).to.eql('1138.00');",
+                  "});",
                   "if (jsonData.product && jsonData.product.id) {",
                   "    pm.collectionVariables.set(\"product_id\", String(jsonData.product.id));",
                   "    if (pm.environment) pm.environment.set(\"product_id\", String(jsonData.product.id));",
@@ -631,7 +640,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (Special Edition)\",\n  \"price\": 3199.00,\n  \"stock\": 65\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (Special Edition)\",\n  \"price\": 1000.00,\n  \"stock\": 65\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products/{{product_id}}",
@@ -644,7 +653,26 @@
                 "{{product_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test(\"Updated product presentation price is 1138.00\", function () {",
+                  "    var p = jsonData.product;",
+                  "    pm.expect(p.seller_price).to.eql('1000.00');",
+                  "    pm.expect(p.price).to.eql('1138.00');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Upload Image (Base64)",

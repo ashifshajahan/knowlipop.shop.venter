@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS `products` (
   `seller_id` BIGINT UNSIGNED NOT NULL,
   `name` VARCHAR(150) NOT NULL,
   `description` TEXT NULL DEFAULT NULL,
+  `seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   `price` DECIMAL(10,2) NOT NULL,
   `stock` INT NOT NULL DEFAULT 0,
   `image_url` LONGTEXT NULL DEFAULT NULL,
@@ -81,18 +86,18 @@ INSERT INTO `users` (`id`, `name`, `email`, `password`, `role`)
 VALUES (1, 'Vendor Administrator', 'admin@vendor.app', '$2y$10$KqFHH9/yS.H5eLF3TbK/AO/U8w9auESJ1u5LZLCMKO0fNpAlPtnTC', 'admin')
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `email` = VALUES(`email`), `password` = VALUES(`password`), `role` = 'admin';
 
--- Default Starter Products for App & Catalog Testing
-INSERT INTO `products` (`id`, `seller_id`, `name`, `description`, `price`, `stock`, `image_url`, `is_active`)
+-- Default Starter Products for App & Catalog Testing (with transparent pricing breakdown)
+INSERT INTO `products` (`id`, `seller_id`, `name`, `description`, `seller_price`, `commission`, `delivery_charge`, `gst`, `other_charges`, `price`, `stock`, `image_url`, `is_active`)
 VALUES
-(1, 1, 'Smart Wireless Headset Pro', 'Active noise cancelling over-ear headphones with 40-hour battery life.', 2999.00, 50, 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 1),
-(2, 1, 'Ultra HD 4K Smart Watch', 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', 4499.00, 35, 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 1),
-(3, 1, 'Vintage Leather Travel Backpack', 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', 3299.00, 20, 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', 1),
-(4, 1, 'Air Cushion Running Sneakers', 'Lightweight breathable sports shoes designed for marathon running and daily training.', 2499.00, 60, 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', 1),
-(5, 1, 'Polarized Aviator Sunglasses', 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', 1299.00, 100, 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', 1),
-(6, 1, 'RGB Mechanical Gaming Keyboard', 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', 3999.00, 25, 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', 1),
-(7, 2, 'Noise-Cancelling Studio Earbuds', 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', 1899.00, 45, 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', 1),
-(8, 2, 'Ergonomic Vertical Mouse Pro', 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', 1499.00, 30, 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', 1)
-ON DUPLICATE KEY UPDATE `seller_id` = VALUES(`seller_id`), `name` = VALUES(`name`), `price` = VALUES(`price`), `stock` = VALUES(`stock`), `image_url` = VALUES(`image_url`);
+(1, 1, 'Smart Wireless Headset Pro', 'Active noise cancelling over-ear headphones with 40-hour battery life.', 2999.00, 149.95, 50.00, 35.99, 20.00, 3254.94, 50, 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500', 1),
+(2, 1, 'Ultra HD 4K Smart Watch', 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', 4499.00, 224.95, 50.00, 49.49, 20.00, 4843.44, 35, 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500', 1),
+(3, 1, 'Vintage Leather Travel Backpack', 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', 3299.00, 164.95, 50.00, 38.69, 20.00, 3572.64, 20, 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500', 1),
+(4, 1, 'Air Cushion Running Sneakers', 'Lightweight breathable sports shoes designed for marathon running and daily training.', 2499.00, 124.95, 50.00, 31.49, 20.00, 2725.44, 60, 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500', 1),
+(5, 1, 'Polarized Aviator Sunglasses', 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', 1299.00, 64.95, 50.00, 20.69, 20.00, 1454.64, 100, 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500', 1),
+(6, 1, 'RGB Mechanical Gaming Keyboard', 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', 3999.00, 199.95, 50.00, 44.99, 20.00, 4313.94, 25, 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500', 1),
+(7, 2, 'Noise-Cancelling Studio Earbuds', 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', 1899.00, 94.95, 50.00, 26.09, 20.00, 2090.04, 45, 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500', 1),
+(8, 2, 'Ergonomic Vertical Mouse Pro', 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', 1499.00, 74.95, 50.00, 22.49, 20.00, 1666.44, 30, 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500', 1)
+ON DUPLICATE KEY UPDATE `seller_id` = VALUES(`seller_id`), `name` = VALUES(`name`), `seller_price` = VALUES(`seller_price`), `commission` = VALUES(`commission`), `delivery_charge` = VALUES(`delivery_charge`), `gst` = VALUES(`gst`), `other_charges` = VALUES(`other_charges`), `price` = VALUES(`price`), `stock` = VALUES(`stock`), `image_url` = VALUES(`image_url`);
 
 -- ======================================================
 -- Buyer Orders & Order Items Tables

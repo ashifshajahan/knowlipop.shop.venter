@@ -1,14 +1,163 @@
 <?php
 
 /**
- * Pure PHP API: Product Controller
+ * Pure PHP API: Product Controller with Pricing Breakdown
  */
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
 
+function calculatePricingBreakdown(array $input): array
+{
+    $rawPrice = isset($input['seller_price']) && $input['seller_price'] !== ''
+        ? (float) $input['seller_price']
+        : (isset($input['price']) && $input['price'] !== '' ? (float) $input['price'] : 0.0);
+
+    $seller_price = max(0.0, round($rawPrice, 2));
+
+    if (isset($input['commission']) && $input['commission'] !== '' && is_numeric($input['commission'])) {
+        $commission = max(0.0, round((float) $input['commission'], 2));
+    } else {
+        $commission = round($seller_price * 0.05, 2);
+    }
+
+    $rawDel = $input['delivery_charge'] ?? $input['shipping_charge'] ?? $input['delivery_fee'] ?? null;
+    if ($rawDel !== null && $rawDel !== '' && is_numeric($rawDel)) {
+        $delivery_charge = max(0.0, round((float) $rawDel, 2));
+    } else {
+        $delivery_charge = 50.00;
+    }
+
+    $rawGst = $input['gst'] ?? $input['tax'] ?? $input['tax_amount'] ?? null;
+    if ($rawGst !== null && $rawGst !== '' && is_numeric($rawGst)) {
+        $gst = max(0.0, round((float) $rawGst, 2));
+    } else {
+        $feeBase = $commission + $delivery_charge;
+        $gst = round($feeBase * 0.18, 2);
+        if ($gst == 0.0 && $seller_price > 0) {
+            $gst = 18.00;
+        }
+    }
+
+    $rawOther = $input['other_charges'] ?? $input['handling_fee'] ?? $input['platform_fee'] ?? null;
+    if ($rawOther !== null && $rawOther !== '' && is_numeric($rawOther)) {
+        $other_charges = max(0.0, round((float) $rawOther, 2));
+    } else {
+        $other_charges = 20.00;
+    }
+
+    $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
+
+    return [
+        'seller_price' => $seller_price,
+        'commission' => $commission,
+        'delivery_charge' => $delivery_charge,
+        'gst' => $gst,
+        'other_charges' => $other_charges,
+        'price' => $presentation_price,
+        'presentation_price' => $presentation_price,
+        'selling_price' => $presentation_price,
+    ];
+}
+
+function formatProductRecord(array $p): array
+{
+    $rawSeller = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
+        ? (float) $p['seller_price']
+        : (isset($p['price']) && is_numeric($p['price']) ? (float) $p['price'] : 0.0);
+
+    $seller_price = round($rawSeller, 2);
+
+    $commission = isset($p['commission']) && is_numeric($p['commission']) && (float) $p['commission'] > 0
+        ? round((float) $p['commission'], 2)
+        : round($seller_price * 0.05, 2);
+
+    $delivery_charge = isset($p['delivery_charge']) && is_numeric($p['delivery_charge']) && (float) $p['delivery_charge'] > 0
+        ? round((float) $p['delivery_charge'], 2)
+        : 50.00;
+
+    $gst = isset($p['gst']) && is_numeric($p['gst']) && (float) $p['gst'] > 0
+        ? round((float) $p['gst'], 2)
+        : round(($commission + $delivery_charge) * 0.18, 2);
+
+    $other_charges = isset($p['other_charges']) && is_numeric($p['other_charges']) && (float) $p['other_charges'] > 0
+        ? round((float) $p['other_charges'], 2)
+        : 20.00;
+
+    $presentation_price = isset($p['price']) && is_numeric($p['price'])
+        ? round((float) $p['price'], 2)
+        : round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
+
+    if (abs($presentation_price - $seller_price) < 0.001 && $seller_price > 0) {
+        $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
+    }
+
+    return array_merge($p, [
+        'id' => (int) $p['id'],
+        'seller_id' => (int) $p['seller_id'],
+        'name' => (string) ($p['name'] ?? ''),
+        'description' => $p['description'] ?? null,
+        'seller_price' => number_format($seller_price, 2, '.', ''),
+        'commission' => number_format($commission, 2, '.', ''),
+        'delivery_charge' => number_format($delivery_charge, 2, '.', ''),
+        'gst' => number_format($gst, 2, '.', ''),
+        'other_charges' => number_format($other_charges, 2, '.', ''),
+        'price' => number_format($presentation_price, 2, '.', ''),
+        'presentation_price' => number_format($presentation_price, 2, '.', ''),
+        'selling_price' => number_format($presentation_price, 2, '.', ''),
+        'stock' => (int) ($p['stock'] ?? 0),
+        'image_url' => $p['image_url'] ?? null,
+        'is_active' => (bool) ($p['is_active'] ?? true),
+    ]);
+}
+
+function ensureProductPriceColumns(PDO $pdo): void
+{
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `products` LIKE 'seller_price'")->fetchAll();
+        if (empty($cols)) {
+            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `description`"); } catch (\Throwable $e) {}
+            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `seller_price`"); } catch (\Throwable $e) {}
+            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission`"); } catch (\Throwable $e) {}
+            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `delivery_charge`"); } catch (\Throwable $e) {}
+            try { $pdo->exec("ALTER TABLE `products` ADD COLUMN `other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `gst`"); } catch (\Throwable $e) {}
+
+            try {
+                $pdo->exec("
+                    UPDATE `products`
+                    SET
+                      `seller_price` = `price`,
+                      `commission` = ROUND(`price` * 0.05, 2),
+                      `delivery_charge` = 50.00,
+                      `gst` = ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2),
+                      `other_charges` = 20.00,
+                      `price` = ROUND(`price` + ROUND(`price` * 0.05, 2) + 50.00 + ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
+                    WHERE `seller_price` = 0.00 OR `seller_price` IS NULL
+                ");
+            } catch (\Throwable $e) {}
+        } else {
+            try {
+                $pdo->exec("
+                    UPDATE `products`
+                    SET
+                      `seller_price` = `price`,
+                      `commission` = ROUND(`price` * 0.05, 2),
+                      `delivery_charge` = 50.00,
+                      `gst` = ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2),
+                      `other_charges` = 20.00,
+                      `price` = ROUND(`price` + ROUND(`price` * 0.05, 2) + 50.00 + ROUND((ROUND(`price` * 0.05, 2) + 50.00) * 0.18, 2) + 20.00, 2)
+                    WHERE (`seller_price` = 0.00 OR `seller_price` IS NULL) AND `price` > 0
+                ");
+            } catch (\Throwable $e) {}
+        }
+    } catch (\Throwable $e) {
+        // ignore
+    }
+}
+
 function apiGetProducts(PDO $pdo): void
 {
+    ensureProductPriceColumns($pdo);
     $page = max(1, (int) ($_GET['page'] ?? 1));
     $limit = 20;
     $offset = ($page - 1) * $limit;
@@ -27,7 +176,8 @@ function apiGetProducts(PDO $pdo): void
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         {$where}
@@ -40,15 +190,9 @@ function apiGetProducts(PDO $pdo): void
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();
-    $products = $stmt->fetchAll();
+    $rawProducts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    foreach ($products as &$p) {
-        $p['id'] = (int) $p['id'];
-        $p['seller_id'] = (int) $p['seller_id'];
-        $p['price'] = (string) number_format((float) $p['price'], 2, '.', '');
-        $p['stock'] = (int) $p['stock'];
-        $p['is_active'] = (bool) $p['is_active'];
-    }
+    $products = array_map('formatProductRecord', $rawProducts);
 
     jsonResponse([
         'products' => [
@@ -63,28 +207,25 @@ function apiGetProducts(PDO $pdo): void
 
 function apiGetProduct(PDO $pdo, int $id): void
 {
+    ensureProductPriceColumns($pdo);
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id AND p.is_active = 1
         LIMIT 1
     ");
     $stmt->execute([':id' => $id]);
-    $product = $stmt->fetch();
+    $product = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$product) {
         errorResponse('Product not found.', [], 404);
     }
 
-    $product['id'] = (int) $product['id'];
-    $product['seller_id'] = (int) $product['seller_id'];
-    $product['price'] = (string) number_format((float) $product['price'], 2, '.', '');
-    $product['stock'] = (int) $product['stock'];
-    $product['is_active'] = (bool) $product['is_active'];
-
-    jsonResponse(['product' => $product]);
+    $formatted = formatProductRecord($product);
+    jsonResponse(['product' => $formatted]);
 }
 
 function saveUploadedProductImage(?string $fallback = null): ?string
@@ -96,7 +237,7 @@ function saveUploadedProductImage(?string $fallback = null): ?string
 
     $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
 
-    // 1. Check $_FILES for multipart/form-data upload (field names: image, file, product_image, photo, picture, img)
+    // 1. Check $_FILES for multipart/form-data upload
     $fileFields = ['image', 'file', 'product_image', 'photo', 'picture', 'img'];
     foreach ($fileFields as $field) {
         if (!empty($_FILES[$field]['tmp_name']) && is_uploaded_file($_FILES[$field]['tmp_name'])) {
@@ -161,17 +302,18 @@ function apiUploadImage(PDO $pdo): void
 function apiCreateProduct(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
     $input = getJsonInput();
     $errors = [];
 
     $name = trim($input['name'] ?? '');
-    $price = $input['price'] ?? null;
+    $rawPrice = $input['seller_price'] ?? ($input['price'] ?? null);
     $stock = $input['stock'] ?? null;
 
     if (empty($name)) {
         $errors['name'] = ['The name field is required.'];
     }
-    if (!isset($price) || !is_numeric($price) || $price < 0) {
+    if (!isset($rawPrice) || !is_numeric($rawPrice) || $rawPrice < 0) {
         $errors['price'] = ['The price field is required and must be a positive number.'];
     }
     if (!isset($stock) || !is_numeric($stock) || $stock < 0) {
@@ -185,15 +327,22 @@ function apiCreateProduct(PDO $pdo): void
     // Process image file upload, base64, or fallback URL
     $imageUrl = saveUploadedProductImage($input['image_url'] ?? $input['image'] ?? null);
 
+    $pricing = calculatePricingBreakdown($input);
+
     $stmt = $pdo->prepare("
-        INSERT INTO products (seller_id, name, description, price, stock, image_url, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :price, :stock, :image_url, 1, NOW(), NOW())
+        INSERT INTO products (seller_id, name, description, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, is_active, created_at, updated_at)
+        VALUES (:seller_id, :name, :description, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, 1, NOW(), NOW())
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
         ':name' => $name,
         ':description' => $input['description'] ?? null,
-        ':price' => number_format((float) $price, 2, '.', ''),
+        ':seller_price' => number_format($pricing['seller_price'], 2, '.', ''),
+        ':commission' => number_format($pricing['commission'], 2, '.', ''),
+        ':delivery_charge' => number_format($pricing['delivery_charge'], 2, '.', ''),
+        ':gst' => number_format($pricing['gst'], 2, '.', ''),
+        ':other_charges' => number_format($pricing['other_charges'], 2, '.', ''),
+        ':price' => number_format($pricing['price'], 2, '.', ''),
         ':stock' => (int) $stock,
         ':image_url' => $imageUrl,
     ]);
@@ -201,26 +350,23 @@ function apiCreateProduct(PDO $pdo): void
     $id = (int) $pdo->lastInsertId();
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id
     ");
     $fetchStmt->execute([':id' => $id]);
-    $product = $fetchStmt->fetch();
+    $product = $fetchStmt->fetch(PDO::FETCH_ASSOC);
 
-    $product['id'] = (int) $product['id'];
-    $product['seller_id'] = (int) $product['seller_id'];
-    $product['price'] = (string) number_format((float) $product['price'], 2, '.', '');
-    $product['stock'] = (int) $product['stock'];
-    $product['is_active'] = (bool) $product['is_active'];
-
-    jsonResponse(['message' => 'Product created.', 'product' => $product], 201);
+    $formatted = formatProductRecord($product);
+    jsonResponse(['message' => 'Product created.', 'product' => $formatted], 201);
 }
 
 function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
 {
     $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
     $targetSellerId = $routeSellerId ?: (!empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : (int)$user['id']);
 
     if (($user['role'] ?? '') !== 'admin' && (int)$user['id'] !== $targetSellerId) {
@@ -251,7 +397,8 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         {$where}
@@ -264,16 +411,9 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();
-    $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $rawProducts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    foreach ($products as &$p) {
-        $p['id'] = (int)$p['id'];
-        $p['seller_id'] = (int)$p['seller_id'];
-        $p['price'] = (string)number_format((float)$p['price'], 2, '.', '');
-        $p['stock'] = (int)$p['stock'];
-        $p['is_active'] = (bool)$p['is_active'];
-    }
-    unset($p);
+    $products = array_map('formatProductRecord', $rawProducts);
 
     jsonResponse([
         'seller_id' => $targetSellerId,
@@ -290,9 +430,10 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
 function apiUpdateProduct(PDO $pdo, int $id): void
 {
     $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
     $stmt->execute([':id' => $id]);
-    $product = $stmt->fetch();
+    $product = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$product) {
         errorResponse('Product not found.', [], 404);
@@ -314,10 +455,41 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $updates[] = "description = :description";
         $params[':description'] = $input['description'];
     }
-    if (isset($input['price']) && is_numeric($input['price'])) {
+
+    $pricingModified = (
+        isset($input['seller_price']) ||
+        isset($input['price']) ||
+        isset($input['commission']) ||
+        isset($input['delivery_charge']) ||
+        isset($input['shipping_charge']) ||
+        isset($input['gst']) ||
+        isset($input['tax']) ||
+        isset($input['other_charges'])
+    );
+
+    if ($pricingModified) {
+        $mergedPricingInput = [
+            'seller_price' => $input['seller_price'] ?? ($input['price'] ?? ($product['seller_price'] ?? $product['price'])),
+            'commission' => $input['commission'] ?? ($product['commission'] ?? null),
+            'delivery_charge' => $input['delivery_charge'] ?? ($input['shipping_charge'] ?? ($product['delivery_charge'] ?? null)),
+            'gst' => $input['gst'] ?? ($input['tax'] ?? ($product['gst'] ?? null)),
+            'other_charges' => $input['other_charges'] ?? ($product['other_charges'] ?? null),
+        ];
+        $newPricing = calculatePricingBreakdown($mergedPricingInput);
+        $updates[] = "seller_price = :seller_price";
+        $params[':seller_price'] = number_format($newPricing['seller_price'], 2, '.', '');
+        $updates[] = "commission = :commission";
+        $params[':commission'] = number_format($newPricing['commission'], 2, '.', '');
+        $updates[] = "delivery_charge = :delivery_charge";
+        $params[':delivery_charge'] = number_format($newPricing['delivery_charge'], 2, '.', '');
+        $updates[] = "gst = :gst";
+        $params[':gst'] = number_format($newPricing['gst'], 2, '.', '');
+        $updates[] = "other_charges = :other_charges";
+        $params[':other_charges'] = number_format($newPricing['other_charges'], 2, '.', '');
         $updates[] = "price = :price";
-        $params[':price'] = number_format((float) $input['price'], 2, '.', '');
+        $params[':price'] = number_format($newPricing['price'], 2, '.', '');
     }
+
     if (isset($input['stock']) && is_numeric($input['stock'])) {
         $updates[] = "stock = :stock";
         $params[':stock'] = (int) $input['stock'];
@@ -344,21 +516,17 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+               p.name, p.description, p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+               p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         WHERE p.id = :id
     ");
     $fetchStmt->execute([':id' => $id]);
-    $updated = $fetchStmt->fetch();
+    $updated = $fetchStmt->fetch(PDO::FETCH_ASSOC);
 
-    $updated['id'] = (int) $updated['id'];
-    $updated['seller_id'] = (int) $updated['seller_id'];
-    $updated['price'] = (string) number_format((float) $updated['price'], 2, '.', '');
-    $updated['stock'] = (int) $updated['stock'];
-    $updated['is_active'] = (bool) $updated['is_active'];
-
-    jsonResponse(['message' => 'Product updated.', 'product' => $updated]);
+    $formatted = formatProductRecord($updated);
+    jsonResponse(['message' => 'Product updated.', 'product' => $formatted]);
 }
 
 function apiDeleteProduct(PDO $pdo, int $id): void
@@ -366,7 +534,7 @@ function apiDeleteProduct(PDO $pdo, int $id): void
     $user = authenticateUser($pdo);
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
     $stmt->execute([':id' => $id]);
-    $product = $stmt->fetch();
+    $product = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$product) {
         errorResponse('Product not found.', [], 404);
@@ -381,4 +549,3 @@ function apiDeleteProduct(PDO $pdo, int $id): void
 
     jsonResponse(['message' => 'Product deleted.']);
 }
-
