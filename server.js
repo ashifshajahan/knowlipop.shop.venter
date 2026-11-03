@@ -1568,7 +1568,7 @@ function calculatePricingBreakdown(body = {}) {
   };
 }
 
-function formatProductRecord(p) {
+function formatProductRecord(p, options = {}) {
   if (!p) return null;
   const rawSellerPrice = (p.seller_price !== undefined && p.seller_price !== null && !isNaN(parseFloat(p.seller_price)) && parseFloat(p.seller_price) > 0)
     ? parseFloat(p.seller_price)
@@ -1601,24 +1601,44 @@ function formatProductRecord(p) {
     presentation_price = Math.round((seller_price + commission + delivery_charge + gst + other_charges) * 100) / 100;
   }
 
-  return {
-    ...p,
+  const record = {
     id: Number(p.id),
     seller_id: Number(p.seller_id),
+    seller_name: p.seller_name || 'Verified Seller',
     name: p.name || '',
     description: p.description || null,
-    seller_price: seller_price.toFixed(2),
-    commission: commission.toFixed(2),
-    delivery_charge: delivery_charge.toFixed(2),
-    gst: gst.toFixed(2),
-    other_charges: other_charges.toFixed(2),
     price: presentation_price.toFixed(2),
     presentation_price: presentation_price.toFixed(2),
     selling_price: presentation_price.toFixed(2),
     stock: Number(p.stock || 0),
     image_url: p.image_url || null,
-    is_active: Boolean(p.is_active)
+    is_active: Boolean(p.is_active),
+    created_at: p.created_at || null,
+    updated_at: p.updated_at || null
   };
+
+  // On the user field (public user view), commission and internal fee margins must NOT be shown
+  if (!options.isPublicUser) {
+    record.seller_price = seller_price.toFixed(2);
+    record.commission = commission.toFixed(2);
+    record.delivery_charge = delivery_charge.toFixed(2);
+    record.gst = gst.toFixed(2);
+    record.other_charges = other_charges.toFixed(2);
+  }
+
+  return record;
+}
+
+function getOptionalAuthUser(req) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return null;
+  const token = authHeader.replace(/^Bearer\s+/i, '');
+  if (!token) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return null;
+  }
 }
 
 async function ensureProductPriceColumns(p) {
@@ -1716,7 +1736,9 @@ app.get('/api/products', async (req, res) => {
     const [[{ total }]] = await pool.query(countSql, countParams);
     const [products] = await pool.query(querySql, queryParams);
 
-    const formatted = products.map(p => formatProductRecord(p));
+    const optUser = getOptionalAuthUser(req);
+    const isSeller = optUser && (optUser.role === 'admin' || (sellerId && Number(optUser.id) === Number(sellerId)));
+    const formatted = products.map(p => formatProductRecord(p, { isPublicUser: !isSeller }));
 
     res.json({
       products: {
@@ -1728,7 +1750,9 @@ app.get('/api/products', async (req, res) => {
       }
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p));
+    const optUser = getOptionalAuthUser(req);
+    const isSeller = optUser && (optUser.role === 'admin' || (sellerId && Number(optUser.id) === Number(sellerId)));
+    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isPublicUser: !isSeller }));
     res.json({
       products: {
         current_page: 1,
@@ -1757,12 +1781,16 @@ app.get('/api/products/:id', async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Product not found.' });
     }
-    const product = formatProductRecord(rows[0]);
+    const optUser = getOptionalAuthUser(req);
+    const isOwner = optUser && (optUser.role === 'admin' || Number(optUser.id) === Number(rows[0].seller_id));
+    const product = formatProductRecord(rows[0], { isPublicUser: !isOwner });
     res.json({ product });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
     if (found) {
-      return res.json({ product: formatProductRecord(found) });
+      const optUser = getOptionalAuthUser(req);
+      const isOwner = optUser && (optUser.role === 'admin' || Number(optUser.id) === Number(found.seller_id));
+      return res.json({ product: formatProductRecord(found, { isPublicUser: !isOwner }) });
     }
     res.status(404).json({ message: 'Product not found.' });
   }

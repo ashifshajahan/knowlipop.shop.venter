@@ -60,7 +60,7 @@ function calculatePricingBreakdown(array $input): array
     ];
 }
 
-function formatProductRecord(array $p): array
+function formatProductRecord(array $p, bool $isPublicUser = false): array
 {
     $rawSeller = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
         ? (float) $p['seller_price']
@@ -92,16 +92,11 @@ function formatProductRecord(array $p): array
         $presentation_price = round($seller_price + $commission + $delivery_charge + $gst + $other_charges, 2);
     }
 
-    return array_merge($p, [
+    $result = array_merge($p, [
         'id' => (int) $p['id'],
         'seller_id' => (int) $p['seller_id'],
         'name' => (string) ($p['name'] ?? ''),
         'description' => $p['description'] ?? null,
-        'seller_price' => number_format($seller_price, 2, '.', ''),
-        'commission' => number_format($commission, 2, '.', ''),
-        'delivery_charge' => number_format($delivery_charge, 2, '.', ''),
-        'gst' => number_format($gst, 2, '.', ''),
-        'other_charges' => number_format($other_charges, 2, '.', ''),
         'price' => number_format($presentation_price, 2, '.', ''),
         'presentation_price' => number_format($presentation_price, 2, '.', ''),
         'selling_price' => number_format($presentation_price, 2, '.', ''),
@@ -109,6 +104,18 @@ function formatProductRecord(array $p): array
         'image_url' => $p['image_url'] ?? null,
         'is_active' => (bool) ($p['is_active'] ?? true),
     ]);
+
+    if (!$isPublicUser) {
+        $result['seller_price'] = number_format($seller_price, 2, '.', '');
+        $result['commission'] = number_format($commission, 2, '.', '');
+        $result['delivery_charge'] = number_format($delivery_charge, 2, '.', '');
+        $result['gst'] = number_format($gst, 2, '.', '');
+        $result['other_charges'] = number_format($other_charges, 2, '.', '');
+    } else {
+        unset($result['seller_price'], $result['commission'], $result['other_charges']);
+    }
+
+    return $result;
 }
 
 function ensureProductPriceColumns(PDO $pdo): void
@@ -192,7 +199,11 @@ function apiGetProducts(PDO $pdo): void
     $stmt->execute();
     $rawProducts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $products = array_map('formatProductRecord', $rawProducts);
+    $optUser = getAuthenticatedUserOptional($pdo);
+    $isSellerOrAdmin = $optUser && ((($optUser['role'] ?? '') === 'admin') || ($sellerId && (int)$optUser['id'] === $sellerId));
+    $products = array_map(function($p) use ($isSellerOrAdmin) {
+        return formatProductRecord($p, !$isSellerOrAdmin);
+    }, $rawProducts);
 
     jsonResponse([
         'products' => [
@@ -224,7 +235,9 @@ function apiGetProduct(PDO $pdo, int $id): void
         errorResponse('Product not found.', [], 404);
     }
 
-    $formatted = formatProductRecord($product);
+    $optUser = getAuthenticatedUserOptional($pdo);
+    $isOwner = $optUser && ((($optUser['role'] ?? '') === 'admin') || ((int)$optUser['id'] === (int)$product['seller_id']));
+    $formatted = formatProductRecord($product, !$isOwner);
     jsonResponse(['product' => $formatted]);
 }
 

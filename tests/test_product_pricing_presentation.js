@@ -215,15 +215,38 @@ async function runLiveTests() {
   }
   console.log('✅ Product Creation Verified: Base 1000 -> Presentation 1138.00 with all 4 charges included!');
 
-  // Step 4: Fetch product by ID (GET /api/products/:id)
-  console.log('\n--- 4. Fetching Product Details (GET /api/products/' + prod.id + ') ---');
+  // Step 4: Fetch product by ID as a Public User (NO Auth Token)
+  console.log('\n--- 4. Verifying User View: Commission Hidden on User Field (GET /api/products/' + prod.id + ') ---');
   const getRes = await request('GET', `/api/products/${prod.id}`);
-  const fetchedProd = getRes.data && getRes.data.product;
-  if (!fetchedProd) throw new Error('Failed to fetch product by id: ' + JSON.stringify(getRes.data));
-  if (fetchedProd.seller_price !== '1000.00' || fetchedProd.price !== '1138.00') {
-    throw new Error(`GET /api/products/:id mismatch: seller_price=${fetchedProd.seller_price}, price=${fetchedProd.price}`);
+  const userProd = getRes.data && getRes.data.product;
+  if (!userProd) throw new Error('Failed to fetch product by id: ' + JSON.stringify(getRes.data));
+  
+  console.log('Public User Product Fields:', {
+    id: userProd.id,
+    name: userProd.name,
+    price: userProd.price,
+    commission: userProd.commission,
+    seller_price: userProd.seller_price
+  });
+
+  if (userProd.price !== '1138.00') {
+    throw new Error(`Expected presentation price on user field to be '1138.00', got '${userProd.price}'`);
   }
-  console.log('✅ GET /api/products/:id Verified: Persisted breakdown matches perfectly!');
+  if (userProd.commission !== undefined) {
+    throw new Error(`Security Violation: Commission should NOT be visible on user field! Got: '${userProd.commission}'`);
+  }
+  if (userProd.seller_price !== undefined) {
+    throw new Error(`Security Violation: Seller price should NOT be visible on user field! Got: '${userProd.seller_price}'`);
+  }
+  console.log('✅ User Field Verified: Public user sees presentation price ₹1138.00 with ZERO commission exposed!');
+
+  // Also verify seller view with Auth token still retains breakdown for the seller
+  const sellerGetRes = await request('GET', `/api/products/${prod.id}`, { Authorization: `Bearer ${token}` });
+  const sellerProd = sellerGetRes.data && sellerGetRes.data.product;
+  if (!sellerProd || sellerProd.commission !== '50.00') {
+    throw new Error(`Expected owner seller to see commission '50.00', got '${sellerProd && sellerProd.commission}'`);
+  }
+  console.log('✅ Seller View Verified: Owner seller correctly retains commission and cost breakdown!');
 
   // Step 5: Update product with custom overrides (PUT /api/products/:id)
   console.log('\n--- 5. Updating Product with Custom Breakdown (PUT /api/products/' + prod.id + ') ---');
