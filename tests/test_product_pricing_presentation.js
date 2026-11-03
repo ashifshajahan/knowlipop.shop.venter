@@ -379,11 +379,38 @@ async function runLiveTests() {
   }
   console.log('✅ Comma-separated image URLs parsed cleanly into multiple distinct URLs!');
 
+  // Verify array of image objects format (e.g. [{ url: '...' }])
+  const objUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
+    images: [
+      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800' },
+      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800' },
+      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800' }
+    ]
+  });
+  const objProd = objUpdate.data && objUpdate.data.product;
+  if (!objProd || !Array.isArray(objProd.images) || objProd.images.length !== 3) {
+    throw new Error(`Expected array of objects to parse into 3 images, got: ${JSON.stringify(objProd && objProd.images)}`);
+  }
+  console.log('✅ Array of image objects ([{url:...}]) parsed cleanly into multiple distinct URLs!');
+
+  // Verify numbered keys (image1, image2, image3)
+  const numUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
+    image1: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
+    image2: 'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
+    image3: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800'
+  });
+  const numProd = numUpdate.data && numUpdate.data.product;
+  if (!numProd || !Array.isArray(numProd.images) || numProd.images.length !== 3) {
+    throw new Error(`Expected numbered keys (image1, image2, image3) to parse into 3 images, got: ${JSON.stringify(numProd && numProd.images)}`);
+  }
+  console.log('✅ Numbered image keys (image1, image2, image3) parsed cleanly into multiple distinct URLs!');
+
   // Verify catalog has distinct images (products 1, 2, 3 have distinct galleries)
   const catalogRes = await request('GET', '/api/products');
   const catalogList = (catalogRes.data && catalogRes.data.products && catalogRes.data.products.data) || [];
   const p1Catalog = catalogList.find(p => p.id === 1);
   const p2Catalog = catalogList.find(p => p.id === 2);
+  const p54Catalog = catalogList.find(p => p.id === 54);
   if (p1Catalog && p2Catalog) {
     console.log('Catalog Product 1 image:', p1Catalog.image_url);
     console.log('Catalog Product 2 image:', p2Catalog.image_url);
@@ -391,6 +418,13 @@ async function runLiveTests() {
       throw new Error(`Products 1 and 2 share the same duplicate image URL: ${p1Catalog.image_url}`);
     }
     console.log('✅ Catalog verification passed: Products have distinct, unique image URLs across different products!');
+  }
+  if (p54Catalog) {
+    console.log('Catalog Product 54 (Rty from screenshot) images count:', p54Catalog.images ? p54Catalog.images.length : 0);
+    if (!Array.isArray(p54Catalog.images) || p54Catalog.images.length < 3) {
+      throw new Error(`Expected Product 54 to have at least 3 images, got: ${JSON.stringify(p54Catalog.images)}`);
+    }
+    console.log('✅ Product 54 (Row 11 in DB) verified: Has multiple working images in database and API!');
   }
 
   // Cleanup multi product

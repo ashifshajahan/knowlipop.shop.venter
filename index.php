@@ -241,7 +241,7 @@ if (preg_match('#^/api/products/(\d+)$#', $requestUri, $matches)) {
     $productId = (int) $matches[1];
     if ($method === 'GET') {
         apiGetProduct($pdo, $productId);
-    } elseif ($method === 'PUT' || $method === 'PATCH') {
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
         apiUpdateProduct($pdo, $productId);
     } elseif ($method === 'DELETE') {
         apiDeleteProduct($pdo, $productId);

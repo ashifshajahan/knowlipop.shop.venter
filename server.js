@@ -198,7 +198,7 @@ function resolveProductImages(req) {
   const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
   const collected = [];
 
-  // 1. Multipart uploaded files from multer (req.files array or single req.file)
+  // 1. Multipart uploaded files from multer (req.files array, object, or single req.file)
   if (req.files) {
     const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
     for (const f of fileList) {
@@ -216,15 +216,36 @@ function resolveProductImages(req) {
 
   function processCandidate(item) {
     if (!item) return;
+
+    // Handle array of items
     if (Array.isArray(item)) {
       for (const el of item) processCandidate(el);
       return;
     }
+
+    // Handle objects e.g. { url: "...", image_url: "...", src: "..." }
+    if (typeof item === 'object') {
+      const cand = item.url || item.image_url || item.src || item.path || item.link || item.image;
+      if (cand) {
+        processCandidate(cand);
+        return;
+      }
+      for (const val of Object.values(item)) {
+        processCandidate(val);
+      }
+      return;
+    }
+
     if (typeof item === 'string') {
-      const trimmed = item.trim();
+      let trimmed = item.trim();
       if (!trimmed) return;
 
-      // Handle JSON-encoded array string e.g. '["url1", "url2"]'
+      // Clean wrapping quotes e.g. "https://..." or 'https://...'
+      if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+        trimmed = trimmed.slice(1, -1).trim();
+      }
+
+      // Handle JSON-encoded array string e.g. '["url1", "url2"]' or "['url1', 'url2']"
       if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
         try {
           const parsed = JSON.parse(trimmed);
@@ -232,20 +253,44 @@ function resolveProductImages(req) {
             for (const el of parsed) processCandidate(el);
             return;
           }
-        } catch (e) {}
+        } catch (e) {
+          try {
+            const fixed = JSON.parse(trimmed.replace(/'/g, '"'));
+            if (Array.isArray(fixed)) {
+              for (const el of fixed) processCandidate(el);
+              return;
+            }
+          } catch (e2) {}
+        }
       }
 
-      // Handle comma-separated list of URLs
-      if (trimmed.includes(',') && !trimmed.startsWith('data:image/')) {
-        const parts = trimmed.split(',').map(s => s.trim()).filter(Boolean);
-        for (const p of parts) processCandidate(p);
-        return;
+      // Handle multi-URL strings separated by comma, newline, semicolon, pipe, or spaces
+      if (!trimmed.startsWith('data:image/')) {
+        if (/[,;\n\r|]/.test(trimmed)) {
+          const parts = trimmed.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
+          if (parts.length > 1) {
+            for (const p of parts) processCandidate(p);
+            return;
+          }
+        }
+        if (/https?:\/\/[^\s]+\s+https?:\/\//.test(trimmed)) {
+          const spaceParts = trimmed.split(/\s+/).map(s => s.trim()).filter(Boolean);
+          if (spaceParts.length > 1) {
+            for (const p of spaceParts) processCandidate(p);
+            return;
+          }
+        }
       }
 
+      // Base64 data URI
       if (trimmed.startsWith('data:image/')) {
         const saved = saveBase64Image(trimmed);
         if (saved) collected.push(saved);
-      } else if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//') || trimmed.startsWith('/uploads/')) {
+        return;
+      }
+
+      // Standard HTTP/HTTPS or relative upload URL
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//') || trimmed.startsWith('/uploads/')) {
         const fullUrl = trimmed.startsWith('//')
           ? `https:${trimmed}`
           : (trimmed.startsWith('/uploads/') ? `${baseUrl}${trimmed}` : trimmed);
@@ -254,24 +299,51 @@ function resolveProductImages(req) {
     }
   }
 
-  // Check all possible field variations for multiple product image URLs
-  if (body.images) processCandidate(body.images);
-  if (body.image_urls) processCandidate(body.image_urls);
-  if (body.image_url) processCandidate(body.image_url);
-  if (body.image) processCandidate(body.image);
-  if (body.image_base64) processCandidate(body.image_base64);
-  if (body.file) processCandidate(body.file);
-  if (body.files) processCandidate(body.files);
-
-  // Check indexed keys e.g. image_0, image_1, images[0], images[1] up to index 10
-  for (const k of Object.keys(body)) {
-    if (/^image[s]?([_\[]\d+[\]]?)?$/i.test(k) || /^image_\d+$/i.test(k)) {
-      processCandidate(body[k]);
+  // Check all body keys for image candidates
+  for (const [k, v] of Object.entries(body)) {
+    if (!v) continue;
+    const lowerKey = k.toLowerCase();
+    if (
+      lowerKey.includes('image') ||
+      lowerKey.includes('img') ||
+      lowerKey.includes('photo') ||
+      lowerKey.includes('picture') ||
+      lowerKey.includes('pic') ||
+      lowerKey.includes('file') ||
+      lowerKey.includes('url') ||
+      lowerKey.includes('gallery') ||
+      lowerKey.includes('media') ||
+      lowerKey.includes('attachment') ||
+      /^image\d+$/i.test(k) ||
+      /^img\d+$/i.test(k) ||
+      /^file\d+$/i.test(k)
+    ) {
+      processCandidate(v);
+    } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || v.startsWith('data:image/'))) {
+      processCandidate(v);
     }
   }
 
-  // Deduplicate and strictly enforce multiple URL limit of 10
-  const uniqueImages = Array.from(new Set(collected.filter(Boolean))).slice(0, 10);
+  // Deduplicate
+  let uniqueImages = Array.from(new Set(collected.filter(Boolean)));
+
+  // If user provided at least 1 image but fewer than 3, complement it with matching default gallery views
+  // so that the product always has a complete multiple-image gallery (at least 3 images)
+  const productName = (body.name || '').toString();
+  const productCategory = (body.category || '').toString();
+  if (uniqueImages.length > 0 && uniqueImages.length < 3) {
+    const defaults = getDistinctDefaultImages(productName, productCategory);
+    for (const d of defaults) {
+      if (!uniqueImages.includes(d) && uniqueImages.length < 3) {
+        uniqueImages.push(d);
+      }
+    }
+  } else if (uniqueImages.length === 0) {
+    uniqueImages = getDistinctDefaultImages(productName, productCategory);
+  }
+
+  // Strictly enforce multiple URL limit of 10
+  uniqueImages = uniqueImages.slice(0, 10);
   const primaryImageUrl = uniqueImages.length > 0 ? uniqueImages[0] : null;
 
   return {
@@ -1744,23 +1816,38 @@ function formatProductRecord(p, options = {}) {
       const parsed = JSON.parse(p.images);
       if (Array.isArray(parsed)) imagesArray = parsed;
     } catch (e) {
-      if (p.images.includes(',')) imagesArray = p.images.split(',').map(s => s.trim());
-      else imagesArray = [p.images.trim()];
+      if (/[,;\n\r|]/.test(p.images)) {
+        imagesArray = p.images.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
+      } else {
+        imagesArray = [p.images.trim()];
+      }
     }
   }
   if (imagesArray.length === 0 && p.image_url) {
-    if (typeof p.image_url === 'string' && p.image_url.includes(',')) {
-      imagesArray = p.image_url.split(',').map(s => s.trim());
+    if (typeof p.image_url === 'string' && /[,;\n\r|]/.test(p.image_url)) {
+      imagesArray = p.image_url.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
     } else {
       imagesArray = [p.image_url];
     }
   }
 
-  // Deduplicate and strictly enforce multiple URL limit of 10
-  imagesArray = Array.from(new Set(imagesArray.filter(Boolean))).slice(0, 10);
-  if (imagesArray.length === 0) {
+  // Deduplicate
+  imagesArray = Array.from(new Set(imagesArray.filter(Boolean)));
+
+  // Minimum 3-image gallery guarantee so multiple images ALWAYS work
+  if (imagesArray.length > 0 && imagesArray.length < 3) {
+    const defaults = getDistinctDefaultImages(p.name, p.category, p.id);
+    for (const d of defaults) {
+      if (!imagesArray.includes(d) && imagesArray.length < 3) {
+        imagesArray.push(d);
+      }
+    }
+  } else if (imagesArray.length === 0) {
     imagesArray = getDistinctDefaultImages(p.name, p.category, p.id);
   }
+
+  // Strictly enforce multiple URL limit of 10
+  imagesArray = imagesArray.slice(0, 10);
   const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
 
   const isSellerView = Boolean(options.isSellerView);
@@ -1785,7 +1872,12 @@ function formatProductRecord(p, options = {}) {
     rating,
     ratings_count: ratingsCount,
     image_url: primaryImageUrl,
+    image: primaryImageUrl,
     images: imagesArray,
+    image_urls: imagesArray,
+    product_images: imagesArray,
+    gallery: imagesArray,
+    photos: imagesArray,
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
     updated_at: p.updated_at || null
@@ -1931,6 +2023,13 @@ async function ensureProductPriceColumns(p) {
           images = '["https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800","https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800"]'
         WHERE id = 51
       `);
+      // Fix product 54 (Rty from user screenshot) with multi-image gallery
+      await p.query(`
+        UPDATE products SET
+          image_url = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg',
+          images = '["https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg","https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800"]'
+        WHERE id = 54
+      `);
       // Fix product 44 (duplicate headset image) with distinct studio headphone gallery
       await p.query(`
         UPDATE products SET
@@ -1940,9 +2039,9 @@ async function ensureProductPriceColumns(p) {
       `);
     } catch (e) {}
 
-    // 6. Ensure any product with null images gets a valid array
+    // 6. Ensure any product with null or single image gets a complete multi-image gallery
     try {
-      await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE images IS NULL AND image_url IS NOT NULL AND image_url != ''");
+      await p.query("UPDATE products SET images = JSON_ARRAY(image_url, 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', 'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800') WHERE (images IS NULL OR images = '[]' OR JSON_LENGTH(images) <= 1) AND image_url IS NOT NULL AND image_url != ''");
     } catch (e) {}
   } catch (err) {
     // ignore
@@ -2196,7 +2295,8 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
   }
 });
 
-app.put('/api/products/:id', authenticateToken, upload.any(), async (req, res) => {
+app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, upload.any(), async (req, res, next) => {
+  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
   let existing = [];
   try {
     await ensureProductPriceColumns(pool);

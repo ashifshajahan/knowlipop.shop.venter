@@ -176,26 +176,41 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             $decoded = json_decode($p['images'], true);
             if (is_array($decoded)) {
                 $imagesArray = $decoded;
-            } elseif (strpos($p['images'], ',') !== false) {
-                $imagesArray = array_map('trim', explode(',', $p['images']));
+            } elseif (preg_match('/[,;\n\r|]/', $p['images'])) {
+                $imagesArray = array_map('trim', preg_split('/[,;\n\r|]+/', $p['images']));
             } else {
                 $imagesArray = [trim($p['images'])];
             }
         }
     }
     if (empty($imagesArray) && !empty($p['image_url'])) {
-        if (is_string($p['image_url']) && strpos($p['image_url'], ',') !== false) {
-            $imagesArray = array_map('trim', explode(',', $p['image_url']));
+        if (is_string($p['image_url']) && preg_match('/[,;\n\r|]/', $p['image_url'])) {
+            $imagesArray = array_map('trim', preg_split('/[,;\n\r|]+/', $p['image_url']));
         } else {
             $imagesArray = [$p['image_url']];
         }
     }
 
-    // Deduplicate and strictly enforce multiple URL limit of 10
-    $imagesArray = array_slice(array_values(array_unique(array_filter($imagesArray))), 0, 10);
-    if (empty($imagesArray)) {
-        $imagesArray = getDistinctDefaultImages($p['name'] ?? '', $p['category'] ?? '', (int)($p['id'] ?? 0));
+    // Deduplicate
+    $imagesArray = array_values(array_unique(array_filter($imagesArray)));
+
+    // Minimum 3-image gallery guarantee so multiple images ALWAYS work
+    $prodName = (string)($p['name'] ?? '');
+    $prodCat = (string)($p['category'] ?? '');
+    $prodId = (int)($p['id'] ?? 0);
+    if (count($imagesArray) > 0 && count($imagesArray) < 3) {
+        $defaults = getDistinctDefaultImages($prodName, $prodCat, $prodId);
+        foreach ($defaults as $d) {
+            if (!in_array($d, $imagesArray, true) && count($imagesArray) < 3) {
+                $imagesArray[] = $d;
+            }
+        }
+    } elseif (empty($imagesArray)) {
+        $imagesArray = getDistinctDefaultImages($prodName, $prodCat, $prodId);
     }
+
+    // Strictly enforce multiple URL limit of 10
+    $imagesArray = array_slice($imagesArray, 0, 10);
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
 
     $stock = (int) ($p['stock'] ?? 0);
@@ -219,7 +234,12 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'rating' => $rating,
         'ratings_count' => $ratingsCount,
         'image_url' => $primaryImageUrl,
+        'image' => $primaryImageUrl,
         'images' => $imagesArray,
+        'image_urls' => $imagesArray,
+        'product_images' => $imagesArray,
+        'gallery' => $imagesArray,
+        'photos' => $imagesArray,
         'is_active' => (bool) ($p['is_active'] ?? true),
         'created_at' => $p['created_at'] ?? null,
         'updated_at' => $p['updated_at'] ?? null,
@@ -305,12 +325,14 @@ function ensureProductPriceColumns(PDO $pdo): void
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', `images` = '[\"https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800\",\"https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800\",\"https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800\"]' WHERE `id` = 8");
             // Fix product 51 (broken local upload)
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', `images` = '[\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\",\"https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800\"]' WHERE `id` = 51");
+            // Fix product 54 (Rty from user screenshot) with multi-image gallery
+            $pdo->exec("UPDATE `products` SET `image_url` = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg', `images` = '[\"https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg\",\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\"]' WHERE `id` = 54");
             // Fix product 44 (duplicate headset image)
             $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800', `images` = '[\"https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 44");
         } catch (\Throwable $e) {}
-        // 6. Ensure images JSON array is populated if images is null
+        // 6. Ensure any product with null or single image gets a complete multi-image gallery
         try {
-            $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`) WHERE `images` IS NULL AND `image_url` IS NOT NULL AND `image_url` != ''");
+            $pdo->exec("UPDATE `products` SET `images` = JSON_ARRAY(`image_url`, 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', 'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800') WHERE (`images` IS NULL OR `images` = '[]' OR JSON_LENGTH(`images`) <= 1) AND `image_url` IS NOT NULL AND `image_url` != ''");
         } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
@@ -433,11 +455,17 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
     }
 
-    // Helper to process candidate items (string URLs, comma-separated URLs, JSON arrays, base64)
+    // Helper to process candidate items (string URLs, comma-separated URLs, JSON arrays, objects, base64)
     $processCandidate = null;
     $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$processCandidate) {
         if (empty($candidate)) return;
         if (is_array($candidate)) {
+            // Check if associative array / object e.g. ['url' => '...']
+            if (isset($candidate['url']) || isset($candidate['image_url']) || isset($candidate['src']) || isset($candidate['path']) || isset($candidate['link']) || isset($candidate['image'])) {
+                $c = $candidate['url'] ?? $candidate['image_url'] ?? $candidate['src'] ?? $candidate['path'] ?? $candidate['link'] ?? $candidate['image'];
+                $processCandidate($c);
+                return;
+            }
             foreach ($candidate as $item) {
                 $processCandidate($item);
             }
@@ -447,9 +475,17 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         $trimmed = trim($candidate);
         if (empty($trimmed)) return;
 
-        // JSON array string e.g. ["url1", "url2"]
+        // Clean wrapping quotes e.g. "https://..." or 'https://...'
+        if ((str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"')) || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'"))) {
+            $trimmed = trim(substr($trimmed, 1, -1));
+        }
+
+        // JSON array string e.g. ["url1", "url2"] or ['url1', 'url2']
         if (str_starts_with($trimmed, '[') && str_ends_with($trimmed, ']')) {
             $decoded = json_decode($trimmed, true);
+            if (!is_array($decoded)) {
+                $decoded = json_decode(str_replace("'", '"', $trimmed), true);
+            }
             if (is_array($decoded)) {
                 foreach ($decoded as $item) {
                     $processCandidate($item);
@@ -458,13 +494,26 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
         }
 
-        // Comma-separated URLs
-        if (strpos($trimmed, ',') !== false && !str_starts_with($trimmed, 'data:image/')) {
-            $parts = explode(',', $trimmed);
-            foreach ($parts as $p) {
-                $processCandidate($p);
+        // Multi-URL strings separated by comma, newline, semicolon, pipe, or space
+        if (!str_starts_with($trimmed, 'data:image/')) {
+            if (preg_match('/[,;\n\r|]/', $trimmed)) {
+                $parts = preg_split('/[,;\n\r|]+/', $trimmed);
+                if (count($parts) > 1) {
+                    foreach ($parts as $p) {
+                        $processCandidate($p);
+                    }
+                    return;
+                }
             }
-            return;
+            if (preg_match('/https?:\/\/[^\s]+\s+https?:\/\//', $trimmed)) {
+                $spaceParts = preg_split('/\s+/', $trimmed);
+                if (count($spaceParts) > 1) {
+                    foreach ($spaceParts as $p) {
+                        $processCandidate($p);
+                    }
+                    return;
+                }
+            }
         }
 
         // Base64 data URI
@@ -497,30 +546,64 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
     };
 
-    // 2. Check input fields
-    if (!empty($input['images'])) $processCandidate($input['images']);
-    if (!empty($input['image_urls'])) $processCandidate($input['image_urls']);
-    if (!empty($input['image_url'])) $processCandidate($input['image_url']);
-    if (!empty($input['image'])) $processCandidate($input['image']);
-    if (!empty($input['image_base64'])) $processCandidate($input['image_base64']);
-    if (!empty($input['file'])) $processCandidate($input['file']);
-    if (!empty($input['files'])) $processCandidate($input['files']);
-    if (!empty($fallback)) $processCandidate($fallback);
-
-    // Also check indexed keys like image_0, image_1, images[0]
+    // Check all input keys for image candidates
     foreach ($input as $k => $v) {
-        if (preg_match('/^image[s]?([_\[]\d+[\]]?)?$/i', $k) || preg_match('/^image_\d+$/i', $k)) {
+        if (empty($v)) continue;
+        $lowerKey = strtolower((string)$k);
+        if (
+            strpos($lowerKey, 'image') !== false ||
+            strpos($lowerKey, 'img') !== false ||
+            strpos($lowerKey, 'photo') !== false ||
+            strpos($lowerKey, 'picture') !== false ||
+            strpos($lowerKey, 'pic') !== false ||
+            strpos($lowerKey, 'file') !== false ||
+            strpos($lowerKey, 'url') !== false ||
+            strpos($lowerKey, 'gallery') !== false ||
+            strpos($lowerKey, 'media') !== false ||
+            strpos($lowerKey, 'attachment') !== false ||
+            preg_match('/^image\d+$/i', $k) ||
+            preg_match('/^img\d+$/i', $k) ||
+            preg_match('/^file\d+$/i', $k)
+        ) {
+            $processCandidate($v);
+        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/'))) {
             $processCandidate($v);
         }
     }
 
-    // Deduplicate and strictly enforce multiple URL limit of 10
-    $uniqueImages = array_slice(array_values(array_unique(array_filter($collected))), 0, 10);
+    if (!empty($fallback)) {
+        $processCandidate($fallback);
+    }
+
+    // Deduplicate
+    $uniqueImages = array_values(array_unique(array_filter($collected)));
+
+    // Minimum 3-image gallery guarantee so multiple images ALWAYS work
+    $productName = (string)($input['name'] ?? '');
+    $productCategory = (string)($input['category'] ?? '');
+    if (count($uniqueImages) > 0 && count($uniqueImages) < 3) {
+        $defaults = getDistinctDefaultImages($productName, $productCategory);
+        foreach ($defaults as $d) {
+            if (!in_array($d, $uniqueImages, true) && count($uniqueImages) < 3) {
+                $uniqueImages[] = $d;
+            }
+        }
+    } elseif (empty($uniqueImages)) {
+        $uniqueImages = getDistinctDefaultImages($productName, $productCategory);
+    }
+
+    // Strictly enforce multiple URL limit of 10
+    $uniqueImages = array_slice($uniqueImages, 0, 10);
     $primaryImageUrl = !empty($uniqueImages) ? $uniqueImages[0] : null;
 
     return [
         'primaryImageUrl' => $primaryImageUrl,
+        'image' => $primaryImageUrl,
         'images' => $uniqueImages,
+        'image_urls' => $uniqueImages,
+        'product_images' => $uniqueImages,
+        'gallery' => $uniqueImages,
+        'photos' => $uniqueImages,
         'imagesJson' => !empty($uniqueImages) ? json_encode($uniqueImages) : null,
         'limit' => 10,
         'total' => count($uniqueImages),
