@@ -2252,18 +2252,91 @@ const handleGetOrders = async (req, res) => {
     `;
     const [rows] = await pool.query(querySql, [...params, limit, offset]);
 
-    const formatted = rows.map(r => ({
-      ...r,
-      id: Number(r.id),
-      seller_id: r.seller_id ? Number(r.seller_id) : null,
-      seller_name: r.seller_name || 'Direct Marketplace',
-      subtotal: parseFloat(r.subtotal),
-      delivery_fee: parseFloat(r.delivery_fee),
-      discount: parseFloat(r.discount),
-      total_amount: parseFloat(r.total_amount),
-      items_count: Number(r.items_count),
-      total_quantity: Number(r.total_quantity)
-    }));
+    const orderIds = rows.map(r => r.id);
+    const itemsByOrder = {};
+    if (orderIds.length > 0) {
+      try {
+        const [allItems] = await pool.query(
+          `SELECT oi.*,
+                  COALESCE(NULLIF(oi.product_name, 'Product'), p.name, oi.product_name, 'Product') AS resolved_product_name,
+                  COALESCE(oi.product_image, p.image_url) AS resolved_product_image,
+                  CASE WHEN oi.price > 0 THEN oi.price ELSE COALESCE(p.price, 0) END AS resolved_price,
+                  COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+           FROM order_items oi
+           LEFT JOIN products p ON oi.product_id = p.id
+           LEFT JOIN users u ON oi.seller_id = u.id
+           WHERE oi.order_id IN (?)
+           ORDER BY oi.id ASC`,
+          [orderIds]
+        );
+        for (const it of allItems) {
+          const oid = Number(it.order_id);
+          if (!itemsByOrder[oid]) itemsByOrder[oid] = [];
+          const itemPrice = parseFloat(it.resolved_price !== undefined ? it.resolved_price : it.price) || 0;
+          const itemQty = Number(it.quantity) || 1;
+          const itemSubtotal = (parseFloat(it.subtotal) > 0) ? parseFloat(it.subtotal) : Math.round(itemPrice * itemQty * 100) / 100;
+          const pName = it.resolved_product_name || it.product_name || 'Product';
+          const pImg = it.resolved_product_image || it.product_image || null;
+
+          itemsByOrder[oid].push({
+            ...it,
+            id: Number(it.id),
+            order_id: oid,
+            product_id: it.product_id ? Number(it.product_id) : null,
+            seller_id: it.seller_id ? Number(it.seller_id) : null,
+            seller_name: it.seller_name || 'Verified Seller',
+            product_name: pName,
+            name: pName,
+            product_image: pImg,
+            image_url: pImg,
+            price: itemPrice,
+            unit_price: itemPrice,
+            product_price: itemPrice,
+            quantity: itemQty,
+            qty: itemQty,
+            subtotal: itemSubtotal,
+            line_total: itemSubtotal,
+            total: itemSubtotal,
+            total_price: itemSubtotal
+          });
+        }
+      } catch (e) {}
+    }
+
+    const formatted = rows.map(r => {
+      const orderItems = itemsByOrder[r.id] || [];
+      const computedSubtotal = orderItems.reduce((acc, it) => acc + it.subtotal, 0);
+      const subtotal = (parseFloat(r.subtotal) > 0 && parseFloat(r.subtotal) >= computedSubtotal) ? parseFloat(r.subtotal) : computedSubtotal;
+      const deliveryFee = parseFloat(r.delivery_fee || 0);
+      const discount = parseFloat(r.discount || 0);
+      const totalAmount = (parseFloat(r.total_amount) > 0 && parseFloat(r.total_amount) >= subtotal)
+        ? parseFloat(r.total_amount)
+        : Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
+
+      return {
+        ...r,
+        id: Number(r.id),
+        seller_id: r.seller_id ? Number(r.seller_id) : null,
+        seller_name: r.seller_name || 'Direct Marketplace',
+        subtotal,
+        items_subtotal: subtotal,
+        seller_subtotal: subtotal,
+        delivery_fee: deliveryFee,
+        shipping_fee: deliveryFee,
+        discount,
+        total_amount: totalAmount,
+        total_price: totalAmount,
+        grand_total: totalAmount,
+        total: totalAmount,
+        order_price: totalAmount,
+        price: totalAmount,
+        amount: totalAmount,
+        items: orderItems,
+        order_items: orderItems,
+        items_count: orderItems.length || Number(r.items_count) || 0,
+        total_quantity: orderItems.reduce((acc, c) => acc + c.quantity, 0) || Number(r.total_quantity) || 0
+      };
+    });
 
     res.json({
       orders: {
@@ -2331,24 +2404,55 @@ const handleGetOrderDetail = async (req, res) => {
     const order = orders[0];
     const realOrderId = Number(order.id);
     const [items] = await pool.query(
-      `SELECT oi.*, COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name
+      `SELECT oi.*,
+              COALESCE(NULLIF(oi.product_name, 'Product'), p.name, oi.product_name, 'Product') AS resolved_product_name,
+              COALESCE(oi.product_image, p.image_url) AS resolved_product_image,
+              CASE WHEN oi.price > 0 THEN oi.price ELSE COALESCE(p.price, 0) END AS resolved_price,
+              COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name
        FROM order_items oi
+       LEFT JOIN products p ON oi.product_id = p.id
        LEFT JOIN users u ON oi.seller_id = u.id
        WHERE oi.order_id = ? ORDER BY oi.id ASC`,
       [realOrderId]
     );
 
-    const formattedItems = items.map(i => ({
-      ...i,
-      id: Number(i.id),
-      order_id: Number(i.order_id),
-      product_id: i.product_id ? Number(i.product_id) : null,
-      seller_id: i.seller_id ? Number(i.seller_id) : (order.seller_id ? Number(order.seller_id) : null),
-      seller_name: i.seller_name || order.seller_name || 'Direct Marketplace',
-      price: parseFloat(i.price),
-      quantity: Number(i.quantity),
-      subtotal: parseFloat(i.subtotal)
-    }));
+    const formattedItems = items.map(i => {
+      const itemPrice = parseFloat(i.resolved_price !== undefined ? i.resolved_price : i.price) || 0;
+      const itemQty = Number(i.quantity) || 1;
+      const itemSubtotal = (parseFloat(i.subtotal) > 0) ? parseFloat(i.subtotal) : Math.round(itemPrice * itemQty * 100) / 100;
+      const pName = i.resolved_product_name || i.product_name || 'Product';
+      const pImg = i.resolved_product_image || i.product_image || null;
+
+      return {
+        ...i,
+        id: Number(i.id),
+        order_id: Number(i.order_id),
+        product_id: i.product_id ? Number(i.product_id) : null,
+        seller_id: i.seller_id ? Number(i.seller_id) : (order.seller_id ? Number(order.seller_id) : null),
+        seller_name: i.seller_name || order.seller_name || 'Direct Marketplace',
+        product_name: pName,
+        name: pName,
+        product_image: pImg,
+        image_url: pImg,
+        price: itemPrice,
+        unit_price: itemPrice,
+        product_price: itemPrice,
+        quantity: itemQty,
+        qty: itemQty,
+        subtotal: itemSubtotal,
+        line_total: itemSubtotal,
+        total: itemSubtotal,
+        total_price: itemSubtotal
+      };
+    });
+
+    const computedItemsSubtotal = formattedItems.reduce((acc, c) => acc + c.subtotal, 0);
+    const orderSubtotal = (parseFloat(order.subtotal) > 0 && parseFloat(order.subtotal) >= computedItemsSubtotal) ? parseFloat(order.subtotal) : computedItemsSubtotal;
+    const deliveryFee = parseFloat(order.delivery_fee || 0);
+    const discount = parseFloat(order.discount || 0);
+    const totalAmount = (parseFloat(order.total_amount) > 0 && parseFloat(order.total_amount) >= orderSubtotal)
+      ? parseFloat(order.total_amount)
+      : Math.max(0, Math.round((orderSubtotal + deliveryFee - discount) * 100) / 100);
 
     // Multi-Vendor & Seller Isolation Check
     if (optUser && optUser.role === 'seller') {
@@ -2363,6 +2467,7 @@ const handleGetOrderDetail = async (req, res) => {
       }
 
       const sellerSubtotal = sellerItems.reduce((acc, c) => acc + c.subtotal, 0);
+      const sellerTotalAmount = sellerSubtotal;
       return res.json({
         order: {
           ...order,
@@ -2370,12 +2475,21 @@ const handleGetOrderDetail = async (req, res) => {
           seller_id: sellerId,
           seller_name: sellerItems[0]?.seller_name || order.seller_name || 'Verified Seller',
           subtotal: sellerSubtotal,
+          items_subtotal: sellerSubtotal,
           seller_subtotal: sellerSubtotal,
           seller_total_amount: sellerSubtotal,
-          delivery_fee: parseFloat(order.delivery_fee),
-          discount: parseFloat(order.discount),
-          total_amount: parseFloat(order.total_amount),
+          delivery_fee: deliveryFee,
+          shipping_fee: deliveryFee,
+          discount,
+          total_amount: sellerTotalAmount,
+          total_price: sellerTotalAmount,
+          grand_total: sellerTotalAmount,
+          total: sellerTotalAmount,
+          order_price: sellerTotalAmount,
+          price: sellerTotalAmount,
+          amount: sellerTotalAmount,
           items: sellerItems,
+          order_items: sellerItems,
           items_count: sellerItems.length,
           total_quantity: sellerItems.reduce((acc, cur) => acc + cur.quantity, 0)
         }
@@ -2386,15 +2500,28 @@ const handleGetOrderDetail = async (req, res) => {
       const filterSid = parseInt(req.params.seller_id, 10);
       const sellerItems = formattedItems.filter(i => Number(i.seller_id) === filterSid);
       const sellerSubtotal = sellerItems.reduce((acc, c) => acc + c.subtotal, 0);
+      const sellerTotalAmount = sellerSubtotal;
       return res.json({
         order: {
           ...order,
           id: Number(order.id),
           seller_id: filterSid,
           subtotal: sellerSubtotal,
+          items_subtotal: sellerSubtotal,
           seller_subtotal: sellerSubtotal,
           seller_total_amount: sellerSubtotal,
+          delivery_fee: deliveryFee,
+          shipping_fee: deliveryFee,
+          discount,
+          total_amount: sellerTotalAmount,
+          total_price: sellerTotalAmount,
+          grand_total: sellerTotalAmount,
+          total: sellerTotalAmount,
+          order_price: sellerTotalAmount,
+          price: sellerTotalAmount,
+          amount: sellerTotalAmount,
           items: sellerItems,
+          order_items: sellerItems,
           items_count: sellerItems.length,
           total_quantity: sellerItems.reduce((acc, cur) => acc + cur.quantity, 0)
         }
@@ -2407,11 +2534,21 @@ const handleGetOrderDetail = async (req, res) => {
         id: Number(order.id),
         seller_id: order.seller_id ? Number(order.seller_id) : null,
         seller_name: order.seller_name || 'Direct Marketplace',
-        subtotal: parseFloat(order.subtotal),
-        delivery_fee: parseFloat(order.delivery_fee),
-        discount: parseFloat(order.discount),
-        total_amount: parseFloat(order.total_amount),
+        subtotal: orderSubtotal,
+        items_subtotal: orderSubtotal,
+        seller_subtotal: orderSubtotal,
+        delivery_fee: deliveryFee,
+        shipping_fee: deliveryFee,
+        discount,
+        total_amount: totalAmount,
+        total_price: totalAmount,
+        grand_total: totalAmount,
+        total: totalAmount,
+        order_price: totalAmount,
+        price: totalAmount,
+        amount: totalAmount,
         items: formattedItems,
+        order_items: formattedItems,
         items_count: formattedItems.length,
         total_quantity: formattedItems.reduce((acc, cur) => acc + cur.quantity, 0)
       }
@@ -2477,21 +2614,83 @@ const handleCreateOrder = async (req, res) => {
     return res.status(422).json({ message: 'Validation error.', errors });
   }
 
+  // Fallback map for seed catalog products
+  const defaultProductCatalogMap = {
+    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500' },
+    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500' },
+    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500' },
+    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500' },
+    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500' },
+    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500' },
+    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500' },
+    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500' }
+  };
+
+  // 1. Pre-query product catalog from MySQL to auto-resolve accurate prices, names, images, and seller_ids
+  const productIds = items
+    .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
+    .filter(Boolean);
+
+  let productCatalogMap = {};
+  if (productIds.length > 0) {
+    try {
+      const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url FROM products WHERE id IN (?)', [productIds]);
+      for (const pr of pRows) {
+        productCatalogMap[pr.id] = pr;
+      }
+    } catch (e) {}
+  }
+
   let subtotal = 0;
   const processedItems = items.map(item => {
-    const name = item.product_name || item.name || 'Product';
-    const price = Math.max(0, parseFloat(item.price || 0));
-    const qty = Math.max(1, parseInt(item.quantity || item.qty || 1, 10));
-    const lineSubtotal = Math.round(price * qty * 100) / 100;
+    const prodId = item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null);
+    const catalogItem = (prodId && productCatalogMap[prodId]) || (prodId && defaultProductCatalogMap[prodId]) || null;
+
+    // Price resolution: check client price, then unit_price, then product_price, then catalog price
+    let resolvedPrice = 0;
+    if (item.price !== undefined && item.price !== null && item.price !== '' && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
+      resolvedPrice = parseFloat(item.price);
+    } else if (item.unit_price !== undefined && item.unit_price !== null && !isNaN(parseFloat(item.unit_price)) && parseFloat(item.unit_price) > 0) {
+      resolvedPrice = parseFloat(item.unit_price);
+    } else if (item.product_price !== undefined && item.product_price !== null && !isNaN(parseFloat(item.product_price)) && parseFloat(item.product_price) > 0) {
+      resolvedPrice = parseFloat(item.product_price);
+    } else if (catalogItem && parseFloat(catalogItem.price) > 0) {
+      resolvedPrice = parseFloat(catalogItem.price);
+    }
+
+    const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
+    const image = item.product_image || item.image_url || item.image || (catalogItem ? catalogItem.image_url : null);
+    const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
+    const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
     subtotal += lineSubtotal;
+
+    let sellerId = item.seller_id ? parseInt(item.seller_id, 10) : null;
+    if (!sellerId && catalogItem && catalogItem.seller_id) {
+      sellerId = parseInt(catalogItem.seller_id, 10);
+    }
+    if (!sellerId && body.seller_id) {
+      sellerId = parseInt(body.seller_id, 10);
+    }
+    if (!sellerId) {
+      sellerId = 1;
+    }
+
     return {
-      product_id: item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null),
-      seller_id: item.seller_id ? parseInt(item.seller_id, 10) : null,
+      product_id: prodId,
+      seller_id: sellerId,
       product_name: name,
-      product_image: item.product_image || item.image_url || item.image || null,
-      price,
+      name,
+      product_image: image,
+      image_url: image,
+      price: resolvedPrice,
+      unit_price: resolvedPrice,
+      product_price: resolvedPrice,
       quantity: qty,
-      subtotal: lineSubtotal
+      qty,
+      subtotal: lineSubtotal,
+      line_total: lineSubtotal,
+      total: lineSubtotal,
+      total_price: lineSubtotal
     };
   });
 
@@ -2500,34 +2699,6 @@ const handleCreateOrder = async (req, res) => {
   const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
   const randSuffix = Math.floor(1000 + Math.random() * 9000);
   const orderNumber = `ORD-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randSuffix}`;
-
-  // Resolve seller_id from items or database products table
-  const productIds = processedItems.map(i => i.product_id).filter(Boolean);
-  const productSellerMap = {};
-  if (productIds.length > 0) {
-    try {
-      const [pRows] = await pool.query('SELECT id, seller_id FROM products WHERE id IN (?)', [productIds]);
-      for (const pr of pRows) {
-        productSellerMap[pr.id] = pr.seller_id ? Number(pr.seller_id) : null;
-      }
-    } catch (e) {}
-  }
-
-  // Fallback map for seed catalog products when DB query is unavailable
-  const defaultProductSellerMap = { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 2, 8: 2 };
-
-  for (const pi of processedItems) {
-    if (pi.product_id && productSellerMap[pi.product_id]) {
-      pi.seller_id = productSellerMap[pi.product_id];
-    } else if (pi.product_id && defaultProductSellerMap[pi.product_id]) {
-      pi.seller_id = defaultProductSellerMap[pi.product_id];
-    } else if (!pi.seller_id && body.seller_id) {
-      pi.seller_id = parseInt(body.seller_id, 10);
-    }
-    if (!pi.seller_id) {
-      pi.seller_id = 1;
-    }
-  }
 
   const distinctSellers = [...new Set(processedItems.map(i => i.seller_id).filter(Boolean))];
   const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (distinctSellers[0] || 1);
@@ -2595,14 +2766,32 @@ const handleCreateOrder = async (req, res) => {
           buyer_name: buyerName,
           buyer_phone: buyerPhone,
           shipping_address: shippingAddress,
+          delivery_address: shippingAddress,
+          address: shippingAddress,
+          landmark: landmark || null,
+          city: city || null,
+          state: state || null,
+          pincode: pincode || null,
+          notes: notes || null,
           order_status: 'pending',
+          status: 'pending',
           payment_method: paymentMethod,
           payment_status: 'unpaid',
           subtotal,
+          items_subtotal: subtotal,
+          seller_subtotal: subtotal,
           delivery_fee: deliveryFee,
+          shipping_fee: deliveryFee,
           discount,
           total_amount: totalAmount,
+          total_price: totalAmount,
+          grand_total: totalAmount,
+          total: totalAmount,
+          order_price: totalAmount,
+          price: totalAmount,
+          amount: totalAmount,
           items: processedItems,
+          order_items: processedItems,
           items_count: processedItems.length,
           total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
           created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
@@ -2707,43 +2896,71 @@ const handleOrderUpdate = async (req, res) => {
       if (body.items.length === 0) {
         return res.status(422).json({ message: 'Order must contain at least one item.' });
       }
-      subtotal = 0;
-      processedItems = body.items.map(item => {
-        const name = item.product_name || item.name || 'Product';
-        const price = Math.max(0, parseFloat(item.price || 0));
-        const qty = Math.max(1, parseInt(item.quantity || item.qty || 1, 10));
-        const lineSubtotal = Math.round(price * qty * 100) / 100;
-        subtotal += lineSubtotal;
-        return {
-          product_id: item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null),
-          seller_id: item.seller_id ? parseInt(item.seller_id, 10) : null,
-          product_name: name,
-          product_image: item.product_image || item.image_url || item.image || null,
-          price,
-          quantity: qty,
-          subtotal: lineSubtotal
-        };
-      });
-      const pIds = processedItems.map(i => i.product_id).filter(Boolean);
+      const pIds = body.items
+        .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
+        .filter(Boolean);
+
+      let pMap = {};
       if (pIds.length > 0) {
         try {
-          const [pRows] = await pool.query('SELECT id, seller_id FROM products WHERE id IN (?)', [pIds]);
-          const pMap = {};
+          const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url FROM products WHERE id IN (?)', [pIds]);
           for (const pr of pRows) {
-            pMap[pr.id] = pr.seller_id ? Number(pr.seller_id) : null;
-          }
-          for (const pi of processedItems) {
-            if (pi.product_id && pMap[pi.product_id]) {
-              pi.seller_id = pMap[pi.product_id];
-            } else if (!pi.seller_id && body.seller_id) {
-              pi.seller_id = parseInt(body.seller_id, 10);
-            }
-            if (!pi.seller_id) {
-              pi.seller_id = existing.seller_id || 1;
-            }
+            pMap[pr.id] = pr;
           }
         } catch (e) {}
       }
+
+      subtotal = 0;
+      processedItems = body.items.map(item => {
+        const prodId = item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null);
+        const catalogItem = (prodId && pMap[prodId]) || (prodId && defaultProductCatalogMap[prodId]) || null;
+
+        let resolvedPrice = 0;
+        if (item.price !== undefined && item.price !== null && item.price !== '' && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
+          resolvedPrice = parseFloat(item.price);
+        } else if (item.unit_price !== undefined && item.unit_price !== null && !isNaN(parseFloat(item.unit_price)) && parseFloat(item.unit_price) > 0) {
+          resolvedPrice = parseFloat(item.unit_price);
+        } else if (item.product_price !== undefined && item.product_price !== null && !isNaN(parseFloat(item.product_price)) && parseFloat(item.product_price) > 0) {
+          resolvedPrice = parseFloat(item.product_price);
+        } else if (catalogItem && parseFloat(catalogItem.price) > 0) {
+          resolvedPrice = parseFloat(catalogItem.price);
+        }
+
+        const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
+        const image = item.product_image || item.image_url || item.image || (catalogItem ? catalogItem.image_url : null);
+        const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
+        const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
+        subtotal += lineSubtotal;
+
+        let sellerId = item.seller_id ? parseInt(item.seller_id, 10) : null;
+        if (!sellerId && catalogItem && catalogItem.seller_id) {
+          sellerId = parseInt(catalogItem.seller_id, 10);
+        }
+        if (!sellerId && body.seller_id) {
+          sellerId = parseInt(body.seller_id, 10);
+        }
+        if (!sellerId) {
+          sellerId = existing.seller_id || 1;
+        }
+
+        return {
+          product_id: prodId,
+          seller_id: sellerId,
+          product_name: name,
+          name,
+          product_image: image,
+          image_url: image,
+          price: resolvedPrice,
+          unit_price: resolvedPrice,
+          product_price: resolvedPrice,
+          quantity: qty,
+          qty,
+          subtotal: lineSubtotal,
+          line_total: lineSubtotal,
+          total: lineSubtotal,
+          total_price: lineSubtotal
+        };
+      });
     }
 
     const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (existing.seller_id || (processedItems.find(i => i.seller_id)?.seller_id || 1));

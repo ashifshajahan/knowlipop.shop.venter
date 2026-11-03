@@ -317,15 +317,85 @@ function apiGetOrders(PDO $pdo): void
     $stmt->execute();
     $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+    $orderIds = array_column($orders, 'id');
+    $itemsByOrder = [];
+    if (!empty($orderIds)) {
+        $inPlaceholders = implode(',', array_fill(0, count($orderIds), '?'));
+        try {
+            $itemStmt = $pdo->prepare("
+                SELECT i.*, 
+                       COALESCE(NULLIF(i.product_name, 'Product'), p.name, i.product_name, 'Product') AS resolved_product_name,
+                       COALESCE(i.product_image, p.image_url) AS resolved_product_image,
+                       CASE WHEN i.price > 0 THEN i.price ELSE COALESCE(p.price, 0) END AS resolved_price,
+                       COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+                FROM `order_items` i
+                LEFT JOIN `products` p ON i.product_id = p.id
+                LEFT JOIN `users` u ON i.seller_id = u.id
+                WHERE i.order_id IN ($inPlaceholders)
+                ORDER BY i.id ASC
+            ");
+            $itemStmt->execute($orderIds);
+            $allItems = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($allItems as $it) {
+                $oid = (int)$it['order_id'];
+                $pName = $it['resolved_product_name'] ?? $it['product_name'] ?? 'Product';
+                $pImg = $it['resolved_product_image'] ?? $it['product_image'] ?? null;
+                $iPrice = (float)($it['resolved_price'] ?? $it['price'] ?? 0);
+                $iQty = max(1, (int)($it['quantity'] ?? 1));
+                $iSubtotal = (float)$it['subtotal'] > 0 ? (float)$it['subtotal'] : round($iPrice * $iQty, 2);
+
+                $itemsByOrder[$oid][] = [
+                    'id' => (int)$it['id'],
+                    'order_id' => $oid,
+                    'product_id' => !empty($it['product_id']) ? (int)$it['product_id'] : null,
+                    'seller_id' => !empty($it['seller_id']) ? (int)$it['seller_id'] : null,
+                    'seller_name' => $it['seller_name'] ?? 'Verified Seller',
+                    'product_name' => $pName,
+                    'name' => $pName,
+                    'product_image' => $pImg,
+                    'image_url' => $pImg,
+                    'price' => $iPrice,
+                    'unit_price' => $iPrice,
+                    'product_price' => $iPrice,
+                    'quantity' => $iQty,
+                    'qty' => $iQty,
+                    'subtotal' => $iSubtotal,
+                    'line_total' => $iSubtotal,
+                    'total' => $iSubtotal,
+                    'total_price' => $iSubtotal,
+                ];
+            }
+        } catch (Throwable $e) {}
+    }
+
     foreach ($orders as &$order) {
-        $order['id'] = (int)$order['id'];
+        $oid = (int)$order['id'];
+        $orderItems = $itemsByOrder[$oid] ?? [];
+        $computedSubtotal = (float)array_sum(array_column($orderItems, 'subtotal'));
+        $subtotal = ((float)$order['subtotal'] > 0 && (float)$order['subtotal'] >= $computedSubtotal) ? (float)$order['subtotal'] : $computedSubtotal;
+        $deliveryFee = (float)($order['delivery_fee'] ?? 0);
+        $discount = (float)($order['discount'] ?? 0);
+        $totalAmount = ((float)$order['total_amount'] > 0 && (float)$order['total_amount'] >= $subtotal) ? (float)$order['total_amount'] : max(0, round($subtotal + $deliveryFee - $discount, 2));
+
+        $order['id'] = $oid;
         $order['seller_id'] = !empty($order['seller_id']) ? (int)$order['seller_id'] : null;
-        $order['items_count'] = (int)$order['items_count'];
-        $order['total_quantity'] = (int)$order['total_quantity'];
-        $order['subtotal'] = (float)$order['subtotal'];
-        $order['delivery_fee'] = (float)$order['delivery_fee'];
-        $order['discount'] = (float)$order['discount'];
-        $order['total_amount'] = (float)$order['total_amount'];
+        $order['items'] = $orderItems;
+        $order['order_items'] = $orderItems;
+        $order['items_count'] = !empty($orderItems) ? count($orderItems) : (int)$order['items_count'];
+        $order['total_quantity'] = !empty($orderItems) ? (int)array_sum(array_column($orderItems, 'quantity')) : (int)$order['total_quantity'];
+        $order['subtotal'] = $subtotal;
+        $order['items_subtotal'] = $subtotal;
+        $order['seller_subtotal'] = $subtotal;
+        $order['delivery_fee'] = $deliveryFee;
+        $order['shipping_fee'] = $deliveryFee;
+        $order['discount'] = $discount;
+        $order['total_amount'] = $totalAmount;
+        $order['total_price'] = $totalAmount;
+        $order['grand_total'] = $totalAmount;
+        $order['total'] = $totalAmount;
+        $order['order_price'] = $totalAmount;
+        $order['price'] = $totalAmount;
+        $order['amount'] = $totalAmount;
     }
     unset($order);
 
@@ -388,10 +458,15 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
     }
     $orderId = (int)$order['id'];
 
-    // Fetch all items with seller name
+    // Fetch all items with seller name and join products table to recover name/image/price if missing
     $itemStmt = $pdo->prepare("
-        SELECT i.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        SELECT i.*, 
+               COALESCE(NULLIF(i.product_name, 'Product'), p.name, i.product_name, 'Product') AS resolved_product_name,
+               COALESCE(i.product_image, p.image_url) AS resolved_product_image,
+               CASE WHEN i.price > 0 THEN i.price ELSE COALESCE(p.price, 0) END AS resolved_price,
+               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
         FROM `order_items` i
+        LEFT JOIN `products` p ON i.product_id = p.id
         LEFT JOIN `users` u ON i.seller_id = u.id
         WHERE i.order_id = :order_id
         ORDER BY i.id ASC
@@ -400,15 +475,37 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
     $allItems = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
 
     foreach ($allItems as &$item) {
+        $pName = $item['resolved_product_name'] ?? $item['product_name'] ?? 'Product';
+        $pImg = $item['resolved_product_image'] ?? $item['product_image'] ?? null;
+        $iPrice = (float)($item['resolved_price'] ?? $item['price'] ?? 0);
+        $iQty = max(1, (int)($item['quantity'] ?? 1));
+        $iSubtotal = (float)$item['subtotal'] > 0 ? (float)$item['subtotal'] : round($iPrice * $iQty, 2);
+
         $item['id'] = (int)$item['id'];
         $item['order_id'] = (int)$item['order_id'];
         $item['product_id'] = !empty($item['product_id']) ? (int)$item['product_id'] : null;
         $item['seller_id'] = !empty($item['seller_id']) ? (int)$item['seller_id'] : null;
-        $item['price'] = (float)$item['price'];
-        $item['quantity'] = (int)$item['quantity'];
-        $item['subtotal'] = (float)$item['subtotal'];
+        $item['product_name'] = $pName;
+        $item['name'] = $pName;
+        $item['product_image'] = $pImg;
+        $item['image_url'] = $pImg;
+        $item['price'] = $iPrice;
+        $item['unit_price'] = $iPrice;
+        $item['product_price'] = $iPrice;
+        $item['quantity'] = $iQty;
+        $item['qty'] = $iQty;
+        $item['subtotal'] = $iSubtotal;
+        $item['line_total'] = $iSubtotal;
+        $item['total'] = $iSubtotal;
+        $item['total_price'] = $iSubtotal;
     }
     unset($item);
+
+    $computedSubtotal = (float)array_sum(array_column($allItems, 'subtotal'));
+    $orderSubtotal = ((float)$order['subtotal'] > 0 && (float)$order['subtotal'] >= $computedSubtotal) ? (float)$order['subtotal'] : $computedSubtotal;
+    $deliveryFee = (float)($order['delivery_fee'] ?? 0);
+    $discount = (float)($order['discount'] ?? 0);
+    $totalAmount = ((float)$order['total_amount'] > 0 && (float)$order['total_amount'] >= $orderSubtotal) ? (float)$order['total_amount'] : max(0, round($orderSubtotal + $deliveryFee - $discount, 2));
 
     // Multi-Vendor Authorization & Product Filtering:
     // If accessed by a seller (or seller route specified)
@@ -430,19 +527,29 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
 
         // Calculate seller-specific financial totals
         $sellerSubtotal = (float)array_sum(array_column($sellerItems, 'subtotal'));
+        $sellerTotalAmount = $sellerSubtotal;
 
         $order['id'] = $orderId;
         $order['seller_id'] = $sellerId;
         $order['seller_name'] = $sellerItems[0]['seller_name'] ?? 'Verified Seller';
         $order['items'] = $sellerItems;
+        $order['order_items'] = $sellerItems;
         $order['items_count'] = count($sellerItems);
         $order['total_quantity'] = (int)array_sum(array_column($sellerItems, 'quantity'));
         $order['seller_subtotal'] = $sellerSubtotal;
         $order['subtotal'] = $sellerSubtotal;
-        $order['seller_total_amount'] = $sellerSubtotal;
-        $order['delivery_fee'] = (float)$order['delivery_fee'];
-        $order['discount'] = (float)$order['discount'];
-        $order['total_amount'] = (float)$order['total_amount'];
+        $order['items_subtotal'] = $sellerSubtotal;
+        $order['seller_total_amount'] = $sellerTotalAmount;
+        $order['delivery_fee'] = $deliveryFee;
+        $order['shipping_fee'] = $deliveryFee;
+        $order['discount'] = $discount;
+        $order['total_amount'] = $sellerTotalAmount;
+        $order['total_price'] = $sellerTotalAmount;
+        $order['grand_total'] = $sellerTotalAmount;
+        $order['total'] = $sellerTotalAmount;
+        $order['order_price'] = $sellerTotalAmount;
+        $order['price'] = $sellerTotalAmount;
+        $order['amount'] = $sellerTotalAmount;
 
         jsonResponse(['order' => $order]);
         return;
@@ -452,18 +559,28 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
     if ($user && ($user['role'] ?? '') === 'admin' && $routeSellerId !== null) {
         $sellerItems = array_values(array_filter($allItems, fn($i) => (int)$i['seller_id'] === $routeSellerId));
         $sellerSubtotal = (float)array_sum(array_column($sellerItems, 'subtotal'));
+        $sellerTotalAmount = $sellerSubtotal;
 
         $order['id'] = $orderId;
         $order['seller_id'] = $routeSellerId;
         $order['items'] = $sellerItems;
+        $order['order_items'] = $sellerItems;
         $order['items_count'] = count($sellerItems);
         $order['total_quantity'] = (int)array_sum(array_column($sellerItems, 'quantity'));
         $order['seller_subtotal'] = $sellerSubtotal;
         $order['subtotal'] = $sellerSubtotal;
-        $order['seller_total_amount'] = $sellerSubtotal;
-        $order['delivery_fee'] = (float)$order['delivery_fee'];
-        $order['discount'] = (float)$order['discount'];
-        $order['total_amount'] = (float)$order['total_amount'];
+        $order['items_subtotal'] = $sellerSubtotal;
+        $order['seller_total_amount'] = $sellerTotalAmount;
+        $order['delivery_fee'] = $deliveryFee;
+        $order['shipping_fee'] = $deliveryFee;
+        $order['discount'] = $discount;
+        $order['total_amount'] = $sellerTotalAmount;
+        $order['total_price'] = $sellerTotalAmount;
+        $order['grand_total'] = $sellerTotalAmount;
+        $order['total'] = $sellerTotalAmount;
+        $order['order_price'] = $sellerTotalAmount;
+        $order['price'] = $sellerTotalAmount;
+        $order['amount'] = $sellerTotalAmount;
 
         jsonResponse(['order' => $order]);
         return;
@@ -472,12 +589,23 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
     // Admin or Buyer: Full order details
     $order['id'] = $orderId;
     $order['seller_id'] = !empty($order['seller_id']) ? (int)$order['seller_id'] : null;
-    $order['subtotal'] = (float)$order['subtotal'];
-    $order['delivery_fee'] = (float)$order['delivery_fee'];
-    $order['discount'] = (float)$order['discount'];
-    $order['total_amount'] = (float)$order['total_amount'];
+    $order['subtotal'] = $orderSubtotal;
+    $order['items_subtotal'] = $orderSubtotal;
+    $order['seller_subtotal'] = $orderSubtotal;
+    $order['delivery_fee'] = $deliveryFee;
+    $order['shipping_fee'] = $deliveryFee;
+    $order['discount'] = $discount;
+    $order['total_amount'] = $totalAmount;
+    $order['total_price'] = $totalAmount;
+    $order['grand_total'] = $totalAmount;
+    $order['total'] = $totalAmount;
+    $order['order_price'] = $totalAmount;
+    $order['price'] = $totalAmount;
+    $order['amount'] = $totalAmount;
     $order['items'] = $allItems;
+    $order['order_items'] = $allItems;
     $order['items_count'] = count($allItems);
+    $order['total_quantity'] = (int)array_sum(array_column($allItems, 'quantity'));
     $order['total_quantity'] = (int)array_sum(array_column($allItems, 'quantity'));
 
     jsonResponse(['order' => $order]);
@@ -687,12 +815,32 @@ function apiCreateOrder(PDO $pdo): void
                 'buyer_name' => $buyerName,
                 'buyer_phone' => $buyerPhone,
                 'shipping_address' => $shippingAddress,
+                'delivery_address' => $shippingAddress,
+                'address' => $shippingAddress,
+                'landmark' => $landmark ?: null,
+                'city' => $city ?: null,
+                'state' => $state ?: null,
+                'pincode' => $pincode ?: null,
+                'notes' => $notes ?: null,
                 'order_status' => 'pending',
+                'status' => 'pending',
+                'payment_method' => $paymentMethod,
+                'payment_status' => 'unpaid',
                 'subtotal' => $subtotal,
+                'items_subtotal' => $subtotal,
+                'seller_subtotal' => $subtotal,
                 'delivery_fee' => $deliveryFee,
+                'shipping_fee' => $deliveryFee,
                 'discount' => $discount,
                 'total_amount' => $totalAmount,
+                'total_price' => $totalAmount,
+                'grand_total' => $totalAmount,
+                'total' => $totalAmount,
+                'order_price' => $totalAmount,
+                'price' => $totalAmount,
+                'amount' => $totalAmount,
                 'items' => $processedItems,
+                'order_items' => $processedItems,
                 'items_count' => count($processedItems),
                 'total_quantity' => (int)array_sum(array_column($processedItems, 'quantity')),
                 'created_at' => date('Y-m-d H:i:s'),
