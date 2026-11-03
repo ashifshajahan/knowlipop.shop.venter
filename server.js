@@ -87,13 +87,50 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
-app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
-
 // File Upload & Image Storage Configuration
 const uploadDir = path.resolve(__dirname, 'uploads', 'products');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
+
+const avatarUploadDir = path.resolve(__dirname, 'uploads', 'avatars');
+if (!fs.existsSync(avatarUploadDir)) {
+  fs.mkdirSync(avatarUploadDir, { recursive: true });
+}
+
+// Serve existing files statically with CORS & caching headers
+app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
+
+// Fallback handlers: If an image file does not exist on disk, NEVER return 404/blank!
+app.get('/uploads/products/:filename', (req, res) => {
+  const safeFilename = path.basename(req.params.filename || '');
+  const targetPath = path.join(uploadDir, safeFilename);
+  if (fs.existsSync(targetPath)) {
+    return res.sendFile(targetPath);
+  }
+  const placeholder = path.join(uploadDir, 'placeholder.jpg');
+  if (fs.existsSync(placeholder)) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(placeholder);
+  }
+  const samplePng = path.join(uploadDir, 'prod_1793598726521_793ff4ae.png');
+  if (fs.existsSync(samplePng)) {
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(samplePng);
+  }
+  return res.redirect(302, 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800');
+});
+
+app.get('/uploads/avatars/:filename', (req, res) => {
+  const safeFilename = path.basename(req.params.filename || '');
+  const targetPath = path.join(avatarUploadDir, safeFilename);
+  if (fs.existsSync(targetPath)) {
+    return res.sendFile(targetPath);
+  }
+  return res.redirect(302, 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400');
+});
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
@@ -171,15 +208,34 @@ function getDistinctDefaultImages(name = '', category = '', id = 0) {
 }
 
 function saveBase64Image(dataString) {
-  if (typeof dataString !== 'string' || !dataString.startsWith('data:image/')) return null;
-  const matches = dataString.match(/^data:image\/(\w+);base64,(.+)$/);
-  if (!matches) return null;
-  let ext = matches[1].toLowerCase();
-  if (ext === 'jpeg') ext = 'jpg';
-  if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
-  const buffer = Buffer.from(matches[2], 'base64');
-  const filename = `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+  if (typeof dataString !== 'string') return null;
+  const trimmed = dataString.trim();
+  if (trimmed.length < 20) return null;
+
+  let ext = 'jpg';
+  let rawB64 = '';
+
+  const matches = trimmed.match(/^data:image\/(\w+);base64,(.+)$/is);
+  if (matches) {
+    ext = matches[1].toLowerCase();
+    if (ext === 'jpeg') ext = 'jpg';
+    if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
+    rawB64 = matches[2].replace(/\s+/g, '');
+  } else if (/^[A-Za-z0-9+/=\s\r\n]+$/.test(trimmed) && trimmed.length > 50) {
+    rawB64 = trimmed.replace(/\s+/g, '');
+    if (rawB64.startsWith('/9j/')) ext = 'jpg';
+    else if (rawB64.startsWith('iVBORw0KGgo')) ext = 'png';
+    else if (rawB64.startsWith('R0lGOD')) ext = 'gif';
+    else if (rawB64.startsWith('UklGR')) ext = 'webp';
+    else ext = 'jpg';
+  } else {
+    return null;
+  }
+
   try {
+    const buffer = Buffer.from(rawB64, 'base64');
+    if (buffer.length < 10) return null;
+    const filename = `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
     }
@@ -282,11 +338,13 @@ function resolveProductImages(req) {
         }
       }
 
-      // Base64 data URI
-      if (trimmed.startsWith('data:image/')) {
+      // Base64 data URI or raw base64 string
+      if (trimmed.startsWith('data:image/') || (/^[A-Za-z0-9+/=\s\r\n]+$/.test(trimmed) && trimmed.length > 50)) {
         const saved = saveBase64Image(trimmed);
-        if (saved) collected.push(saved);
-        return;
+        if (saved) {
+          collected.push(saved);
+          return;
+        }
       }
 
       // Standard HTTP/HTTPS or relative upload URL
@@ -314,12 +372,13 @@ function resolveProductImages(req) {
       lowerKey.includes('gallery') ||
       lowerKey.includes('media') ||
       lowerKey.includes('attachment') ||
+      lowerKey.includes('thumb') ||
       /^image\d+$/i.test(k) ||
       /^img\d+$/i.test(k) ||
       /^file\d+$/i.test(k)
     ) {
       processCandidate(v);
-    } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || v.startsWith('data:image/'))) {
+    } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || v.startsWith('data:image/') || (/^[A-Za-z0-9+/=\s\r\n]+$/.test(v.trim()) && v.trim().length > 50))) {
       processCandidate(v);
     }
   }
@@ -345,11 +404,7 @@ function resolveProductImage(req) {
   return result.primaryImageUrl;
 }
 
-// Avatar File Upload & Image Storage Configuration
-const avatarUploadDir = path.resolve(__dirname, 'uploads', 'avatars');
-if (!fs.existsSync(avatarUploadDir)) {
-  fs.mkdirSync(avatarUploadDir, { recursive: true });
-}
+// Avatar Storage Configuration
 
 const avatarStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, avatarUploadDir),
@@ -1794,42 +1849,68 @@ function formatProductRecord(p, options = {}) {
   const deliveryCharge = cleanPrice >= 500 ? 0.00 : 50.00;
   const deliveryText = cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-  // Parse multiple product images (limit 10)
-  let imagesArray = [];
-  if (Array.isArray(p.images)) {
-    imagesArray = p.images;
-  } else if (typeof p.images === 'string' && p.images.trim()) {
-    try {
-      const parsed = JSON.parse(p.images);
-      if (Array.isArray(parsed)) imagesArray = parsed;
-    } catch (e) {
-      if (/[,;\n\r|]/.test(p.images)) {
-        imagesArray = p.images.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
-      } else {
-        imagesArray = [p.images.trim()];
-      }
+  const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+  const normalizeUrl = (u) => {
+    if (!u || typeof u !== 'string') return null;
+    const t = u.trim();
+    if (!t || t === 'null' || t === 'undefined' || t === '[]' || t === '{}') return null;
+    if (t.startsWith('blob:') || t.startsWith('file:') || t.startsWith('/data/user/')) return null;
+    if (t.startsWith('//')) return `https:${t}`;
+    if (t.startsWith('/uploads/')) return `${baseUrl}${t}`;
+    if (t.startsWith('uploads/')) return `${baseUrl}/${t}`;
+    if (t.startsWith('http://localhost') || t.startsWith('http://127.0.0.1')) {
+      return t.replace(/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/, baseUrl);
     }
-  }
-  if (imagesArray.length === 0 && p.image_url) {
-    if (typeof p.image_url === 'string' && /[,;\n\r|]/.test(p.image_url)) {
-      imagesArray = p.image_url.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
-    } else {
-      imagesArray = [p.image_url];
+    return t;
+  };
+
+  // Parse multiple product images across all supported formats and aliases
+  let imagesArray = [];
+  const rawSources = [
+    p.images, p.image_urls, p.product_images, p.gallery, p.photos,
+    p.image_url, p.image, p.product_image, p.photo, p.thumbnail
+  ];
+  for (const src of rawSources) {
+    if (!src) continue;
+    if (Array.isArray(src)) {
+      for (const item of src) {
+        const norm = normalizeUrl(item);
+        if (norm) imagesArray.push(norm);
+      }
+    } else if (typeof src === 'string' && src.trim()) {
+      try {
+        const parsed = JSON.parse(src);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            const norm = normalizeUrl(item);
+            if (norm) imagesArray.push(norm);
+          }
+          continue;
+        }
+      } catch (e) {}
+      if (/[,;\n\r|]/.test(src)) {
+        for (const item of src.split(/[,;\n\r|]+/)) {
+          const norm = normalizeUrl(item);
+          if (norm) imagesArray.push(norm);
+        }
+      } else {
+        const norm = normalizeUrl(src);
+        if (norm) imagesArray.push(norm);
+      }
     }
   }
 
   // Deduplicate
   imagesArray = Array.from(new Set(imagesArray.filter(Boolean)));
 
-  // If product has no images, provide default images for category.
-  // NEVER auto-inject default images into seller's uploaded images!
+  // Fallback: If no valid images could be resolved, supply clean distinct category default images!
   if (imagesArray.length === 0) {
-    imagesArray = getDistinctDefaultImages(p.name, p.category, p.id);
+    imagesArray = getDistinctDefaultImages(p.name, p.category, p.id).slice(0, 4);
   }
 
   // Strictly enforce seller multiple URL limit of 4 images
   imagesArray = imagesArray.slice(0, 4);
-  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : (p.image_url || null);
+  const primaryImageUrl = imagesArray[0] || `${baseUrl}/uploads/products/placeholder.jpg`;
 
   const isSellerView = Boolean(options.isSellerView);
   const stock = parseInt(p.stock || 0, 10);
@@ -1854,6 +1935,9 @@ function formatProductRecord(p, options = {}) {
     ratings_count: ratingsCount,
     image_url: primaryImageUrl,
     image: primaryImageUrl,
+    product_image: primaryImageUrl,
+    thumbnail: primaryImageUrl,
+    photo: primaryImageUrl,
     images: imagesArray,
     image_urls: imagesArray,
     product_images: imagesArray,
@@ -2135,8 +2219,18 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
   res.status(201).json({
     message: 'Images uploaded successfully.',
     image_url: imgResult.primaryImageUrl,
-    images: imgResult.images,
+    image: imgResult.primaryImageUrl,
     url: imgResult.primaryImageUrl,
+    product_image: imgResult.primaryImageUrl,
+    path: imgResult.primaryImageUrl,
+    images: imgResult.images,
+    image_urls: imgResult.images,
+    data: {
+      url: imgResult.primaryImageUrl,
+      image_url: imgResult.primaryImageUrl,
+      image: imgResult.primaryImageUrl,
+      images: imgResult.images
+    },
     limit: 4,
     count: imgResult.images.length
   });

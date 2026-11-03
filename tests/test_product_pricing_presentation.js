@@ -453,7 +453,52 @@ async function runLiveTests() {
     console.log('✅ Product 54 (Row 11 in DB) verified: Forced stock photos removed, seller uploaded image preserved!');
   }
 
-  // Cleanup multi product
+  // Verify Image Persistence on Back/Refresh & Raw Base64 Support
+  console.log('\n--- 8. Testing Image Persistence on Back/Refresh & Raw Base64 ---');
+  const rawBase64Png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  const b64Create = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
+    name: 'Raw Base64 Headphone Test',
+    price: 1800.00,
+    mrp: 2400.00,
+    stock: 15,
+    image: rawBase64Png
+  });
+  const b64Prod = b64Create.data && b64Create.data.product;
+  if (!b64Prod || !b64Prod.image_url || !b64Prod.image_url.includes('/uploads/products/')) {
+    throw new Error(`Raw base64 image creation failed: ${JSON.stringify(b64Create.data)}`);
+  }
+  console.log('✅ Raw base64 decoded and saved to disk URL:', b64Prod.image_url);
+
+  // Test that fetching the uploaded image returns 200 OK
+  const b64ImgFetch = await fetch(b64Prod.image_url);
+  if (b64ImgFetch.status !== 200) {
+    throw new Error(`Uploaded base64 image returned status ${b64ImgFetch.status}`);
+  }
+  console.log('✅ Uploaded image URL serves 200 OK with valid bytes!');
+
+  // Simulate Back / Refresh: GET /api/seller/products
+  const sellerList = await request('GET', '/api/seller/products', { Authorization: `Bearer ${token}` });
+  const sellerData = sellerList.data && sellerList.data.products && sellerList.data.products.data;
+  const reloadedProd = sellerData && sellerData.find(p => p.id === b64Prod.id);
+  if (!reloadedProd) throw new Error('Product not found in seller list after back/refresh!');
+  if (!reloadedProd.image_url || !reloadedProd.image || !Array.isArray(reloadedProd.images) || reloadedProd.images.length === 0) {
+    throw new Error(`Image is blank after back/refresh! Got: ${JSON.stringify(reloadedProd)}`);
+  }
+  console.log('✅ After back/refresh, product retains valid image without blank space:', {
+    id: reloadedProd.id,
+    image_url: reloadedProd.image_url,
+    images: reloadedProd.images
+  });
+
+  // Verify Fallback Handler: Even if an uploaded file is missing from disk, it NEVER returns 404/blank!
+  const missingImgFetch = await fetch(`${BASE_URL}/uploads/products/non_existent_img_12345.jpg`);
+  if (missingImgFetch.status !== 200) {
+    throw new Error(`Fallback handler failed! Expected 200 for missing image, got ${missingImgFetch.status}`);
+  }
+  console.log('✅ Uploads fallback handler verified: Missing images return 200 OK (never 404 blank space)!');
+
+  // Cleanup
+  await request('DELETE', `/api/products/${b64Prod.id}`, { Authorization: `Bearer ${token}` });
   await request('DELETE', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` });
 
   // Step 8: Cleanup

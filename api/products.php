@@ -167,45 +167,82 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     $delivery_charge = $cleanPrice >= 500 ? 0.00 : 50.00;
     $delivery_text = $cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-    // Parse multiple product images (limit 10)
-    $imagesArray = [];
-    if (!empty($p['images'])) {
-        if (is_array($p['images'])) {
-            $imagesArray = $p['images'];
-        } elseif (is_string($p['images'])) {
-            $decoded = json_decode($p['images'], true);
-            if (is_array($decoded)) {
-                $imagesArray = $decoded;
-            } elseif (preg_match('/[,;\n\r|]/', $p['images'])) {
-                $imagesArray = array_map('trim', preg_split('/[,;\n\r|]+/', $p['images']));
-            } else {
-                $imagesArray = [trim($p['images'])];
-            }
+    $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    $normalizeUrl = function(?string $u) use ($baseUrl): ?string {
+        if (!$u) return null;
+        $t = trim($u);
+        if (empty($t) || in_array($t, ['null', 'undefined', '[]', '{}'], true)) return null;
+        if (str_starts_with($t, 'blob:') || str_starts_with($t, 'file:') || str_starts_with($t, '/data/user/')) return null;
+        if (str_starts_with($t, '//')) return 'https:' . $t;
+        if (str_starts_with($t, '/uploads/')) return $baseUrl . $t;
+        if (str_starts_with($t, 'uploads/')) return $baseUrl . '/' . $t;
+        if (str_starts_with($t, 'http://localhost') || str_starts_with($t, 'http://127.0.0.1')) {
+            return preg_replace('/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/', $baseUrl, $t);
         }
-    }
-    if (empty($imagesArray) && !empty($p['image_url'])) {
-        if (is_string($p['image_url']) && preg_match('/[,;\n\r|]/', $p['image_url'])) {
-            $imagesArray = array_map('trim', preg_split('/[,;\n\r|]+/', $p['image_url']));
-        } else {
-            $imagesArray = [$p['image_url']];
+        return $t;
+    };
+
+    // Parse multiple product images across all supported formats and aliases
+    $imagesArray = [];
+    $rawSources = [
+        $p['images'] ?? null,
+        $p['image_urls'] ?? null,
+        $p['product_images'] ?? null,
+        $p['gallery'] ?? null,
+        $p['photos'] ?? null,
+        $p['image_url'] ?? null,
+        $p['image'] ?? null,
+        $p['product_image'] ?? null,
+        $p['photo'] ?? null,
+        $p['thumbnail'] ?? null,
+    ];
+
+    foreach ($rawSources as $src) {
+        if (empty($src)) continue;
+        if (is_array($src)) {
+            foreach ($src as $item) {
+                if (is_string($item)) {
+                    $norm = $normalizeUrl($item);
+                    if ($norm) $imagesArray[] = $norm;
+                }
+            }
+        } elseif (is_string($src) && trim($src)) {
+            $decoded = json_decode($src, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $item) {
+                    if (is_string($item)) {
+                        $norm = $normalizeUrl($item);
+                        if ($norm) $imagesArray[] = $norm;
+                    }
+                }
+                continue;
+            }
+            if (preg_match('/[,;\n\r|]/', $src)) {
+                foreach (preg_split('/[,;\n\r|]+/', $src) as $item) {
+                    $norm = $normalizeUrl($item);
+                    if ($norm) $imagesArray[] = $norm;
+                }
+            } else {
+                $norm = $normalizeUrl($src);
+                if ($norm) $imagesArray[] = $norm;
+            }
         }
     }
 
     // Deduplicate
     $imagesArray = array_values(array_unique(array_filter($imagesArray)));
 
-    // If product has no images, provide default images for category.
-    // NEVER auto-inject default images into seller's uploaded images!
+    // Fallback: If no valid images could be resolved, supply clean distinct category default images!
     $prodName = (string)($p['name'] ?? '');
     $prodCat = (string)($p['category'] ?? '');
     $prodId = (int)($p['id'] ?? 0);
     if (empty($imagesArray)) {
-        $imagesArray = getDistinctDefaultImages($prodName, $prodCat, $prodId);
+        $imagesArray = array_slice(getDistinctDefaultImages($prodName, $prodCat, $prodId), 0, 4);
     }
 
     // Strictly enforce seller multiple URL limit of 4 images
     $imagesArray = array_slice($imagesArray, 0, 4);
-    $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($p['image_url'] ?? null);
+    $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($baseUrl . '/uploads/products/placeholder.jpg');
 
     $stock = (int) ($p['stock'] ?? 0);
     $rating = isset($p['rating']) && is_numeric($p['rating']) ? (float) $p['rating'] : 4.5;
@@ -229,6 +266,9 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'ratings_count' => $ratingsCount,
         'image_url' => $primaryImageUrl,
         'image' => $primaryImageUrl,
+        'product_image' => $primaryImageUrl,
+        'thumbnail' => $primaryImageUrl,
+        'photo' => $primaryImageUrl,
         'images' => $imagesArray,
         'image_urls' => $imagesArray,
         'product_images' => $imagesArray,
@@ -506,19 +546,28 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
         }
 
-        // Base64 data URI
-        if (str_starts_with($trimmed, 'data:image/')) {
-            if (preg_match('/^data:image\/(\w+);base64,(.+)$/', $trimmed, $matches)) {
+        // Base64 data URI or raw base64 string
+        if (str_starts_with($trimmed, 'data:image/') || (strlen($trimmed) > 50 && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', $trimmed))) {
+            $rawB64 = '';
+            $ext = 'jpg';
+            if (preg_match('/^data:image\/(\w+);base64,(.+)$/is', $trimmed, $matches)) {
                 $ext = strtolower($matches[1]);
                 if ($ext === 'jpeg') $ext = 'jpg';
                 if (!in_array($ext, ['jpg', 'png', 'webp', 'gif', 'svg'])) $ext = 'png';
-                $data = base64_decode($matches[2]);
-                if ($data !== false) {
-                    $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
-                    if (file_put_contents($uploadDir . $filename, $data)) {
-                        @chmod($uploadDir . $filename, 0644);
-                        $collected[] = $baseUrl . '/uploads/products/' . $filename;
-                    }
+                $rawB64 = preg_replace('/\s+/', '', $matches[2]);
+            } else {
+                $rawB64 = preg_replace('/\s+/', '', $trimmed);
+                if (str_starts_with($rawB64, '/9j/')) $ext = 'jpg';
+                elseif (str_starts_with($rawB64, 'iVBORw0KGgo')) $ext = 'png';
+                elseif (str_starts_with($rawB64, 'R0lGOD')) $ext = 'gif';
+                elseif (str_starts_with($rawB64, 'UklGR')) $ext = 'webp';
+            }
+            $data = base64_decode($rawB64);
+            if ($data !== false && strlen($data) > 10) {
+                $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+                if (file_put_contents($uploadDir . $filename, $data)) {
+                    @chmod($uploadDir . $filename, 0644);
+                    $collected[] = $baseUrl . '/uploads/products/' . $filename;
                 }
             }
             return;
@@ -551,12 +600,13 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             strpos($lowerKey, 'gallery') !== false ||
             strpos($lowerKey, 'media') !== false ||
             strpos($lowerKey, 'attachment') !== false ||
+            strpos($lowerKey, 'thumb') !== false ||
             preg_match('/^image\d+$/i', $k) ||
             preg_match('/^img\d+$/i', $k) ||
             preg_match('/^file\d+$/i', $k)
         ) {
             $processCandidate($v);
-        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/'))) {
+        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/') || (strlen(trim($v)) > 50 && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', trim($v))))) {
             $processCandidate($v);
         }
     }
@@ -611,8 +661,18 @@ function apiUploadImage(PDO $pdo): void
     jsonResponse([
         'message' => 'Images uploaded successfully.',
         'image_url' => $res['primaryImageUrl'],
-        'images' => $res['images'],
+        'image' => $res['primaryImageUrl'],
         'url' => $res['primaryImageUrl'],
+        'product_image' => $res['primaryImageUrl'],
+        'path' => $res['primaryImageUrl'],
+        'images' => $res['images'],
+        'image_urls' => $res['images'],
+        'data' => [
+            'url' => $res['primaryImageUrl'],
+            'image_url' => $res['primaryImageUrl'],
+            'image' => $res['primaryImageUrl'],
+            'images' => $res['images']
+        ],
         'limit' => 4,
         'total' => count($res['images'])
     ], 201);

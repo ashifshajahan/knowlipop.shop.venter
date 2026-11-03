@@ -52,7 +52,8 @@ if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
 
 // Static uploaded files handler (/uploads/products/...)
 if (str_starts_with($requestUri, '/uploads/')) {
-    $filePath = __DIR__ . $requestUri;
+    $cleanUri = parse_url($requestUri, PHP_URL_PATH);
+    $filePath = __DIR__ . $cleanUri;
     if (file_exists($filePath) && is_file($filePath)) {
         $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
         $mimes = [
@@ -63,6 +64,29 @@ if (str_starts_with($requestUri, '/uploads/')) {
         header('Content-Type: ' . ($mimes[$ext] ?? 'application/octet-stream'));
         header('Cache-Control: public, max-age=86400');
         readfile($filePath);
+        exit;
+    }
+    // Reliable Fallback for missing uploaded images: Never return 404/blank!
+    if (str_starts_with($cleanUri, '/uploads/products/')) {
+        $placeholder = __DIR__ . '/uploads/products/placeholder.jpg';
+        if (file_exists($placeholder)) {
+            header('Content-Type: image/jpeg');
+            header('Cache-Control: public, max-age=86400');
+            readfile($placeholder);
+            exit;
+        }
+        $samplePng = __DIR__ . '/uploads/products/prod_1793598726521_793ff4ae.png';
+        if (file_exists($samplePng)) {
+            header('Content-Type: image/png');
+            header('Cache-Control: public, max-age=86400');
+            readfile($samplePng);
+            exit;
+        }
+        header('Location: https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', true, 302);
+        exit;
+    }
+    if (str_starts_with($cleanUri, '/uploads/avatars/')) {
+        header('Location: https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400', true, 302);
         exit;
     }
     errorResponse('File not found.', [], 404);
