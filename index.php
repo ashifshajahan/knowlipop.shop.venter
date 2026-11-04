@@ -59,7 +59,7 @@ $isImgPrefix = str_starts_with($requestUri, '/uploads/') || str_starts_with($req
                str_starts_with($requestUri, '/images/') || str_starts_with($requestUri, '/products/') ||
                str_contains($requestUri, '/uploads/products/') || str_contains($requestUri, '/uploads/avatars/');
 
-if ($hasImgFile || $isImgPrefix) {
+if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefix)) {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
     header('Access-Control-Allow-Headers: *');
@@ -290,16 +290,34 @@ if ($requestUri === '/api/upload' || $requestUri === '/api/products/upload') {
     apiUploadImage($pdo);
 }
 
-// Product images list: /api/products/{id}/images
-if (preg_match('#^/api/products/(\d+)/images$#', $requestUri, $matches)) {
-    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
-    apiGetProductImages($pdo, (int) $matches[1]);
+// Standalone image deletion: /api/images/{filename}
+if (preg_match('#^/api/images/([^/]+)$#', $requestUri, $matches)) {
+    if ($method === 'DELETE') {
+        apiDeleteStandaloneImage($pdo, $matches[1]);
+    }
 }
 
-// Product image replacement: /api/products/{id}/image or /upload
-if (preg_match('#^/api/products/(\d+)/(image|upload)$#', $requestUri, $matches)) {
+// Product single image detail / replace / delete: /api/products/{id}/images/{image_id}
+if (preg_match('#^/api/products/(\d+)/images/([^/]+)$#', $requestUri, $matches)) {
     $productId = (int) $matches[1];
-    if ($method === 'PUT' || $method === 'POST' || $method === 'PATCH') {
+    $targetIdOrFile = $matches[2];
+    if ($method === 'GET') {
+        apiGetProductImageDetail($pdo, $productId, $targetIdOrFile);
+    } elseif ($method === 'PUT' || $method === 'POST' || $method === 'PATCH') {
+        apiReplaceProductImage($pdo, $productId, $targetIdOrFile);
+    } elseif ($method === 'DELETE') {
+        apiDeleteProductImage($pdo, $productId, $targetIdOrFile);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Product images list / replace / delete: /api/products/{id}/images or /api/products/{id}/image or /upload
+if (preg_match('#^/api/products/(\d+)/(images|image|upload)$#', $requestUri, $matches)) {
+    $productId = (int) $matches[1];
+    if ($method === 'GET') {
+        apiGetProductImages($pdo, $productId);
+    } elseif ($method === 'PUT' || $method === 'POST' || $method === 'PATCH') {
         apiReplaceProductImage($pdo, $productId);
     } elseif ($method === 'DELETE') {
         apiDeleteProductImage($pdo, $productId);

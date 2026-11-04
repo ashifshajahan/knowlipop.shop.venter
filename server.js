@@ -2650,6 +2650,8 @@ app.get('/api/products/:id/images', async (req, res) => {
     const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
 
     res.json({
+      success: true,
+      status: true,
       product_id: prodId,
       image_url: images[0] || `${baseUrl}/uploads/products/placeholder.jpg`,
       images,
@@ -2667,7 +2669,52 @@ app.get('/api/products/:id/images', async (req, res) => {
   }
 });
 
-// Dedicated Image Replacement Endpoint
+// Individual Image Detail Endpoint: /api/products/:id/images/:image_id
+app.get('/api/products/:id/images/:image_id', async (req, res) => {
+  const prodId = parseInt(req.params.id, 10);
+  const targetIdOrFile = req.params.image_id;
+  try {
+    await ensureProductPriceColumns(pool);
+    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
+
+    let piRows = [];
+    if (/^\d+$/.test(targetIdOrFile)) {
+      const [byNum] = await pool.query('SELECT * FROM product_images WHERE product_id = ? AND id = ? LIMIT 1', [prodId, parseInt(targetIdOrFile, 10)]);
+      piRows = byNum;
+    }
+    if (!piRows || piRows.length === 0) {
+      const safeFn = path.basename(targetIdOrFile.split('?')[0]);
+      const [byFn] = await pool.query('SELECT * FROM product_images WHERE product_id = ? AND file_name = ? LIMIT 1', [prodId, safeFn]);
+      piRows = byFn;
+    }
+    if (!piRows || piRows.length === 0) {
+      return res.status(404).json({ message: 'Image not found.' });
+    }
+
+    const r = piRows[0];
+    res.json({
+      success: true,
+      status: true,
+      product_id: prodId,
+      image: {
+        id: Number(r.id),
+        product_id: prodId,
+        image_url: r.image_url,
+        url: r.image_url,
+        relative_path: r.relative_path,
+        file_name: r.file_name,
+        file_size: r.file_size ? Number(r.file_size) : null,
+        mime_type: r.mime_type,
+        created_at: r.created_at
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to retrieve image.' });
+  }
+});
+
+// Dedicated Image Replacement & Attachment Endpoint
 const handleProductImageReplacement = async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
   let existing = [];
@@ -2697,7 +2744,25 @@ const handleProductImageReplacement = async (req, res) => {
   let newImages = [];
 
   const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true';
-  const imgIndex = req.body.image_index !== undefined ? parseInt(req.body.image_index, 10) : 0;
+  let imgIndex = req.body.image_index !== undefined ? parseInt(req.body.image_index, 10) : 0;
+
+  if (req.params.image_id) {
+    const targetIdOrFile = req.params.image_id;
+    if (/^\d+$/.test(targetIdOrFile)) {
+      try {
+        const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetIdOrFile, 10), prodId]);
+        if (piRow.length > 0) {
+          const fn = piRow[0].file_name;
+          const foundIdx = parseImagesJson(existing[0].images || existing[0].image_url).findIndex(u => u.includes(fn));
+          if (foundIdx !== -1) imgIndex = foundIdx;
+        }
+      } catch (e) {}
+    } else {
+      const safeFn = path.basename(targetIdOrFile.split('?')[0]);
+      const foundIdx = parseImagesJson(existing[0].images || existing[0].image_url).findIndex(u => u.includes(safeFn));
+      if (foundIdx !== -1) imgIndex = foundIdx;
+    }
+  }
 
   if (isReplaceAll) {
     newImages = imgResult.images.slice(0, 4);
@@ -2747,12 +2812,12 @@ const handleProductImageReplacement = async (req, res) => {
   }
 };
 
-app.put(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
-app.post(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
-app.patch(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.put(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.post(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.patch(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
 
 // Dedicated Image Deletion Endpoint
-app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
+app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:image_id', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
   let existing = [];
   try {
@@ -2768,9 +2833,20 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
     return res.status(403).json({ message: 'Access denied. You do not own this product.' });
   }
 
-  const targetFilename = req.params.filename || req.query.filename || req.body?.filename || req.query.image_url || req.body?.image_url;
+  const targetParam = req.params.image_id || req.params.filename || req.query.filename || req.body?.filename || req.query.image_url || req.body?.image_url;
   let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
   let removedUrl = null;
+  let targetFilename = null;
+
+  if (targetParam) {
+    if (/^\d+$/.test(targetParam)) {
+      try {
+        const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetParam, 10), prodId]);
+        if (piRow.length > 0) targetFilename = piRow[0].file_name;
+      } catch (e) {}
+    }
+    if (!targetFilename) targetFilename = path.basename(targetParam.split('?')[0]);
+  }
 
   if (targetFilename) {
     const safeTarget = path.basename(targetFilename.split('?')[0]);
@@ -2817,6 +2893,30 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to delete product image.' });
+  }
+});
+
+// Standalone Physical Image Deletion API: DELETE /api/images/:filename
+app.delete('/api/images/:filename', authenticateToken, async (req, res) => {
+  const safeFilename = path.basename(req.params.filename || '');
+  if (!safeFilename) return res.status(400).json({ message: 'Filename required.' });
+
+  try {
+    await ensureProductPriceColumns(pool);
+    if (req.user.role !== 'admin') {
+      const [rows] = await pool.query(
+        'SELECT id FROM product_images WHERE file_name = ? AND seller_id = ? LIMIT 1',
+        [safeFilename, req.user.id]
+      );
+      if (rows.length === 0) {
+        return res.status(403).json({ message: 'Access denied. You do not own this image.' });
+      }
+    }
+    await pool.query('DELETE FROM product_images WHERE file_name = ?', [safeFilename]);
+    await safeDeleteLocalImageFile(pool, safeFilename);
+    res.json({ success: true, status: true, message: 'Image deleted successfully.' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to delete image.' });
   }
 });
 

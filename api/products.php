@@ -966,6 +966,8 @@ function apiGetProductImages(PDO $pdo, int $productId): void
     $gallery = $piStmt->fetchAll(PDO::FETCH_ASSOC);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
         'product_id' => $productId,
         'image_url' => $formatted['image_url'],
         'images' => $formatted['images'],
@@ -982,7 +984,51 @@ function apiGetProductImages(PDO $pdo, int $productId): void
     ]);
 }
 
-function apiReplaceProductImage(PDO $pdo, int $productId): void
+function apiGetProductImageDetail(PDO $pdo, int $productId, mixed $targetIdOrFile): void
+{
+    ensureProductPriceColumns($pdo);
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $productId]);
+    $p = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$p) {
+        errorResponse('Product not found.', [], 404);
+    }
+
+    $row = null;
+    if (is_numeric($targetIdOrFile)) {
+        $piStmt = $pdo->prepare("SELECT * FROM product_images WHERE product_id = :pid AND id = :id LIMIT 1");
+        $piStmt->execute([':pid' => $productId, ':id' => (int)$targetIdOrFile]);
+        $row = $piStmt->fetch(PDO::FETCH_ASSOC);
+    }
+    if (!$row) {
+        $safeFn = basename(explode('?', (string)$targetIdOrFile)[0]);
+        $piStmt = $pdo->prepare("SELECT * FROM product_images WHERE product_id = :pid AND file_name = :fn LIMIT 1");
+        $piStmt->execute([':pid' => $productId, ':fn' => $safeFn]);
+        $row = $piStmt->fetch(PDO::FETCH_ASSOC);
+    }
+    if (!$row) {
+        errorResponse('Image not found.', [], 404);
+    }
+
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'product_id' => $productId,
+        'image' => [
+            'id' => (int)$row['id'],
+            'product_id' => $productId,
+            'image_url' => $row['image_url'],
+            'url' => $row['image_url'],
+            'relative_path' => $row['relative_path'],
+            'file_name' => $row['file_name'],
+            'file_size' => $row['file_size'] ? (int)$row['file_size'] : null,
+            'mime_type' => $row['mime_type'],
+            'created_at' => $row['created_at'] ?? null
+        ]
+    ]);
+}
+
+function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile = null): void
 {
     $user = authenticateUser($pdo);
     ensureProductPriceColumns($pdo);
@@ -1018,6 +1064,31 @@ function apiReplaceProductImage(PDO $pdo, int $productId): void
         $currentImgs = [$product['image_url']];
     }
 
+    if ($targetIdOrFile !== null) {
+        if (is_numeric($targetIdOrFile)) {
+            $piStmt = $pdo->prepare("SELECT file_name FROM product_images WHERE id = :id AND product_id = :pid LIMIT 1");
+            $piStmt->execute([':id' => (int)$targetIdOrFile, ':pid' => $productId]);
+            $piRow = $piStmt->fetch(PDO::FETCH_ASSOC);
+            if ($piRow) {
+                $fn = $piRow['file_name'];
+                foreach ($currentImgs as $idx => $u) {
+                    if (str_contains($u, $fn)) {
+                        $imgIndex = $idx;
+                        break;
+                    }
+                }
+            }
+        } else {
+            $safeFn = basename(explode('?', (string)$targetIdOrFile)[0]);
+            foreach ($currentImgs as $idx => $u) {
+                if (str_contains($u, $safeFn)) {
+                    $imgIndex = $idx;
+                    break;
+                }
+            }
+        }
+    }
+
     if ($isReplaceAll) {
         $newImages = array_slice($res['images'], 0, 4);
     } else {
@@ -1047,6 +1118,8 @@ function apiReplaceProductImage(PDO $pdo, int $productId): void
     $updated = formatProductRecord($fetchStmt->fetch(PDO::FETCH_ASSOC), true);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
         'message' => 'Product image updated successfully.',
         'image_url' => $primaryUrl,
         'images' => $newImages,
@@ -1054,7 +1127,7 @@ function apiReplaceProductImage(PDO $pdo, int $productId): void
     ]);
 }
 
-function apiDeleteProductImage(PDO $pdo, int $productId): void
+function apiDeleteProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile = null): void
 {
     $user = authenticateUser($pdo);
     ensureProductPriceColumns($pdo);
@@ -1070,7 +1143,7 @@ function apiDeleteProductImage(PDO $pdo, int $productId): void
     }
 
     $input = array_merge($_GET, $_POST, getJsonInput());
-    $targetFilename = $input['filename'] ?? ($input['image_url'] ?? null);
+    $targetParam = $targetIdOrFile ?? ($input['filename'] ?? ($input['image_url'] ?? null));
 
     $currentImgs = [];
     if (!empty($product['images'])) {
@@ -1078,6 +1151,21 @@ function apiDeleteProductImage(PDO $pdo, int $productId): void
         if (is_array($dec)) $currentImgs = $dec;
     } elseif (!empty($product['image_url'])) {
         $currentImgs = [$product['image_url']];
+    }
+
+    $targetFilename = null;
+    if ($targetParam !== null) {
+        if (is_numeric($targetParam)) {
+            $piStmt = $pdo->prepare("SELECT file_name FROM product_images WHERE id = :id AND product_id = :pid LIMIT 1");
+            $piStmt->execute([':id' => (int)$targetParam, ':pid' => $productId]);
+            $piRow = $piStmt->fetch(PDO::FETCH_ASSOC);
+            if ($piRow) {
+                $targetFilename = $piRow['file_name'];
+            }
+        }
+        if (!$targetFilename) {
+            $targetFilename = basename(explode('?', (string)$targetParam)[0]);
+        }
     }
 
     $removedUrl = null;
@@ -1115,10 +1203,41 @@ function apiDeleteProductImage(PDO $pdo, int $productId): void
     $updated = formatProductRecord($fetchStmt->fetch(PDO::FETCH_ASSOC), true);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
         'message' => 'Product image deleted successfully.',
         'image_url' => $primaryUrl,
         'images' => $currentImgs,
         'product' => $updated
+    ]);
+}
+
+function apiDeleteStandaloneImage(PDO $pdo, string $filename): void
+{
+    $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
+    $safeFn = basename(explode('?', $filename)[0]);
+    if (empty($safeFn)) {
+        errorResponse('Filename required.', [], 400);
+    }
+
+    if (($user['role'] ?? '') !== 'admin') {
+        $checkStmt = $pdo->prepare("SELECT id FROM product_images WHERE file_name = :fn AND seller_id = :sid LIMIT 1");
+        $checkStmt->execute([':fn' => $safeFn, ':sid' => (int)$user['id']]);
+        if (!$checkStmt->fetch()) {
+            errorResponse('Access denied. You do not own this image.', [], 403);
+        }
+    }
+
+    $delStmt = $pdo->prepare("DELETE FROM product_images WHERE file_name = :fn");
+    $delStmt->execute([':fn' => $safeFn]);
+
+    safeDeleteLocalImageFilePHP($pdo, $safeFn);
+
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'message' => 'Image deleted successfully.'
     ]);
 }
 
