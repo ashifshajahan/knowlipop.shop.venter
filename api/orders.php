@@ -777,8 +777,8 @@ function apiCreateOrder(PDO $pdo): void
     ensureOrdersSchema($pdo);
     $input = getJsonInput();
 
-    $buyerName = trim($input['buyer_name'] ?? '');
-    $buyerPhone = trim($input['buyer_phone'] ?? '');
+    $buyerName = trim($input['buyer_name'] ?? ($input['customer_name'] ?? ($input['name'] ?? '')));
+    $buyerPhone = trim($input['buyer_phone'] ?? ($input['customer_phone'] ?? ($input['phone'] ?? '')));
     $shippingAddress = trim($input['shipping_address'] ?? $input['delivery_address'] ?? $input['address'] ?? '');
     $landmark = trim($input['landmark'] ?? '');
     $city = trim($input['city'] ?? '');

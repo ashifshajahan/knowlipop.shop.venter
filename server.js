@@ -4688,8 +4688,8 @@ app.get(['/api/orders/:id', '/api/order/:id'], handleGetOrderDetail);
 // POST /api/orders and /api/order
 const handleCreateOrder = async (req, res) => {
   const body = req.body || {};
-  const buyerName = (body.buyer_name || '').trim();
-  const buyerPhone = (body.buyer_phone || '').trim();
+  const buyerName = (body.buyer_name || body.customer_name || body.name || '').trim();
+  const buyerPhone = (body.buyer_phone || body.customer_phone || body.phone || '').trim();
   const shippingAddress = (body.shipping_address || body.delivery_address || body.address || '').trim();
   const landmark = (body.landmark || '').trim();
   const city = (body.city || '').trim();
