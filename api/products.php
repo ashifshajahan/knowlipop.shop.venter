@@ -254,26 +254,13 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'ratings_count' => $ratingsCount,
         'image_url' => $primaryImageUrl,
         'image' => $primaryImageUrl,
-        'url' => $primaryImageUrl,
-        'product_image' => $primaryImageUrl,
-        'thumbnail' => $primaryImageUrl,
-        'photo' => $primaryImageUrl,
-        'path' => $primaryRelative,
         'relative_path' => $relativePaths[0] ?? null,
         'images' => $imagesArray,
-        'image_urls' => $imagesArray,
-        'product_images' => $imagesArray,
-        'gallery' => $imagesArray,
-        'photos' => $imagesArray,
-        'image_paths' => $relativePaths,
-        'relative_paths' => $relativePaths,
         'gallery_items' => array_map(function($u, $i) use ($p, $relativePaths) {
             return [
                 'id' => $i + 1,
                 'product_id' => (int) $p['id'],
                 'image_url' => $u,
-                'url' => $u,
-                'path' => $relativePaths[$i] ?? null,
                 'relative_path' => $relativePaths[$i] ?? null,
             ];
         }, $imagesArray, array_keys($imagesArray)),
@@ -435,20 +422,21 @@ function apiGetProducts(PDO $pdo): void
         return formatProductRecord($p, false);
     }, $rawProducts);
 
+    $lastPage = (int)ceil($total / $limit) ?: 1;
     jsonResponse([
         'success' => true,
         'status' => true,
         'data' => $products,
-        'products' => [
-            'current_page' => $page,
-            'data' => $products,
-            'total' => $total,
-            'per_page' => $limit,
-            'last_page' => (int)ceil($total / $limit) ?: 1,
-        ],
-        'items' => $products,
-        'results' => $products,
         'total' => $total,
+        'current_page' => $page,
+        'per_page' => $limit,
+        'last_page' => $lastPage,
+        'pagination' => [
+            'current_page' => $page,
+            'per_page' => $limit,
+            'total' => $total,
+            'last_page' => $lastPage,
+        ],
     ]);
 }
 
@@ -474,12 +462,12 @@ function apiGetProduct(PDO $pdo, int $id): void
 
     $isSellerView = (isset($_GET['seller_view']) && ($_GET['seller_view'] === '1' || $_GET['seller_view'] === 'true'));
     $formatted = formatProductRecord($product, $isSellerView);
-    jsonResponse(array_merge([
+    jsonResponse([
         'success' => true,
         'status' => true,
         'product' => $formatted,
         'data' => $formatted,
-    ], $formatted));
+    ]);
 }
 
 function saveUploadedProductImages(array $input = [], ?string $fallback = null): array
@@ -980,8 +968,6 @@ function apiGetProductImages(PDO $pdo, int $productId): void
         'product_id' => $productId,
         'image_url' => $formatted['image_url'],
         'images' => $formatted['images'],
-        'image_urls' => $formatted['images'],
-        'product_images' => $formatted['images'],
         'gallery' => $galleryRows,
         'total' => count($formatted['images'])
     ]);
@@ -1450,21 +1436,22 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
         return formatProductRecord($p, true);
     }, $rawProducts);
 
+    $lastPage = (int)ceil($total / $limit) ?: 1;
     jsonResponse([
         'success' => true,
         'status' => true,
         'seller_id' => $targetSellerId,
         'data' => $products,
-        'products' => [
-            'current_page' => $page,
-            'data' => $products,
-            'total' => $total,
-            'per_page' => $limit,
-            'last_page' => (int)ceil($total / $limit) ?: 1,
-        ],
-        'items' => $products,
-        'results' => $products,
         'total' => $total,
+        'current_page' => $page,
+        'per_page' => $limit,
+        'last_page' => $lastPage,
+        'pagination' => [
+            'current_page' => $page,
+            'per_page' => $limit,
+            'total' => $total,
+            'last_page' => $lastPage,
+        ],
     ]);
 }
 

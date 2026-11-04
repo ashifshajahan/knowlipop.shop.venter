@@ -2338,25 +2338,12 @@ function formatProductRecord(p, options = {}) {
     ratings_count: ratingsCount,
     image_url: primaryImageUrl,
     image: primaryImageUrl,
-    url: primaryImageUrl,
-    product_image: primaryImageUrl,
-    thumbnail: primaryImageUrl,
-    photo: primaryImageUrl,
-    path: primaryRelative,
     relative_path: relativePaths[0] || null,
     images: finalImagesArray,
-    image_urls: finalImagesArray,
-    product_images: finalImagesArray,
-    gallery: finalImagesArray,
-    photos: finalImagesArray,
-    image_paths: relativePaths,
-    relative_paths: relativePaths,
     gallery_items: finalImagesArray.map((u, i) => ({
       id: i + 1,
       product_id: Number(p.id),
       image_url: u,
-      url: u,
-      path: relativePaths[i] || null,
       relative_path: relativePaths[i] || null
     })),
     is_active: Boolean(p.is_active),
@@ -2576,16 +2563,16 @@ app.get('/api/products', async (req, res) => {
       success: true,
       status: true,
       data: formatted,
-      products: {
+      total,
+      current_page: page,
+      per_page: limit,
+      last_page: Math.ceil(total / limit) || 1,
+      pagination: {
         current_page: page,
-        data: formatted,
-        total,
         per_page: limit,
-        last_page: Math.ceil(total / limit)
-      },
-      items: formatted,
-      results: formatted,
-      total
+        total,
+        last_page: Math.ceil(total / limit) || 1
+      }
     });
   } catch (err) {
     const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isSellerView: false, req }));
@@ -2593,16 +2580,16 @@ app.get('/api/products', async (req, res) => {
       success: true,
       status: true,
       data: filtered,
-      products: {
+      total: filtered.length,
+      current_page: 1,
+      per_page: limit,
+      last_page: 1,
+      pagination: {
         current_page: 1,
-        data: filtered,
-        total: filtered.length,
         per_page: limit,
+        total: filtered.length,
         last_page: 1
-      },
-      items: filtered,
-      results: filtered,
-      total: filtered.length
+      }
     });
   }
 });
@@ -2635,9 +2622,8 @@ app.get([
     res.json({
       success: true,
       status: true,
-      product,
       data: product,
-      ...product
+      product
     });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
@@ -2647,9 +2633,8 @@ app.get([
       return res.json({
         success: true,
         status: true,
-        product,
         data: product,
-        ...product
+        product
       });
     }
     res.status(404).json({ message: 'Product not found.' });
@@ -2806,9 +2791,6 @@ app.get('/api/products/:id/images', async (req, res) => {
       product_id: prodId,
       image_url: images[0] || null,
       images,
-      image_urls: images,
-      product_images: images,
-      gallery_urls: images,
       gallery: galleryList,
       total: images.length
     });
@@ -3008,8 +2990,7 @@ const handleProductImageReplacement = async (req, res) => {
       image_url: primaryUrl,
       images: newImages,
       product: formatted,
-      data: formatted,
-      ...formatted
+      data: formatted
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to update product image.' });
@@ -3092,8 +3073,7 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
       image_url: primaryUrl,
       images: currentImgs,
       product: formatted,
-      data: formatted,
-      ...formatted
+      data: formatted
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to delete product image.' });
@@ -3208,8 +3188,7 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       status: true,
       message: 'Product created.',
       product,
-      data: product,
-      ...product
+      data: product
     });
   } catch (err) {
     const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => p.id)) + 1 : 9;
@@ -3236,8 +3215,7 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       status: true,
       message: 'Product created.',
       product: newProduct,
-      data: newProduct,
-      ...newProduct
+      data: newProduct
     });
   }
 });
@@ -3291,16 +3269,16 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       status: true,
       seller_id: targetSellerId,
       data: formatted,
-      products: {
+      total,
+      current_page: page,
+      per_page: limit,
+      last_page: Math.ceil(total / limit) || 1,
+      pagination: {
         current_page: page,
-        data: formatted,
-        total,
         per_page: limit,
+        total,
         last_page: Math.ceil(total / limit) || 1
-      },
-      items: formatted,
-      results: formatted,
-      total
+      }
     });
   } catch (err) {
     const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p, { isSellerView: true, req }));
@@ -3309,16 +3287,16 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       status: true,
       seller_id: targetSellerId,
       data: filtered,
-      products: {
+      total: filtered.length,
+      current_page: 1,
+      per_page: limit,
+      last_page: 1,
+      pagination: {
         current_page: 1,
-        data: filtered,
-        total: filtered.length,
         per_page: limit,
-        last_page: Math.ceil(filtered.length / limit) || 1
-      },
-      items: filtered,
-      results: filtered,
-      total: filtered.length
+        total: filtered.length,
+        last_page: 1
+      }
     });
   }
 });
@@ -3481,8 +3459,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       status: true,
       message: 'Product updated.',
       product,
-      data: product,
-      ...product
+      data: product
     });
   } catch (err) {
     const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
@@ -3512,8 +3489,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
         status: true,
         message: 'Product updated.',
         product: updatedFallback,
-        data: updatedFallback,
-        ...updatedFallback
+        data: updatedFallback
       });
     }
     res.status(500).json({ message: 'Update failed.' });
