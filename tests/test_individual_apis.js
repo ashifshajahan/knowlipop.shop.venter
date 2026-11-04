@@ -18,15 +18,24 @@ async function makeRequest(path, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const response = await fetch(url, { ...options, headers });
-  const contentType = response.headers.get('content-type') || '';
-  let body = null;
-  if (contentType.includes('application/json')) {
-    body = await response.json();
-  } else {
-    body = await response.text();
+  let attempts = 0;
+  while (attempts < 3) {
+    attempts++;
+    try {
+      const response = await fetch(url, { ...options, headers });
+      const contentType = response.headers.get('content-type') || '';
+      let body = null;
+      if (contentType.includes('application/json')) {
+        body = await response.json();
+      } else {
+        body = await response.text();
+      }
+      return { status: response.status, body, headers: response.headers };
+    } catch (err) {
+      if (attempts >= 3) throw err;
+      await new Promise(res => setTimeout(res, 500 * attempts));
+    }
   }
-  return { status: response.status, body, headers: response.headers };
 }
 
 async function run() {
