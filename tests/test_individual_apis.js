@@ -250,6 +250,39 @@ async function run() {
     });
     console.log(`Deliver status: ${delivRes.status}, new status: ${(delivRes.body.order || delivRes.body.data)?.order_status}`);
     if (delivRes.status !== 200) throw new Error(`POST /api/seller/orders/${orderId}/deliver failed`);
+
+    // 17b. Test Rejection on another order
+    console.log('\n--- 16b. Placing second order to test Reject with Reason ---');
+    const orderRes2 = await makeRequest('/api/orders', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        buyer_name: 'Test Buyer 2',
+        buyer_phone: '+919876543211',
+        shipping_address: '456 Hill Road, Kochi, Kerala',
+        items: [{ product_id: productId, quantity: 1, price: 500 }]
+      })
+    });
+    const order2Id = (orderRes2.body.order || orderRes2.body.data)?.id;
+    if (order2Id) {
+      const rejRes = await makeRequest(`/api/seller/orders/${order2Id}/reject`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ rejection_reason: 'Out of stock for this pincode.' })
+      });
+      console.log(`Reject status: ${rejRes.status}, reason: ${(rejRes.body.order || rejRes.body.data)?.rejection_reason}`);
+      if (rejRes.status !== 200) throw new Error(`POST /api/seller/orders/${order2Id}/reject failed`);
+    }
+
+    // 17c. Standalone Image Deletion: DELETE /api/images/:filename
+    console.log('\n--- 16c. Testing Standalone Image Deletion DELETE /api/images/:filename ---');
+    const filename2 = uploadedUrls[1].split('/').pop();
+    const delStandRes = await makeRequest(`/api/images/${filename2}`, {
+      method: 'DELETE',
+      headers: authHeaders
+    });
+    console.log(`DELETE /api/images/${filename2} status: ${delStandRes.status}, message: ${delStandRes.body.message}`);
+    if (delStandRes.status !== 200) throw new Error(`DELETE /api/images/${filename2} failed`);
   }
 
   // 18. Seller Notifications APIs
