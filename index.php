@@ -50,9 +50,25 @@ if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
     exit;
 }
 
-// Static uploaded files handler (/uploads/products/...)
-if (str_starts_with($requestUri, '/uploads/')) {
+// Static uploaded files handler (/uploads/products/..., /api/images/...)
+if (str_starts_with($requestUri, '/uploads/') || str_starts_with($requestUri, '/api/images/') || str_starts_with($requestUri, '/public/uploads/') || str_starts_with($requestUri, '/storage/uploads/')) {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
+    header('Cross-Origin-Resource-Policy: cross-origin');
+    if ($method === 'OPTIONS') {
+        http_response_code(204);
+        exit;
+    }
+
     $cleanUri = parse_url($requestUri, PHP_URL_PATH);
+    if (str_starts_with($cleanUri, '/api/images/')) {
+        $cleanUri = '/uploads/products/' . substr($cleanUri, strlen('/api/images/'));
+    } elseif (str_starts_with($cleanUri, '/public/uploads/')) {
+        $cleanUri = '/uploads/' . substr($cleanUri, strlen('/public/uploads/'));
+    } elseif (str_starts_with($cleanUri, '/storage/uploads/')) {
+        $cleanUri = '/uploads/' . substr($cleanUri, strlen('/storage/uploads/'));
+    }
+
     $filePath = __DIR__ . $cleanUri;
     if (file_exists($filePath) && is_file($filePath)) {
         $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
@@ -62,7 +78,7 @@ if (str_starts_with($requestUri, '/uploads/')) {
             'gif' => 'image/gif', 'svg' => 'image/svg+xml'
         ];
         header('Content-Type: ' . ($mimes[$ext] ?? 'application/octet-stream'));
-        header('Cache-Control: public, max-age=86400');
+        header('Cache-Control: public, max-age=31536000, immutable');
         readfile($filePath);
         exit;
     }
@@ -260,8 +276,26 @@ if ($requestUri === '/api/upload' || $requestUri === '/api/products/upload') {
     apiUploadImage($pdo);
 }
 
-// Product detail / update / delete: /api/products/{id}
-if (preg_match('#^/api/products/(\d+)$#', $requestUri, $matches)) {
+// Product images list: /api/products/{id}/images
+if (preg_match('#^/api/products/(\d+)/images$#', $requestUri, $matches)) {
+    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
+    apiGetProductImages($pdo, (int) $matches[1]);
+}
+
+// Product image replacement: /api/products/{id}/image or /upload
+if (preg_match('#^/api/products/(\d+)/(image|upload)$#', $requestUri, $matches)) {
+    $productId = (int) $matches[1];
+    if ($method === 'PUT' || $method === 'POST' || $method === 'PATCH') {
+        apiReplaceProductImage($pdo, $productId);
+    } elseif ($method === 'DELETE') {
+        apiDeleteProductImage($pdo, $productId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Product detail / update / delete: /api/products/{id}, /api/product/{id}, /api/seller/products/{id}, /api/seller/product/{id}
+if (preg_match('#^/api/(?:seller/)?products?/(\d+)$#', $requestUri, $matches)) {
     $productId = (int) $matches[1];
     if ($method === 'GET') {
         apiGetProduct($pdo, $productId);

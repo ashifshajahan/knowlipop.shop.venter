@@ -90,24 +90,65 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // File Upload & Image Storage Configuration
 const uploadDir = path.resolve(__dirname, 'uploads', 'products');
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
 }
 
 const avatarUploadDir = path.resolve(__dirname, 'uploads', 'avatars');
 if (!fs.existsSync(avatarUploadDir)) {
-  fs.mkdirSync(avatarUploadDir, { recursive: true });
+  fs.mkdirSync(avatarUploadDir, { recursive: true, mode: 0o755 });
 }
 
-// Serve existing files statically with CORS & caching headers
-app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
+const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+const ALLOWED_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
 
-// Fallback handlers: If an image file does not exist on disk, NEVER return 404/blank!
-app.get('/uploads/products/:filename', (req, res) => {
+// Serve existing files statically with CORS & caching headers
+app.use(['/uploads', '/public/uploads', '/storage/uploads'], (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+}, express.static(path.resolve(__dirname, 'uploads'), {
+  maxAge: '30d',
+  immutable: true,
+  setHeaders: (res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
+}));
+
+// Fallback handlers & Direct Image Retrieval: If an image file does not exist on disk, NEVER return 404/blank!
+app.get([
+  '/uploads/products/:filename',
+  '/api/images/:filename',
+  '/api/products/images/:filename',
+  '/storage/uploads/products/:filename',
+  '/public/uploads/products/:filename'
+], (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
   const safeFilename = path.basename(req.params.filename || '');
+  if (!safeFilename) return res.status(400).json({ message: 'Filename required.' });
+
   const targetPath = path.join(uploadDir, safeFilename);
   if (fs.existsSync(targetPath)) {
+    const ext = path.extname(safeFilename).toLowerCase();
+    const mimeMap = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif',
+      '.svg': 'image/svg+xml'
+    };
+    res.setHeader('Content-Type', mimeMap[ext] || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.sendFile(targetPath);
   }
+
   const placeholder = path.join(uploadDir, 'placeholder.jpg');
   if (fs.existsSync(placeholder)) {
     res.setHeader('Content-Type', 'image/jpeg');
@@ -124,6 +165,8 @@ app.get('/uploads/products/:filename', (req, res) => {
 });
 
 app.get('/uploads/avatars/:filename', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   const safeFilename = path.basename(req.params.filename || '');
   const targetPath = path.join(avatarUploadDir, safeFilename);
   if (fs.existsSync(targetPath)) {
@@ -133,16 +176,90 @@ app.get('/uploads/avatars/:filename', (req, res) => {
 });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+    }
+    cb(null, uploadDir);
+  },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-    cb(null, `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+    let ext = path.extname(file.originalname || '').toLowerCase();
+    if (!ALLOWED_IMAGE_EXTS.includes(ext)) {
+      if (file.mimetype === 'image/png') ext = '.png';
+      else if (file.mimetype === 'image/webp') ext = '.webp';
+      else ext = '.jpg';
+    }
+    const safeBase = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
+    cb(null, safeBase);
   }
 });
-const upload = multer({
+
+const imageFileFilter = (req, file, cb) => {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  const mime = (file.mimetype || '').toLowerCase();
+
+  // Block executable or script files
+  const dangerousExts = ['.php', '.phtml', '.php5', '.exe', '.sh', '.bat', '.cmd', '.js', '.vbs', '.html', '.htm', '.cgi', '.pl'];
+  if (dangerousExts.includes(ext)) {
+    return cb(new Error('Security violation: Executable or script files are strictly prohibited.'), false);
+  }
+
+  const isValidMime = ALLOWED_IMAGE_MIMES.includes(mime) || mime.startsWith('image/');
+  const isValidExt = ALLOWED_IMAGE_EXTS.includes(ext) || ext === '';
+
+  if (isValidMime && isValidExt) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid image format. Allowed formats: JPG, JPEG, PNG, and WEBP.'), false);
+  }
+};
+
+const rawUpload = multer({
   storage,
-  limits: { fileSize: 15 * 1024 * 1024 }
+  fileFilter: imageFileFilter,
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB limit per file
+    files: 10
+  }
 });
+
+function handleMulterUpload(req, res, next) {
+  rawUpload.any()(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(422).json({
+          message: 'File size exceeds maximum limit of 15MB.',
+          errors: { image: ['The image file size must not exceed 15MB.'] }
+        });
+      }
+      return res.status(422).json({
+        message: err.message || 'File upload validation failed.',
+        errors: { image: [err.message || 'Invalid image file.'] }
+      });
+    }
+
+    // Ensure permissions 0644 on all saved files
+    if (req.files) {
+      const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+      for (const f of fileList) {
+        if (f && f.path) {
+          try { fs.chmodSync(f.path, 0o644); } catch (e) {}
+        }
+      }
+    }
+    if (req.file && req.file.path) {
+      try { fs.chmodSync(req.file.path, 0o644); } catch (e) {}
+    }
+    next();
+  });
+}
+
+const upload = {
+  any: () => handleMulterUpload,
+  single: () => handleMulterUpload,
+  array: () => handleMulterUpload,
+  fields: () => handleMulterUpload
+};
 
 const distinctProductGalleries = {
   headphones: [
@@ -230,13 +347,12 @@ function saveBase64Image(dataString) {
   if (matches) {
     ext = matches[1].toLowerCase();
     if (ext === 'jpeg') ext = 'jpg';
-    if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
+    if (!['jpg', 'png', 'webp'].includes(ext)) ext = 'jpg';
     rawB64 = matches[2].replace(/\s+/g, '');
   } else {
     rawB64 = trimmed.replace(/\s+/g, '');
     if (rawB64.startsWith('/9j/')) ext = 'jpg';
     else if (rawB64.startsWith('iVBORw0KGgo')) ext = 'png';
-    else if (rawB64.startsWith('R0lGOD')) ext = 'gif';
     else if (rawB64.startsWith('UklGR')) ext = 'webp';
     else ext = 'jpg';
   }
@@ -244,7 +360,9 @@ function saveBase64Image(dataString) {
   try {
     const buffer = Buffer.from(rawB64, 'base64');
     if (buffer.length < 10) return null;
-    const filename = `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+    if (buffer.length > 15 * 1024 * 1024) return null; // 15MB size limit
+
+    const filename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${ext}`;
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
     }
@@ -262,18 +380,35 @@ function saveBase64Image(dataString) {
 function resolveProductImages(req) {
   const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
   const collected = [];
+  const filesInfo = [];
 
   // 1. Multipart uploaded files from multer (req.files array, object, or single req.file)
   if (req.files) {
     const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
     for (const f of fileList) {
       if (f && f.filename) {
-        collected.push(`${baseUrl}/uploads/products/${f.filename}`);
+        const fullUrl = `${baseUrl}/uploads/products/${f.filename}`;
+        collected.push(fullUrl);
+        filesInfo.push({
+          file_name: f.filename,
+          relative_path: `uploads/products/${f.filename}`,
+          image_url: fullUrl,
+          file_size: f.size || 0,
+          mime_type: f.mimetype || 'image/jpeg'
+        });
       }
     }
   }
   if (req.file && req.file.filename) {
-    collected.push(`${baseUrl}/uploads/products/${req.file.filename}`);
+    const fullUrl = `${baseUrl}/uploads/products/${req.file.filename}`;
+    collected.push(fullUrl);
+    filesInfo.push({
+      file_name: req.file.filename,
+      relative_path: `uploads/products/${req.file.filename}`,
+      image_url: fullUrl,
+      file_size: req.file.size || 0,
+      mime_type: req.file.mimetype || 'image/jpeg'
+    });
   }
 
   // 2. Process candidate items from request body
@@ -290,7 +425,7 @@ function resolveProductImages(req) {
 
     // Handle objects e.g. { url: "...", image_url: "...", src: "..." }
     if (typeof item === 'object') {
-      const cand = item.url || item.image_url || item.src || item.path || item.link || item.image;
+      const cand = item.url || item.image_url || item.src || item.path || item.link || item.image || item.relative_path;
       if (cand) {
         processCandidate(cand);
         return;
@@ -303,10 +438,15 @@ function resolveProductImages(req) {
 
     if (typeof item === 'string') {
       let trimmed = item.trim();
-      if (!trimmed) return;
+      if (!trimmed || trimmed === 'null' || trimmed === 'undefined' || trimmed === '[]' || trimmed === '{}') return;
+
+      // Ignore client local cache / blob URIs that disappear on refresh
+      if (trimmed.startsWith('blob:') || trimmed.startsWith('file:') || trimmed.startsWith('/data/user/') || trimmed.startsWith('/var/mobile/')) {
+        return;
+      }
 
       // Clean wrapping quotes e.g. "https://..." or 'https://...'
-      if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+      while ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
         trimmed = trimmed.slice(1, -1).trim();
       }
 
@@ -352,16 +492,26 @@ function resolveProductImages(req) {
         const saved = saveBase64Image(trimmed);
         if (saved) {
           collected.push(saved);
+          filesInfo.push({
+            file_name: path.basename(saved),
+            relative_path: `uploads/products/${path.basename(saved)}`,
+            image_url: saved,
+            file_size: null,
+            mime_type: 'image/jpeg'
+          });
           return;
         }
       }
 
-      // Standard HTTP/HTTPS or relative upload URL
-      if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//') || trimmed.startsWith('/uploads/')) {
-        const fullUrl = trimmed.startsWith('//')
-          ? `https:${trimmed}`
-          : (trimmed.startsWith('/uploads/') ? `${baseUrl}${trimmed}` : trimmed);
+      // Standard HTTP/HTTPS or relative upload URL or filename
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//')) {
+        const fullUrl = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
         collected.push(fullUrl);
+      } else if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') || trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') || trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')) {
+        const cleanPath = trimmed.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
+        collected.push(`${baseUrl}/${cleanPath}`);
+      } else if (/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(trimmed) || /^placeholder\.(jpg|jpeg|png)$/i.test(trimmed)) {
+        collected.push(`${baseUrl}/uploads/products/${trimmed}`);
       }
     }
   }
@@ -403,9 +553,143 @@ function resolveProductImages(req) {
   return {
     hasImages,
     primaryImageUrl,
+    image: primaryImageUrl,
     images: uniqueImages,
-    imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null
+    image_urls: uniqueImages,
+    imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null,
+    filesInfo,
+    limit: 4,
+    count: uniqueImages.length
   };
+}
+
+function parseImagesJson(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.flatMap(parseImagesJson);
+  if (typeof raw !== 'string') return [];
+  let s = raw.trim();
+  if (!s || s === 'null' || s === 'undefined' || s === '[]') return [];
+
+  // Strip outer quotes if double quoted
+  while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+
+  // Handle JSON array
+  if (s.startsWith('[') && s.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed.flatMap(parseImagesJson);
+    } catch (e) {
+      try {
+        const parsed = JSON.parse(s.replace(/'/g, '"'));
+        if (Array.isArray(parsed)) return parsed.flatMap(parseImagesJson);
+      } catch (e2) {}
+    }
+  }
+
+  // Handle delimiter separated URLs (commas, newlines, semicolons, pipe)
+  if (/[,;\n\r|]/.test(s) && !s.startsWith('data:image/')) {
+    return s.split(/[,;\n\r|]+/).map(item => item.trim()).filter(Boolean);
+  }
+
+  return [s];
+}
+
+async function syncProductImagesRecord(pPool, sellerId, productId, images, filesInfo = []) {
+  if (!pPool || !sellerId || !Array.isArray(images) || images.length === 0) return;
+  try {
+    for (const imgUrl of images) {
+      const fileName = path.basename(imgUrl.split('?')[0]);
+      const relativePath = imgUrl.includes('/uploads/products/')
+        ? `uploads/products/${fileName}`
+        : (imgUrl.startsWith('http') ? imgUrl : `uploads/products/${fileName}`);
+
+      let fileSize = null;
+      let mimeType = null;
+      const matched = (filesInfo || []).find(fi => fi.file_name === fileName || fi.image_url === imgUrl);
+      if (matched) {
+        fileSize = matched.file_size;
+        mimeType = matched.mime_type;
+      } else {
+        const localPath = path.join(uploadDir, fileName);
+        if (fs.existsSync(localPath)) {
+          try {
+            const stat = fs.statSync(localPath);
+            fileSize = stat.size;
+            const ext = path.extname(fileName).toLowerCase();
+            const mimes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
+            mimeType = mimes[ext] || 'image/jpeg';
+          } catch (e) {}
+        }
+      }
+
+      // Check if image record already exists to avoid duplicate image records
+      const [existing] = await pPool.query(
+        'SELECT id FROM product_images WHERE seller_id = ? AND (image_url = ? OR file_name = ?) LIMIT 1',
+        [sellerId, imgUrl, fileName]
+      );
+      if (existing.length > 0) {
+        if (productId) {
+          await pPool.query('UPDATE product_images SET product_id = ?, updated_at = NOW() WHERE id = ?', [productId, existing[0].id]);
+        }
+      } else {
+        await pPool.query(
+          `INSERT INTO product_images (seller_id, product_id, image_url, relative_path, file_name, file_size, mime_type, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [sellerId, productId || null, imgUrl, relativePath, fileName, fileSize, mimeType]
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[Product Images Sync Error]:', err.message);
+  }
+}
+
+async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null) {
+  if (!fileName || typeof fileName !== 'string') return false;
+  const safeName = path.basename(fileName.split('?')[0]);
+  if (!safeName.startsWith('prod_') || !/\.(jpg|jpeg|png|webp)$/i.test(safeName)) {
+    return false; // Never delete placeholders or sample images!
+  }
+
+  try {
+    // Check if any other product in products table uses this file
+    const searchPattern = `%${safeName}%`;
+    let query = 'SELECT id FROM products WHERE (image_url LIKE ? OR images LIKE ?)';
+    const params = [searchPattern, searchPattern];
+    if (excludeProductId) {
+      query += ' AND id != ?';
+      params.push(excludeProductId);
+    }
+    const [rows] = await pPool.query(query, params);
+    if (rows.length > 0) {
+      // File is still referenced by another product! Do not delete physical file!
+      return false;
+    }
+
+    // Check if referenced by any other product_images record
+    let piQuery = 'SELECT id FROM product_images WHERE file_name = ?';
+    const piParams = [safeName];
+    if (excludeProductId) {
+      piQuery += ' AND (product_id IS NULL OR product_id != ?)';
+      piParams.push(excludeProductId);
+    }
+    const [piRows] = await pPool.query(piQuery, piParams);
+    if (piRows.length > 0) {
+      return false;
+    }
+
+    // Safe to delete physical file
+    const localPath = path.join(uploadDir, safeName);
+    if (fs.existsSync(localPath)) {
+      fs.unlinkSync(localPath);
+      return true;
+    }
+  } catch (e) {
+    console.error('Error during safe file delete:', e);
+  }
+  return false;
 }
 
 function resolveProductImage(req) {
@@ -1861,14 +2145,26 @@ function formatProductRecord(p, options = {}) {
   const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
   const normalizeUrl = (u) => {
     if (!u || typeof u !== 'string') return null;
-    const t = u.trim();
+    let t = u.trim();
     if (!t || t === 'null' || t === 'undefined' || t === '[]' || t === '{}') return null;
-    if (t.startsWith('blob:') || t.startsWith('file:') || t.startsWith('/data/user/')) return null;
+    while ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+      t = t.slice(1, -1).trim();
+    }
+    if (!t || t.startsWith('blob:') || t.startsWith('file:') || t.startsWith('/data/user/') || t.startsWith('/var/mobile/')) return null;
     if (t.startsWith('//')) return `https:${t}`;
-    if (t.startsWith('/uploads/')) return `${baseUrl}${t}`;
-    if (t.startsWith('uploads/')) return `${baseUrl}/${t}`;
-    if (t.startsWith('http://localhost') || t.startsWith('http://127.0.0.1')) {
-      return t.replace(/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/, baseUrl);
+    if (t.startsWith('http://') || t.startsWith('https://')) {
+      if (t.startsWith('http://localhost') || t.startsWith('http://127.0.0.1')) {
+        return t.replace(/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/, baseUrl);
+      }
+      return t;
+    }
+    if (t.startsWith('data:image/')) return t;
+    if (t.startsWith('/uploads/') || t.startsWith('uploads/') || t.startsWith('/storage/') || t.startsWith('storage/') || t.startsWith('/public/uploads/') || t.startsWith('public/uploads/')) {
+      const clean = t.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
+      return `${baseUrl}/${clean}`;
+    }
+    if (/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(t) || /^placeholder\.(jpg|jpeg|png)$/i.test(t) || /^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp)$/i.test(t)) {
+      return `${baseUrl}/uploads/products/${t}`;
     }
     return t;
   };
@@ -1878,38 +2174,17 @@ function formatProductRecord(p, options = {}) {
   const gallerySources = [p.images, p.image_urls, p.product_images, p.gallery, p.photos];
   for (const src of gallerySources) {
     if (!src) continue;
-    if (Array.isArray(src)) {
-      for (const item of src) {
-        const norm = normalizeUrl(item);
-        if (norm) imagesArray.push(norm);
-      }
-    } else if (typeof src === 'string' && src.trim()) {
-      try {
-        const parsed = JSON.parse(src);
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            const norm = normalizeUrl(item);
-            if (norm) imagesArray.push(norm);
-          }
-          if (imagesArray.length > 0) break;
-        }
-      } catch (e) {}
-      if (/[,;\n\r|]/.test(src)) {
-        for (const item of src.split(/[,;\n\r|]+/)) {
-          const norm = normalizeUrl(item);
-          if (norm) imagesArray.push(norm);
-        }
-      } else {
-        const norm = normalizeUrl(src);
-        if (norm) imagesArray.push(norm);
-      }
+    const parsedList = parseImagesJson(src);
+    for (const item of parsedList) {
+      const norm = normalizeUrl(item);
+      if (norm) imagesArray.push(norm);
     }
     if (imagesArray.length > 0) break;
   }
 
   // If no multi-image gallery found, fall back to single image fields
   if (imagesArray.length === 0) {
-    const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail];
+    const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail, p.path];
     for (const src of singleSources) {
       const norm = normalizeUrl(src);
       if (norm) {
@@ -1930,6 +2205,11 @@ function formatProductRecord(p, options = {}) {
   // Strictly enforce seller multiple URL limit of 4 images
   imagesArray = imagesArray.slice(0, 4);
   const primaryImageUrl = imagesArray[0] || `${baseUrl}/uploads/products/placeholder.jpg`;
+  const relativePaths = imagesArray.map(u => {
+    const fn = path.basename(u.split('?')[0]);
+    return u.includes('/uploads/products/') ? `uploads/products/${fn}` : u;
+  });
+  const primaryRelative = relativePaths[0] ? `/${relativePaths[0]}` : null;
 
   const isSellerView = Boolean(options.isSellerView);
   const stock = parseInt(p.stock || 0, 10);
@@ -1957,11 +2237,15 @@ function formatProductRecord(p, options = {}) {
     product_image: primaryImageUrl,
     thumbnail: primaryImageUrl,
     photo: primaryImageUrl,
+    path: primaryRelative,
+    relative_path: relativePaths[0] || null,
     images: imagesArray,
     image_urls: imagesArray,
     product_images: imagesArray,
     gallery: imagesArray,
     photos: imagesArray,
+    image_paths: relativePaths,
+    relative_paths: relativePaths,
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
     updated_at: p.updated_at || null
@@ -2050,76 +2334,24 @@ async function ensureProductPriceColumns(p) {
     try {
       await p.query("UPDATE products SET sku = CONCAT('SKU-', LPAD(id, 4, '0')) WHERE sku IS NULL OR sku = ''");
     } catch (e) {}
-    // 5. Ensure distinct, working multi-image galleries (up to 10 URLs) for products, replacing duplicate or broken URLs
+    // Ensure product_images table exists
     try {
       await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
-          images = '["https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800","https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800","https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800"]'
-        WHERE id = 1
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
-          images = '["https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800","https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800","https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800"]'
-        WHERE id = 2
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
-          images = '["https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800","https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800","https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800"]'
-        WHERE id = 3
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
-          images = '["https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800","https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800","https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800"]'
-        WHERE id = 4
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
-          images = '["https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800","https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800","https://images.unsplash.com/photo-1577803645773-f96470509666?w=800"]'
-        WHERE id = 5
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
-          images = '["https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800","https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800","https://images.unsplash.com/photo-1595225476474-87563907a212?w=800"]'
-        WHERE id = 6
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
-          images = '["https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800","https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800","https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800"]'
-        WHERE id = 7
-      `);
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
-          images = '["https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800","https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800","https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800"]'
-        WHERE id = 8
-      `);
-      // Fix product 51 (broken local upload) with working distinct gadget gallery
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
-          images = '["https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800","https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800","https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800"]'
-        WHERE id = 51
-      `);
-      // Clean product 54 (Rty from user screenshot) to strictly have its seller uploaded image
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg',
-          images = '["https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg"]'
-        WHERE id = 54
-      `);
-      // Fix product 44 (duplicate headset image) with distinct studio headphone gallery
-      await p.query(`
-        UPDATE products SET
-          image_url = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800',
-          images = '["https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800","https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800","https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800"]'
-        WHERE id = 44
+        CREATE TABLE IF NOT EXISTS product_images (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          seller_id BIGINT UNSIGNED NOT NULL,
+          product_id BIGINT UNSIGNED NULL DEFAULT NULL,
+          image_url LONGTEXT NOT NULL,
+          relative_path VARCHAR(255) NOT NULL,
+          file_name VARCHAR(255) NOT NULL,
+          file_size BIGINT UNSIGNED NULL DEFAULT NULL,
+          mime_type VARCHAR(50) NULL DEFAULT NULL,
+          created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          INDEX idx_pi_seller (seller_id),
+          INDEX idx_pi_product (product_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
     } catch (e) {}
   } catch (err) {
@@ -2196,7 +2428,13 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
-app.get('/api/products/:id', async (req, res) => {
+app.get([
+  '/api/products/:id',
+  '/api/product/:id',
+  '/api/seller/products/:id',
+  '/api/seller/product/:id',
+  '/api/sellers/:seller_id/products/:id'
+], async (req, res) => {
   try {
     await ensureProductPriceColumns(pool);
     const [rows] = await pool.query(
@@ -2226,33 +2464,258 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// Dedicated Image Upload Endpoint (Supports single or multiple images)
-app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), (req, res) => {
+// Dedicated Image Upload Endpoint (Supports single or multiple images, base64, multipart)
+app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), async (req, res) => {
   const imgResult = resolveProductImages(req);
-  if (imgResult.images.length === 0) {
+  if (!imgResult.hasImages || imgResult.images.length === 0) {
     return res.status(422).json({
       message: 'No image uploaded or invalid format.',
-      errors: { image: ['Please upload image file(s) (jpg, png, webp) or provide image data/URLs.'] }
+      errors: { image: ['Please upload image file(s) (jpg, jpeg, png, webp) or provide image data/URLs.'] }
     });
   }
+
+  const targetProductId = req.body.product_id ? parseInt(req.body.product_id, 10) : (req.query.product_id ? parseInt(req.query.product_id, 10) : null);
+  const sellerId = req.user.id;
+  let attachedProduct = null;
+
+  if (targetProductId) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const [pRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
+      if (pRows.length === 0) {
+        return res.status(404).json({ message: 'Target product not found.' });
+      }
+      if (req.user.role !== 'admin' && Number(pRows[0].seller_id) !== Number(sellerId)) {
+        return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+      }
+
+      const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
+      let existingImgs = [];
+      try {
+        existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url);
+      } catch (e) {}
+
+      let combinedImgs = isReplace ? imgResult.images : Array.from(new Set([...existingImgs, ...imgResult.images])).slice(0, 4);
+      const primaryUrl = combinedImgs[0] || imgResult.primaryImageUrl;
+      const imagesJson = JSON.stringify(combinedImgs);
+
+      await pool.query(
+        'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+        [primaryUrl, imagesJson, targetProductId]
+      );
+
+      const [updatedRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
+      attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true });
+    } catch (dbErr) {
+      console.error('[Upload Product Attach Error]:', dbErr.message);
+    }
+  }
+
+  // Record permanent images into product_images table in MySQL
+  await syncProductImagesRecord(pool, sellerId, targetProductId, imgResult.images, imgResult.filesInfo);
+
+  const relativePaths = imgResult.images.map(u => {
+    const fn = path.basename(u.split('?')[0]);
+    return u.includes('/uploads/products/') ? `uploads/products/${fn}` : u;
+  });
+
   res.status(201).json({
     message: 'Images uploaded successfully.',
     image_url: imgResult.primaryImageUrl,
     image: imgResult.primaryImageUrl,
     url: imgResult.primaryImageUrl,
     product_image: imgResult.primaryImageUrl,
-    path: imgResult.primaryImageUrl,
+    path: `/uploads/products/${path.basename(imgResult.primaryImageUrl.split('?')[0])}`,
+    relative_path: relativePaths[0] || null,
+    file_name: path.basename(imgResult.primaryImageUrl.split('?')[0]),
     images: imgResult.images,
     image_urls: imgResult.images,
+    relative_paths: relativePaths,
+    product_id: targetProductId || null,
+    product: attachedProduct,
     data: {
       url: imgResult.primaryImageUrl,
       image_url: imgResult.primaryImageUrl,
       image: imgResult.primaryImageUrl,
-      images: imgResult.images
+      images: imgResult.images,
+      relative_path: relativePaths[0] || null
     },
     limit: 4,
     count: imgResult.images.length
   });
+});
+
+// Dedicated Image Retrieval Endpoint for product images
+app.get('/api/products/:id/images', async (req, res) => {
+  const prodId = parseInt(req.params.id, 10);
+  try {
+    await ensureProductPriceColumns(pool);
+    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
+
+    const p = rows[0];
+    const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+    const images = parseImagesJson(p.images || p.image_url).map(u => {
+      const fn = path.basename(u.split('?')[0]);
+      return u.includes('/uploads/products/') || /^prod_/.test(fn) ? `${baseUrl}/uploads/products/${fn}` : u;
+    }).filter(Boolean);
+
+    const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
+
+    res.json({
+      product_id: prodId,
+      image_url: images[0] || `${baseUrl}/uploads/products/placeholder.jpg`,
+      images,
+      gallery: piRows.map(r => ({
+        id: Number(r.id),
+        image_url: r.image_url,
+        relative_path: r.relative_path,
+        file_name: r.file_name,
+        file_size: r.file_size ? Number(r.file_size) : null,
+        mime_type: r.mime_type
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to retrieve product images.' });
+  }
+});
+
+// Dedicated Image Replacement Endpoint
+app.all(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), async (req, res) => {
+  if (!['PUT', 'POST', 'PATCH'].includes(req.method)) {
+    return res.status(405).json({ message: 'Method not allowed.' });
+  }
+
+  const prodId = parseInt(req.params.id, 10);
+  let existing = [];
+  try {
+    await ensureProductPriceColumns(pool);
+    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    existing = rows;
+  } catch (e) {
+    existing = fallbackProducts.filter(p => Number(p.id) === prodId);
+  }
+
+  if (existing.length === 0) return res.status(404).json({ message: 'Product not found.' });
+  if (req.user.role !== 'admin' && Number(existing[0].seller_id) !== Number(req.user.id)) {
+    return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+  }
+
+  const imgResult = resolveProductImages(req);
+  if (!imgResult.hasImages) {
+    return res.status(422).json({
+      message: 'No replacement image provided.',
+      errors: { image: ['Please upload an image file (jpg, jpeg, png, webp) or image URL.'] }
+    });
+  }
+
+  const oldImageUrl = existing[0].image_url;
+  const newImageUrl = imgResult.primaryImageUrl;
+  let newImages = [];
+
+  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true';
+  const imgIndex = req.body.image_index !== undefined ? parseInt(req.body.image_index, 10) : 0;
+
+  if (isReplaceAll) {
+    newImages = imgResult.images.slice(0, 4);
+  } else {
+    let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
+    if (imgIndex >= 0 && imgIndex < currentImgs.length) {
+      currentImgs[imgIndex] = newImageUrl;
+    } else {
+      currentImgs = [newImageUrl, ...currentImgs];
+    }
+    newImages = Array.from(new Set(currentImgs)).slice(0, 4);
+  }
+
+  const primaryUrl = newImages[0] || newImageUrl;
+  const imagesJson = JSON.stringify(newImages);
+
+  try {
+    await pool.query(
+      'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+      [primaryUrl, imagesJson, prodId]
+    );
+
+    // Sync product_images table in MySQL
+    await syncProductImagesRecord(pool, req.user.id, prodId, newImages, imgResult.filesInfo);
+
+    // Safe deletion of old physical file ONLY IF oldImageUrl is not used elsewhere
+    if (oldImageUrl && oldImageUrl !== primaryUrl && oldImageUrl.includes('/uploads/products/')) {
+      const oldFileName = path.basename(oldImageUrl.split('?')[0]);
+      await safeDeleteLocalImageFile(pool, oldFileName, prodId);
+    }
+
+    const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    const formatted = formatProductRecord(updated[0], { isSellerView: true });
+
+    res.json({
+      message: 'Product image updated successfully.',
+      image_url: primaryUrl,
+      images: newImages,
+      product: formatted
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to update product image.' });
+  }
+});
+
+// Dedicated Image Deletion Endpoint
+app.delete(['/api/products/:id/image', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
+  const prodId = parseInt(req.params.id, 10);
+  let existing = [];
+  try {
+    await ensureProductPriceColumns(pool);
+    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    existing = rows;
+  } catch (e) {
+    existing = fallbackProducts.filter(p => Number(p.id) === prodId);
+  }
+
+  if (existing.length === 0) return res.status(404).json({ message: 'Product not found.' });
+  if (req.user.role !== 'admin' && Number(existing[0].seller_id) !== Number(req.user.id)) {
+    return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+  }
+
+  const targetFilename = req.params.filename || req.query.filename || req.body?.filename || req.query.image_url || req.body?.image_url;
+  let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
+  let removedUrl = null;
+
+  if (targetFilename) {
+    const safeTarget = path.basename(targetFilename.split('?')[0]);
+    removedUrl = currentImgs.find(u => u.includes(safeTarget));
+    currentImgs = currentImgs.filter(u => !u.includes(safeTarget));
+  } else {
+    removedUrl = currentImgs.shift();
+  }
+
+  const primaryUrl = currentImgs.length > 0 ? currentImgs[0] : null;
+  const imagesJson = currentImgs.length > 0 ? JSON.stringify(currentImgs) : null;
+
+  try {
+    await pool.query(
+      'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+      [primaryUrl, imagesJson, prodId]
+    );
+
+    if (removedUrl) {
+      const removedFn = path.basename(removedUrl.split('?')[0]);
+      await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, removedFn]);
+      await safeDeleteLocalImageFile(pool, removedFn, prodId);
+    }
+
+    const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    const formatted = formatProductRecord(updated[0], { isSellerView: true });
+
+    res.json({
+      message: 'Product image deleted successfully.',
+      image_url: primaryUrl,
+      images: currentImgs,
+      product: formatted
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to delete product image.' });
+  }
 });
 
 app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
@@ -2285,6 +2748,10 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
       [req.user.id, name, description, sku, category, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson]
     );
+
+    // Sync permanent records in product_images table in MySQL
+    await syncProductImagesRecord(pool, req.user.id, result.insertId, finalImages, imgResult.filesInfo);
+
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
@@ -2478,6 +2945,10 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       updates.push('updated_at = NOW()');
       params.push(req.params.id);
       await pool.query(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`, params);
+
+      if (imgResult.hasImages && imgResult.images.length > 0) {
+        await syncProductImagesRecord(pool, req.user.id, req.params.id, imgResult.images, imgResult.filesInfo);
+      }
     }
 
     const [updated] = await pool.query(
@@ -2525,7 +2996,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   let existing = [];
   try {
-    const [rows] = await pool.query('SELECT id, seller_id FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+    const [rows] = await pool.query('SELECT id, seller_id, image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
     existing = rows;
   } catch (err) {
     existing = fallbackProducts.filter(p => String(p.id) === String(req.params.id));
@@ -2537,8 +3008,20 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
     return res.status(403).json({ message: 'Access denied. You do not own this product.' });
   }
 
+  const prodId = Number(existing[0].id);
+  const imagesToDelete = parseImagesJson(existing[0].images || existing[0].image_url);
+
   try {
-    await pool.query('DELETE FROM products WHERE id = ?', [req.params.id]);
+    await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
+    await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
+
+    // Safely delete associated physical image files ONLY IF no other product is referencing them
+    for (const imgUrl of imagesToDelete) {
+      if (imgUrl && imgUrl.includes('/uploads/products/')) {
+        const fn = path.basename(imgUrl.split('?')[0]);
+        await safeDeleteLocalImageFile(pool, fn, prodId);
+      }
+    }
   } catch (err) {
     fallbackProducts = fallbackProducts.filter(p => String(p.id) !== String(req.params.id));
   }

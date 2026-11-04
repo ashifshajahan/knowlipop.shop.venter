@@ -172,12 +172,24 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         if (!$u) return null;
         $t = trim($u);
         if (empty($t) || in_array($t, ['null', 'undefined', '[]', '{}'], true)) return null;
-        if (str_starts_with($t, 'blob:') || str_starts_with($t, 'file:') || str_starts_with($t, '/data/user/')) return null;
+        while ((str_starts_with($t, '"') && str_ends_with($t, '"')) || (str_starts_with($t, "'") && str_ends_with($t, "'"))) {
+            $t = trim(substr($t, 1, -1));
+        }
+        if (empty($t) || str_starts_with($t, 'blob:') || str_starts_with($t, 'file:') || str_starts_with($t, '/data/user/') || str_starts_with($t, '/var/mobile/')) return null;
         if (str_starts_with($t, '//')) return 'https:' . $t;
-        if (str_starts_with($t, '/uploads/')) return $baseUrl . $t;
-        if (str_starts_with($t, 'uploads/')) return $baseUrl . '/' . $t;
-        if (str_starts_with($t, 'http://localhost') || str_starts_with($t, 'http://127.0.0.1')) {
-            return preg_replace('/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/', $baseUrl, $t);
+        if (str_starts_with($t, 'http://') || str_starts_with($t, 'https://')) {
+            if (str_starts_with($t, 'http://localhost') || str_starts_with($t, 'http://127.0.0.1')) {
+                return preg_replace('/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/', $baseUrl, $t);
+            }
+            return $t;
+        }
+        if (str_starts_with($t, 'data:image/')) return $t;
+        if (str_starts_with($t, '/uploads/') || str_starts_with($t, 'uploads/') || str_starts_with($t, '/storage/') || str_starts_with($t, 'storage/') || str_starts_with($t, '/public/uploads/') || str_starts_with($t, 'public/uploads/')) {
+            $clean = ltrim(preg_replace('/^\/?(storage\/|public\/uploads\/)/', 'uploads/', $t), '/');
+            return $baseUrl . '/' . $clean;
+        }
+        if (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $t) || preg_match('/^placeholder\.(jpg|jpeg|png)$/i', $t) || preg_match('/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp)$/i', $t)) {
+            return $baseUrl . '/uploads/products/' . $t;
         }
         return $t;
     };
@@ -234,6 +246,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             $p['product_image'] ?? null,
             $p['photo'] ?? null,
             $p['thumbnail'] ?? null,
+            $p['path'] ?? null,
         ];
         foreach ($singleSources as $src) {
             if (is_string($src)) {
@@ -260,6 +273,11 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     // Strictly enforce seller multiple URL limit of 4 images
     $imagesArray = array_slice($imagesArray, 0, 4);
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($baseUrl . '/uploads/products/placeholder.jpg');
+    $relativePaths = array_map(function($u) {
+        $fn = basename(explode('?', $u)[0]);
+        return str_contains($u, '/uploads/products/') ? 'uploads/products/' . $fn : $u;
+    }, $imagesArray);
+    $primaryRelative = !empty($relativePaths) ? '/' . $relativePaths[0] : null;
 
     $stock = (int) ($p['stock'] ?? 0);
     $rating = isset($p['rating']) && is_numeric($p['rating']) ? (float) $p['rating'] : 4.5;
@@ -286,11 +304,15 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'product_image' => $primaryImageUrl,
         'thumbnail' => $primaryImageUrl,
         'photo' => $primaryImageUrl,
+        'path' => $primaryRelative,
+        'relative_path' => $relativePaths[0] ?? null,
         'images' => $imagesArray,
         'image_urls' => $imagesArray,
         'product_images' => $imagesArray,
         'gallery' => $imagesArray,
         'photos' => $imagesArray,
+        'image_paths' => $relativePaths,
+        'relative_paths' => $relativePaths,
         'is_active' => (bool) ($p['is_active'] ?? true),
         'created_at' => $p['created_at'] ?? null,
         'updated_at' => $p['updated_at'] ?? null,
@@ -364,22 +386,25 @@ function ensureProductPriceColumns(PDO $pdo): void
         try {
             $pdo->exec("UPDATE `products` SET `sku` = CONCAT('SKU-', LPAD(`id`, 4, '0')) WHERE `sku` IS NULL OR `sku` = ''");
         } catch (\Throwable $e) {}
-        // 5. Ensure distinct, working multi-image galleries (up to 10 URLs) for products, replacing duplicate or broken URLs
+        // Ensure product_images table exists
         try {
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', `images` = '[\"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 1");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', `images` = '[\"https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800\",\"https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800\",\"https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800\"]' WHERE `id` = 2");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', `images` = '[\"https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800\",\"https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800\",\"https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800\"]' WHERE `id` = 3");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', `images` = '[\"https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800\",\"https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800\",\"https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800\"]' WHERE `id` = 4");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', `images` = '[\"https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800\",\"https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800\",\"https://images.unsplash.com/photo-1577803645773-f96470509666?w=800\"]' WHERE `id` = 5");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', `images` = '[\"https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800\",\"https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800\",\"https://images.unsplash.com/photo-1595225476474-87563907a212?w=800\"]' WHERE `id` = 6");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', `images` = '[\"https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800\",\"https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800\",\"https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800\"]' WHERE `id` = 7");
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', `images` = '[\"https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800\",\"https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800\",\"https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800\"]' WHERE `id` = 8");
-            // Fix product 51 (broken local upload)
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800', `images` = '[\"https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800\",\"https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800\",\"https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800\"]' WHERE `id` = 51");
-            // Clean product 54 (Rty from user screenshot) to strictly have its seller uploaded image
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg', `images` = '[\"https://knowlipop.shop/uploads/products/prod_1793703083099_bc9d07ba.jpg\"]' WHERE `id` = 54");
-            // Fix product 44 (duplicate headset image)
-            $pdo->exec("UPDATE `products` SET `image_url` = 'https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800', `images` = '[\"https://images.unsplash.com/photo-1546435770-a3e426bf472b?w=800\",\"https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800\",\"https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800\"]' WHERE `id` = 44");
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `product_images` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `seller_id` BIGINT UNSIGNED NOT NULL,
+                    `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `image_url` LONGTEXT NOT NULL,
+                    `relative_path` VARCHAR(255) NOT NULL,
+                    `file_name` VARCHAR(255) NOT NULL,
+                    `file_size` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `mime_type` VARCHAR(50) NULL DEFAULT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    INDEX `idx_pi_seller` (`seller_id`),
+                    INDEX `idx_pi_product` (`product_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
         } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
@@ -474,18 +499,53 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
 
     $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
     $collected = [];
+    $filesInfo = [];
+    $allowedExts = ['jpg', 'jpeg', 'png', 'webp'];
+    $allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    $dangerousExts = ['php', 'phtml', 'php5', 'exe', 'sh', 'bat', 'cmd', 'js', 'vbs', 'html', 'htm', 'cgi', 'pl'];
 
-    // Helper to process uploaded file
-    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, &$collected) {
+    // Helper to process uploaded file with strict validation
+    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, $allowedExts, $allowedMimes, $dangerousExts, &$collected, &$filesInfo) {
         if (!empty($tmp) && is_uploaded_file($tmp)) {
             $ext = strtolower(pathinfo($origName ?: 'product.jpg', PATHINFO_EXTENSION));
-            if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'])) {
-                $ext = 'jpg';
+            if (in_array($ext, $dangerousExts, true)) {
+                return; // Strictly reject dangerous files
             }
-            $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+            if (filesize($tmp) > 15 * 1024 * 1024) {
+                return; // Exceeds 15MB
+            }
+
+            // Verify MIME type
+            $mime = 'image/jpeg';
+            if (function_exists('finfo_open')) {
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                $detected = finfo_file($finfo, $tmp);
+                finfo_close($finfo);
+                if ($detected) $mime = strtolower($detected);
+            } elseif (function_exists('mime_content_type')) {
+                $detected = mime_content_type($tmp);
+                if ($detected) $mime = strtolower($detected);
+            }
+
+            if (!in_array($ext, $allowedExts, true) && !in_array($mime, $allowedMimes, true)) {
+                return;
+            }
+            if (!in_array($ext, $allowedExts, true)) {
+                $ext = ($mime === 'image/png') ? 'png' : (($mime === 'image/webp') ? 'webp' : 'jpg');
+            }
+
+            $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
             if (move_uploaded_file($tmp, $uploadDir . $filename)) {
                 @chmod($uploadDir . $filename, 0644);
-                $collected[] = $baseUrl . '/uploads/products/' . $filename;
+                $fullUrl = $baseUrl . '/uploads/products/' . $filename;
+                $collected[] = $fullUrl;
+                $filesInfo[] = [
+                    'file_name' => $filename,
+                    'relative_path' => 'uploads/products/' . $filename,
+                    'image_url' => $fullUrl,
+                    'file_size' => @filesize($uploadDir . $filename) ?: 0,
+                    'mime_type' => $mime
+                ];
             }
         }
     };
@@ -504,10 +564,9 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
 
     // Helper to process candidate items (string URLs, comma-separated URLs, JSON arrays, objects, base64)
     $processCandidate = null;
-    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$processCandidate) {
+    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$filesInfo, &$processCandidate) {
         if (empty($candidate)) return;
         if (is_array($candidate)) {
-            // Check if associative array / object e.g. ['url' => '...']
             if (isset($candidate['url']) || isset($candidate['image_url']) || isset($candidate['src']) || isset($candidate['path']) || isset($candidate['link']) || isset($candidate['image'])) {
                 $c = $candidate['url'] ?? $candidate['image_url'] ?? $candidate['src'] ?? $candidate['path'] ?? $candidate['link'] ?? $candidate['image'];
                 $processCandidate($c);
@@ -520,10 +579,15 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
         if (!is_string($candidate)) return;
         $trimmed = trim($candidate);
-        if (empty($trimmed)) return;
+        if (empty($trimmed) || in_array($trimmed, ['null', 'undefined', '[]', '{}'], true)) return;
+
+        // Ignore temporary device URIs
+        if (str_starts_with($trimmed, 'blob:') || str_starts_with($trimmed, 'file:') || str_starts_with($trimmed, '/data/user/') || str_starts_with($trimmed, '/var/mobile/')) {
+            return;
+        }
 
         // Clean wrapping quotes e.g. "https://..." or 'https://...'
-        if ((str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"')) || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'"))) {
+        while ((str_starts_with($trimmed, '"') && str_ends_with($trimmed, '"')) || (str_starts_with($trimmed, "'") && str_ends_with($trimmed, "'"))) {
             $trimmed = trim(substr($trimmed, 1, -1));
         }
 
@@ -571,35 +635,41 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             if (preg_match('/^data:image\/(\w+);base64,(.+)$/is', $trimmed, $matches)) {
                 $ext = strtolower($matches[1]);
                 if ($ext === 'jpeg') $ext = 'jpg';
-                if (!in_array($ext, ['jpg', 'png', 'webp', 'gif', 'svg'])) $ext = 'png';
+                if (!in_array($ext, ['jpg', 'png', 'webp'])) $ext = 'jpg';
                 $rawB64 = preg_replace('/\s+/', '', $matches[2]);
             } else {
                 $rawB64 = preg_replace('/\s+/', '', $trimmed);
                 if (str_starts_with($rawB64, '/9j/')) $ext = 'jpg';
                 elseif (str_starts_with($rawB64, 'iVBORw0KGgo')) $ext = 'png';
-                elseif (str_starts_with($rawB64, 'R0lGOD')) $ext = 'gif';
                 elseif (str_starts_with($rawB64, 'UklGR')) $ext = 'webp';
             }
             $data = base64_decode($rawB64);
-            if ($data !== false && strlen($data) > 10) {
-                $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+            if ($data !== false && strlen($data) > 10 && strlen($data) <= 15 * 1024 * 1024) {
+                $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
                 if (file_put_contents($uploadDir . $filename, $data)) {
                     @chmod($uploadDir . $filename, 0644);
-                    $collected[] = $baseUrl . '/uploads/products/' . $filename;
+                    $fullUrl = $baseUrl . '/uploads/products/' . $filename;
+                    $collected[] = $fullUrl;
+                    $filesInfo[] = [
+                        'file_name' => $filename,
+                        'relative_path' => 'uploads/products/' . $filename,
+                        'image_url' => $fullUrl,
+                        'file_size' => strlen($data),
+                        'mime_type' => ($ext === 'png') ? 'image/png' : (($ext === 'webp') ? 'image/webp' : 'image/jpeg')
+                    ];
                 }
             }
             return;
         }
 
         // HTTP/HTTPS or relative URLs
-        if (str_starts_with($trimmed, 'http://') || str_starts_with($trimmed, 'https://') || str_starts_with($trimmed, '//') || str_starts_with($trimmed, '/uploads/')) {
-            if (str_starts_with($trimmed, '//')) {
-                $collected[] = 'https:' . $trimmed;
-            } elseif (str_starts_with($trimmed, '/uploads/')) {
-                $collected[] = $baseUrl . $trimmed;
-            } else {
-                $collected[] = $trimmed;
-            }
+        if (str_starts_with($trimmed, 'http://') || str_starts_with($trimmed, 'https://') || str_starts_with($trimmed, '//')) {
+            $collected[] = str_starts_with($trimmed, '//') ? ('https:' . $trimmed) : $trimmed;
+        } elseif (str_starts_with($trimmed, '/uploads/') || str_starts_with($trimmed, 'uploads/') || str_starts_with($trimmed, '/storage/') || str_starts_with($trimmed, 'storage/') || str_starts_with($trimmed, '/public/uploads/') || str_starts_with($trimmed, 'public/uploads/')) {
+            $clean = ltrim(preg_replace('/^\/?(storage\/|public\/uploads\/)/', 'uploads/', $trimmed), '/');
+            $collected[] = $baseUrl . '/' . $clean;
+        } elseif (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $trimmed) || preg_match('/^placeholder\.(jpg|jpeg|png)$/i', $trimmed)) {
+            $collected[] = $baseUrl . '/uploads/products/' . $trimmed;
         }
     };
 
@@ -651,6 +721,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         'gallery' => $uniqueImages,
         'photos' => $uniqueImages,
         'imagesJson' => !empty($uniqueImages) ? json_encode($uniqueImages) : null,
+        'filesInfo' => $filesInfo,
         'limit' => 4,
         'total' => count($uniqueImages),
     ];
@@ -663,34 +734,357 @@ function saveUploadedProductImage(?string $fallback = null): ?string
     return $res['primaryImageUrl'];
 }
 
+function syncProductImagesRecordPHP(PDO $pdo, int $sellerId, ?int $productId, array $images, array $filesInfo = []): void
+{
+    if (empty($images) || empty($sellerId)) return;
+    $uploadDir = __DIR__ . '/../uploads/products/';
+
+    foreach ($images as $imgUrl) {
+        $fileName = basename(explode('?', $imgUrl)[0]);
+        $relativePath = str_contains($imgUrl, '/uploads/products/')
+            ? 'uploads/products/' . $fileName
+            : (str_starts_with($imgUrl, 'http') ? $imgUrl : 'uploads/products/' . $fileName);
+
+        $fileSize = null;
+        $mimeType = null;
+        foreach ($filesInfo as $fi) {
+            if (($fi['file_name'] ?? '') === $fileName || ($fi['image_url'] ?? '') === $imgUrl) {
+                $fileSize = $fi['file_size'] ?? null;
+                $mimeType = $fi['mime_type'] ?? null;
+                break;
+            }
+        }
+        if (!$fileSize && file_exists($uploadDir . $fileName)) {
+            $fileSize = @filesize($uploadDir . $fileName);
+            $ext = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+            $mimes = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'webp' => 'image/webp'];
+            $mimeType = $mimes[$ext] ?? 'image/jpeg';
+        }
+
+        try {
+            $checkStmt = $pdo->prepare("SELECT id FROM product_images WHERE seller_id = :seller_id AND (image_url = :url OR file_name = :fn) LIMIT 1");
+            $checkStmt->execute([':seller_id' => $sellerId, ':url' => $imgUrl, ':fn' => $fileName]);
+            $existing = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($existing) {
+                if ($productId) {
+                    $upd = $pdo->prepare("UPDATE product_images SET product_id = :pid, updated_at = NOW() WHERE id = :id");
+                    $upd->execute([':pid' => $productId, ':id' => $existing['id']]);
+                }
+            } else {
+                $ins = $pdo->prepare("
+                    INSERT INTO product_images (seller_id, product_id, image_url, relative_path, file_name, file_size, mime_type, created_at, updated_at)
+                    VALUES (:seller_id, :product_id, :image_url, :relative_path, :file_name, :file_size, :mime_type, NOW(), NOW())
+                ");
+                $ins->execute([
+                    ':seller_id' => $sellerId,
+                    ':product_id' => $productId,
+                    ':image_url' => $imgUrl,
+                    ':relative_path' => $relativePath,
+                    ':file_name' => $fileName,
+                    ':file_size' => $fileSize,
+                    ':mime_type' => $mimeType
+                ]);
+            }
+        } catch (\Throwable $e) {}
+    }
+}
+
+function safeDeleteLocalImageFilePHP(PDO $pdo, string $fileName, ?int $excludeProductId = null): bool
+{
+    $safeName = basename(explode('?', $fileName)[0]);
+    if (!str_starts_with($safeName, 'prod_') || !preg_match('/\.(jpg|jpeg|png|webp)$/i', $safeName)) {
+        return false;
+    }
+
+    try {
+        $search = '%' . $safeName . '%';
+        $sql = "SELECT id FROM products WHERE (image_url LIKE :s1 OR images LIKE :s2)";
+        $params = [':s1' => $search, ':s2' => $search];
+        if ($excludeProductId) {
+            $sql .= " AND id != :ex_id";
+            $params[':ex_id'] = $excludeProductId;
+        }
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        if ($stmt->fetch()) {
+            return false; // Still referenced by another product
+        }
+
+        $piSql = "SELECT id FROM product_images WHERE file_name = :fn";
+        $piParams = [':fn' => $safeName];
+        if ($excludeProductId) {
+            $piSql .= " AND (product_id IS NULL OR product_id != :ex_id)";
+            $piParams[':ex_id'] = $excludeProductId;
+        }
+        $piStmt = $pdo->prepare($piSql);
+        $piStmt->execute($piParams);
+        if ($piStmt->fetch()) {
+            return false;
+        }
+
+        $uploadDir = __DIR__ . '/../uploads/products/';
+        if (file_exists($uploadDir . $safeName)) {
+            @unlink($uploadDir . $safeName);
+            return true;
+        }
+    } catch (\Throwable $e) {}
+    return false;
+}
+
 function apiUploadImage(PDO $pdo): void
 {
-    authenticateUser($pdo);
-    $input = getJsonInput();
+    $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
+    $input = array_merge($_POST, getJsonInput());
     $res = saveUploadedProductImages($input);
     if (empty($res['images'])) {
         errorResponse('No image uploaded or invalid format.', [
-            'image' => ['Please upload an image file (jpg, png, webp) or provide image data/URLs.']
+            'image' => ['Please upload an image file (jpg, jpeg, png, webp) or provide image data/URLs.']
         ], 422);
     }
+
+    $targetProductId = !empty($input['product_id']) ? (int)$input['product_id'] : (!empty($_GET['product_id']) ? (int)$_GET['product_id'] : null);
+    $attachedProduct = null;
+
+    if ($targetProductId) {
+        $pStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+        $pStmt->execute([':id' => $targetProductId]);
+        $prod = $pStmt->fetch(PDO::FETCH_ASSOC);
+        if (!$prod) {
+            errorResponse('Target product not found.', [], 404);
+        }
+        if (($user['role'] ?? '') !== 'admin' && (int)$prod['seller_id'] !== (int)$user['id']) {
+            errorResponse('Access denied. You do not own this product.', [], 403);
+        }
+
+        $isReplace = !empty($input['replace']) && ($input['replace'] === true || $input['replace'] === 'true' || $input['replace'] === '1');
+        $existingImgs = [];
+        if (!empty($prod['images'])) {
+            $dec = json_decode($prod['images'], true);
+            if (is_array($dec)) $existingImgs = $dec;
+        } elseif (!empty($prod['image_url'])) {
+            $existingImgs = [$prod['image_url']];
+        }
+
+        $combinedImgs = $isReplace ? $res['images'] : array_slice(array_values(array_unique(array_merge($existingImgs, $res['images']))), 0, 4);
+        $primaryUrl = $combinedImgs[0] ?? $res['primaryImageUrl'];
+        $imagesJson = json_encode($combinedImgs);
+
+        $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+        $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $targetProductId]);
+
+        $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+        $fetchStmt->execute([':id' => $targetProductId]);
+        $attachedProduct = formatProductRecord($fetchStmt->fetch(PDO::FETCH_ASSOC), true);
+    }
+
+    syncProductImagesRecordPHP($pdo, (int)$user['id'], $targetProductId, $res['images'], $res['filesInfo'] ?? []);
+
+    $fileName = basename(explode('?', $res['primaryImageUrl'])[0]);
+    $relativePaths = array_map(function($u) {
+        $fn = basename(explode('?', $u)[0]);
+        return str_contains($u, '/uploads/products/') ? 'uploads/products/' . $fn : $u;
+    }, $res['images']);
+
     jsonResponse([
         'message' => 'Images uploaded successfully.',
         'image_url' => $res['primaryImageUrl'],
         'image' => $res['primaryImageUrl'],
         'url' => $res['primaryImageUrl'],
         'product_image' => $res['primaryImageUrl'],
-        'path' => $res['primaryImageUrl'],
+        'path' => '/uploads/products/' . $fileName,
+        'relative_path' => $relativePaths[0] ?? null,
+        'file_name' => $fileName,
         'images' => $res['images'],
         'image_urls' => $res['images'],
+        'relative_paths' => $relativePaths,
+        'product_id' => $targetProductId,
+        'product' => $attachedProduct,
         'data' => [
             'url' => $res['primaryImageUrl'],
             'image_url' => $res['primaryImageUrl'],
             'image' => $res['primaryImageUrl'],
-            'images' => $res['images']
+            'images' => $res['images'],
+            'relative_path' => $relativePaths[0] ?? null
         ],
         'limit' => 4,
         'total' => count($res['images'])
     ], 201);
+}
+
+function apiGetProductImages(PDO $pdo, int $productId): void
+{
+    ensureProductPriceColumns($pdo);
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $productId]);
+    $p = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$p) {
+        errorResponse('Product not found.', [], 404);
+    }
+
+    $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    $formatted = formatProductRecord($p);
+
+    $piStmt = $pdo->prepare("SELECT * FROM product_images WHERE product_id = :pid ORDER BY id ASC");
+    $piStmt->execute([':pid' => $productId]);
+    $gallery = $piStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    jsonResponse([
+        'product_id' => $productId,
+        'image_url' => $formatted['image_url'],
+        'images' => $formatted['images'],
+        'gallery' => array_map(function($r) {
+            return [
+                'id' => (int)$r['id'],
+                'image_url' => $r['image_url'],
+                'relative_path' => $r['relative_path'],
+                'file_name' => $r['file_name'],
+                'file_size' => $r['file_size'] ? (int)$r['file_size'] : null,
+                'mime_type' => $r['mime_type']
+            ];
+        }, $gallery)
+    ]);
+}
+
+function apiReplaceProductImage(PDO $pdo, int $productId): void
+{
+    $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
+
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $productId]);
+    $product = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$product) {
+        errorResponse('Product not found.', [], 404);
+    }
+    if (($user['role'] ?? '') !== 'admin' && (int)$product['seller_id'] !== (int)$user['id']) {
+        errorResponse('Access denied. You do not own this product.', [], 403);
+    }
+
+    $input = array_merge($_POST, getJsonInput());
+    $res = saveUploadedProductImages($input);
+    if (empty($res['images'])) {
+        errorResponse('No replacement image provided.', [
+            'image' => ['Please upload an image file (jpg, jpeg, png, webp) or image URL.']
+        ], 422);
+    }
+
+    $oldImageUrl = $product['image_url'];
+    $newImageUrl = $res['primaryImageUrl'];
+    $isReplaceAll = !empty($input['replace_all']) && ($input['replace_all'] === true || $input['replace_all'] === 'true' || $input['replace_all'] === '1');
+    $imgIndex = isset($input['image_index']) && is_numeric($input['image_index']) ? (int)$input['image_index'] : 0;
+
+    $currentImgs = [];
+    if (!empty($product['images'])) {
+        $dec = json_decode($product['images'], true);
+        if (is_array($dec)) $currentImgs = $dec;
+    } elseif (!empty($product['image_url'])) {
+        $currentImgs = [$product['image_url']];
+    }
+
+    if ($isReplaceAll) {
+        $newImages = array_slice($res['images'], 0, 4);
+    } else {
+        if ($imgIndex >= 0 && $imgIndex < count($currentImgs)) {
+            $currentImgs[$imgIndex] = $newImageUrl;
+        } else {
+            array_unshift($currentImgs, $newImageUrl);
+        }
+        $newImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+    }
+
+    $primaryUrl = $newImages[0] ?? $newImageUrl;
+    $imagesJson = json_encode($newImages);
+
+    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+    $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $productId]);
+
+    syncProductImagesRecordPHP($pdo, (int)$user['id'], $productId, $newImages, $res['filesInfo'] ?? []);
+
+    if ($oldImageUrl && $oldImageUrl !== $primaryUrl && str_contains($oldImageUrl, '/uploads/products/')) {
+        $oldFileName = basename(explode('?', $oldImageUrl)[0]);
+        safeDeleteLocalImageFilePHP($pdo, $oldFileName, $productId);
+    }
+
+    $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $fetchStmt->execute([':id' => $productId]);
+    $updated = formatProductRecord($fetchStmt->fetch(PDO::FETCH_ASSOC), true);
+
+    jsonResponse([
+        'message' => 'Product image updated successfully.',
+        'image_url' => $primaryUrl,
+        'images' => $newImages,
+        'product' => $updated
+    ]);
+}
+
+function apiDeleteProductImage(PDO $pdo, int $productId): void
+{
+    $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
+
+    $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $productId]);
+    $product = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$product) {
+        errorResponse('Product not found.', [], 404);
+    }
+    if (($user['role'] ?? '') !== 'admin' && (int)$product['seller_id'] !== (int)$user['id']) {
+        errorResponse('Access denied. You do not own this product.', [], 403);
+    }
+
+    $input = array_merge($_GET, $_POST, getJsonInput());
+    $targetFilename = $input['filename'] ?? ($input['image_url'] ?? null);
+
+    $currentImgs = [];
+    if (!empty($product['images'])) {
+        $dec = json_decode($product['images'], true);
+        if (is_array($dec)) $currentImgs = $dec;
+    } elseif (!empty($product['image_url'])) {
+        $currentImgs = [$product['image_url']];
+    }
+
+    $removedUrl = null;
+    if ($targetFilename) {
+        $safeTarget = basename(explode('?', (string)$targetFilename)[0]);
+        foreach ($currentImgs as $idx => $u) {
+            if (str_contains($u, $safeTarget)) {
+                $removedUrl = $u;
+                unset($currentImgs[$idx]);
+                break;
+            }
+        }
+        $currentImgs = array_values($currentImgs);
+    } else {
+        $removedUrl = array_shift($currentImgs);
+    }
+
+    $primaryUrl = !empty($currentImgs) ? $currentImgs[0] : null;
+    $imagesJson = !empty($currentImgs) ? json_encode($currentImgs) : null;
+
+    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+    $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $productId]);
+
+    if ($removedUrl) {
+        $removedFn = basename(explode('?', $removedUrl)[0]);
+        try {
+            $delPi = $pdo->prepare("DELETE FROM product_images WHERE product_id = :pid AND file_name = :fn");
+            $delPi->execute([':pid' => $productId, ':fn' => $removedFn]);
+        } catch (\Throwable $e) {}
+        safeDeleteLocalImageFilePHP($pdo, $removedFn, $productId);
+    }
+
+    $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $fetchStmt->execute([':id' => $productId]);
+    $updated = formatProductRecord($fetchStmt->fetch(PDO::FETCH_ASSOC), true);
+
+    jsonResponse([
+        'message' => 'Product image deleted successfully.',
+        'image_url' => $primaryUrl,
+        'images' => $currentImgs,
+        'product' => $updated
+    ]);
 }
 
 function apiCreateProduct(PDO $pdo): void
@@ -754,6 +1148,7 @@ function apiCreateProduct(PDO $pdo): void
     ]);
 
     $id = (int) $pdo->lastInsertId();
+    syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $finalImages, $imgResult['filesInfo'] ?? []);
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
@@ -913,6 +1308,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $params[':image_url'] = $imgResult['primaryImageUrl'];
         $updates[] = "images = :images";
         $params[':images'] = $imgResult['imagesJson'];
+        syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $imgResult['images'], $imgResult['filesInfo'] ?? []);
     }
 
     if (isset($input['is_active'])) {
@@ -959,8 +1355,28 @@ function apiDeleteProduct(PDO $pdo, int $id): void
         errorResponse('Access denied. You do not own this product.', [], 403);
     }
 
+    $imagesToDelete = [];
+    if (!empty($product['images'])) {
+        $dec = json_decode($product['images'], true);
+        if (is_array($dec)) $imagesToDelete = $dec;
+    } elseif (!empty($product['image_url'])) {
+        $imagesToDelete = [$product['image_url']];
+    }
+
     $delStmt = $pdo->prepare("DELETE FROM products WHERE id = :id");
     $delStmt->execute([':id' => $id]);
+
+    try {
+        $delPi = $pdo->prepare("DELETE FROM product_images WHERE product_id = :id");
+        $delPi->execute([':id' => $id]);
+    } catch (\Throwable $e) {}
+
+    foreach ($imagesToDelete as $imgUrl) {
+        if ($imgUrl && str_contains($imgUrl, '/uploads/products/')) {
+            $fn = basename(explode('?', $imgUrl)[0]);
+            safeDeleteLocalImageFilePHP($pdo, $fn, $id);
+        }
+    }
 
     jsonResponse(['message' => 'Product deleted.']);
 }

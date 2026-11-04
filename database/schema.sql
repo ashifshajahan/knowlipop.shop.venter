@@ -192,6 +192,22 @@ CREATE TABLE IF NOT EXISTS `device_tokens` (
   INDEX `idx_device_tokens_user` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `product_images` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `image_url` LONGTEXT NOT NULL,
+  `relative_path` VARCHAR(255) NOT NULL,
+  `file_name` VARCHAR(255) NOT NULL,
+  `file_size` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `mime_type` VARCHAR(50) NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_pi_seller` (`seller_id`),
+  INDEX `idx_pi_product` (`product_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Sample Starter Order for Buyer Module Testing
 INSERT INTO `orders` (`id`, `seller_id`, `order_number`, `buyer_name`, `buyer_phone`, `shipping_address`, `landmark`, `city`, `state`, `pincode`, `order_status`, `payment_method`, `payment_status`, `subtotal`, `delivery_fee`, `discount`, `total_amount`, `notes`)
 VALUES
