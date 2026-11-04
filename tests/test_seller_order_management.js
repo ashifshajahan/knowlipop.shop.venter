@@ -34,20 +34,24 @@ async function makeRequest(path, options = {}) {
 }
 
 async function registerTestSeller(suffix) {
-  const phone = `${Math.floor(6000000000 + Math.random() * 3999999999)}`;
+  const phone = `+91${Math.floor(6000000000 + Math.random() * 3999999999)}`;
   const email = `seller_${Date.now()}_${suffix}@vendor.app`;
   const name = `Test Seller ${suffix}`;
 
-  const res = await makeRequest('/api/auth/register', {
+  const res = await makeRequest('/api/register', {
     method: 'POST',
     body: JSON.stringify({
+      seller_name: name,
       name,
       email,
       phone,
+      address: '123 Market Road',
+      landmark: 'Near City Square',
+      state: 'Kerala',
+      country: 'India',
       password: 'Password123!',
       password_confirmation: 'Password123!',
-      role: 'seller',
-      seller_name: name
+      role: 'seller'
     })
   });
 
@@ -56,7 +60,7 @@ async function registerTestSeller(suffix) {
   }
 
   const token = res.body.token || res.body.access_token || res.body.data?.token;
-  const sellerId = res.body.seller?.id || res.body.user?.id || res.body.data?.id;
+  const sellerId = res.body.user?.id || res.body.seller?.id || res.body.data?.id;
 
   return { token, sellerId, name, phone, email };
 }
@@ -432,3 +436,4 @@ run().catch(err => {
   console.error('\n❌ Test execution failed:', err);
   process.exit(1);
 });
+

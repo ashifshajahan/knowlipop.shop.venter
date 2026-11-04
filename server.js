@@ -835,13 +835,13 @@ function normalizePhone(raw) {
   return '+' + str;
 }
 
-app.get('/api/register', (req, res) => {
+app.get(['/api/register', '/api/auth/register'], (req, res) => {
   res.status(405).json({
     message: 'The register endpoint only accepts POST requests with seller details (seller_name, phone, address, landmark, state, country, password, password_confirmation).'
   });
 });
 
-app.post('/api/register', async (req, res) => {
+app.post(['/api/register', '/api/auth/register'], async (req, res) => {
   const body = req.body || {};
   const seller_name = extractField(body, [
     'seller_name', 'sellerName', 'name', 'business_name', 'businessName',
@@ -937,13 +937,13 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-app.get('/api/login', (req, res) => {
+app.get(['/api/login', '/api/auth/login'], (req, res) => {
   res.status(405).json({
     message: 'The login endpoint only accepts POST requests with credentials (phone, password).'
   });
 });
 
-app.post('/api/login', async (req, res) => {
+app.post(['/api/login', '/api/auth/login'], async (req, res) => {
   const body = req.body || {};
   const rawPhone = extractPhone(body) || extractField(body, ['email', 'username', 'user', 'login'], '');
   const phone = normalizePhone(rawPhone);
