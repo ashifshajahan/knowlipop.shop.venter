@@ -564,17 +564,28 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             $trimmed = trim(substr($trimmed, 1, -1));
         }
 
-        // JSON array string e.g. ["url1", "url2"] or ['url1', 'url2']
+        // JSON array string or Dart list.toString() e.g. ["url1", "url2"] or [url1, url2]
         if (str_starts_with($trimmed, '[') && str_ends_with($trimmed, ']')) {
-            $decoded = json_decode($trimmed, true);
-            if (!is_array($decoded)) {
-                $decoded = json_decode(str_replace("'", '"', $trimmed), true);
-            }
-            if (is_array($decoded)) {
-                foreach ($decoded as $item) {
-                    $processCandidate($item);
+            $inner = trim(substr($trimmed, 1, -1));
+            if (!empty($inner)) {
+                $decoded = json_decode($trimmed, true);
+                if (!is_array($decoded)) {
+                    $decoded = json_decode(str_replace("'", '"', $trimmed), true);
                 }
-                return;
+                if (is_array($decoded)) {
+                    foreach ($decoded as $item) {
+                        $processCandidate($item);
+                    }
+                    return;
+                }
+                $parts = preg_split('/[,;\n\r|]+/', $inner);
+                if (!empty($parts)) {
+                    foreach ($parts as $p) {
+                        $pClean = trim($p, " \t\n\r\0\x0B\"'");
+                        if (!empty($pClean)) $processCandidate($pClean);
+                    }
+                    return;
+                }
             }
         }
 
@@ -1261,6 +1272,25 @@ function apiCreateProduct(PDO $pdo): void
     // Process image file uploads, base64, or multiple images (up to 4 max). Never inject demo images.
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
     $finalImages = $imgResult['hasImages'] ? array_slice($imgResult['images'], 0, 4) : [];
+
+    // If fewer than 4 images, check for recently uploaded unattached images by this seller
+    if (count($finalImages) < 4) {
+        try {
+            $unStmt = $pdo->prepare("
+                SELECT image_url FROM product_images 
+                WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE 
+                ORDER BY id ASC LIMIT 4
+            ");
+            $unStmt->execute([':sid' => (int)$user['id']]);
+            $unRows = $unStmt->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($unRows as $ur) {
+                if (count($finalImages) < 4 && !in_array($ur['image_url'], $finalImages, true)) {
+                    $finalImages[] = $ur['image_url'];
+                }
+            }
+        } catch (\Throwable $e) {}
+    }
+
     $finalPrimaryUrl = !empty($finalImages) ? $finalImages[0] : null;
     $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
 

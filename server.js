@@ -435,8 +435,10 @@ function resolveProductImages(req) {
         trimmed = trimmed.slice(1, -1).trim();
       }
 
-      // Handle JSON-encoded array string e.g. '["url1", "url2"]' or "['url1', 'url2']"
+      // Handle brackets e.g. [url1, url2] or ['url1', 'url2'] or ["url1", "url2"] (e.g. Dart list.toString())
       if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        const inner = trimmed.slice(1, -1).trim();
+        if (!inner) return;
         try {
           const parsed = JSON.parse(trimmed);
           if (Array.isArray(parsed)) {
@@ -452,19 +454,25 @@ function resolveProductImages(req) {
             }
           } catch (e2) {}
         }
+        // Fallback for non-JSON bracketed string e.g. Dart's list.toString() [url1, url2]
+        const parts = inner.split(/[,;\n\r|]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+        if (parts.length > 0) {
+          for (const p of parts) processCandidate(p);
+          return;
+        }
       }
 
       // Handle multi-URL strings separated by comma, newline, semicolon, pipe, or spaces
       if (!trimmed.startsWith('data:image/')) {
         if (/[,;\n\r|]/.test(trimmed)) {
-          const parts = trimmed.split(/[,;\n\r|]+/).map(s => s.trim()).filter(Boolean);
+          const parts = trimmed.split(/[,;\n\r|]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
           if (parts.length > 1) {
             for (const p of parts) processCandidate(p);
             return;
           }
         }
         if (/https?:\/\/[^\s]+\s+https?:\/\//.test(trimmed)) {
-          const spaceParts = trimmed.split(/\s+/).map(s => s.trim()).filter(Boolean);
+          const spaceParts = trimmed.split(/\s+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
           if (spaceParts.length > 1) {
             for (const p of spaceParts) processCandidate(p);
             return;
@@ -488,6 +496,13 @@ function resolveProductImages(req) {
         }
       }
 
+      // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or device path)
+      const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png))/i);
+      if (fnMatch) {
+        collected.push(`${baseUrl}/uploads/products/${fnMatch[1]}`);
+        return;
+      }
+
       // Standard HTTP/HTTPS or relative upload URL or filename
       if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//')) {
         const fullUrl = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
@@ -495,7 +510,7 @@ function resolveProductImages(req) {
       } else if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') || trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') || trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')) {
         const cleanPath = trimmed.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
         collected.push(`${baseUrl}/${cleanPath}`);
-      } else if (/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(trimmed) || /^placeholder\.(jpg|jpeg|png)$/i.test(trimmed)) {
+      } else if (/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(trimmed)) {
         collected.push(`${baseUrl}/uploads/products/${trimmed}`);
       }
     }
@@ -1003,6 +1018,23 @@ app.get('/api/health', async (req, res) => {
       ...(dbError ? { error: dbError } : {})
     }
   });
+});
+
+app.get('/api/debug/db-inspect', async (req, res) => {
+  try {
+    await ensureProductPriceColumns(pool);
+    const [recentProducts] = await pool.query('SELECT id, seller_id, name, stock, image_url, images, created_at, updated_at FROM products ORDER BY id DESC LIMIT 10');
+    const [recentProductImages] = await pool.query('SELECT * FROM product_images ORDER BY id DESC LIMIT 30');
+    const [unattached] = await pool.query('SELECT * FROM product_images WHERE product_id IS NULL ORDER BY id DESC LIMIT 20');
+    res.json({
+      success: true,
+      recent_products: recentProducts,
+      recent_product_images: recentProductImages,
+      unattached_images: unattached
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ==========================================
@@ -2956,7 +2988,23 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const mrp = pricing.mrp;
 
   // Use seller's uploaded/provided images (up to 4 max). Never inject demo or sample images.
-  const finalImages = imgResult.hasImages ? imgResult.images.slice(0, 4) : [];
+  let finalImages = imgResult.hasImages ? imgResult.images.slice(0, 4) : [];
+
+  // If client provided fewer than 4 images, check if the seller uploaded unattached images in the last 15 minutes
+  if (finalImages.length < 4) {
+    try {
+      const [unattached] = await pool.query(
+        'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE ORDER BY id ASC LIMIT 4',
+        [req.user.id]
+      );
+      for (const u of unattached) {
+        if (finalImages.length < 4 && !finalImages.includes(u.image_url)) {
+          finalImages.push(u.image_url);
+        }
+      }
+    } catch (e) {}
+  }
+
   const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
   const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
 
@@ -2970,6 +3018,16 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
 
     // Sync permanent records in product_images table in MySQL
     await syncProductImagesRecord(pool, req.user.id, result.insertId, finalImages, imgResult.filesInfo);
+
+    // Link any previously unattached images for this seller to this newly created product
+    try {
+      for (const imgUrl of finalImages) {
+        await pool.query(
+          'UPDATE product_images SET product_id = ? WHERE seller_id = ? AND product_id IS NULL AND image_url = ?',
+          [result.insertId, req.user.id, imgUrl]
+        );
+      }
+    } catch (e) {}
 
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
