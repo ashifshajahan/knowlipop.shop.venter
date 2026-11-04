@@ -148,7 +148,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             foreach ($src as $item) {
                 if (is_string($item)) {
                     $norm = $normalizeUrl($item);
-                    if ($norm) $imagesArray[] = $norm;
+                    if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
                 }
             }
         } elseif (is_string($src) && trim($src)) {
@@ -157,42 +157,37 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
                 foreach ($decoded as $item) {
                     if (is_string($item)) {
                         $norm = $normalizeUrl($item);
-                        if ($norm) $imagesArray[] = $norm;
+                        if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
                     }
                 }
-                if (!empty($imagesArray)) break;
                 continue;
             }
             if (preg_match('/[,;\n\r|]/', $src)) {
                 foreach (preg_split('/[,;\n\r|]+/', $src) as $item) {
                     $norm = $normalizeUrl($item);
-                    if ($norm) $imagesArray[] = $norm;
+                    if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
                 }
             } else {
                 $norm = $normalizeUrl($src);
-                if ($norm) $imagesArray[] = $norm;
+                if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
             }
         }
-        if (!empty($imagesArray)) break;
     }
 
-    // If no multi-image gallery found, fall back to single image fields
-    if (empty($imagesArray)) {
-        $singleSources = [
-            $p['image_url'] ?? null,
-            $p['image'] ?? null,
-            $p['product_image'] ?? null,
-            $p['photo'] ?? null,
-            $p['thumbnail'] ?? null,
-            $p['path'] ?? null,
-        ];
-        foreach ($singleSources as $src) {
-            if (is_string($src)) {
-                $norm = $normalizeUrl($src);
-                if ($norm) {
-                    $imagesArray[] = $norm;
-                    break;
-                }
+    // Also include single image fields if not already in imagesArray
+    $singleSources = [
+        $p['image_url'] ?? null,
+        $p['image'] ?? null,
+        $p['product_image'] ?? null,
+        $p['photo'] ?? null,
+        $p['thumbnail'] ?? null,
+        $p['path'] ?? null,
+    ];
+    foreach ($singleSources as $src) {
+        if (is_string($src)) {
+            $norm = $normalizeUrl($src);
+            if ($norm && !in_array($norm, $imagesArray, true)) {
+                $imagesArray[] = $norm;
             }
         }
     }
@@ -523,15 +518,20 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
     };
 
-    // 1. Process $_FILES (both single fields and multiple file array uploads)
-    foreach ($_FILES as $field => $fileData) {
-        if (is_array($fileData['tmp_name'])) {
-            foreach ($fileData['tmp_name'] as $idx => $tmp) {
-                $name = $fileData['name'][$idx] ?? 'product.jpg';
-                $processUploadedFile($tmp, $name);
+    // 1. Process $_FILES (both single fields and multiple file array uploads, recursive for nested structures)
+    $extractFiles = function($tmpName, $name) use (&$extractFiles, $processUploadedFile) {
+        if (is_array($tmpName)) {
+            foreach ($tmpName as $k => $v) {
+                $subName = is_array($name) ? ($name[$k] ?? 'product.jpg') : 'product.jpg';
+                $extractFiles($v, $subName);
             }
-        } else {
-            $processUploadedFile($fileData['tmp_name'], $fileData['name'] ?? 'product.jpg');
+        } elseif (!empty($tmpName)) {
+            $processUploadedFile($tmpName, is_string($name) ? $name : 'product.jpg');
+        }
+    };
+    foreach ($_FILES as $field => $fileData) {
+        if (isset($fileData['tmp_name'])) {
+            $extractFiles($fileData['tmp_name'], $fileData['name'] ?? 'product.jpg');
         }
     }
 
@@ -646,9 +646,17 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
     };
 
-    // Check all input keys for image candidates
+    // Prioritize explicit gallery array keys first to preserve exact order
+    $explicitGalleryKeys = ['images', 'image_urls', 'product_images', 'gallery', 'photos'];
+    foreach ($explicitGalleryKeys as $key) {
+        if (!empty($input[$key])) {
+            $processCandidate($input[$key]);
+        }
+    }
+
+    // Check all other input keys for image candidates
     foreach ($input as $k => $v) {
-        if (empty($v)) continue;
+        if (empty($v) || in_array($k, $explicitGalleryKeys, true)) continue;
         $lowerKey = strtolower((string)$k);
         if (
             strpos($lowerKey, 'image') !== false ||
@@ -990,10 +998,6 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
     }
 
     $oldImageUrl = $product['image_url'];
-    $newImageUrl = $res['primaryImageUrl'];
-    $isReplaceAll = !empty($input['replace_all']) && ($input['replace_all'] === true || $input['replace_all'] === 'true' || $input['replace_all'] === '1');
-    $imgIndex = isset($input['image_index']) && is_numeric($input['image_index']) ? (int)$input['image_index'] : 0;
-
     $currentImgs = [];
     if (!empty($product['images'])) {
         $dec = json_decode($product['images'], true);
@@ -1002,7 +1006,14 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
         $currentImgs = [$product['image_url']];
     }
 
+    $isReplaceAll = !empty($input['replace_all']) && ($input['replace_all'] === true || $input['replace_all'] === 'true' || $input['replace_all'] === '1');
+    $isExplicitReplace = (!empty($input['mode']) && $input['mode'] === 'replace') || (!empty($input['action']) && $input['action'] === 'replace');
+
+    $hasExplicitIndex = false;
+    $imgIndex = -1;
+
     if ($targetIdOrFile !== null) {
+        $hasExplicitIndex = true;
         if (is_numeric($targetIdOrFile)) {
             $piStmt = $pdo->prepare("SELECT file_name FROM product_images WHERE id = :id AND product_id = :pid LIMIT 1");
             $piStmt->execute([':id' => (int)$targetIdOrFile, ':pid' => $productId]);
@@ -1025,20 +1036,56 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
                 }
             }
         }
+    } elseif (isset($input['image_index']) && is_numeric($input['image_index'])) {
+        $hasExplicitIndex = true;
+        $imgIndex = (int)$input['image_index'];
+    } elseif (isset($input['index']) && is_numeric($input['index'])) {
+        $hasExplicitIndex = true;
+        $imgIndex = (int)$input['index'];
     }
+
+    $newImages = [];
+    $replacedUrls = [];
 
     if ($isReplaceAll) {
         $newImages = array_slice($res['images'], 0, 4);
-    } else {
-        if ($imgIndex >= 0 && $imgIndex < count($currentImgs)) {
-            $currentImgs[$imgIndex] = $newImageUrl;
+        foreach ($currentImgs as $u) {
+            if (!in_array($u, $newImages, true)) $replacedUrls[] = $u;
+        }
+    } elseif ($hasExplicitIndex && $imgIndex >= 0) {
+        if ($imgIndex < count($currentImgs)) {
+            $replacedUrls[] = $currentImgs[$imgIndex];
+            $currentImgs[$imgIndex] = $res['images'][0];
+            if (count($res['images']) > 1) {
+                for ($i = 1; $i < count($res['images']); $i++) {
+                    if (!in_array($res['images'][$i], $currentImgs, true)) {
+                        $currentImgs[] = $res['images'][$i];
+                    }
+                }
+            }
         } else {
-            array_unshift($currentImgs, $newImageUrl);
+            foreach ($res['images'] as $img) {
+                if (!in_array($img, $currentImgs, true)) $currentImgs[] = $img;
+            }
         }
         $newImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+    } elseif ($isExplicitReplace) {
+        if (!empty($currentImgs)) $replacedUrls[] = $currentImgs[0];
+        $currentImgs[0] = $res['images'][0];
+        if (count($res['images']) > 1) {
+            for ($i = 1; $i < count($res['images']); $i++) {
+                if (!in_array($res['images'][$i], $currentImgs, true)) {
+                    $currentImgs[] = $res['images'][$i];
+                }
+            }
+        }
+        $newImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+    } else {
+        // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
+        $newImages = array_slice(array_values(array_unique(array_merge($currentImgs, $res['images']))), 0, 4);
     }
 
-    $primaryUrl = $newImages[0] ?? $newImageUrl;
+    $primaryUrl = $newImages[0] ?? $res['primaryImageUrl'];
     $imagesJson = json_encode($newImages);
 
     $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
@@ -1046,9 +1093,16 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
 
     syncProductImagesRecordPHP($pdo, (int)$user['id'], $productId, $newImages, $res['filesInfo'] ?? []);
 
-    if ($oldImageUrl && $oldImageUrl !== $primaryUrl && str_contains($oldImageUrl, '/uploads/products/')) {
-        $oldFileName = basename(explode('?', $oldImageUrl)[0]);
-        safeDeleteLocalImageFilePHP($pdo, $oldFileName, $productId);
+    // Safe deletion of old physical file ONLY IF explicitly replaced and not present in newImages
+    foreach ($replacedUrls as $repUrl) {
+        if ($repUrl && !in_array($repUrl, $newImages, true) && str_contains($repUrl, '/uploads/products/')) {
+            $repFn = basename(explode('?', $repUrl)[0]);
+            try {
+                $delPi = $pdo->prepare("DELETE FROM product_images WHERE product_id = :pid AND file_name = :fn");
+                $delPi->execute([':pid' => $productId, ':fn' => $repFn]);
+            } catch (\Throwable $e) {}
+            safeDeleteLocalImageFilePHP($pdo, $repFn, $productId);
+        }
     }
 
     $fetchStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
@@ -1183,7 +1237,7 @@ function apiCreateProduct(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
     ensureProductPriceColumns($pdo);
-    $input = getJsonInput();
+    $input = array_merge($_POST, getJsonInput());
     $errors = [];
 
     $name = trim($input['name'] ?? '');
@@ -1348,7 +1402,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         errorResponse('Access denied. You do not own this product.', [], 403);
     }
 
-    $input = getJsonInput();
+    $input = array_merge($_POST, getJsonInput());
     $updates = [];
     $params = [':id' => $id];
 
@@ -1402,11 +1456,40 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     // Process uploaded file(s), base64, or image URLs if provided (up to 4 max)
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
     if (!empty($imgResult['hasImages']) && !empty($imgResult['images'])) {
+        $currentImgs = [];
+        if (!empty($product['images'])) {
+            $dec = json_decode($product['images'], true);
+            if (is_array($dec)) $currentImgs = $dec;
+        } elseif (!empty($product['image_url'])) {
+            $currentImgs = [$product['image_url']];
+        }
+
+        $isReplaceAll = !empty($input['replace_all']) || !empty($input['replace_images']) || (!empty($input['mode']) && $input['mode'] === 'replace');
+        $finalImages = [];
+
+        if ($isReplaceAll || empty($currentImgs)) {
+            $finalImages = array_slice($imgResult['images'], 0, 4);
+        } elseif (isset($input['image_index']) && is_numeric($input['image_index'])) {
+            $idx = (int)$input['image_index'];
+            if ($idx >= 0 && $idx < count($currentImgs)) {
+                $currentImgs[$idx] = $imgResult['primaryImageUrl'];
+            } else {
+                $currentImgs[] = $imgResult['primaryImageUrl'];
+            }
+            $finalImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+        } elseif (!empty($input['images']) && (is_array($input['images']) || (is_string($input['images']) && str_starts_with(trim($input['images']), '[')))) {
+            // Client explicitly sent the full array of retained images
+            $finalImages = array_slice($imgResult['images'], 0, 4);
+        } else {
+            // Files uploaded without explicit replacement array: keep existing images and append newly uploaded files up to 4
+            $finalImages = array_slice(array_values(array_unique(array_merge($currentImgs, $imgResult['images']))), 0, 4);
+        }
+
         $updates[] = "image_url = :image_url";
-        $params[':image_url'] = $imgResult['primaryImageUrl'];
+        $params[':image_url'] = $finalImages[0] ?? $imgResult['primaryImageUrl'];
         $updates[] = "images = :images";
-        $params[':images'] = $imgResult['imagesJson'];
-        syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $imgResult['images'], $imgResult['filesInfo'] ?? []);
+        $params[':images'] = json_encode($finalImages);
+        syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $finalImages, $imgResult['filesInfo'] ?? []);
     }
 
     if (isset($input['is_active'])) {

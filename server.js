@@ -501,9 +501,17 @@ function resolveProductImages(req) {
     }
   }
 
-  // Check all body keys for image candidates
+  // Prioritize explicit gallery array keys first to preserve exact order
+  const explicitGalleryKeys = ['images', 'image_urls', 'product_images', 'gallery', 'photos'];
+  for (const key of explicitGalleryKeys) {
+    if (body[key]) {
+      processCandidate(body[key]);
+    }
+  }
+
+  // Check all other body keys for image candidates
   for (const [k, v] of Object.entries(body)) {
-    if (!v) continue;
+    if (!v || explicitGalleryKeys.includes(k)) continue;
     const lowerKey = k.toLowerCase();
     if (
       lowerKey.includes('image') ||
@@ -2181,20 +2189,16 @@ function formatProductRecord(p, options = {}) {
     const parsedList = parseImagesJson(src);
     for (const item of parsedList) {
       const norm = normalizeUrl(item);
-      if (norm) imagesArray.push(norm);
+      if (norm && !imagesArray.includes(norm)) imagesArray.push(norm);
     }
-    if (imagesArray.length > 0) break;
   }
 
-  // If no multi-image gallery found, fall back to single image fields
-  if (imagesArray.length === 0) {
-    const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail, p.path];
-    for (const src of singleSources) {
-      const norm = normalizeUrl(src);
-      if (norm) {
-        imagesArray.push(norm);
-        break;
-      }
+  // Also include single image fields if not already in imagesArray
+  const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail, p.path];
+  for (const src of singleSources) {
+    const norm = normalizeUrl(src);
+    if (norm && !imagesArray.includes(norm)) {
+      imagesArray.push(norm);
     }
   }
 
@@ -2607,12 +2611,18 @@ app.get('/api/products/:id/images', async (req, res) => {
 
     const p = rows[0];
     const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
-    const images = parseImagesJson(p.images || p.image_url).map(u => {
+    let images = parseImagesJson(p.images || p.image_url).map(u => {
       const fn = path.basename(u.split('?')[0]);
       return u.includes('/uploads/products/') || /^prod_/.test(fn) ? `${baseUrl}/uploads/products/${fn}` : u;
     }).filter(Boolean);
 
     const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
+    for (const r of piRows) {
+      if (r.image_url && !images.includes(r.image_url)) {
+        images.push(r.image_url);
+      }
+    }
+    images = Array.from(new Set(images.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com')))).slice(0, 4);
 
     res.json({
       success: true,
@@ -2620,6 +2630,9 @@ app.get('/api/products/:id/images', async (req, res) => {
       product_id: prodId,
       image_url: images[0] || `${baseUrl}/uploads/products/placeholder.jpg`,
       images,
+      image_urls: images,
+      product_images: images,
+      gallery_urls: images,
       gallery: piRows.map(r => ({
         id: Number(r.id),
         image_url: r.image_url,
@@ -2627,7 +2640,8 @@ app.get('/api/products/:id/images', async (req, res) => {
         file_name: r.file_name,
         file_size: r.file_size ? Number(r.file_size) : null,
         mime_type: r.mime_type
-      }))
+      })),
+      total: images.length
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to retrieve product images.' });
@@ -2705,43 +2719,78 @@ const handleProductImageReplacement = async (req, res) => {
   }
 
   const oldImageUrl = existing[0].image_url;
-  const newImageUrl = imgResult.primaryImageUrl;
-  let newImages = [];
+  let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
+  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.query.replace_all === 'true';
+  const isExplicitReplace = req.body.mode === 'replace' || req.query.mode === 'replace' || req.body.action === 'replace';
 
-  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true';
-  let imgIndex = req.body.image_index !== undefined ? parseInt(req.body.image_index, 10) : 0;
+  let hasExplicitIndex = false;
+  let imgIndex = -1;
 
   if (req.params.image_id) {
+    hasExplicitIndex = true;
     const targetIdOrFile = req.params.image_id;
     if (/^\d+$/.test(targetIdOrFile)) {
       try {
         const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetIdOrFile, 10), prodId]);
         if (piRow.length > 0) {
           const fn = piRow[0].file_name;
-          const foundIdx = parseImagesJson(existing[0].images || existing[0].image_url).findIndex(u => u.includes(fn));
+          const foundIdx = currentImgs.findIndex(u => u.includes(fn));
           if (foundIdx !== -1) imgIndex = foundIdx;
         }
       } catch (e) {}
     } else {
       const safeFn = path.basename(targetIdOrFile.split('?')[0]);
-      const foundIdx = parseImagesJson(existing[0].images || existing[0].image_url).findIndex(u => u.includes(safeFn));
+      const foundIdx = currentImgs.findIndex(u => u.includes(safeFn));
       if (foundIdx !== -1) imgIndex = foundIdx;
     }
+  } else if (req.body.image_index !== undefined || req.query.image_index !== undefined || req.body.index !== undefined) {
+    hasExplicitIndex = true;
+    imgIndex = parseInt(req.body.image_index ?? req.query.image_index ?? req.body.index, 10);
   }
+
+  let newImages = [];
+  let replacedUrls = [];
 
   if (isReplaceAll) {
     newImages = imgResult.images.slice(0, 4);
-  } else {
-    let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
-    if (imgIndex >= 0 && imgIndex < currentImgs.length) {
-      currentImgs[imgIndex] = newImageUrl;
+    replacedUrls = currentImgs.filter(u => !newImages.includes(u));
+  } else if (hasExplicitIndex && imgIndex >= 0) {
+    // Explicit replace at specified slot index
+    if (imgIndex < currentImgs.length) {
+      replacedUrls.push(currentImgs[imgIndex]);
+      currentImgs[imgIndex] = imgResult.images[0];
+      // If multiple images were uploaded, append the extra images to subsequent slots up to 4
+      if (imgResult.images.length > 1) {
+        for (let i = 1; i < imgResult.images.length; i++) {
+          if (!currentImgs.includes(imgResult.images[i])) {
+            currentImgs.push(imgResult.images[i]);
+          }
+        }
+      }
     } else {
-      currentImgs = [newImageUrl, ...currentImgs];
+      // Index is beyond current array: append new images
+      for (const img of imgResult.images) {
+        if (!currentImgs.includes(img)) currentImgs.push(img);
+      }
     }
     newImages = Array.from(new Set(currentImgs)).slice(0, 4);
+  } else if (isExplicitReplace) {
+    // Explicit replace without index: replace primary (index 0)
+    if (currentImgs.length > 0) replacedUrls.push(currentImgs[0]);
+    currentImgs[0] = imgResult.images[0];
+    if (imgResult.images.length > 1) {
+      for (let i = 1; i < imgResult.images.length; i++) {
+        if (!currentImgs.includes(imgResult.images[i])) currentImgs.push(imgResult.images[i]);
+      }
+    }
+    newImages = Array.from(new Set(currentImgs)).slice(0, 4);
+  } else {
+    // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
+    // Appends new uploaded images to current gallery slots so seller can have multiple images (1/4, 2/4, 3/4, 4/4)
+    newImages = Array.from(new Set([...currentImgs, ...imgResult.images])).slice(0, 4);
   }
 
-  const primaryUrl = newImages[0] || newImageUrl;
+  const primaryUrl = newImages[0] || imgResult.primaryImageUrl;
   const imagesJson = JSON.stringify(newImages);
 
   try {
@@ -2753,10 +2802,13 @@ const handleProductImageReplacement = async (req, res) => {
     // Sync product_images table in MySQL
     await syncProductImagesRecord(pool, req.user.id, prodId, newImages, imgResult.filesInfo);
 
-    // Safe deletion of old physical file ONLY IF oldImageUrl is not used elsewhere
-    if (oldImageUrl && oldImageUrl !== primaryUrl && oldImageUrl.includes('/uploads/products/')) {
-      const oldFileName = path.basename(oldImageUrl.split('?')[0]);
-      await safeDeleteLocalImageFile(pool, oldFileName, prodId);
+    // Safe deletion of old physical file ONLY IF oldImageUrl was explicitly replaced and is not used anywhere else
+    for (const repUrl of replacedUrls) {
+      if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
+        const repFn = path.basename(repUrl.split('?')[0]);
+        await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, repFn]);
+        await safeDeleteLocalImageFile(pool, repFn, prodId);
+      }
     }
 
     const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
@@ -3124,8 +3176,38 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
   // Resolve newly uploaded image files, base64, or image URLs if provided (limit 4)
   const imgResult = resolveProductImages(req);
   if (imgResult.hasImages && imgResult.images.length > 0) {
+    const isReplaceAll = body.replace_all === true || body.replace_all === 'true' || body.replace_images === true || body.replace_images === 'true' || body.mode === 'replace';
+    let currentImgs = [];
+    try {
+      const [prodRows] = await pool.query('SELECT image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+      if (prodRows.length > 0) {
+        currentImgs = parseImagesJson(prodRows[0].images || prodRows[0].image_url);
+      }
+    } catch (e) {}
+
+    let finalImages = [];
+    if (isReplaceAll || currentImgs.length === 0) {
+      finalImages = imgResult.images.slice(0, 4);
+    } else if (body.image_index !== undefined || body.index !== undefined) {
+      const idx = parseInt(body.image_index ?? body.index, 10);
+      if (idx >= 0 && idx < currentImgs.length) {
+        currentImgs[idx] = imgResult.primaryImageUrl;
+      } else {
+        currentImgs.push(imgResult.primaryImageUrl);
+      }
+      finalImages = Array.from(new Set(currentImgs)).slice(0, 4);
+    } else if (body.images && (Array.isArray(body.images) || (typeof body.images === 'string' && body.images.trim().startsWith('[')))) {
+      // Client explicitly passed the full list of images to retain
+      finalImages = imgResult.images.slice(0, 4);
+    } else {
+      // Files uploaded without explicit replacement array: keep existing images and append newly uploaded files up to 4
+      finalImages = Array.from(new Set([...currentImgs, ...imgResult.images])).slice(0, 4);
+    }
+
+    const primaryUrl = finalImages[0] || imgResult.primaryImageUrl;
+    const imagesJson = JSON.stringify(finalImages);
     updates.push('image_url = ?', 'images = ?');
-    params.push(imgResult.primaryImageUrl, imgResult.imagesJson);
+    params.push(primaryUrl, imagesJson);
   }
 
   if (body.is_active !== undefined) {
