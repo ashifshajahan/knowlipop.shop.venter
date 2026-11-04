@@ -1023,15 +1023,19 @@ app.get('/api/health', async (req, res) => {
 app.get('/api/debug/db-inspect', async (req, res) => {
   try {
     await ensureProductPriceColumns(pool);
+    const [tables] = await pool.query('SHOW TABLES');
     const [recentProducts] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products ORDER BY id DESC LIMIT 30');
     const [allCount] = await pool.query('SELECT COUNT(*) as cnt, is_active FROM products GROUP BY is_active');
     const [matching] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products WHERE name LIKE "%Rty%" OR sku LIKE "%54%" OR id = 54');
+    const [matchingDesc] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products WHERE description LIKE "%Rt%"');
     const [recentProductImages] = await pool.query('SELECT * FROM product_images ORDER BY id DESC LIMIT 30');
     const [unattached] = await pool.query('SELECT * FROM product_images WHERE product_id IS NULL ORDER BY id DESC LIMIT 20');
     res.json({
       success: true,
+      tables,
       product_counts: allCount,
       matching_rty: matching,
+      matching_desc: matchingDesc,
       recent_products: recentProducts,
       recent_product_images: recentProductImages,
       unattached_images: unattached
