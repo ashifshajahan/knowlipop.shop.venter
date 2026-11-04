@@ -66,6 +66,28 @@ function calculatePricingBreakdown(array $input): array
     return resolveProductPricing($input);
 }
 
+function getImageBasename(?string $url): string {
+    if (!$url) return '';
+    $clean = explode('#', explode('?', trim($url))[0])[0];
+    if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $clean, $matches)) {
+        return strtolower($matches[1]);
+    }
+    return strtolower(basename($clean));
+}
+
+function dedupeImagesByFilename(array $list): array {
+    $result = [];
+    $seen = [];
+    foreach ($list as $item) {
+        if (!is_string($item) || empty(trim($item))) continue;
+        $key = getImageBasename($item);
+        if (empty($key) || in_array($key, $seen, true)) continue;
+        $seen[] = $key;
+        $result[] = $item;
+    }
+    return $result;
+}
+
 function formatProductRecord(array $p, bool $isSellerView = false): array
 {
     $rawPrice = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
@@ -137,8 +159,20 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         return $t;
     };
 
-    // Parse multiple product images across all supported formats and aliases
+    // Parse multiple product images across all supported formats and aliases with strict basename deduplication
     $imagesArray = [];
+    $seenProductKeys = [];
+
+    $addImageToRecord = function(?string $item) use (&$imagesArray, &$seenProductKeys, $normalizeUrl) {
+        if (!$item) return;
+        $norm = $normalizeUrl($item);
+        if (!$norm) return;
+        $key = getImageBasename($norm);
+        if (empty($key) || in_array($key, $seenProductKeys, true)) return;
+        $seenProductKeys[] = $key;
+        $imagesArray[] = $norm;
+    };
+
     $gallerySources = [
         $p['images'] ?? null,
         $p['image_urls'] ?? null,
@@ -151,35 +185,27 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         if (empty($src)) continue;
         if (is_array($src)) {
             foreach ($src as $item) {
-                if (is_string($item)) {
-                    $norm = $normalizeUrl($item);
-                    if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
-                }
+                if (is_string($item)) $addImageToRecord($item);
             }
         } elseif (is_string($src) && trim($src)) {
             $decoded = json_decode($src, true);
             if (is_array($decoded)) {
                 foreach ($decoded as $item) {
-                    if (is_string($item)) {
-                        $norm = $normalizeUrl($item);
-                        if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
-                    }
+                    if (is_string($item)) $addImageToRecord($item);
                 }
                 continue;
             }
             if (preg_match('/[,;\n\r|]/', $src)) {
                 foreach (preg_split('/[,;\n\r|]+/', $src) as $item) {
-                    $norm = $normalizeUrl($item);
-                    if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
+                    $addImageToRecord($item);
                 }
             } else {
-                $norm = $normalizeUrl($src);
-                if ($norm && !in_array($norm, $imagesArray, true)) $imagesArray[] = $norm;
+                $addImageToRecord($src);
             }
         }
     }
 
-    // Also include single image fields if not already in imagesArray
+    // Also include single image fields ONLY if not already in imagesArray
     $singleSources = [
         $p['image_url'] ?? null,
         $p['image'] ?? null,
@@ -190,20 +216,12 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     ];
     foreach ($singleSources as $src) {
         if (is_string($src)) {
-            $norm = $normalizeUrl($src);
-            if ($norm && !in_array($norm, $imagesArray, true)) {
-                $imagesArray[] = $norm;
-            }
+            $addImageToRecord($src);
         }
     }
 
-    // Deduplicate and filter out any external demo/sample images or placeholders
-    $imagesArray = array_values(array_filter(array_unique(array_filter($imagesArray)), function($u) {
-        return is_string($u) && !str_contains(strtolower($u), 'unsplash.com') && !str_contains(strtolower($u), 'placeholder');
-    }));
-
-    // Strictly enforce maximum 4 images per product
-    $imagesArray = array_slice($imagesArray, 0, 4);
+    // Strictly enforce maximum 4 images per product (no duplicates)
+    $imagesArray = array_slice(dedupeImagesByFilename($imagesArray), 0, 4);
 
     // If no image is uploaded, return an empty image list. Never insert or display an automatic image.
     $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : null;
@@ -478,8 +496,9 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
     $allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
     $dangerousExts = ['php', 'phtml', 'php5', 'exe', 'sh', 'bat', 'cmd', 'js', 'vbs', 'html', 'htm', 'cgi', 'pl'];
 
-    // Helper to process uploaded file with strict validation
-    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, $allowedExts, $allowedMimes, $dangerousExts, &$collected, &$filesInfo) {
+    // Helper to process uploaded file with strict validation and SHA-256 deduplication
+    $seenHashes = [];
+    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, $allowedExts, $allowedMimes, $dangerousExts, &$collected, &$filesInfo, &$seenHashes) {
         if (!empty($tmp) && is_uploaded_file($tmp)) {
             $ext = strtolower(pathinfo($origName ?: 'product.jpg', PATHINFO_EXTENSION));
             if (in_array($ext, $dangerousExts, true)) {
@@ -488,6 +507,12 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             if (filesize($tmp) > 15 * 1024 * 1024) {
                 return; // Exceeds 15MB
             }
+
+            $fileHash = @hash_file('sha256', $tmp);
+            if ($fileHash && in_array($fileHash, $seenHashes, true)) {
+                return; // Duplicate file upload in same request: ignore
+            }
+            if ($fileHash) $seenHashes[] = $fileHash;
 
             // Verify MIME type
             $mime = 'image/jpeg';
@@ -706,8 +731,8 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         $processCandidate($fallback);
     }
 
-    // Deduplicate
-    $uniqueImages = array_values(array_unique(array_filter($collected)));
+    // Deduplicate strictly by physical filename / basename
+    $uniqueImages = dedupeImagesByFilename(array_filter($collected));
     $hasImages = count($uniqueImages) > 0;
 
     // Strictly enforce seller multiple URL limit of 4 images
@@ -933,22 +958,32 @@ function apiGetProductImages(PDO $pdo, int $productId): void
     $piStmt->execute([':pid' => $productId]);
     $gallery = $piStmt->fetchAll(PDO::FETCH_ASSOC);
 
+    $galleryRows = [];
+    $seenGalleryKeys = [];
+    foreach ($gallery as $r) {
+        $k = getImageBasename($r['image_url'] ?? $r['file_name'] ?? '');
+        if (empty($k) || in_array($k, $seenGalleryKeys, true)) continue;
+        $seenGalleryKeys[] = $k;
+        $galleryRows[] = [
+            'id' => (int)$r['id'],
+            'image_url' => $r['image_url'],
+            'relative_path' => $r['relative_path'],
+            'file_name' => $r['file_name'],
+            'file_size' => $r['file_size'] ? (int)$r['file_size'] : null,
+            'mime_type' => $r['mime_type']
+        ];
+    }
+
     jsonResponse([
         'success' => true,
         'status' => true,
         'product_id' => $productId,
         'image_url' => $formatted['image_url'],
         'images' => $formatted['images'],
-        'gallery' => array_map(function($r) {
-            return [
-                'id' => (int)$r['id'],
-                'image_url' => $r['image_url'],
-                'relative_path' => $r['relative_path'],
-                'file_name' => $r['file_name'],
-                'file_size' => $r['file_size'] ? (int)$r['file_size'] : null,
-                'mime_type' => $r['mime_type']
-            ];
-        }, $gallery)
+        'image_urls' => $formatted['images'],
+        'product_images' => $formatted['images'],
+        'gallery' => $galleryRows,
+        'total' => count($formatted['images'])
     ]);
 }
 
@@ -1090,7 +1125,7 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
                 if (!in_array($img, $currentImgs, true)) $currentImgs[] = $img;
             }
         }
-        $newImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+        $newImages = array_slice(dedupeImagesByFilename($currentImgs), 0, 4);
     } elseif ($isExplicitReplace) {
         if (!empty($currentImgs)) $replacedUrls[] = $currentImgs[0];
         $currentImgs[0] = $res['images'][0];
@@ -1101,10 +1136,10 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
                 }
             }
         }
-        $newImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
+        $newImages = array_slice(dedupeImagesByFilename($currentImgs), 0, 4);
     } else {
         // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
-        $newImages = array_slice(array_values(array_unique(array_merge($currentImgs, $res['images']))), 0, 4);
+        $newImages = array_slice(dedupeImagesByFilename(array_merge($currentImgs, $res['images'])), 0, 4);
     }
 
     $primaryUrl = $newImages[0] ?? $res['primaryImageUrl'];
@@ -1282,29 +1317,32 @@ function apiCreateProduct(PDO $pdo): void
 
     // Process image file uploads, base64, or multiple images (up to 4 max). Never inject demo images or placeholders.
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
-    $finalImages = $imgResult['hasImages'] ? array_values(array_filter($imgResult['images'], function($u) {
+    $finalImages = $imgResult['hasImages'] ? dedupeImagesByFilename(array_values(array_filter($imgResult['images'], function($u) {
         return !str_contains(strtolower($u), 'placeholder') && !str_contains(strtolower($u), 'unsplash.com');
-    })) : [];
+    }))) : [];
 
-    // If fewer than 4 images, check for recently uploaded unattached images by this seller
-    if (count($finalImages) < 4) {
+    // ONLY check unattached if client provided ZERO images
+    if (empty($finalImages)) {
         try {
             $unStmt = $pdo->prepare("
                 SELECT image_url FROM product_images 
-                WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE 
+                WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE 
                 ORDER BY id ASC LIMIT 4
             ");
             $unStmt->execute([':sid' => (int)$user['id']]);
             $unRows = $unStmt->fetchAll(PDO::FETCH_ASSOC);
             foreach ($unRows as $ur) {
-                if (count($finalImages) < 4 && !in_array($ur['image_url'], $finalImages, true) && !str_contains(strtolower($ur['image_url']), 'placeholder') && !str_contains(strtolower($ur['image_url']), 'unsplash.com')) {
-                    $finalImages[] = $ur['image_url'];
+                if (count($finalImages) < 4 && !str_contains(strtolower($ur['image_url']), 'placeholder') && !str_contains(strtolower($ur['image_url']), 'unsplash.com')) {
+                    $k = getImageBasename($ur['image_url']);
+                    if (!in_array($k, array_map('getImageBasename', $finalImages), true)) {
+                        $finalImages[] = $ur['image_url'];
+                    }
                 }
             }
         } catch (\Throwable $e) {}
     }
 
-    $finalImages = array_slice($finalImages, 0, 4);
+    $finalImages = array_slice(dedupeImagesByFilename($finalImages), 0, 4);
     $finalPrimaryUrl = !empty($finalImages) ? $finalImages[0] : null;
     $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
 
@@ -1518,7 +1556,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
             if (count($imgResult['images']) > 4) {
                 errorResponse('Maximum 4 images allowed per product.', [], 422);
             }
-            $finalImages = array_slice($imgResult['images'], 0, 4);
+            $finalImages = array_slice(dedupeImagesByFilename($imgResult['images']), 0, 4);
         } elseif (isset($input['image_index']) && is_numeric($input['image_index'])) {
             $idx = (int)$input['image_index'];
             if ($idx >= 0 && $idx < count($currentImgs)) {
@@ -1526,16 +1564,16 @@ function apiUpdateProduct(PDO $pdo, int $id): void
             } else {
                 $currentImgs[] = $imgResult['primaryImageUrl'];
             }
-            if (count($currentImgs) > 4) {
+            $finalImages = array_slice(dedupeImagesByFilename($currentImgs), 0, 4);
+            if (count($finalImages) > 4) {
                 errorResponse('Maximum 4 images allowed per product.', [], 422);
             }
-            $finalImages = array_slice(array_values(array_unique($currentImgs)), 0, 4);
         } elseif (!empty($input['images']) && (is_array($input['images']) || (is_string($input['images']) && str_starts_with(trim($input['images']), '[')))) {
             // Client explicitly sent the full array of retained images
-            $finalImages = array_slice($imgResult['images'], 0, 4);
+            $finalImages = array_slice(dedupeImagesByFilename($imgResult['images']), 0, 4);
         } else {
             // Files uploaded without explicit replacement array: keep existing images and append newly uploaded files up to 4
-            $combined = array_values(array_unique(array_merge($currentImgs, $imgResult['images'])));
+            $combined = dedupeImagesByFilename(array_merge($currentImgs, $imgResult['images']));
             if (count($combined) > 4) {
                 errorResponse('Maximum 4 images allowed per product. Currently has ' . count($currentImgs) . ', cannot add ' . count($imgResult['images']) . ' more.', [], 422);
             }

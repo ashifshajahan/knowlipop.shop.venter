@@ -266,16 +266,34 @@ function handleMulterUpload(req, res, next) {
       });
     }
 
-    // Ensure permissions 0644 on all saved files
+    // Ensure permissions 0644 on all saved files and deduplicate identical file uploads (e.g. Flutter sending image + images[])
     if (req.files) {
       const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+      const seenHashes = new Set();
+      const uniqueFiles = [];
       for (const f of fileList) {
-        if (f && f.path) {
-          try { fs.chmodSync(f.path, 0o644); } catch (e) {}
+        if (!f || !f.path) continue;
+        try {
+          fs.chmodSync(f.path, 0o644);
+          const buf = fs.readFileSync(f.path);
+          const hash = crypto.createHash('sha256').update(buf).digest('hex');
+          if (seenHashes.has(hash)) {
+            // Duplicate file in same request: delete physical copy and omit from req.files
+            try { fs.unlinkSync(f.path); } catch (e) {}
+            continue;
+          }
+          seenHashes.add(hash);
+          uniqueFiles.push(f);
+        } catch (e) {
+          uniqueFiles.push(f);
         }
       }
-    }
-    if (req.file && req.file.path) {
+      req.files = uniqueFiles;
+      if (req.file) {
+        const found = uniqueFiles.find(f => f.path === req.file.path);
+        req.file = found || (uniqueFiles.length > 0 ? uniqueFiles[0] : null);
+      }
+    } else if (req.file && req.file.path) {
       try { fs.chmodSync(req.file.path, 0o644); } catch (e) {}
     }
     next();
@@ -344,10 +362,42 @@ function saveBase64Image(dataString) {
   }
 }
 
+function getImageBasename(url) {
+  if (!url || typeof url !== 'string') return '';
+  const clean = url.split('?')[0].split('#')[0].trim();
+  const fnMatch = clean.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
+  if (fnMatch) return fnMatch[1].toLowerCase();
+  return path.basename(clean).toLowerCase();
+}
+
+function dedupeImagesByFilename(list) {
+  if (!Array.isArray(list)) return [];
+  const result = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item || typeof item !== 'string') continue;
+    const key = getImageBasename(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
 function resolveProductImages(req) {
   const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
   const collected = [];
   const filesInfo = [];
+  const seenKeys = new Set();
+
+  function addCollected(url, info = null) {
+    if (!url || typeof url !== 'string') return;
+    const key = getImageBasename(url);
+    if (!key || seenKeys.has(key)) return;
+    seenKeys.add(key);
+    collected.push(url);
+    if (info) filesInfo.push(info);
+  }
 
   // 1. Multipart uploaded files from multer (req.files array, object, or single req.file)
   if (req.files) {
@@ -355,8 +405,7 @@ function resolveProductImages(req) {
     for (const f of fileList) {
       if (f && f.filename) {
         const fullUrl = `${baseUrl}/uploads/products/${f.filename}`;
-        collected.push(fullUrl);
-        filesInfo.push({
+        addCollected(fullUrl, {
           file_name: f.filename,
           relative_path: `uploads/products/${f.filename}`,
           image_url: fullUrl,
@@ -365,11 +414,9 @@ function resolveProductImages(req) {
         });
       }
     }
-  }
-  if (req.file && req.file.filename) {
+  } else if (req.file && req.file.filename) {
     const fullUrl = `${baseUrl}/uploads/products/${req.file.filename}`;
-    collected.push(fullUrl);
-    filesInfo.push({
+    addCollected(fullUrl, {
       file_name: req.file.filename,
       relative_path: `uploads/products/${req.file.filename}`,
       image_url: fullUrl,
@@ -466,8 +513,7 @@ function resolveProductImages(req) {
       if (isBase64Image(trimmed)) {
         const saved = saveBase64Image(trimmed);
         if (saved) {
-          collected.push(saved);
-          filesInfo.push({
+          addCollected(saved, {
             file_name: path.basename(saved),
             relative_path: `uploads/products/${path.basename(saved)}`,
             image_url: saved,
@@ -486,19 +532,19 @@ function resolveProductImages(req) {
       // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or device path)
       const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
       if (fnMatch) {
-        collected.push(`${baseUrl}/uploads/products/${fnMatch[1]}`);
+        addCollected(`${baseUrl}/uploads/products/${fnMatch[1]}`);
         return;
       }
 
       // Standard HTTP/HTTPS or relative upload URL or filename
       if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//')) {
         const fullUrl = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
-        collected.push(fullUrl);
+        addCollected(fullUrl);
       } else if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') || trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') || trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')) {
         const cleanPath = trimmed.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
-        collected.push(`${baseUrl}/${cleanPath}`);
+        addCollected(`${baseUrl}/${cleanPath}`);
       } else if (/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(trimmed)) {
-        collected.push(`${baseUrl}/uploads/products/${trimmed}`);
+        addCollected(`${baseUrl}/uploads/products/${trimmed}`);
       }
     }
   }
@@ -537,8 +583,8 @@ function resolveProductImages(req) {
     }
   }
 
-  // Deduplicate
-  let uniqueImages = Array.from(new Set(collected.filter(Boolean)));
+  // Deduplicate strictly by physical filename / basename
+  let uniqueImages = dedupeImagesByFilename(collected);
   const hasImages = uniqueImages.length > 0;
 
   // Strictly enforce seller multiple URL limit of 4 images
@@ -635,6 +681,16 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
           [sellerId, productId || null, imgUrl, relativePath, fileName, fileSize, mimeType]
         );
       }
+    }
+
+    if (productId) {
+      await pPool.query(`
+        DELETE pi1 FROM product_images pi1
+        INNER JOIN product_images pi2
+        WHERE pi1.id > pi2.id
+          AND pi1.product_id = ?
+          AND pi1.file_name = pi2.file_name
+      `, [productId]);
     }
   } catch (err) {
     console.error('[Product Images Sync Error]:', err.message);
@@ -2219,37 +2275,41 @@ function formatProductRecord(p, options = {}) {
     return t;
   };
 
-  // Parse multiple product images across all supported formats and aliases
-  let imagesArray = [];
+  // Parse multiple product images across all supported formats and aliases with strict basename deduplication
+  const imagesArray = [];
+  const seenProductKeys = new Set();
+
+  function addImageToRecord(item) {
+    const norm = normalizeUrl(item);
+    if (!norm) return;
+    const key = getImageBasename(norm);
+    if (!key || seenProductKeys.has(key)) return;
+    seenProductKeys.add(key);
+    imagesArray.push(norm);
+  }
+
   const gallerySources = [p.images, p.image_urls, p.product_images, p.gallery, p.photos];
   for (const src of gallerySources) {
     if (!src) continue;
     const parsedList = parseImagesJson(src);
     for (const item of parsedList) {
-      const norm = normalizeUrl(item);
-      if (norm && !imagesArray.includes(norm)) imagesArray.push(norm);
+      addImageToRecord(item);
     }
   }
 
-  // Also include single image fields if not already in imagesArray
+  // Also include single image fields ONLY if not already in imagesArray
   const singleSources = [p.image_url, p.image, p.product_image, p.photo, p.thumbnail, p.path];
   for (const src of singleSources) {
-    const norm = normalizeUrl(src);
-    if (norm && !imagesArray.includes(norm)) {
-      imagesArray.push(norm);
-    }
+    addImageToRecord(src);
   }
 
-  // Deduplicate and filter out any external demo/sample images or placeholders
-  imagesArray = Array.from(new Set(imagesArray.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com') && !u.toLowerCase().includes('placeholder'))));
-
-  // Strictly enforce maximum 4 images per product
-  imagesArray = imagesArray.slice(0, 4);
+  // Strictly enforce maximum 4 images per product (no duplicates)
+  const finalImagesArray = dedupeImagesByFilename(imagesArray).slice(0, 4);
 
   // If no image is uploaded, return an empty image list. Never insert or display an automatic image.
-  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : null;
+  const primaryImageUrl = finalImagesArray.length > 0 ? finalImagesArray[0] : null;
 
-  const relativePaths = imagesArray.map(u => {
+  const relativePaths = finalImagesArray.map(u => {
     const fn = path.basename(u.split('?')[0]);
     return u.includes('/uploads/products/') ? `uploads/products/${fn}` : u;
   });
@@ -2284,14 +2344,14 @@ function formatProductRecord(p, options = {}) {
     photo: primaryImageUrl,
     path: primaryRelative,
     relative_path: relativePaths[0] || null,
-    images: imagesArray,
-    image_urls: imagesArray,
-    product_images: imagesArray,
-    gallery: imagesArray,
-    photos: imagesArray,
+    images: finalImagesArray,
+    image_urls: finalImagesArray,
+    product_images: finalImagesArray,
+    gallery: finalImagesArray,
+    photos: finalImagesArray,
     image_paths: relativePaths,
     relative_paths: relativePaths,
-    gallery_items: imagesArray.map((u, i) => ({
+    gallery_items: finalImagesArray.map((u, i) => ({
       id: i + 1,
       product_id: Number(p.id),
       image_url: u,
@@ -2436,6 +2496,29 @@ async function ensureProductPriceColumns(p) {
           INDEX idx_pi_seller (seller_id),
           INDEX idx_pi_product (product_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+      `);
+    } catch (e) {}
+
+    // 8. Deduplicate images for any products that contain duplicate images in their images column or product_images table
+    try {
+      const [allProds] = await p.query('SELECT id, image_url, images FROM products WHERE images IS NOT NULL');
+      for (const prod of allProds) {
+        if (!prod.images) continue;
+        const parsed = parseImagesJson(prod.images);
+        const deduped = dedupeImagesByFilename(parsed).slice(0, 4);
+        if (deduped.length !== parsed.length) {
+          const prim = deduped[0] || null;
+          const j = deduped.length > 0 ? JSON.stringify(deduped) : null;
+          await p.query('UPDATE products SET image_url = ?, images = ? WHERE id = ?', [prim, j, prod.id]);
+        }
+      }
+      await p.query(`
+        DELETE pi1 FROM product_images pi1
+        INNER JOIN product_images pi2
+        WHERE pi1.id > pi2.id
+          AND pi1.product_id IS NOT NULL
+          AND pi1.product_id = pi2.product_id
+          AND pi1.file_name = pi2.file_name
       `);
     } catch (e) {}
   } catch (err) {
@@ -2687,13 +2770,35 @@ app.get('/api/products/:id/images', async (req, res) => {
       return u.includes('/uploads/products/') || /^prod_/.test(fn) ? `${baseUrl}/uploads/products/${fn}` : u;
     }).filter(Boolean);
 
+    images = dedupeImagesByFilename(images);
+
     const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
     for (const r of piRows) {
-      if (r.image_url && !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com') && !images.includes(r.image_url)) {
-        images.push(r.image_url);
+      if (r.image_url && !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com')) {
+        const k = getImageBasename(r.image_url);
+        if (images.length < 4 && !images.some(img => getImageBasename(img) === k)) {
+          images.push(r.image_url);
+        }
       }
     }
-    images = Array.from(new Set(images.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com') && !u.toLowerCase().includes('placeholder')))).slice(0, 4);
+    images = dedupeImagesByFilename(images).slice(0, 4);
+
+    const galleryList = [];
+    const seenGalleryKeys = new Set();
+    for (const r of piRows) {
+      if (!r.image_url || r.image_url.includes('placeholder') || r.image_url.includes('unsplash.com')) continue;
+      const k = getImageBasename(r.image_url);
+      if (seenGalleryKeys.has(k)) continue;
+      seenGalleryKeys.add(k);
+      galleryList.push({
+        id: Number(r.id),
+        image_url: r.image_url,
+        relative_path: r.relative_path,
+        file_name: r.file_name,
+        file_size: r.file_size ? Number(r.file_size) : null,
+        mime_type: r.mime_type
+      });
+    }
 
     res.json({
       success: true,
@@ -2704,14 +2809,7 @@ app.get('/api/products/:id/images', async (req, res) => {
       image_urls: images,
       product_images: images,
       gallery_urls: images,
-      gallery: piRows.filter(r => !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com')).map(r => ({
-        id: Number(r.id),
-        image_url: r.image_url,
-        relative_path: r.relative_path,
-        file_name: r.file_name,
-        file_size: r.file_size ? Number(r.file_size) : null,
-        mime_type: r.mime_type
-      })),
+      gallery: galleryList,
       total: images.length
     });
   } catch (err) {
@@ -2853,7 +2951,7 @@ const handleProductImageReplacement = async (req, res) => {
         limit: 4
       });
     }
-    newImages = Array.from(new Set(currentImgs)).slice(0, 4);
+    newImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
   } else if (isExplicitReplace) {
     // Explicit replace without index: replace primary (index 0)
     if (currentImgs.length > 0) replacedUrls.push(currentImgs[0]);
@@ -2863,11 +2961,11 @@ const handleProductImageReplacement = async (req, res) => {
         if (!currentImgs.includes(imgResult.images[i])) currentImgs.push(imgResult.images[i]);
       }
     }
-    newImages = Array.from(new Set(currentImgs)).slice(0, 4);
+    newImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
   } else {
     // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
     // Appends new uploaded images to current gallery slots so seller can have multiple images (1/4, 2/4, 3/4, 4/4)
-    const combined = Array.from(new Set([...currentImgs, ...imgResult.images]));
+    const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
     if (combined.length > 4) {
       return res.status(422).json({
         message: `Maximum 4 images allowed per product. Product already has ${currentImgs.length} image(s), cannot add ${imgResult.images.length} more.`,
@@ -3045,25 +3143,28 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const mrp = pricing.mrp;
 
   // Use seller's uploaded/provided images (up to 4 max). Never inject demo, sample, or placeholder images.
-  let finalImages = imgResult.hasImages ? imgResult.images.filter(u => !u.includes('placeholder') && !u.includes('unsplash.com')).slice(0, 4) : [];
+  let finalImages = imgResult.hasImages ? dedupeImagesByFilename(imgResult.images.filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'))).slice(0, 4) : [];
 
-  // If client provided fewer than 4 images, check if the seller uploaded unattached images in the last 15 minutes
-  if (finalImages.length < 4) {
+  // ONLY if client provided ZERO images in body or files, check if the seller uploaded unattached images in the last 5 minutes
+  if (finalImages.length === 0) {
     try {
       const [unattached] = await pool.query(
-        'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE ORDER BY id ASC LIMIT ?',
-        [req.user.id, 4 - finalImages.length]
+        'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE ORDER BY id ASC LIMIT 4',
+        [req.user.id]
       );
       for (const u of unattached) {
-        if (finalImages.length < 4 && !finalImages.includes(u.image_url) && !u.image_url.includes('placeholder') && !u.image_url.includes('unsplash.com')) {
+        if (finalImages.length >= 4) break;
+        if (!u.image_url || u.image_url.includes('placeholder') || u.image_url.includes('unsplash.com')) continue;
+        const k = getImageBasename(u.image_url);
+        if (!finalImages.some(img => getImageBasename(img) === k)) {
           finalImages.push(u.image_url);
         }
       }
     } catch (e) {}
   }
 
-  // Strictly enforce max 4 real seller uploaded images
-  finalImages = finalImages.slice(0, 4);
+  // Strictly enforce max 4 real seller uploaded images (strictly deduplicated)
+  finalImages = dedupeImagesByFilename(finalImages).slice(0, 4);
 
   // If no image is uploaded, return an empty image list. Never insert or display an automatic image.
   const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
@@ -3309,7 +3410,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       if (imgResult.images.length > 4) {
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
       }
-      finalImages = imgResult.images.slice(0, 4);
+      finalImages = dedupeImagesByFilename(imgResult.images).slice(0, 4);
     } else if (body.image_index !== undefined || body.index !== undefined) {
       const idx = parseInt(body.image_index ?? body.index, 10);
       if (idx >= 0 && idx < currentImgs.length) {
@@ -3317,16 +3418,16 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       } else {
         currentImgs.push(imgResult.primaryImageUrl);
       }
-      if (currentImgs.length > 4) {
+      finalImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
+      if (finalImages.length > 4) {
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
-      finalImages = Array.from(new Set(currentImgs)).slice(0, 4);
     } else if (body.images && (Array.isArray(body.images) || (typeof body.images === 'string' && body.images.trim().startsWith('[')))) {
       // Client explicitly passed the full list of images to retain
-      finalImages = imgResult.images.slice(0, 4);
+      finalImages = dedupeImagesByFilename(imgResult.images).slice(0, 4);
     } else {
       // Files uploaded without explicit replacement array: preserve existing images and append newly uploaded files up to 4
-      const combined = Array.from(new Set([...currentImgs, ...imgResult.images]));
+      const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
       if (combined.length > 4) {
         return res.status(422).json({
           message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length}, cannot add ${imgResult.images.length} more.`,
