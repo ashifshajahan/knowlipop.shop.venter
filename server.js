@@ -1023,11 +1023,15 @@ app.get('/api/health', async (req, res) => {
 app.get('/api/debug/db-inspect', async (req, res) => {
   try {
     await ensureProductPriceColumns(pool);
-    const [recentProducts] = await pool.query('SELECT id, seller_id, name, stock, image_url, images, created_at, updated_at FROM products ORDER BY id DESC LIMIT 10');
+    const [recentProducts] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products ORDER BY id DESC LIMIT 30');
+    const [allCount] = await pool.query('SELECT COUNT(*) as cnt, is_active FROM products GROUP BY is_active');
+    const [matching] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products WHERE name LIKE "%Rty%" OR sku LIKE "%54%" OR id = 54');
     const [recentProductImages] = await pool.query('SELECT * FROM product_images ORDER BY id DESC LIMIT 30');
     const [unattached] = await pool.query('SELECT * FROM product_images WHERE product_id IS NULL ORDER BY id DESC LIMIT 20');
     res.json({
       success: true,
+      product_counts: allCount,
+      matching_rty: matching,
       recent_products: recentProducts,
       recent_product_images: recentProductImages,
       unattached_images: unattached
@@ -2396,6 +2400,20 @@ async function ensureProductPriceColumns(p) {
         DELETE FROM product_images 
         WHERE image_url LIKE '%unsplash.com%' OR relative_path LIKE '%unsplash.com%' OR file_name LIKE '%unsplash%'
       `);
+    } catch (e) {}
+    // 6. Split multi-URL strings in image_url (e.g. pasted with newlines or commas) into clean images array
+    try {
+      const [malformed] = await p.query("SELECT id, image_url FROM products WHERE image_url LIKE '%\n%' OR image_url LIKE '%\r%'");
+      for (const m of malformed) {
+        const splitUrls = m.image_url.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+        if (splitUrls.length > 1) {
+          await p.query("UPDATE products SET image_url = ?, images = ? WHERE id = ?", [splitUrls[0], JSON.stringify(splitUrls.slice(0, 4)), m.id]);
+        }
+      }
+    } catch (e) {}
+    // 7. Ensure every product has valid images JSON array
+    try {
+      await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE (images IS NULL OR images = 'null' OR images = '[]' OR images = '') AND image_url IS NOT NULL AND image_url != ''");
     } catch (e) {}
     // Ensure product_images table exists
     try {
