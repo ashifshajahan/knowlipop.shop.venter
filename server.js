@@ -172,7 +172,7 @@ app.use((req, res, next) => {
     return res.sendFile(targetPath);
   }
 
-  // Graceful Fallback if file does not exist on disk: NEVER redirect to external sample/demo URLs
+  // File not found on disk: Never redirect to external sample/demo URLs or automatic placeholders
   if (isAvatar) {
     const avatarPlaceholder = path.join(avatarUploadDir, 'placeholder.jpg');
     if (fs.existsSync(avatarPlaceholder)) {
@@ -180,28 +180,10 @@ app.use((req, res, next) => {
       res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.sendFile(avatarPlaceholder);
     }
-    const genericPlaceholder = path.join(uploadDir, 'placeholder.jpg');
-    if (fs.existsSync(genericPlaceholder)) {
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      return res.sendFile(genericPlaceholder);
-    }
-    return res.status(404).json({ message: 'Avatar not found.' });
+    return res.status(404).json({ message: 'Avatar image not found.' });
   }
 
-  const placeholder = path.join(uploadDir, 'placeholder.jpg');
-  if (fs.existsSync(placeholder)) {
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    return res.sendFile(placeholder);
-  }
-  const samplePng = path.join(uploadDir, 'prod_1793598726521_793ff4ae.png');
-  if (fs.existsSync(samplePng)) {
-    res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    return res.sendFile(samplePng);
-  }
-  return res.status(404).json({ message: 'No image available.' });
+  return res.status(404).json({ message: 'Product image not found.' });
 });
 
 // Secondary static directories mounting for direct file paths
@@ -496,8 +478,13 @@ function resolveProductImages(req) {
         }
       }
 
+      // Reject external demo/sample images (e.g. Unsplash) and placeholder images
+      if (trimmed.toLowerCase().includes('unsplash.com') || trimmed.toLowerCase().includes('placeholder')) {
+        return;
+      }
+
       // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or device path)
-      const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png))/i);
+      const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
       if (fnMatch) {
         collected.push(`${baseUrl}/uploads/products/${fnMatch[1]}`);
         return;
@@ -2202,8 +2189,13 @@ function formatProductRecord(p, options = {}) {
     }
     if (!t || t.startsWith('blob:') || t.startsWith('file:') || t.startsWith('/data/user/') || t.startsWith('/var/mobile/')) return null;
 
+    // Reject external demo/sample images (e.g. Unsplash) and placeholder images
+    if (t.toLowerCase().includes('unsplash.com') || t.toLowerCase().includes('placeholder')) {
+      return null;
+    }
+
     // Check if string contains a product image filename anywhere (e.g. mangled/double URLs)
-    const fnMatch = t.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png))/i);
+    const fnMatch = t.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
     if (fnMatch) {
       return `${baseUrl}/uploads/products/${fnMatch[1]}`;
     }
@@ -2219,6 +2211,10 @@ function formatProductRecord(p, options = {}) {
     if (t.startsWith('/uploads/') || t.startsWith('uploads/') || t.startsWith('/storage/') || t.startsWith('storage/') || t.startsWith('/public/uploads/') || t.startsWith('public/uploads/')) {
       const clean = t.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
       return `${baseUrl}/${clean}`;
+    }
+    if (/\.(jpg|jpeg|png|webp|gif|svg)(\?.*)?$/i.test(t)) {
+      const fn = path.basename(t.split('?')[0]);
+      return `${baseUrl}/uploads/products/${fn}`;
     }
     return t;
   };
@@ -2244,17 +2240,14 @@ function formatProductRecord(p, options = {}) {
     }
   }
 
-  // Deduplicate and filter out any external demo/sample images (e.g. Unsplash demo URLs)
-  imagesArray = Array.from(new Set(imagesArray.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com'))));
+  // Deduplicate and filter out any external demo/sample images or placeholders
+  imagesArray = Array.from(new Set(imagesArray.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com') && !u.toLowerCase().includes('placeholder'))));
 
-  // If seller uploaded no images, use neutral "No image available" state
-  const placeholderUrl = `${baseUrl}/uploads/products/placeholder.jpg`;
-  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : placeholderUrl;
-  if (imagesArray.length === 0) {
-    imagesArray = [placeholderUrl];
-  } else {
-    imagesArray = imagesArray.slice(0, 4);
-  }
+  // Strictly enforce maximum 4 images per product
+  imagesArray = imagesArray.slice(0, 4);
+
+  // If no image is uploaded, return an empty image list. Never insert or display an automatic image.
+  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : null;
 
   const relativePaths = imagesArray.map(u => {
     const fn = path.basename(u.split('?')[0]);
@@ -2394,17 +2387,19 @@ async function ensureProductPriceColumns(p) {
     try {
       await p.query("UPDATE products SET sku = CONCAT('SKU-', LPAD(id, 4, '0')) WHERE sku IS NULL OR sku = ''");
     } catch (e) {}
-    // 5. Cleanse any leftover external sample/demo images (e.g. Unsplash demo URLs) from database
+    // 5. Cleanse any leftover external sample/demo images (e.g. Unsplash demo URLs) and placeholders from database
     try {
       await p.query(`
         UPDATE products 
-        SET image_url = 'https://knowlipop.shop/uploads/products/placeholder.jpg',
-            images = '["https://knowlipop.shop/uploads/products/placeholder.jpg"]'
+        SET image_url = NULL,
+            images = NULL
         WHERE image_url LIKE '%unsplash.com%' OR images LIKE '%unsplash.com%'
+           OR image_url LIKE '%placeholder%' OR images LIKE '%placeholder%'
       `);
       await p.query(`
         DELETE FROM product_images 
         WHERE image_url LIKE '%unsplash.com%' OR relative_path LIKE '%unsplash.com%' OR file_name LIKE '%unsplash%'
+           OR image_url LIKE '%placeholder%' OR relative_path LIKE '%placeholder%' OR file_name LIKE '%placeholder%'
       `);
     } catch (e) {}
     // 6. Split multi-URL strings in image_url (e.g. pasted with newlines or commas) into clean images array
@@ -2417,9 +2412,11 @@ async function ensureProductPriceColumns(p) {
         }
       }
     } catch (e) {}
-    // 7. Ensure every product has valid images JSON array
+    // 7. Ensure every product with a real image_url has valid images JSON array, otherwise NULL
     try {
-      await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE (images IS NULL OR images = 'null' OR images = '[]' OR images = '') AND image_url IS NOT NULL AND image_url != ''");
+      await p.query("UPDATE products SET images = JSON_ARRAY(image_url) WHERE (images IS NULL OR images = 'null' OR images = '[]' OR images = '') AND image_url IS NOT NULL AND image_url != '' AND image_url NOT LIKE '%placeholder%' AND image_url NOT LIKE '%unsplash%'");
+      await p.query("UPDATE products SET images = NULL WHERE images = '[]' OR images = '[\"\"]' OR images = 'null'");
+      await p.query("UPDATE products SET image_url = NULL WHERE image_url = '' OR image_url = 'null'");
     } catch (e) {}
     // Ensure product_images table exists
     try {
@@ -2447,14 +2444,14 @@ async function ensureProductPriceColumns(p) {
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: null, images: [], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: null, images: [], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: null, images: [], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: null, images: [], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: null, images: [], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: null, images: [], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: null, images: [], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: null, images: [], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
@@ -2604,27 +2601,44 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
       const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
       let existingImgs = [];
       try {
-        existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url);
+        existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
       } catch (e) {}
 
-      let combinedImgs = isReplace ? imgResult.images : Array.from(new Set([...existingImgs, ...imgResult.images])).slice(0, 4);
-      const primaryUrl = combinedImgs[0] || imgResult.primaryImageUrl;
-      const imagesJson = JSON.stringify(combinedImgs);
+      let combinedImgs = isReplace ? imgResult.images : Array.from(new Set([...existingImgs, ...imgResult.images]));
+      if (combinedImgs.length > 4) {
+        return res.status(422).json({
+          message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
+          current_count: existingImgs.length,
+          attempted_to_add: imgResult.images.length,
+          limit: 4
+        });
+      }
+
+      const primaryUrl = combinedImgs[0] || null;
+      const imagesJson = combinedImgs.length > 0 ? JSON.stringify(combinedImgs) : null;
 
       await pool.query(
         'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
         [primaryUrl, imagesJson, targetProductId]
       );
 
+      // Sync permanent records in product_images table in MySQL
+      await syncProductImagesRecord(pool, sellerId, targetProductId, combinedImgs, imgResult.filesInfo);
+
       const [updatedRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
       attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true });
     } catch (dbErr) {
       console.error('[Upload Product Attach Error]:', dbErr.message);
+      return res.status(500).json({ message: 'Failed to update product images in database: ' + dbErr.message });
+    }
+  } else {
+    try {
+      await syncProductImagesRecord(pool, sellerId, null, imgResult.images, imgResult.filesInfo);
+    } catch (dbErr) {
+      console.error('[Upload Sync Error]:', dbErr.message);
+      return res.status(500).json({ message: 'Failed to record image in database: ' + dbErr.message });
     }
   }
-
-  // Record permanent images into product_images table in MySQL
-  await syncProductImagesRecord(pool, sellerId, targetProductId, imgResult.images, imgResult.filesInfo);
 
   const relativePaths = imgResult.images.map(u => {
     const fn = path.basename(u.split('?')[0]);
@@ -2668,28 +2682,29 @@ app.get('/api/products/:id/images', async (req, res) => {
     const p = rows[0];
     const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
     let images = parseImagesJson(p.images || p.image_url).map(u => {
+      if (!u || u.includes('placeholder') || u.includes('unsplash.com')) return null;
       const fn = path.basename(u.split('?')[0]);
       return u.includes('/uploads/products/') || /^prod_/.test(fn) ? `${baseUrl}/uploads/products/${fn}` : u;
     }).filter(Boolean);
 
     const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
     for (const r of piRows) {
-      if (r.image_url && !images.includes(r.image_url)) {
+      if (r.image_url && !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com') && !images.includes(r.image_url)) {
         images.push(r.image_url);
       }
     }
-    images = Array.from(new Set(images.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com')))).slice(0, 4);
+    images = Array.from(new Set(images.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com') && !u.toLowerCase().includes('placeholder')))).slice(0, 4);
 
     res.json({
       success: true,
       status: true,
       product_id: prodId,
-      image_url: images[0] || `${baseUrl}/uploads/products/placeholder.jpg`,
+      image_url: images[0] || null,
       images,
       image_urls: images,
       product_images: images,
       gallery_urls: images,
-      gallery: piRows.map(r => ({
+      gallery: piRows.filter(r => !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com')).map(r => ({
         id: Number(r.id),
         image_url: r.image_url,
         relative_path: r.relative_path,
@@ -2775,7 +2790,7 @@ const handleProductImageReplacement = async (req, res) => {
   }
 
   const oldImageUrl = existing[0].image_url;
-  let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url);
+  let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
   const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.query.replace_all === 'true';
   const isExplicitReplace = req.body.mode === 'replace' || req.query.mode === 'replace' || req.body.action === 'replace';
 
@@ -2808,6 +2823,9 @@ const handleProductImageReplacement = async (req, res) => {
   let replacedUrls = [];
 
   if (isReplaceAll) {
+    if (imgResult.images.length > 4) {
+      return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
+    }
     newImages = imgResult.images.slice(0, 4);
     replacedUrls = currentImgs.filter(u => !newImages.includes(u));
   } else if (hasExplicitIndex && imgIndex >= 0) {
@@ -2829,6 +2847,12 @@ const handleProductImageReplacement = async (req, res) => {
         if (!currentImgs.includes(img)) currentImgs.push(img);
       }
     }
+    if (currentImgs.length > 4) {
+      return res.status(422).json({
+        message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length} images.`,
+        limit: 4
+      });
+    }
     newImages = Array.from(new Set(currentImgs)).slice(0, 4);
   } else if (isExplicitReplace) {
     // Explicit replace without index: replace primary (index 0)
@@ -2843,11 +2867,20 @@ const handleProductImageReplacement = async (req, res) => {
   } else {
     // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
     // Appends new uploaded images to current gallery slots so seller can have multiple images (1/4, 2/4, 3/4, 4/4)
-    newImages = Array.from(new Set([...currentImgs, ...imgResult.images])).slice(0, 4);
+    const combined = Array.from(new Set([...currentImgs, ...imgResult.images]));
+    if (combined.length > 4) {
+      return res.status(422).json({
+        message: `Maximum 4 images allowed per product. Product already has ${currentImgs.length} image(s), cannot add ${imgResult.images.length} more.`,
+        current_count: currentImgs.length,
+        attempted_to_add: imgResult.images.length,
+        limit: 4
+      });
+    }
+    newImages = combined;
   }
 
-  const primaryUrl = newImages[0] || imgResult.primaryImageUrl;
-  const imagesJson = JSON.stringify(newImages);
+  const primaryUrl = newImages[0] || null;
+  const imagesJson = newImages.length > 0 ? JSON.stringify(newImages) : null;
 
   try {
     await pool.query(
@@ -3011,24 +3044,28 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
 
-  // Use seller's uploaded/provided images (up to 4 max). Never inject demo or sample images.
-  let finalImages = imgResult.hasImages ? imgResult.images.slice(0, 4) : [];
+  // Use seller's uploaded/provided images (up to 4 max). Never inject demo, sample, or placeholder images.
+  let finalImages = imgResult.hasImages ? imgResult.images.filter(u => !u.includes('placeholder') && !u.includes('unsplash.com')).slice(0, 4) : [];
 
   // If client provided fewer than 4 images, check if the seller uploaded unattached images in the last 15 minutes
   if (finalImages.length < 4) {
     try {
       const [unattached] = await pool.query(
-        'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE ORDER BY id ASC LIMIT 4',
-        [req.user.id]
+        'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 15 MINUTE ORDER BY id ASC LIMIT ?',
+        [req.user.id, 4 - finalImages.length]
       );
       for (const u of unattached) {
-        if (finalImages.length < 4 && !finalImages.includes(u.image_url)) {
+        if (finalImages.length < 4 && !finalImages.includes(u.image_url) && !u.image_url.includes('placeholder') && !u.image_url.includes('unsplash.com')) {
           finalImages.push(u.image_url);
         }
       }
     } catch (e) {}
   }
 
+  // Strictly enforce max 4 real seller uploaded images
+  finalImages = finalImages.slice(0, 4);
+
+  // If no image is uploaded, return an empty image list. Never insert or display an automatic image.
   const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
   const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
 
@@ -3263,12 +3300,15 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
     try {
       const [prodRows] = await pool.query('SELECT image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
       if (prodRows.length > 0) {
-        currentImgs = parseImagesJson(prodRows[0].images || prodRows[0].image_url);
+        currentImgs = parseImagesJson(prodRows[0].images || prodRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
       }
     } catch (e) {}
 
     let finalImages = [];
     if (isReplaceAll || currentImgs.length === 0) {
+      if (imgResult.images.length > 4) {
+        return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
+      }
       finalImages = imgResult.images.slice(0, 4);
     } else if (body.image_index !== undefined || body.index !== undefined) {
       const idx = parseInt(body.image_index ?? body.index, 10);
@@ -3277,17 +3317,29 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       } else {
         currentImgs.push(imgResult.primaryImageUrl);
       }
+      if (currentImgs.length > 4) {
+        return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
+      }
       finalImages = Array.from(new Set(currentImgs)).slice(0, 4);
     } else if (body.images && (Array.isArray(body.images) || (typeof body.images === 'string' && body.images.trim().startsWith('[')))) {
       // Client explicitly passed the full list of images to retain
       finalImages = imgResult.images.slice(0, 4);
     } else {
-      // Files uploaded without explicit replacement array: keep existing images and append newly uploaded files up to 4
-      finalImages = Array.from(new Set([...currentImgs, ...imgResult.images])).slice(0, 4);
+      // Files uploaded without explicit replacement array: preserve existing images and append newly uploaded files up to 4
+      const combined = Array.from(new Set([...currentImgs, ...imgResult.images]));
+      if (combined.length > 4) {
+        return res.status(422).json({
+          message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length}, cannot add ${imgResult.images.length} more.`,
+          current_count: currentImgs.length,
+          attempted_to_add: imgResult.images.length,
+          limit: 4
+        });
+      }
+      finalImages = combined;
     }
 
-    const primaryUrl = finalImages[0] || imgResult.primaryImageUrl;
-    const imagesJson = JSON.stringify(finalImages);
+    const primaryUrl = finalImages[0] || null;
+    const imagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
     updates.push('image_url = ?', 'images = ?');
     params.push(primaryUrl, imagesJson);
   }
@@ -3304,7 +3356,9 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       await pool.query(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`, params);
 
       if (imgResult.hasImages && imgResult.images.length > 0) {
-        await syncProductImagesRecord(pool, req.user.id, req.params.id, imgResult.images, imgResult.filesInfo);
+        const [freshRows] = await pool.query('SELECT images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+        const freshImgs = freshRows.length > 0 ? parseImagesJson(freshRows[0].images) : [];
+        await syncProductImagesRecord(pool, req.user.id, req.params.id, freshImgs, imgResult.filesInfo);
       }
     }
 
@@ -4840,14 +4894,14 @@ const handleCreateOrder = async (req, res) => {
 
   // Fallback map for seed catalog products
   const defaultProductCatalogMap = {
-    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
-    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' }
+    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: null },
+    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: null },
+    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: null },
+    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: null },
+    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: null },
+    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: null },
+    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: null },
+    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: null }
   };
 
   // 1. Pre-query product catalog from MySQL to auto-resolve accurate prices, names, images, and seller_ids
