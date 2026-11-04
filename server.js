@@ -1030,9 +1030,11 @@ app.get('/api/debug/db-inspect', async (req, res) => {
     const [matchingDesc] = await pool.query('SELECT id, seller_id, name, sku, stock, is_active, image_url, images, created_at, updated_at FROM products WHERE description LIKE "%Rt%"');
     const [recentProductImages] = await pool.query('SELECT * FROM product_images ORDER BY id DESC LIMIT 30');
     const [unattached] = await pool.query('SELECT * FROM product_images WHERE product_id IS NULL ORDER BY id DESC LIMIT 20');
+    const [users] = await pool.query('SELECT id, name, seller_name, phone, role, created_at, updated_at FROM users ORDER BY id DESC LIMIT 20');
     res.json({
       success: true,
       tables,
+      users,
       product_counts: allCount,
       matching_rty: matching,
       matching_desc: matchingDesc,
