@@ -2661,6 +2661,10 @@ let fallbackOrders = [
   }
 ];
 
+// In-memory fallback notifications & device tokens
+let fallbackNotifications = [];
+let fallbackDeviceTokens = [];
+
 function getOptionalUser(req) {
   if (req.user) return req.user;
   const authHeader = req.headers['authorization'];
@@ -2696,6 +2700,10 @@ async function ensureOrdersTables(p) {
         discount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
         total_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
         notes TEXT NULL DEFAULT NULL,
+        rejection_reason TEXT NULL DEFAULT NULL,
+        cancellation_reason TEXT NULL DEFAULT NULL,
+        shipped_at TIMESTAMP NULL DEFAULT NULL,
+        delivered_at TIMESTAMP NULL DEFAULT NULL,
         created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -2716,12 +2724,48 @@ async function ensureOrdersTables(p) {
         price DECIMAL(10,2) NOT NULL,
         quantity INT NOT NULL DEFAULT 1,
         subtotal DECIMAL(10,2) NOT NULL,
+        item_status VARCHAR(40) NOT NULL DEFAULT 'pending',
+        rejection_reason TEXT NULL DEFAULT NULL,
         created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         INDEX idx_order_items_order (order_id),
         INDEX idx_order_items_product (product_id),
         INDEX idx_order_items_seller (seller_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        buyer_phone VARCHAR(30) NULL DEFAULT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        type VARCHAR(50) NOT NULL DEFAULT 'order',
+        data JSON NULL DEFAULT NULL,
+        is_read TINYINT(1) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_notifications_user (user_id),
+        INDEX idx_notifications_phone (buyer_phone),
+        INDEX idx_notifications_read (is_read)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS device_tokens (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        phone VARCHAR(30) NULL DEFAULT NULL,
+        token VARCHAR(255) NOT NULL,
+        platform VARCHAR(20) NOT NULL DEFAULT 'android',
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_token (token),
+        INDEX idx_device_tokens_user (user_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
@@ -2733,10 +2777,45 @@ async function ensureOrdersTables(p) {
     } catch (e) {}
 
     try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "rejection_reason"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN rejection_reason TEXT NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "cancellation_reason"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN cancellation_reason TEXT NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "shipped_at"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN shipped_at TIMESTAMP NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "delivered_at"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN delivered_at TIMESTAMP NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
       const [itemCols] = await p.query('SHOW COLUMNS FROM order_items LIKE "seller_id"');
       if (itemCols.length === 0) {
         await p.query('ALTER TABLE order_items ADD COLUMN seller_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER product_id, ADD INDEX idx_order_items_seller (seller_id)');
       }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM order_items LIKE "item_status"');
+      if (cols.length === 0) await p.query('ALTER TABLE order_items ADD COLUMN item_status VARCHAR(40) NOT NULL DEFAULT "pending"');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM order_items LIKE "rejection_reason"');
+      if (cols.length === 0) await p.query('ALTER TABLE order_items ADD COLUMN rejection_reason TEXT NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM users LIKE "fcm_token"');
+      if (cols.length === 0) await p.query('ALTER TABLE users ADD COLUMN fcm_token VARCHAR(255) NULL DEFAULT NULL');
     } catch (e) {}
 
     // Ensure product pricing breakdown columns exist
@@ -2744,6 +2823,87 @@ async function ensureOrdersTables(p) {
   } catch (err) {
     // ignore
   }
+}
+
+async function sendPushNotification({ userId, phone, title, message, data }) {
+  console.log(`[PUSH NOTIFICATION] Target: ${userId ? 'User #' + userId : (phone || 'All')} | "${title}": "${message}"`);
+  let tokens = [];
+  try {
+    if (pool) {
+      if (userId) {
+        const [uTokens] = await pool.query('SELECT token FROM device_tokens WHERE user_id = ?', [userId]);
+        tokens.push(...uTokens.map(t => t.token));
+        const [userRows] = await pool.query('SELECT fcm_token FROM users WHERE id = ? AND fcm_token IS NOT NULL', [userId]);
+        tokens.push(...userRows.map(u => u.fcm_token));
+      }
+      if (phone) {
+        const [pTokens] = await pool.query('SELECT token FROM device_tokens WHERE phone = ?', [phone]);
+        tokens.push(...pTokens.map(t => t.token));
+      }
+    }
+  } catch (e) {}
+
+  tokens = [...new Set(tokens.filter(Boolean))];
+  const fcmKey = process.env.FCM_SERVER_KEY || process.env.FIREBASE_SERVER_KEY;
+  if (fcmKey && tokens.length > 0) {
+    for (const token of tokens) {
+      try {
+        await fetch('https://fcm.googleapis.com/fcm/send', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `key=${fcmKey}`
+          },
+          body: JSON.stringify({
+            to: token,
+            notification: { title, body: message },
+            data: data || {}
+          })
+        });
+      } catch (fcmErr) {
+        console.error('FCM Dispatch error:', fcmErr.message);
+      }
+    }
+  }
+  return { success: true, delivered: tokens.length };
+}
+
+async function createNotification(p, { userId = null, phone = null, title, message, type = 'order', data = null }) {
+  const notifObj = {
+    user_id: userId ? Number(userId) : null,
+    buyer_phone: phone || null,
+    title,
+    message,
+    type,
+    data: data ? (typeof data === 'string' ? data : JSON.stringify(data)) : null,
+    is_read: 0,
+    created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+  };
+
+  try {
+    if (p) {
+      await ensureOrdersTables(p);
+      const [res] = await p.query(
+        `INSERT INTO notifications (user_id, buyer_phone, title, message, type, data, is_read)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+        [notifObj.user_id, notifObj.buyer_phone, notifObj.title, notifObj.message, notifObj.type, notifObj.data]
+      );
+      notifObj.id = res.insertId;
+    }
+  } catch (err) {
+    console.error('Failed to insert notification into DB:', err.message);
+  }
+
+  if (!notifObj.id) {
+    notifObj.id = fallbackNotifications.length ? Math.max(...fallbackNotifications.map(n => n.id || 0)) + 1 : 1;
+  }
+  fallbackNotifications.unshift(notifObj);
+
+  try {
+    await sendPushNotification({ userId, phone, title, message, data });
+  } catch (pushErr) {}
+
+  return notifObj;
 }
 
 // Dedicated Seller Orders Endpoint:
@@ -2766,8 +2926,29 @@ const handleGetSellerOrders = async (req, res) => {
     const params = [targetSellerId];
 
     if (req.query.status) {
-      whereClauses.push('o.order_status = ?');
-      params.push(req.query.status.toLowerCase().trim());
+      const statuses = req.query.status.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      if (statuses.length === 1) {
+        whereClauses.push('o.order_status = ?');
+        params.push(statuses[0]);
+      } else if (statuses.length > 1) {
+        whereClauses.push(`o.order_status IN (${statuses.map(() => '?').join(',')})`);
+        params.push(...statuses);
+      }
+    } else if (req.query.history === 'true' || req.path.endsWith('/history')) {
+      whereClauses.push("o.order_status IN ('delivered', 'cancelled', 'rejected')");
+    }
+
+    if (req.query.date) {
+      whereClauses.push('DATE(o.created_at) = ?');
+      params.push(req.query.date.trim());
+    }
+    if (req.query.start_date || req.query.from || req.query.from_date) {
+      whereClauses.push('DATE(o.created_at) >= ?');
+      params.push((req.query.start_date || req.query.from || req.query.from_date).trim());
+    }
+    if (req.query.end_date || req.query.to || req.query.to_date) {
+      whereClauses.push('DATE(o.created_at) <= ?');
+      params.push((req.query.end_date || req.query.to || req.query.to_date).trim());
     }
     if (req.query.phone) {
       whereClauses.push('o.buyer_phone LIKE ?');
@@ -2824,8 +3005,11 @@ const handleGetSellerOrders = async (req, res) => {
           seller_id: targetSellerId,
           seller_name: it.seller_name || 'Verified Seller',
           price: parseFloat(it.price),
+          unit_price: parseFloat(it.price),
           quantity: Number(it.quantity),
-          subtotal: parseFloat(it.subtotal)
+          subtotal: parseFloat(it.subtotal),
+          item_status: it.item_status || 'pending',
+          rejection_reason: it.rejection_reason || null
         });
       }
     }
@@ -2846,7 +3030,11 @@ const handleGetSellerOrders = async (req, res) => {
         seller_total_amount: sellerSubtotal,
         delivery_fee: parseFloat(r.delivery_fee),
         discount: parseFloat(r.discount),
-        total_amount: parseFloat(r.total_amount)
+        total_amount: sellerSubtotal,
+        rejection_reason: r.rejection_reason || null,
+        cancellation_reason: r.cancellation_reason || null,
+        shipped_at: r.shipped_at || null,
+        delivered_at: r.delivered_at || null
       };
     });
 
@@ -2864,7 +3052,21 @@ const handleGetSellerOrders = async (req, res) => {
     // Fallback offline mode
     let filtered = fallbackOrders.filter(o => (o.items || []).some(i => (i.seller_id || o.seller_id || 1) === targetSellerId));
     if (req.query.status) {
-      filtered = filtered.filter(o => o.order_status.toLowerCase() === req.query.status.toLowerCase().trim());
+      const statuses = req.query.status.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      filtered = filtered.filter(o => statuses.includes(o.order_status.toLowerCase().trim()));
+    } else if (req.query.history === 'true' || req.path.endsWith('/history')) {
+      filtered = filtered.filter(o => ['delivered', 'cancelled', 'rejected'].includes(o.order_status.toLowerCase().trim()));
+    }
+    if (req.query.date) {
+      filtered = filtered.filter(o => String(o.created_at || '').slice(0, 10) === req.query.date.trim());
+    }
+    if (req.query.start_date || req.query.from || req.query.from_date) {
+      const s = (req.query.start_date || req.query.from || req.query.from_date).trim();
+      filtered = filtered.filter(o => String(o.created_at || '').slice(0, 10) >= s);
+    }
+    if (req.query.end_date || req.query.to || req.query.to_date) {
+      const e = (req.query.end_date || req.query.to || req.query.to_date).trim();
+      filtered = filtered.filter(o => String(o.created_at || '').slice(0, 10) <= e);
     }
     if (req.query.search) {
       const q = req.query.search.toLowerCase();
@@ -2882,7 +3084,9 @@ const handleGetSellerOrders = async (req, res) => {
         total_quantity: sellerItems.reduce((acc, c) => acc + (parseInt(c.quantity, 10) || 0), 0),
         seller_subtotal: sellerSubtotal,
         subtotal: sellerSubtotal,
-        seller_total_amount: sellerSubtotal
+        seller_total_amount: sellerSubtotal,
+        rejection_reason: o.rejection_reason || null,
+        cancellation_reason: o.cancellation_reason || null
       };
     });
 
@@ -3292,6 +3496,464 @@ const handleGetOrderDetail = async (req, res) => {
   }
 };
 
+// ==========================================
+// 4a-1. Seller Dashboard & Analytics
+// ==========================================
+const handleGetSellerDashboard = async (req, res) => {
+  const optUser = req.user || getOptionalUser(req);
+  if (!optUser) {
+    return res.status(401).json({ message: 'Authentication required.' });
+  }
+
+  const targetSellerId = req.params.seller_id ? parseInt(req.params.seller_id, 10) : (req.query.seller_id ? parseInt(req.query.seller_id, 10) : optUser.id);
+  if (optUser.role !== 'admin' && optUser.id !== targetSellerId) {
+    return res.status(403).json({ message: 'Access denied. You can only access your own dashboard.' });
+  }
+
+  try {
+    await ensureOrdersTables(pool);
+
+    // 1. Get status counts for this seller
+    const countSql = `
+      SELECT o.order_status, COUNT(DISTINCT o.id) AS cnt
+      FROM orders o
+      INNER JOIN order_items oi ON o.id = oi.order_id
+      WHERE oi.seller_id = ?
+      GROUP BY o.order_status
+    `;
+    const [statusRows] = await pool.query(countSql, [targetSellerId]);
+
+    const statusCounts = {
+      pending: 0,
+      accepted: 0,
+      processing: 0,
+      packed: 0,
+      shipped: 0,
+      delivered: 0,
+      rejected: 0,
+      cancelled: 0
+    };
+
+    let totalOrders = 0;
+    for (const row of statusRows) {
+      const s = (row.order_status || '').toLowerCase().trim();
+      const cnt = Number(row.cnt) || 0;
+      if (statusCounts.hasOwnProperty(s)) {
+        statusCounts[s] = cnt;
+      }
+      totalOrders += cnt;
+    }
+
+    // 2. Financials for this seller
+    const salesSql = `
+      SELECT
+        COALESCE(SUM(CASE WHEN o.order_status NOT IN ('cancelled', 'rejected') THEN oi.subtotal ELSE 0 END), 0) AS total_sales,
+        COALESCE(SUM(CASE WHEN (o.order_status = 'delivered' OR o.payment_status = 'paid') AND o.order_status NOT IN ('cancelled', 'rejected') THEN oi.subtotal ELSE 0 END), 0) AS completed_payments,
+        COALESCE(SUM(CASE WHEN o.order_status NOT IN ('delivered', 'cancelled', 'rejected') AND o.payment_status != 'paid' THEN oi.subtotal ELSE 0 END), 0) AS pending_payments
+      FROM order_items oi
+      INNER JOIN orders o ON oi.order_id = o.id
+      WHERE oi.seller_id = ?
+    `;
+    const [[financials]] = await pool.query(salesSql, [targetSellerId]);
+
+    const totalSales = Math.round((parseFloat(financials?.total_sales || 0)) * 100) / 100;
+    const completedPayments = Math.round((parseFloat(financials?.completed_payments || 0)) * 100) / 100;
+    const pendingPayments = Math.round((parseFloat(financials?.pending_payments || 0)) * 100) / 100;
+
+    // 3. Total active products count
+    let totalProducts = 0;
+    try {
+      const [[{ pCount }]] = await pool.query('SELECT COUNT(*) AS pCount FROM products WHERE seller_id = ? AND is_active = 1', [targetSellerId]);
+      totalProducts = Number(pCount) || 0;
+    } catch (e) {}
+
+    // 4. Recent orders (top 5)
+    let recentOrders = [];
+    try {
+      const [recentRows] = await pool.query(`
+        SELECT o.id, o.order_number, o.buyer_name, o.buyer_phone, o.order_status, o.created_at,
+               COALESCE(SUM(oi.subtotal), 0) AS seller_subtotal,
+               COUNT(oi.id) AS items_count
+        FROM orders o
+        INNER JOIN order_items oi ON o.id = oi.order_id
+        WHERE oi.seller_id = ?
+        GROUP BY o.id
+        ORDER BY o.id DESC
+        LIMIT 5
+      `, [targetSellerId]);
+      recentOrders = recentRows.map(r => ({
+        ...r,
+        id: Number(r.id),
+        seller_subtotal: parseFloat(r.seller_subtotal),
+        total_amount: parseFloat(r.seller_subtotal)
+      }));
+    } catch (e) {}
+
+    let sellerName = 'Verified Seller';
+    try {
+      const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [targetSellerId]);
+      if (sRows.length > 0) {
+        sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
+      }
+    } catch (e) {}
+
+    const dashboardData = {
+      seller_id: targetSellerId,
+      seller_name: sellerName,
+      total_orders: totalOrders,
+      pending_orders: statusCounts.pending,
+      accepted_orders: statusCounts.accepted,
+      processing_orders: statusCounts.processing,
+      packed_orders: statusCounts.packed,
+      shipped_orders: statusCounts.shipped,
+      delivered_orders: statusCounts.delivered,
+      rejected_orders: statusCounts.rejected,
+      cancelled_orders: statusCounts.cancelled,
+      total_sales: totalSales,
+      pending_payments: pendingPayments,
+      completed_payments: completedPayments,
+      total_products: totalProducts,
+      recent_orders: recentOrders,
+      currency: 'INR',
+      currency_symbol: '₹',
+      total_sales_formatted: `₹${totalSales.toFixed(2)}`,
+      pending_payments_formatted: `₹${pendingPayments.toFixed(2)}`,
+      completed_payments_formatted: `₹${completedPayments.toFixed(2)}`
+    };
+
+    return res.json({
+      status: 'success',
+      seller_id: targetSellerId,
+      seller_name: sellerName,
+      dashboard: dashboardData,
+      stats: dashboardData,
+      ...dashboardData
+    });
+  } catch (err) {
+    // Fallback offline calculation
+    const sellerOrders = fallbackOrders.filter(o => (o.items || []).some(i => (i.seller_id || o.seller_id || 1) === targetSellerId));
+    const statusCounts = {
+      pending: 0, accepted: 0, processing: 0, packed: 0, shipped: 0, delivered: 0, rejected: 0, cancelled: 0
+    };
+    let totalSales = 0;
+    let completedPayments = 0;
+    let pendingPayments = 0;
+
+    for (const o of sellerOrders) {
+      const s = (o.order_status || '').toLowerCase().trim();
+      if (statusCounts.hasOwnProperty(s)) statusCounts[s]++;
+      const sellerSubtotal = (o.items || [])
+        .filter(i => (i.seller_id || o.seller_id || 1) === targetSellerId)
+        .reduce((acc, c) => acc + (parseFloat(c.subtotal) || 0), 0);
+
+      if (!['cancelled', 'rejected'].includes(s)) {
+        totalSales += sellerSubtotal;
+        if (s === 'delivered' || o.payment_status === 'paid') {
+          completedPayments += sellerSubtotal;
+        } else {
+          pendingPayments += sellerSubtotal;
+        }
+      }
+    }
+
+    const dashboardData = {
+      seller_id: targetSellerId,
+      total_orders: sellerOrders.length,
+      pending_orders: statusCounts.pending,
+      accepted_orders: statusCounts.accepted,
+      processing_orders: statusCounts.processing,
+      packed_orders: statusCounts.packed,
+      shipped_orders: statusCounts.shipped,
+      delivered_orders: statusCounts.delivered,
+      rejected_orders: statusCounts.rejected,
+      cancelled_orders: statusCounts.cancelled,
+      total_sales: totalSales,
+      pending_payments: pendingPayments,
+      completed_payments: completedPayments,
+      currency: 'INR',
+      currency_symbol: '₹',
+      total_sales_formatted: `₹${totalSales.toFixed(2)}`,
+      pending_payments_formatted: `₹${pendingPayments.toFixed(2)}`,
+      completed_payments_formatted: `₹${completedPayments.toFixed(2)}`
+    };
+
+    return res.json({
+      status: 'success',
+      seller_id: targetSellerId,
+      dashboard: dashboardData,
+      stats: dashboardData,
+      ...dashboardData
+    });
+  }
+};
+
+// ==========================================
+// 4a-2. In-App & Push Notifications Controller
+// ==========================================
+const handleGetNotifications = async (req, res) => {
+  const optUser = req.user || getOptionalUser(req);
+  if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
+
+  const userId = optUser.id;
+  const userPhone = optUser.phone;
+  const isReadFilter = req.query.is_read !== undefined ? parseInt(req.query.is_read, 10) : null;
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
+  const offset = (page - 1) * limit;
+
+  try {
+    await ensureOrdersTables(pool);
+    const whereClauses = ['(user_id = ? OR buyer_phone = ?)'];
+    const params = [userId, userPhone || ''];
+
+    if (isReadFilter !== null && !isNaN(isReadFilter)) {
+      whereClauses.push('is_read = ?');
+      params.push(isReadFilter);
+    }
+
+    const whereSql = 'WHERE ' + whereClauses.join(' AND ');
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM notifications ${whereSql}`, params);
+    const [[{ unread_count }]] = await pool.query(`SELECT COUNT(*) AS unread_count FROM notifications WHERE (user_id = ? OR buyer_phone = ?) AND is_read = 0`, [userId, userPhone || '']);
+
+    const [rows] = await pool.query(
+      `SELECT * FROM notifications ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    const formatted = rows.map(r => {
+      let parsedData = null;
+      if (r.data) {
+        try {
+          parsedData = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+        } catch (e) {
+          parsedData = r.data;
+        }
+      }
+      return {
+        ...r,
+        id: Number(r.id),
+        user_id: r.user_id ? Number(r.user_id) : null,
+        is_read: Boolean(r.is_read),
+        data: parsedData
+      };
+    });
+
+    res.json({
+      notifications: formatted,
+      unread_count: Number(unread_count) || 0,
+      total: Number(total) || 0,
+      page,
+      limit,
+      last_page: Math.ceil(total / limit) || 1
+    });
+  } catch (err) {
+    const userNotifs = fallbackNotifications.filter(n => n.user_id === userId || (userPhone && n.buyer_phone === userPhone));
+    const unreadCount = userNotifs.filter(n => !n.is_read).length;
+    res.json({
+      notifications: userNotifs,
+      unread_count: unreadCount,
+      total: userNotifs.length,
+      page: 1,
+      limit: 20,
+      last_page: 1
+    });
+  }
+};
+
+const handleGetUnreadNotificationsCount = async (req, res) => {
+  const optUser = req.user || getOptionalUser(req);
+  if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
+
+  try {
+    await ensureOrdersTables(pool);
+    const [[{ unread_count }]] = await pool.query(
+      'SELECT COUNT(*) AS unread_count FROM notifications WHERE (user_id = ? OR buyer_phone = ?) AND is_read = 0',
+      [optUser.id, optUser.phone || '']
+    );
+    res.json({ unread_count: Number(unread_count) || 0 });
+  } catch (err) {
+    const unreadCount = fallbackNotifications.filter(n => (n.user_id === optUser.id || (optUser.phone && n.buyer_phone === optUser.phone)) && !n.is_read).length;
+    res.json({ unread_count: unreadCount });
+  }
+};
+
+const handleMarkNotificationRead = async (req, res) => {
+  const notifId = parseInt(req.params.id, 10);
+  const optUser = req.user || getOptionalUser(req);
+  if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
+
+  try {
+    await ensureOrdersTables(pool);
+    await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND (user_id = ? OR user_id IS NULL)', [notifId, optUser.id]);
+    const idx = fallbackNotifications.findIndex(n => n.id === notifId);
+    if (idx !== -1) fallbackNotifications[idx].is_read = 1;
+    res.json({ success: true, message: 'Notification marked as read.' });
+  } catch (err) {
+    const idx = fallbackNotifications.findIndex(n => n.id === notifId);
+    if (idx !== -1) fallbackNotifications[idx].is_read = 1;
+    res.json({ success: true, message: 'Notification marked as read.' });
+  }
+};
+
+const handleMarkAllNotificationsRead = async (req, res) => {
+  const optUser = req.user || getOptionalUser(req);
+  if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
+
+  try {
+    await ensureOrdersTables(pool);
+    await pool.query('UPDATE notifications SET is_read = 1 WHERE user_id = ? OR buyer_phone = ?', [optUser.id, optUser.phone || '']);
+    for (const n of fallbackNotifications) {
+      if (n.user_id === optUser.id || (optUser.phone && n.buyer_phone === optUser.phone)) {
+        n.is_read = 1;
+      }
+    }
+    res.json({ success: true, message: 'All notifications marked as read.' });
+  } catch (err) {
+    for (const n of fallbackNotifications) {
+      if (n.user_id === optUser.id || (optUser.phone && n.buyer_phone === optUser.phone)) {
+        n.is_read = 1;
+      }
+    }
+    res.json({ success: true, message: 'All notifications marked as read.' });
+  }
+};
+
+const handleRegisterDeviceToken = async (req, res) => {
+  const optUser = req.user || getOptionalUser(req);
+  const body = req.body || {};
+  const token = (body.token || body.fcm_token || body.device_token || '').trim();
+  const platform = (body.platform || 'android').toLowerCase().trim();
+  const phone = body.phone || optUser?.phone || null;
+  const userId = optUser ? optUser.id : (body.user_id ? parseInt(body.user_id, 10) : null);
+
+  if (!token) {
+    return res.status(422).json({ message: 'Device token is required.' });
+  }
+
+  try {
+    await ensureOrdersTables(pool);
+    await pool.query(
+      `INSERT INTO device_tokens (user_id, phone, token, platform)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
+      [userId, phone, token, platform]
+    );
+    if (userId) {
+      await pool.query('UPDATE users SET fcm_token = ? WHERE id = ?', [token, userId]);
+    }
+    res.json({ success: true, message: 'Device push token registered successfully.' });
+  } catch (err) {
+    const existingIdx = fallbackDeviceTokens.findIndex(d => d.token === token);
+    if (existingIdx !== -1) {
+      fallbackDeviceTokens[existingIdx] = { user_id: userId, phone, token, platform };
+    } else {
+      fallbackDeviceTokens.push({ user_id: userId, phone, token, platform });
+    }
+    res.json({ success: true, message: 'Device push token registered successfully (fallback mode).' });
+  }
+};
+
+// ==========================================
+// 4a-3. Seller Order Actions (Accept, Reject, Cancel, Status)
+// ==========================================
+const handleSellerAcceptOrder = async (req, res) => {
+  req.body = req.body || {};
+  req.body.order_status = 'accepted';
+  req.body.status = 'accepted';
+  return handleOrderUpdate(req, res);
+};
+
+const handleSellerRejectOrder = async (req, res) => {
+  req.body = req.body || {};
+  req.body.order_status = 'rejected';
+  req.body.status = 'rejected';
+  if (!req.body.rejection_reason && !req.body.reason) {
+    req.body.rejection_reason = req.body.notes || 'Seller is unable to fulfill this order at this time.';
+  }
+  return handleOrderUpdate(req, res);
+};
+
+const handleSellerCancelOrder = async (req, res) => {
+  req.body = req.body || {};
+  req.body.order_status = 'cancelled';
+  req.body.status = 'cancelled';
+  if (!req.body.cancellation_reason && !req.body.reason) {
+    req.body.cancellation_reason = req.body.notes || 'Cancelled by seller.';
+  }
+  return handleOrderUpdate(req, res);
+};
+
+const handleSellerStatusUpdate = async (req, res) => {
+  req.body = req.body || {};
+  const newStatus = req.body.order_status || req.body.status || req.query.status || req.params.status;
+  if (!newStatus) {
+    return res.status(422).json({ message: 'Order status is required.' });
+  }
+  req.body.order_status = newStatus;
+  req.body.status = newStatus;
+  return handleOrderUpdate(req, res);
+};
+
+// Route registrations
+app.get([
+  '/api/seller/dashboard',
+  '/api/sellers/dashboard',
+  '/api/sellers/:seller_id/dashboard',
+  '/api/seller/:seller_id/dashboard',
+  '/api/seller/stats',
+  '/api/sellers/stats',
+  '/api/sellers/:seller_id/stats',
+  '/api/seller/:seller_id/stats',
+  '/api/seller/analytics',
+  '/api/sellers/analytics'
+], authenticateToken, handleGetSellerDashboard);
+
+app.get([
+  '/api/seller/orders/history',
+  '/api/sellers/orders/history',
+  '/api/sellers/:seller_id/orders/history',
+  '/api/seller/:seller_id/orders/history'
+], authenticateToken, (req, res) => {
+  req.query.history = 'true';
+  return handleGetSellerOrders(req, res);
+});
+
+app.get(['/api/seller/notifications', '/api/notifications'], authenticateToken, handleGetNotifications);
+app.get(['/api/seller/notifications/unread-count', '/api/notifications/unread-count'], authenticateToken, handleGetUnreadNotificationsCount);
+app.put(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
+app.post(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
+app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all'], authenticateToken, handleMarkAllNotificationsRead);
+app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
+app.post(['/api/seller/fcm-token', '/api/fcm-token', '/api/device-token', '/api/notifications/token'], authenticateToken, handleRegisterDeviceToken);
+
+app.post(['/api/seller/orders/:id/accept', '/api/sellers/:seller_id/orders/:id/accept'], authenticateToken, handleSellerAcceptOrder);
+app.put(['/api/seller/orders/:id/accept', '/api/sellers/:seller_id/orders/:id/accept'], authenticateToken, handleSellerAcceptOrder);
+
+app.post(['/api/seller/orders/:id/reject', '/api/sellers/:seller_id/orders/:id/reject'], authenticateToken, handleSellerRejectOrder);
+app.put(['/api/seller/orders/:id/reject', '/api/sellers/:seller_id/orders/:id/reject'], authenticateToken, handleSellerRejectOrder);
+
+app.post(['/api/seller/orders/:id/cancel', '/api/sellers/:seller_id/orders/:id/cancel'], authenticateToken, handleSellerCancelOrder);
+app.put(['/api/seller/orders/:id/cancel', '/api/sellers/:seller_id/orders/:id/cancel'], authenticateToken, handleSellerCancelOrder);
+
+app.post(['/api/seller/orders/:id/status', '/api/sellers/:seller_id/orders/:id/status'], authenticateToken, handleSellerStatusUpdate);
+app.put(['/api/seller/orders/:id/status', '/api/sellers/:seller_id/orders/:id/status'], authenticateToken, handleSellerStatusUpdate);
+app.patch(['/api/seller/orders/:id/status', '/api/sellers/:seller_id/orders/:id/status'], authenticateToken, handleSellerStatusUpdate);
+
+app.post(['/api/seller/orders/:id/process', '/api/seller/orders/:id/pack', '/api/seller/orders/:id/ship', '/api/seller/orders/:id/deliver'], authenticateToken, (req, res) => {
+  const action = req.path.split('/').pop();
+  const statusMap = { process: 'processing', pack: 'packed', ship: 'shipped', deliver: 'delivered' };
+  req.body = req.body || {};
+  req.body.order_status = statusMap[action] || action;
+  return handleOrderUpdate(req, res);
+});
+app.put(['/api/seller/orders/:id/process', '/api/seller/orders/:id/pack', '/api/seller/orders/:id/ship', '/api/seller/orders/:id/deliver'], authenticateToken, (req, res) => {
+  const action = req.path.split('/').pop();
+  const statusMap = { process: 'processing', pack: 'packed', ship: 'shipped', deliver: 'delivered' };
+  req.body = req.body || {};
+  req.body.order_status = statusMap[action] || action;
+  return handleOrderUpdate(req, res);
+});
+
 app.get(['/api/seller/orders', '/api/sellers/orders', '/api/sellers/:seller_id/orders', '/api/seller/:seller_id/orders'], authenticateToken, handleGetSellerOrders);
 app.get(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleGetOrderDetail);
 app.get(['/api/orders', '/api/order'], handleGetOrders);
@@ -3455,6 +4117,38 @@ const handleCreateOrder = async (req, res) => {
       await conn.commit();
       conn.release();
 
+      // Dispatch Notifications to Sellers and Buyer
+      try {
+        for (const sid of distinctSellers) {
+          const sItems = processedItems.filter(i => i.seller_id === sid);
+          const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
+          await createNotification(pool, {
+            userId: sid,
+            title: 'New Order Received! 🛍️',
+            message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
+            type: 'order_created',
+            data: {
+              order_id: newOrderId,
+              order_number: orderNumber,
+              items_count: sItems.length,
+              subtotal: sSubtotal
+            }
+          });
+        }
+        await createNotification(pool, {
+          userId: body.buyer_id || null,
+          phone: buyerPhone,
+          title: 'Order Placed Successfully! 🎉',
+          message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
+          type: 'order_created',
+          data: {
+            order_id: newOrderId,
+            order_number: orderNumber,
+            total: totalAmount
+          }
+        });
+      } catch (notifErr) {}
+
       let sellerName = 'Verified Seller';
       try {
         const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
@@ -3538,6 +4232,29 @@ const handleCreateOrder = async (req, res) => {
       updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
     };
     fallbackOrders.unshift(newOrder);
+
+    try {
+      for (const sid of distinctSellers) {
+        const sItems = processedItems.filter(i => (i.seller_id || primarySellerId) === sid);
+        const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
+        createNotification(null, {
+          userId: sid,
+          title: 'New Order Received! 🛍️',
+          message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
+          type: 'order_created',
+          data: { order_id: newOrderId, order_number: orderNumber, items_count: sItems.length, subtotal: sSubtotal }
+        });
+      }
+      createNotification(null, {
+        userId: body.buyer_id || null,
+        phone: buyerPhone,
+        title: 'Order Placed Successfully! 🎉',
+        message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
+        type: 'order_created',
+        data: { order_id: newOrderId, order_number: orderNumber, total: totalAmount }
+      });
+    } catch (nErr) {}
+
     return res.status(201).json({
       message: 'Order created successfully (local sync mode).',
       order: newOrder
@@ -3580,6 +4297,39 @@ const handleOrderUpdate = async (req, res) => {
       }
     }
 
+    const orderStatus = body.order_status !== undefined
+      ? body.order_status.toLowerCase().trim()
+      : (body.status !== undefined ? body.status.toLowerCase().trim() : existing.order_status);
+
+    // Cancellation Permission Check
+    if (orderStatus === 'cancelled') {
+      if (['shipped', 'delivered'].includes(existing.order_status)) {
+        return res.status(400).json({ message: `Cannot cancel order that is already ${existing.order_status}.` });
+      }
+      if (existing.order_status === 'cancelled') {
+        return res.status(400).json({ message: 'Order is already cancelled.' });
+      }
+      if (existing.order_status === 'rejected') {
+        return res.status(400).json({ message: 'Order is already rejected.' });
+      }
+    }
+
+    // Rejection reason handling
+    let rejectionReason = body.rejection_reason !== undefined
+      ? String(body.rejection_reason).trim()
+      : (body.reason !== undefined ? String(body.reason).trim() : (existing.rejection_reason || null));
+    if (orderStatus === 'rejected' && !rejectionReason) {
+      rejectionReason = 'Seller is unable to fulfill this order at this time.';
+    }
+
+    // Cancellation reason handling
+    let cancellationReason = body.cancellation_reason !== undefined
+      ? String(body.cancellation_reason).trim()
+      : (body.reason !== undefined ? String(body.reason).trim() : (existing.cancellation_reason || null));
+    if (orderStatus === 'cancelled' && !cancellationReason) {
+      cancellationReason = 'Cancelled by seller.';
+    }
+
     const buyerName = body.buyer_name !== undefined ? body.buyer_name.trim() : existing.buyer_name;
     const buyerPhone = body.buyer_phone !== undefined ? body.buyer_phone.trim() : existing.buyer_phone;
     const shippingAddress = body.shipping_address !== undefined ? body.shipping_address.trim() : existing.shipping_address;
@@ -3588,9 +4338,12 @@ const handleOrderUpdate = async (req, res) => {
     const state = body.state !== undefined ? body.state.trim() : existing.state;
     const pincode = body.pincode !== undefined ? body.pincode.trim() : existing.pincode;
     const notes = body.notes !== undefined ? body.notes.trim() : existing.notes;
-    const orderStatus = body.order_status !== undefined ? body.order_status.toLowerCase().trim() : existing.order_status;
     const paymentMethod = body.payment_method !== undefined ? body.payment_method.trim() : existing.payment_method;
-    const paymentStatus = body.payment_status !== undefined ? body.payment_status.trim() : existing.payment_status;
+
+    let paymentStatus = body.payment_status !== undefined ? body.payment_status.trim() : existing.payment_status;
+    if (orderStatus === 'delivered' && (paymentStatus === 'unpaid' || !paymentStatus)) {
+      paymentStatus = 'paid';
+    }
 
     let subtotal = parseFloat(existing.subtotal);
     const deliveryFee = body.delivery_fee !== undefined ? Math.max(0, parseFloat(body.delivery_fee)) : parseFloat(existing.delivery_fee);
@@ -3676,12 +4429,31 @@ const handleOrderUpdate = async (req, res) => {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
+
+      // If order is transitioning into cancelled or rejected, restore inventory
+      if (!['cancelled', 'rejected'].includes(existing.order_status) && ['cancelled', 'rejected'].includes(orderStatus)) {
+        const [itemsToRestore] = await conn.query(
+          'SELECT product_id, quantity FROM order_items WHERE order_id = ?' + (optUser && optUser.role === 'seller' ? ' AND seller_id = ?' : ''),
+          optUser && optUser.role === 'seller' ? [orderId, Number(optUser.id)] : [orderId]
+        );
+        for (const oi of itemsToRestore) {
+          if (oi.product_id) {
+            try {
+              await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
+            } catch (e) {}
+          }
+        }
+      }
+
       await conn.query(
         `UPDATE orders
          SET seller_id = ?, buyer_name = ?, buyer_phone = ?,
              shipping_address = ?, landmark = ?, city = ?, state = ?, pincode = ?,
              order_status = ?, payment_method = ?, payment_status = ?,
-             subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?
+             subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?,
+             rejection_reason = ?, cancellation_reason = ?,
+             shipped_at = CASE WHEN ? = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
+             delivered_at = CASE WHEN ? = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END
          WHERE id = ?`,
         [
           primarySellerId,
@@ -3689,9 +4461,17 @@ const handleOrderUpdate = async (req, res) => {
           shippingAddress, landmark || null, city || null, state || null, pincode || null,
           orderStatus, paymentMethod, paymentStatus,
           subtotal, deliveryFee, discount, totalAmount, notes || null,
+          rejectionReason, cancellationReason,
+          orderStatus, orderStatus,
           orderId
         ]
       );
+
+      if (optUser && optUser.role === 'seller') {
+        await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ? AND seller_id = ?', [orderStatus, rejectionReason, orderId, Number(optUser.id)]);
+      } else {
+        await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ?', [orderStatus, rejectionReason, orderId]);
+      }
 
       if (hasItemsUpdate) {
         // Restore stock of previously ordered items before updating
@@ -3731,6 +4511,80 @@ const handleOrderUpdate = async (req, res) => {
       await conn.commit();
       conn.release();
 
+      // Dispatch Notifications on Status Change
+      if (orderStatus !== existing.order_status) {
+        let notifTitle = '';
+        let notifMsg = '';
+        let notifType = 'order_status_update';
+
+        if (orderStatus === 'accepted') {
+          notifTitle = 'Order Accepted! ✅';
+          notifMsg = `Great news! Your order #${existing.order_number} has been accepted by the seller and will be processed soon.`;
+          notifType = 'order_accepted';
+        } else if (orderStatus === 'rejected') {
+          notifTitle = 'Order Rejected ❌';
+          notifMsg = `Your order #${existing.order_number} was rejected. Reason: ${rejectionReason}`;
+          notifType = 'order_rejected';
+        } else if (orderStatus === 'processing') {
+          notifTitle = 'Order Processing ⚙️';
+          notifMsg = `Your order #${existing.order_number} is now being processed.`;
+          notifType = 'order_processing';
+        } else if (orderStatus === 'packed') {
+          notifTitle = 'Order Packed 📦';
+          notifMsg = `Your order #${existing.order_number} has been packed and is ready for dispatch.`;
+          notifType = 'order_packed';
+        } else if (orderStatus === 'shipped') {
+          notifTitle = 'Order Shipped 🚚';
+          notifMsg = `Your order #${existing.order_number} is on the way!`;
+          notifType = 'order_shipped';
+        } else if (orderStatus === 'delivered') {
+          notifTitle = 'Order Delivered 🎉';
+          notifMsg = `Your order #${existing.order_number} has been delivered. Thank you for shopping with us!`;
+          notifType = 'order_delivered';
+        } else if (orderStatus === 'cancelled') {
+          notifTitle = 'Order Cancelled ❌';
+          notifMsg = `Your order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`;
+          notifType = 'order_cancelled';
+        }
+
+        if (notifTitle) {
+          try {
+            await createNotification(pool, {
+              userId: existing.buyer_id || null,
+              phone: existing.buyer_phone,
+              title: notifTitle,
+              message: notifMsg,
+              type: notifType,
+              data: {
+                order_id: existing.id,
+                order_number: existing.order_number,
+                status: orderStatus,
+                rejection_reason: rejectionReason,
+                cancellation_reason: cancellationReason
+              }
+            });
+          } catch (nErr) {}
+        }
+
+        // Notify seller when order is cancelled by buyer or admin
+        if (orderStatus === 'cancelled' && (!optUser || optUser.role !== 'seller')) {
+          try {
+            const [sRows] = await pool.query('SELECT DISTINCT seller_id FROM order_items WHERE order_id = ?', [orderId]);
+            for (const sr of sRows) {
+              if (sr.seller_id) {
+                await createNotification(pool, {
+                  userId: sr.seller_id,
+                  title: 'Order Cancelled ❌',
+                  message: `Order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`,
+                  type: 'order_cancelled',
+                  data: { order_id: existing.id, order_number: existing.order_number, reason: cancellationReason }
+                });
+              }
+            }
+          } catch (sErr) {}
+        }
+      }
+
       let sellerName = 'Verified Seller';
       try {
         const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
@@ -3760,6 +4614,20 @@ const handleOrderUpdate = async (req, res) => {
         return res.status(403).json({ message: 'Access denied. You do not have permission to update this order.' });
       }
     }
+
+    const orderStatus = body.order_status !== undefined
+      ? body.order_status.toLowerCase().trim()
+      : (body.status !== undefined ? body.status.toLowerCase().trim() : current.order_status);
+
+    if (orderStatus === 'cancelled' && ['shipped', 'delivered'].includes(current.order_status)) {
+      return res.status(400).json({ message: `Cannot cancel order that is already ${current.order_status}.` });
+    }
+
+    let rejectionReason = body.rejection_reason || body.reason || current.rejection_reason || null;
+    if (orderStatus === 'rejected' && !rejectionReason) rejectionReason = 'Seller is unable to fulfill this order at this time.';
+
+    let cancellationReason = body.cancellation_reason || body.reason || current.cancellation_reason || null;
+    if (orderStatus === 'cancelled' && !cancellationReason) cancellationReason = 'Cancelled by seller.';
 
     let newItems = current.items;
     let newSubtotal = current.subtotal;
@@ -3799,9 +4667,11 @@ const handleOrderUpdate = async (req, res) => {
       state: body.state !== undefined ? body.state : current.state,
       pincode: body.pincode !== undefined ? body.pincode : current.pincode,
       notes: body.notes !== undefined ? body.notes : current.notes,
-      order_status: body.order_status ? body.order_status.toLowerCase() : current.order_status,
+      order_status: orderStatus,
       payment_method: body.payment_method || current.payment_method,
-      payment_status: body.payment_status || current.payment_status,
+      payment_status: orderStatus === 'delivered' ? 'paid' : (body.payment_status || current.payment_status),
+      rejection_reason: rejectionReason,
+      cancellation_reason: cancellationReason,
       subtotal: newSubtotal,
       delivery_fee: deliveryFee,
       discount,

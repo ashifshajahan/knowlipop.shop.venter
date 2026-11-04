@@ -339,10 +339,106 @@ if (preg_match('#^/(?:api/sellers?)/(\d+)/orders$#', $requestUri, $matches)) {
     }
 }
 
+// Seller Dashboard & Analytics: /api/seller/dashboard or /api/seller/stats or /api/sellers/dashboard
+if ($requestUri === '/api/seller/dashboard' || $requestUri === '/api/seller/stats' || $requestUri === '/api/sellers/dashboard' || $requestUri === '/api/sellers/stats' || $requestUri === '/api/seller/analytics') {
+    if ($method === 'GET') {
+        apiGetSellerDashboard($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Dashboard by Seller ID: /api/sellers/{id}/dashboard or /api/sellers/{id}/stats
+if (preg_match('#^/(?:api/sellers?)/(\d+)/(?:dashboard|stats|analytics)$#', $requestUri, $matches)) {
+    $sellerId = (int)$matches[1];
+    if ($method === 'GET') {
+        apiGetSellerDashboard($pdo, $sellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Notifications Endpoints
+if ($requestUri === '/api/seller/notifications' || $requestUri === '/api/notifications') {
+    if ($method === 'GET') {
+        apiGetNotifications($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/notifications/unread-count' || $requestUri === '/api/notifications/unread-count') {
+    if ($method === 'GET') {
+        apiGetUnreadNotificationsCount($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/notifications/mark-all-read' || $requestUri === '/api/notifications/read-all' || $requestUri === '/api/notifications/mark-all-read') {
+    if ($method === 'PUT' || $method === 'POST') {
+        apiMarkAllNotificationsRead($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/(?:api/seller/notifications|api/notifications)/(\d+)/read$#', $requestUri, $matches)) {
+    $notifId = (int)$matches[1];
+    if ($method === 'PUT' || $method === 'POST') {
+        apiMarkNotificationRead($pdo, $notifId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/fcm-token' || $requestUri === '/api/fcm-token' || $requestUri === '/api/device-token' || $requestUri === '/api/notifications/token') {
+    if ($method === 'POST') {
+        apiRegisterDeviceToken($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Orders History: /api/seller/orders/history or /api/sellers/orders/history
+if ($requestUri === '/api/seller/orders/history' || $requestUri === '/api/sellers/orders/history') {
+    if ($method === 'GET') {
+        $_GET['history'] = 'true';
+        apiGetSellerOrders($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Orders Actions: /api/seller/orders/{order_id}/(accept|reject|cancel|status|process|pack|ship|deliver)
+if (preg_match('#^/api/seller/orders/([^/]+)/(accept|reject|cancel|status|process|pack|ship|deliver)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    $action = strtolower(trim($matches[2]));
+    if ($action === 'accept') {
+        apiAcceptOrder($pdo, $orderParam);
+    } elseif ($action === 'reject') {
+        apiRejectOrder($pdo, $orderParam);
+    } elseif ($action === 'cancel') {
+        apiCancelOrder($pdo, $orderParam);
+    } elseif ($action === 'status') {
+        apiUpdateOrderStatus($pdo, $orderParam);
+    } else {
+        $statusMap = ['process' => 'processing', 'pack' => 'packed', 'ship' => 'shipped', 'deliver' => 'delivered'];
+        $st = $statusMap[$action] ?? $action;
+        $input = getJsonInput();
+        $input['order_status'] = $st;
+        $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
+        apiUpdateOrder($pdo, $orderParam);
+    }
+}
+
 // Seller Single Order Detail by Order ID: /api/seller/orders/{order_id}
 if (preg_match('#^/api/seller/orders/([^/]+)$#', $requestUri, $matches)) {
     $orderParam = trim($matches[1]);
-    if ($method === 'GET') {
+    if ($orderParam === 'history') {
+        $_GET['history'] = 'true';
+        apiGetSellerOrders($pdo);
+    } elseif ($method === 'GET') {
         apiGetOrder($pdo, $orderParam);
     } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
         apiUpdateOrder($pdo, $orderParam);

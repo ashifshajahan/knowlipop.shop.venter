@@ -79,9 +79,96 @@ function ensureOrdersSchema(PDO $pdo): void
     } catch (Throwable $e) {}
 
     try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'rejection_reason'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `rejection_reason` TEXT NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'cancellation_reason'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `cancellation_reason` TEXT NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'shipped_at'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `shipped_at` TIMESTAMP NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'delivered_at'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `delivered_at` TIMESTAMP NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
         $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'seller_id'")->fetchAll();
         if (empty($cols)) {
             $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `product_id`, ADD INDEX `idx_order_items_seller` (`seller_id`)");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'item_status'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `item_status` VARCHAR(40) NOT NULL DEFAULT 'pending'");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'rejection_reason'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `rejection_reason` TEXT NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS `notifications` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
+                `title` VARCHAR(255) NOT NULL,
+                `message` TEXT NOT NULL,
+                `type` VARCHAR(50) NOT NULL DEFAULT 'order',
+                `data` JSON NULL DEFAULT NULL,
+                `is_read` TINYINT(1) NOT NULL DEFAULT 0,
+                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`id`),
+                INDEX `idx_notifications_user` (`user_id`),
+                INDEX `idx_notifications_phone` (`buyer_phone`),
+                INDEX `idx_notifications_read` (`is_read`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        ");
+    } catch (Throwable $e) {}
+
+    try {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS `device_tokens` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                `phone` VARCHAR(30) NULL DEFAULT NULL,
+                `token` VARCHAR(255) NOT NULL,
+                `platform` VARCHAR(20) NOT NULL DEFAULT 'android',
+                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uniq_token` (`token`),
+                INDEX `idx_device_tokens_user` (`user_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        ");
+    } catch (Throwable $e) {}
+
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `users` LIKE 'fcm_token'")->fetchAll();
+        if (empty($cols)) {
+            $pdo->exec("ALTER TABLE `users` ADD COLUMN `fcm_token` VARCHAR(255) NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
@@ -118,8 +205,36 @@ function apiGetSellerOrders(PDO $pdo, ?int $routeSellerId = null): void
     $params = [':seller_id' => $sellerId];
 
     if (!empty($_GET['status'])) {
-        $whereClauses[] = "o.order_status = :status";
-        $params[':status'] = strtolower(trim($_GET['status']));
+        $statuses = array_filter(array_map('trim', explode(',', strtolower($_GET['status']))));
+        if (count($statuses) === 1) {
+            $whereClauses[] = "o.order_status = :status";
+            $params[':status'] = reset($statuses);
+        } elseif (count($statuses) > 1) {
+            $inPlaceholders = [];
+            foreach ($statuses as $idx => $st) {
+                $ph = ":status_" . $idx;
+                $inPlaceholders[] = $ph;
+                $params[$ph] = $st;
+            }
+            $whereClauses[] = "o.order_status IN (" . implode(',', $inPlaceholders) . ")";
+        }
+    } elseif (!empty($_GET['history']) && $_GET['history'] === 'true') {
+        $whereClauses[] = "o.order_status IN ('delivered', 'cancelled', 'rejected')";
+    }
+
+    if (!empty($_GET['date'])) {
+        $whereClauses[] = "DATE(o.created_at) = :created_date";
+        $params[':created_date'] = trim($_GET['date']);
+    }
+    if (!empty($_GET['start_date']) || !empty($_GET['from']) || !empty($_GET['from_date'])) {
+        $sDate = trim($_GET['start_date'] ?? $_GET['from'] ?? $_GET['from_date']);
+        $whereClauses[] = "DATE(o.created_at) >= :start_date";
+        $params[':start_date'] = $sDate;
+    }
+    if (!empty($_GET['end_date']) || !empty($_GET['to']) || !empty($_GET['to_date'])) {
+        $eDate = trim($_GET['end_date'] ?? $_GET['to'] ?? $_GET['to_date']);
+        $whereClauses[] = "DATE(o.created_at) <= :end_date";
+        $params[':end_date'] = $eDate;
     }
 
     if (!empty($_GET['phone'])) {
@@ -223,7 +338,11 @@ function apiGetSellerOrders(PDO $pdo, ?int $routeSellerId = null): void
         $order['seller_total_amount'] = $sellerSubtotal;
         $order['delivery_fee'] = (float)$order['delivery_fee'];
         $order['discount'] = (float)$order['discount'];
-        $order['total_amount'] = (float)$order['total_amount'];
+        $order['total_amount'] = $sellerSubtotal;
+        $order['rejection_reason'] = $order['rejection_reason'] ?? null;
+        $order['cancellation_reason'] = $order['cancellation_reason'] ?? null;
+        $order['shipped_at'] = $order['shipped_at'] ?? null;
+        $order['delivered_at'] = $order['delivered_at'] ?? null;
     }
     unset($order);
 
@@ -270,8 +389,36 @@ function apiGetOrders(PDO $pdo): void
     }
 
     if (!empty($_GET['status'])) {
-        $whereClauses[] = "o.order_status = :status";
-        $params[':status'] = strtolower(trim($_GET['status']));
+        $statuses = array_filter(array_map('trim', explode(',', strtolower($_GET['status']))));
+        if (count($statuses) === 1) {
+            $whereClauses[] = "o.order_status = :status";
+            $params[':status'] = reset($statuses);
+        } elseif (count($statuses) > 1) {
+            $inPlaceholders = [];
+            foreach ($statuses as $idx => $st) {
+                $ph = ":status_" . $idx;
+                $inPlaceholders[] = $ph;
+                $params[$ph] = $st;
+            }
+            $whereClauses[] = "o.order_status IN (" . implode(',', $inPlaceholders) . ")";
+        }
+    } elseif (!empty($_GET['history']) && $_GET['history'] === 'true') {
+        $whereClauses[] = "o.order_status IN ('delivered', 'cancelled', 'rejected')";
+    }
+
+    if (!empty($_GET['date'])) {
+        $whereClauses[] = "DATE(o.created_at) = :created_date";
+        $params[':created_date'] = trim($_GET['date']);
+    }
+    if (!empty($_GET['start_date']) || !empty($_GET['from']) || !empty($_GET['from_date'])) {
+        $sDate = trim($_GET['start_date'] ?? $_GET['from'] ?? $_GET['from_date']);
+        $whereClauses[] = "DATE(o.created_at) >= :start_date";
+        $params[':start_date'] = $sDate;
+    }
+    if (!empty($_GET['end_date']) || !empty($_GET['to']) || !empty($_GET['to_date'])) {
+        $eDate = trim($_GET['end_date'] ?? $_GET['to'] ?? $_GET['to_date']);
+        $whereClauses[] = "DATE(o.created_at) <= :end_date";
+        $params[':end_date'] = $eDate;
     }
 
     if (!empty($_GET['phone'])) {
@@ -550,6 +697,10 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
         $order['order_price'] = $sellerTotalAmount;
         $order['price'] = $sellerTotalAmount;
         $order['amount'] = $sellerTotalAmount;
+        $order['rejection_reason'] = $order['rejection_reason'] ?? null;
+        $order['cancellation_reason'] = $order['cancellation_reason'] ?? null;
+        $order['shipped_at'] = $order['shipped_at'] ?? null;
+        $order['delivered_at'] = $order['delivered_at'] ?? null;
 
         jsonResponse(['order' => $order]);
         return;
@@ -581,6 +732,10 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
         $order['order_price'] = $sellerTotalAmount;
         $order['price'] = $sellerTotalAmount;
         $order['amount'] = $sellerTotalAmount;
+        $order['rejection_reason'] = $order['rejection_reason'] ?? null;
+        $order['cancellation_reason'] = $order['cancellation_reason'] ?? null;
+        $order['shipped_at'] = $order['shipped_at'] ?? null;
+        $order['delivered_at'] = $order['delivered_at'] ?? null;
 
         jsonResponse(['order' => $order]);
         return;
@@ -893,6 +1048,37 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
         }
     }
 
+    $orderStatus = isset($input['order_status']) ? trim(strtolower($input['order_status'])) : (isset($input['status']) ? trim(strtolower($input['status'])) : $existing['order_status']);
+
+    // Cancellation Permission Check
+    if ($orderStatus === 'cancelled') {
+        if (in_array(strtolower($existing['order_status']), ['shipped', 'delivered'], true)) {
+            errorResponse('Cannot cancel order that is already ' . $existing['order_status'] . '.', [], 400);
+        }
+        if (strtolower($existing['order_status']) === 'cancelled') {
+            errorResponse('Order is already cancelled.', [], 400);
+        }
+        if (strtolower($existing['order_status']) === 'rejected') {
+            errorResponse('Order is already rejected.', [], 400);
+        }
+    }
+
+    $rejectionReason = isset($input['rejection_reason']) ? trim($input['rejection_reason']) : (isset($input['reason']) ? trim($input['reason']) : ($existing['rejection_reason'] ?? null));
+    if ($orderStatus === 'rejected' && empty($rejectionReason)) {
+        $rejectionReason = 'Seller is unable to fulfill this order at this time.';
+    }
+
+    $cancellationReason = isset($input['cancellation_reason']) ? trim($input['cancellation_reason']) : (isset($input['reason']) ? trim($input['reason']) : ($existing['cancellation_reason'] ?? null));
+    if ($orderStatus === 'cancelled' && empty($cancellationReason)) {
+        $cancellationReason = 'Cancelled by seller.';
+    }
+
+    $paymentMethod = isset($input['payment_method']) ? trim($input['payment_method']) : $existing['payment_method'];
+    $paymentStatus = isset($input['payment_status']) ? trim($input['payment_status']) : $existing['payment_status'];
+    if ($orderStatus === 'delivered' && ($paymentStatus === 'unpaid' || empty($paymentStatus))) {
+        $paymentStatus = 'paid';
+    }
+
     $buyerName = isset($input['buyer_name']) ? trim($input['buyer_name']) : $existing['buyer_name'];
     $buyerPhone = isset($input['buyer_phone']) ? trim($input['buyer_phone']) : $existing['buyer_phone'];
     $shippingAddress = isset($input['shipping_address']) ? trim($input['shipping_address']) : $existing['shipping_address'];
@@ -901,9 +1087,6 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
     $state = isset($input['state']) ? trim($input['state']) : $existing['state'];
     $pincode = isset($input['pincode']) ? trim($input['pincode']) : $existing['pincode'];
     $notes = isset($input['notes']) ? trim($input['notes']) : $existing['notes'];
-    $orderStatus = isset($input['order_status']) ? trim(strtolower($input['order_status'])) : $existing['order_status'];
-    $paymentMethod = isset($input['payment_method']) ? trim($input['payment_method']) : $existing['payment_method'];
-    $paymentStatus = isset($input['payment_status']) ? trim($input['payment_status']) : $existing['payment_status'];
 
     $subtotal = (float)$existing['subtotal'];
     $deliveryFee = isset($input['delivery_fee']) ? max(0, (float)$input['delivery_fee']) : (float)$existing['delivery_fee'];
@@ -975,6 +1158,25 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
 
     $pdo->beginTransaction();
     try {
+        // If transitioning into cancelled or rejected, restore stock of ordered items
+        if (!in_array(strtolower($existing['order_status']), ['cancelled', 'rejected'], true) && in_array($orderStatus, ['cancelled', 'rejected'], true)) {
+            $sql = "SELECT product_id, quantity FROM `order_items` WHERE order_id = :oid";
+            $pParams = [':oid' => $id];
+            if ($user && ($user['role'] ?? '') === 'seller') {
+                $sql .= " AND seller_id = :sid";
+                $pParams[':sid'] = (int)$user['id'];
+            }
+            $rStmt = $pdo->prepare($sql);
+            $rStmt->execute($pParams);
+            $rItems = $rStmt->fetchAll(PDO::FETCH_ASSOC);
+            $upStock = $pdo->prepare("UPDATE `products` SET `stock` = `stock` + :qty WHERE `id` = :pid");
+            foreach ($rItems as $ri) {
+                if (!empty($ri['product_id'])) {
+                    $upStock->execute([':qty' => (int)$ri['quantity'], ':pid' => (int)$ri['product_id']]);
+                }
+            }
+        }
+
         $updateStmt = $pdo->prepare("
             UPDATE `orders`
             SET seller_id = :seller_id,
@@ -992,7 +1194,11 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
                 delivery_fee = :delivery_fee,
                 discount = :discount,
                 total_amount = :total_amount,
-                notes = :notes
+                notes = :notes,
+                rejection_reason = :rejection_reason,
+                cancellation_reason = :cancellation_reason,
+                shipped_at = CASE WHEN :os1 = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
+                delivered_at = CASE WHEN :os2 = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END
             WHERE id = :id
         ");
 
@@ -1013,8 +1219,20 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
             ':discount' => $discount,
             ':total_amount' => $totalAmount,
             ':notes' => $notes ?: null,
+            ':rejection_reason' => $rejectionReason,
+            ':cancellation_reason' => $cancellationReason,
+            ':os1' => $orderStatus,
+            ':os2' => $orderStatus,
             ':id' => $id,
         ]);
+
+        if ($user && ($user['role'] ?? '') === 'seller') {
+            $upItem = $pdo->prepare("UPDATE `order_items` SET `item_status` = :st, `rejection_reason` = :rr WHERE `order_id` = :oid AND `seller_id` = :sid");
+            $upItem->execute([':st' => $orderStatus, ':rr' => $rejectionReason, ':oid' => $id, ':sid' => (int)$user['id']]);
+        } else {
+            $upItem = $pdo->prepare("UPDATE `order_items` SET `item_status` = :st, `rejection_reason` = :rr WHERE `order_id` = :oid");
+            $upItem->execute([':st' => $orderStatus, ':rr' => $rejectionReason, ':oid' => $id]);
+        }
 
         if ($hasItemsUpdate) {
             // Restore stock of old items
@@ -1145,4 +1363,324 @@ function apiDeleteOrder(PDO $pdo, mixed $idOrNumber): void
         $pdo->rollBack();
         errorResponse('Failed to delete order: ' . $e->getMessage(), [], 500);
     }
+}
+
+/**
+ * Helper to dispatch in-app notifications
+ */
+function createNotification(PDO $pdo, ?int $userId, ?string $phone, string $title, string $message, string $type = 'order', mixed $data = null): void
+{
+    ensureOrdersSchema($pdo);
+    try {
+        $dataStr = is_string($data) ? $data : ($data !== null ? json_encode($data) : null);
+        $stmt = $pdo->prepare("
+            INSERT INTO `notifications` (user_id, buyer_phone, title, message, type, data, is_read)
+            VALUES (:uid, :phone, :title, :msg, :type, :data, 0)
+        ");
+        $stmt->execute([
+            ':uid' => $userId ?: null,
+            ':phone' => $phone ?: null,
+            ':title' => $title,
+            ':msg' => $message,
+            ':type' => $type,
+            ':data' => $dataStr,
+        ]);
+    } catch (Throwable $e) {}
+}
+
+/**
+ * Seller Order Management: Accept Order
+ */
+function apiAcceptOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): void
+{
+    $input = getJsonInput();
+    $input['order_status'] = 'accepted';
+    $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
+    apiUpdateOrder($pdo, $idOrNumber, $routeSellerId);
+}
+
+/**
+ * Seller Order Management: Reject Order with Rejection Reason
+ */
+function apiRejectOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): void
+{
+    $input = getJsonInput();
+    $input['order_status'] = 'rejected';
+    if (empty($input['rejection_reason']) && empty($input['reason'])) {
+        $input['rejection_reason'] = $input['notes'] ?? 'Seller is unable to fulfill this order at this time.';
+    }
+    $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
+    apiUpdateOrder($pdo, $idOrNumber, $routeSellerId);
+}
+
+/**
+ * Seller Order Management: Cancel Order when permitted
+ */
+function apiCancelOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): void
+{
+    $input = getJsonInput();
+    $input['order_status'] = 'cancelled';
+    if (empty($input['cancellation_reason']) && empty($input['reason'])) {
+        $input['cancellation_reason'] = $input['notes'] ?? 'Cancelled by seller.';
+    }
+    $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
+    apiUpdateOrder($pdo, $idOrNumber, $routeSellerId);
+}
+
+/**
+ * Seller Order Management: Update Status (Processing, Packed, Shipped, Delivered)
+ */
+function apiUpdateOrderStatus(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): void
+{
+    $input = getJsonInput();
+    $st = $input['order_status'] ?? $input['status'] ?? $_GET['status'] ?? null;
+    if (!$st) {
+        errorResponse('Order status is required.', [], 422);
+    }
+    $input['order_status'] = $st;
+    $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
+    apiUpdateOrder($pdo, $idOrNumber, $routeSellerId);
+}
+
+/**
+ * Seller Dashboard & Stats Endpoint
+ * Returns: Total Orders, Pending Orders, Accepted Orders, Processing Orders,
+ * Shipped Orders, Delivered Orders, Rejected Orders, Total Sales, Pending Payments, Completed Payments
+ */
+function apiGetSellerDashboard(PDO $pdo, ?int $routeSellerId = null): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $targetSellerId = $routeSellerId ?: (!empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : (int)$user['id']);
+
+    if (($user['role'] ?? '') !== 'admin' && (int)$user['id'] !== $targetSellerId) {
+        errorResponse('Access denied. You can only access your own dashboard.', [], 403);
+    }
+
+    // Status counts
+    $countStmt = $pdo->prepare("
+        SELECT o.order_status, COUNT(DISTINCT o.id) AS cnt
+        FROM `orders` o
+        INNER JOIN `order_items` oi ON o.id = oi.order_id
+        WHERE oi.seller_id = :sid
+        GROUP BY o.order_status
+    ");
+    $countStmt->execute([':sid' => $targetSellerId]);
+    $statusRows = $countStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $statusCounts = [
+        'pending' => 0,
+        'accepted' => 0,
+        'processing' => 0,
+        'packed' => 0,
+        'shipped' => 0,
+        'delivered' => 0,
+        'rejected' => 0,
+        'cancelled' => 0,
+    ];
+    $totalOrders = 0;
+    foreach ($statusRows as $r) {
+        $st = strtolower(trim($r['order_status']));
+        $c = (int)$r['cnt'];
+        if (isset($statusCounts[$st])) {
+            $statusCounts[$st] = $c;
+        }
+        $totalOrders += $c;
+    }
+
+    // Financials
+    $salesStmt = $pdo->prepare("
+        SELECT
+            COALESCE(SUM(CASE WHEN o.order_status NOT IN ('cancelled', 'rejected') THEN oi.subtotal ELSE 0 END), 0) AS total_sales,
+            COALESCE(SUM(CASE WHEN (o.order_status = 'delivered' OR o.payment_status = 'paid') AND o.order_status NOT IN ('cancelled', 'rejected') THEN oi.subtotal ELSE 0 END), 0) AS completed_payments,
+            COALESCE(SUM(CASE WHEN o.order_status NOT IN ('delivered', 'cancelled', 'rejected') AND o.payment_status != 'paid' THEN oi.subtotal ELSE 0 END), 0) AS pending_payments
+        FROM `order_items` oi
+        INNER JOIN `orders` o ON oi.order_id = o.id
+        WHERE oi.seller_id = :sid
+    ");
+    $salesStmt->execute([':sid' => $targetSellerId]);
+    $fin = $salesStmt->fetch(PDO::FETCH_ASSOC);
+
+    $totalSales = (float)($fin['total_sales'] ?? 0);
+    $completedPayments = (float)($fin['completed_payments'] ?? 0);
+    $pendingPayments = (float)($fin['pending_payments'] ?? 0);
+
+    // Products count
+    $pCountStmt = $pdo->prepare("SELECT COUNT(*) FROM `products` WHERE seller_id = :sid AND is_active = 1");
+    $pCountStmt->execute([':sid' => $targetSellerId]);
+    $totalProducts = (int)$pCountStmt->fetchColumn();
+
+    // Recent orders
+    $recStmt = $pdo->prepare("
+        SELECT o.id, o.order_number, o.buyer_name, o.order_status, o.created_at,
+               COALESCE(SUM(oi.subtotal), 0) AS seller_subtotal,
+               COUNT(oi.id) AS items_count
+        FROM `orders` o
+        INNER JOIN `order_items` oi ON o.id = oi.order_id
+        WHERE oi.seller_id = :sid
+        GROUP BY o.id
+        ORDER BY o.id DESC
+        LIMIT 5
+    ");
+    $recStmt->execute([':sid' => $targetSellerId]);
+    $recentOrders = $recStmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($recentOrders as &$ro) {
+        $ro['id'] = (int)$ro['id'];
+        $ro['seller_subtotal'] = (float)$ro['seller_subtotal'];
+        $ro['total_amount'] = (float)$ro['seller_subtotal'];
+    }
+    unset($ro);
+
+    $sStmt = $pdo->prepare("SELECT seller_name, name FROM `users` WHERE id = :sid LIMIT 1");
+    $sStmt->execute([':sid' => $targetSellerId]);
+    $sUser = $sStmt->fetch(PDO::FETCH_ASSOC);
+    $sellerName = $sUser['seller_name'] ?? $sUser['name'] ?? 'Verified Seller';
+
+    $dashboardData = [
+        'seller_id' => $targetSellerId,
+        'seller_name' => $sellerName,
+        'total_orders' => $totalOrders,
+        'pending_orders' => $statusCounts['pending'],
+        'accepted_orders' => $statusCounts['accepted'],
+        'processing_orders' => $statusCounts['processing'],
+        'packed_orders' => $statusCounts['packed'],
+        'shipped_orders' => $statusCounts['shipped'],
+        'delivered_orders' => $statusCounts['delivered'],
+        'rejected_orders' => $statusCounts['rejected'],
+        'cancelled_orders' => $statusCounts['cancelled'],
+        'total_sales' => $totalSales,
+        'pending_payments' => $pendingPayments,
+        'completed_payments' => $completedPayments,
+        'total_products' => $totalProducts,
+        'recent_orders' => $recentOrders,
+        'currency' => 'INR',
+        'currency_symbol' => '₹',
+        'total_sales_formatted' => '₹' . number_format($totalSales, 2),
+        'pending_payments_formatted' => '₹' . number_format($pendingPayments, 2),
+        'completed_payments_formatted' => '₹' . number_format($completedPayments, 2),
+    ];
+
+    jsonResponse(array_merge([
+        'status' => 'success',
+        'dashboard' => $dashboardData,
+        'stats' => $dashboardData,
+    ], $dashboardData));
+}
+
+/**
+ * Notifications Controller
+ */
+function apiGetNotifications(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $userId = (int)$user['id'];
+    $phone = $user['phone'] ?? '';
+
+    $page = max(1, (int)($_GET['page'] ?? 1));
+    $limit = min(100, max(1, (int)($_GET['limit'] ?? 20)));
+    $offset = ($page - 1) * $limit;
+
+    $whereClauses = ["(user_id = :uid OR buyer_phone = :phone)"];
+    $params = [':uid' => $userId, ':phone' => $phone];
+
+    if (isset($_GET['is_read'])) {
+        $whereClauses[] = "is_read = :is_read";
+        $params[':is_read'] = (int)$_GET['is_read'];
+    }
+
+    $whereSql = "WHERE " . implode(' AND ', $whereClauses);
+
+    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM `notifications` {$whereSql}");
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetchColumn();
+
+    $unStmt = $pdo->prepare("SELECT COUNT(*) FROM `notifications` WHERE (user_id = :uid OR buyer_phone = :phone) AND is_read = 0");
+    $unStmt->execute([':uid' => $userId, ':phone' => $phone]);
+    $unreadCount = (int)$unStmt->fetchColumn();
+
+    $stmt = $pdo->prepare("SELECT * FROM `notifications` {$whereSql} ORDER BY id DESC LIMIT :limit OFFSET :offset");
+    foreach ($params as $k => $v) {
+        $stmt->bindValue($k, $v);
+    }
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($rows as &$r) {
+        $r['id'] = (int)$r['id'];
+        $r['user_id'] = !empty($r['user_id']) ? (int)$r['user_id'] : null;
+        $r['is_read'] = (bool)$r['is_read'];
+        $r['data'] = !empty($r['data']) ? json_decode($r['data'], true) : null;
+    }
+    unset($r);
+
+    jsonResponse([
+        'notifications' => $rows,
+        'unread_count' => $unreadCount,
+        'total' => $total,
+        'page' => $page,
+        'limit' => $limit,
+        'last_page' => (int)ceil($total / $limit) ?: 1,
+    ]);
+}
+
+function apiGetUnreadNotificationsCount(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $unStmt = $pdo->prepare("SELECT COUNT(*) FROM `notifications` WHERE (user_id = :uid OR buyer_phone = :phone) AND is_read = 0");
+    $unStmt->execute([':uid' => (int)$user['id'], ':phone' => $user['phone'] ?? '']);
+    jsonResponse(['unread_count' => (int)$unStmt->fetchColumn()]);
+}
+
+function apiMarkNotificationRead(PDO $pdo, int $id): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id AND (user_id = :uid OR user_id IS NULL)");
+    $stmt->execute([':id' => $id, ':uid' => (int)$user['id']]);
+    jsonResponse(['success' => true, 'message' => 'Notification marked as read.']);
+}
+
+function apiMarkAllNotificationsRead(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE user_id = :uid OR buyer_phone = :phone");
+    $stmt->execute([':uid' => (int)$user['id'], ':phone' => $user['phone'] ?? '']);
+    jsonResponse(['success' => true, 'message' => 'All notifications marked as read.']);
+}
+
+function apiRegisterDeviceToken(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = getAuthenticatedUserOptional($pdo);
+    $input = getJsonInput();
+    $token = trim($input['token'] ?? $input['fcm_token'] ?? $input['device_token'] ?? '');
+    $platform = strtolower(trim($input['platform'] ?? 'android'));
+    $phone = $input['phone'] ?? ($user['phone'] ?? null);
+    $userId = $user ? (int)$user['id'] : (!empty($input['user_id']) ? (int)$input['user_id'] : null);
+
+    if (empty($token)) {
+        errorResponse('Device token is required.', [], 422);
+    }
+
+    $stmt = $pdo->prepare("
+        INSERT INTO `device_tokens` (user_id, phone, token, platform)
+        VALUES (:uid, :phone, :token, :platform)
+        ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP
+    ");
+    $stmt->execute([
+        ':uid' => $userId,
+        ':phone' => $phone,
+        ':token' => $token,
+        ':platform' => $platform,
+    ]);
+    if ($userId) {
+        $uStmt = $pdo->prepare("UPDATE `users` SET fcm_token = :token WHERE id = :uid");
+        $uStmt->execute([':token' => $token, ':uid' => $userId]);
+    }
+    jsonResponse(['success' => true, 'message' => 'Device push token registered successfully.']);
 }

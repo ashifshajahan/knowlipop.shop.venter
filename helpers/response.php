@@ -38,6 +38,9 @@ function errorResponse(string $message, array $errors = [], int $statusCode = 40
 
 function getJsonInput(): array
 {
+    if (isset($GLOBALS['_CUSTOM_JSON_INPUT']) && is_array($GLOBALS['_CUSTOM_JSON_INPUT'])) {
+        return $GLOBALS['_CUSTOM_JSON_INPUT'];
+    }
     $raw = file_get_contents('php://input');
     if (!$raw) {
         return $_POST;
