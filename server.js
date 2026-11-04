@@ -2581,11 +2581,7 @@ app.get('/api/products/:id/images', async (req, res) => {
 });
 
 // Dedicated Image Replacement Endpoint
-app.all(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), async (req, res) => {
-  if (!['PUT', 'POST', 'PATCH'].includes(req.method)) {
-    return res.status(405).json({ message: 'Method not allowed.' });
-  }
-
+const handleProductImageReplacement = async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
   let existing = [];
   try {
@@ -2658,10 +2654,14 @@ app.all(['/api/products/:id/image', '/api/products/:id/upload'], authenticateTok
   } catch (err) {
     res.status(500).json({ message: 'Failed to update product image.' });
   }
-});
+};
+
+app.put(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.post(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.patch(['/api/products/:id/image', '/api/products/:id/upload'], authenticateToken, upload.any(), handleProductImageReplacement);
 
 // Dedicated Image Deletion Endpoint
-app.delete(['/api/products/:id/image', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
+app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
   let existing = [];
   try {
@@ -2685,6 +2685,13 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images/:filename?'], a
     const safeTarget = path.basename(targetFilename.split('?')[0]);
     removedUrl = currentImgs.find(u => u.includes(safeTarget));
     currentImgs = currentImgs.filter(u => !u.includes(safeTarget));
+  } else if (req.body?.image_index !== undefined || req.query?.image_index !== undefined) {
+    const idx = parseInt(req.body?.image_index ?? req.query?.image_index, 10);
+    if (idx >= 0 && idx < currentImgs.length) {
+      removedUrl = currentImgs.splice(idx, 1)[0];
+    } else {
+      removedUrl = currentImgs.shift();
+    }
   } else {
     removedUrl = currentImgs.shift();
   }

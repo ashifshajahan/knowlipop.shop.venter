@@ -1,1 +1,1 @@
-Restart Hostinger Passenger Node.js app for image upload & permanent storage - 2026-11-04 11:14
+Restarting Passenger after fixing DELETE product image endpoint routing at Wed Nov  4 11:32:00 IST 2026
