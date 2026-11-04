@@ -76,7 +76,7 @@ async function createTestProduct(seller, productName, price) {
       price: price,
       mrp: Math.round(price * 1.3),
       stock: 50,
-      image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500'
+      image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg'
     })
   });
 

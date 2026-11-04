@@ -98,9 +98,24 @@ if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefi
         }
     }
 
-    // Reliable Fallback for missing uploaded images: Never return 404/blank!
+    // Reliable Fallback for missing uploaded images: NEVER redirect to external sample/demo URLs
     if ($isAvatar) {
-        header('Location: https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400', true, 302);
+        $avatarPlaceholder = __DIR__ . '/uploads/avatars/placeholder.jpg';
+        if (file_exists($avatarPlaceholder)) {
+            header('Content-Type: image/jpeg');
+            header('Cache-Control: public, max-age=86400');
+            readfile($avatarPlaceholder);
+            exit;
+        }
+        $genericPlaceholder = __DIR__ . '/uploads/products/placeholder.jpg';
+        if (file_exists($genericPlaceholder)) {
+            header('Content-Type: image/jpeg');
+            header('Cache-Control: public, max-age=86400');
+            readfile($genericPlaceholder);
+            exit;
+        }
+        http_response_code(404);
+        echo json_encode(['message' => 'Avatar not found.']);
         exit;
     }
 
@@ -118,7 +133,8 @@ if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefi
         readfile($samplePng);
         exit;
     }
-    header('Location: https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', true, 302);
+    http_response_code(404);
+    echo json_encode(['message' => 'No image available.']);
     exit;
 }
 

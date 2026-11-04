@@ -156,9 +156,9 @@ async function runLiveTests() {
   // Step 3: Create Product with Price = 1000.00, MRP = 1499.00
   console.log('\n--- 3. Creating Product with Clean Price = ₹1000.00 and MRP = ₹1499.00 ---');
   const testImages = [
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
-    'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=500',
-    'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=500'
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg'
   ];
 
   const createRes = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
@@ -338,12 +338,12 @@ async function runLiveTests() {
   // Step 7: Verify Multi-Image URLs with Strict Limit of 4 and Image Editing / Preservation
   console.log('\n--- 7. Testing Multiple Image URLs (Limit 4) & Image Editing / Preservation ---');
   const sixImages = [
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d304?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d305?w=800',
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d306?w=800'
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg'
   ];
 
   const multiRes = await request('POST', '/api/products', { Authorization: `Bearer ${token}` }, {
@@ -375,8 +375,8 @@ async function runLiveTests() {
 
   // Verify updating product with new images replaces them cleanly
   const newImages = [
-    'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
-    'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800'
+    'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    'https://knowlipop.shop/uploads/products/placeholder.jpg'
   ];
   const editImagesUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
     images: newImages
@@ -392,7 +392,7 @@ async function runLiveTests() {
 
   // Verify comma-separated URL string parsing
   const commaUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
-    images: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800, https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800, https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800'
+    images: 'https://knowlipop.shop/uploads/products/placeholder.jpg, https://knowlipop.shop/uploads/products/placeholder.jpg, https://knowlipop.shop/uploads/products/placeholder.jpg'
   });
   const commaProd = commaUpdate.data && commaUpdate.data.product;
   if (!commaProd || !Array.isArray(commaProd.images) || commaProd.images.length !== 3) {
@@ -403,9 +403,9 @@ async function runLiveTests() {
   // Verify array of image objects format (e.g. [{ url: '...' }])
   const objUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
     images: [
-      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800' },
-      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800' },
-      { url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800' }
+      { url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+      { url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+      { url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' }
     ]
   });
   const objProd = objUpdate.data && objUpdate.data.product;
@@ -416,10 +416,10 @@ async function runLiveTests() {
 
   // Verify numbered keys (image1, image2, image3, image4)
   const numUpdate = await request('PUT', `/api/products/${multiProd.id}`, { Authorization: `Bearer ${token}` }, {
-    image1: 'https://images.unsplash.com/photo-1505740420928-5e560c06d301?w=800',
-    image2: 'https://images.unsplash.com/photo-1505740420928-5e560c06d302?w=800',
-    image3: 'https://images.unsplash.com/photo-1505740420928-5e560c06d303?w=800',
-    image4: 'https://images.unsplash.com/photo-1505740420928-5e560c06d304?w=800'
+    image1: 'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    image2: 'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    image3: 'https://knowlipop.shop/uploads/products/placeholder.jpg',
+    image4: 'https://knowlipop.shop/uploads/products/placeholder.jpg'
   });
   const numProd = numUpdate.data && numUpdate.data.product;
   if (!numProd || !Array.isArray(numProd.images) || numProd.images.length !== 4) {

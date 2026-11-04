@@ -66,81 +66,6 @@ function calculatePricingBreakdown(array $input): array
     return resolveProductPricing($input);
 }
 
-$distinctProductGalleries = [
-    'headphones' => [
-        'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
-        'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800',
-        'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'
-    ],
-    'watch' => [
-        'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
-        'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800',
-        'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'
-    ],
-    'backpack' => [
-        'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
-        'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800',
-        'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'
-    ],
-    'sneakers' => [
-        'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
-        'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800',
-        'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'
-    ],
-    'sunglasses' => [
-        'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
-        'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800',
-        'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'
-    ],
-    'keyboard' => [
-        'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
-        'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800',
-        'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'
-    ],
-    'earbuds' => [
-        'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
-        'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800',
-        'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'
-    ],
-    'mouse' => [
-        'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
-        'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800',
-        'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'
-    ],
-    'general' => [
-        'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
-        'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800',
-        'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800'
-    ]
-];
-
-function getDistinctDefaultImages(string $name = '', string $category = '', int $id = 0): array
-{
-    global $distinctProductGalleries;
-    $text = strtolower($name . ' ' . $category);
-    $gallery = $distinctProductGalleries['general'];
-
-    if (strpos($text, 'headphone') !== false || strpos($text, 'headset') !== false) {
-        $gallery = $distinctProductGalleries['headphones'];
-    } elseif (strpos($text, 'watch') !== false || strpos($text, 'wearable') !== false) {
-        $gallery = $distinctProductGalleries['watch'];
-    } elseif (strpos($text, 'backpack') !== false || strpos($text, 'bag') !== false || strpos($text, 'luggage') !== false) {
-        $gallery = $distinctProductGalleries['backpack'];
-    } elseif (strpos($text, 'sneaker') !== false || strpos($text, 'shoe') !== false || strpos($text, 'footwear') !== false) {
-        $gallery = $distinctProductGalleries['sneakers'];
-    } elseif (strpos($text, 'glass') !== false || strpos($text, 'aviator') !== false || strpos($text, 'opti') !== false) {
-        $gallery = $distinctProductGalleries['sunglasses'];
-    } elseif (strpos($text, 'keyboard') !== false) {
-        $gallery = $distinctProductGalleries['keyboard'];
-    } elseif (strpos($text, 'earbud') !== false || strpos($text, 'audio') !== false) {
-        $gallery = $distinctProductGalleries['earbuds'];
-    } elseif (strpos($text, 'mouse') !== false) {
-        $gallery = $distinctProductGalleries['mouse'];
-    }
-
-    return array_slice($gallery, 0, 4);
-}
-
 function formatProductRecord(array $p, bool $isSellerView = false): array
 {
     $rawPrice = isset($p['seller_price']) && is_numeric($p['seller_price']) && (float) $p['seller_price'] > 0
@@ -272,20 +197,20 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         }
     }
 
-    // Deduplicate
-    $imagesArray = array_values(array_unique(array_filter($imagesArray)));
+    // Deduplicate and filter out any external demo/sample images (e.g. Unsplash demo URLs)
+    $imagesArray = array_values(array_filter(array_unique(array_filter($imagesArray)), function($u) {
+        return is_string($u) && !str_contains(strtolower($u), 'unsplash.com');
+    }));
 
-    // Fallback: If no valid images could be resolved, supply clean distinct category default images!
-    $prodName = (string)($p['name'] ?? '');
-    $prodCat = (string)($p['category'] ?? '');
-    $prodId = (int)($p['id'] ?? 0);
+    // If seller uploaded no images, use neutral "No image available" state
+    $placeholderUrl = $baseUrl . '/uploads/products/placeholder.jpg';
+    $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : $placeholderUrl;
     if (empty($imagesArray)) {
-        $imagesArray = array_slice(getDistinctDefaultImages($prodName, $prodCat, $prodId), 0, 4);
+        $imagesArray = [$placeholderUrl];
+    } else {
+        $imagesArray = array_slice($imagesArray, 0, 4);
     }
 
-    // Strictly enforce seller multiple URL limit of 4 images
-    $imagesArray = array_slice($imagesArray, 0, 4);
-    $primaryImageUrl = !empty($imagesArray) ? $imagesArray[0] : ($baseUrl . '/uploads/products/placeholder.jpg');
     $relativePaths = array_map(function($u) {
         $fn = basename(explode('?', $u)[0]);
         return str_contains($u, '/uploads/products/') ? 'uploads/products/' . $fn : $u;
@@ -409,6 +334,19 @@ function ensureProductPriceColumns(PDO $pdo): void
         // 4. Ensure SKU is set
         try {
             $pdo->exec("UPDATE `products` SET `sku` = CONCAT('SKU-', LPAD(`id`, 4, '0')) WHERE `sku` IS NULL OR `sku` = ''");
+        } catch (\Throwable $e) {}
+        // 5. Cleanse any leftover external sample/demo images (e.g. Unsplash demo URLs) from database
+        try {
+            $pdo->exec("
+                UPDATE `products` 
+                SET `image_url` = 'https://knowlipop.shop/uploads/products/placeholder.jpg',
+                    `images` = '[\"https://knowlipop.shop/uploads/products/placeholder.jpg\"]'
+                WHERE `image_url` LIKE '%unsplash.com%' OR `images` LIKE '%unsplash.com%'
+            ");
+            $pdo->exec("
+                DELETE FROM `product_images` 
+                WHERE `image_url` LIKE '%unsplash.com%' OR `relative_path` LIKE '%unsplash.com%' OR `file_name` LIKE '%unsplash%'
+            ");
         } catch (\Throwable $e) {}
         // Ensure product_images table exists
         try {
@@ -1266,9 +1204,9 @@ function apiCreateProduct(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
-    // Process image file uploads, base64, or multiple images (up to 4 max)
+    // Process image file uploads, base64, or multiple images (up to 4 max). Never inject demo images.
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
-    $finalImages = $imgResult['hasImages'] ? $imgResult['images'] : array_slice(getDistinctDefaultImages($name, $category, 0), 0, 4);
+    $finalImages = $imgResult['hasImages'] ? array_slice($imgResult['images'], 0, 4) : [];
     $finalPrimaryUrl = !empty($finalImages) ? $finalImages[0] : null;
     $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
 

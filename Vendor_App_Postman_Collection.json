@@ -565,7 +565,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50,\n  \"image_url\": \"https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500\"\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50,\n  \"image_url\": \"https://knowlipop.shop/uploads/products/placeholder.jpg\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products",

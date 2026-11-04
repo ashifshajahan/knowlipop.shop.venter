@@ -172,9 +172,21 @@ app.use((req, res, next) => {
     return res.sendFile(targetPath);
   }
 
-  // Graceful Fallback if file does not exist on disk: NEVER return 404/blank
+  // Graceful Fallback if file does not exist on disk: NEVER redirect to external sample/demo URLs
   if (isAvatar) {
-    return res.redirect(302, 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400');
+    const avatarPlaceholder = path.join(avatarUploadDir, 'placeholder.jpg');
+    if (fs.existsSync(avatarPlaceholder)) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.sendFile(avatarPlaceholder);
+    }
+    const genericPlaceholder = path.join(uploadDir, 'placeholder.jpg');
+    if (fs.existsSync(genericPlaceholder)) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.sendFile(genericPlaceholder);
+    }
+    return res.status(404).json({ message: 'Avatar not found.' });
   }
 
   const placeholder = path.join(uploadDir, 'placeholder.jpg');
@@ -189,7 +201,7 @@ app.use((req, res, next) => {
     res.setHeader('Cache-Control', 'public, max-age=86400');
     return res.sendFile(samplePng);
   }
-  return res.redirect(302, 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800');
+  return res.status(404).json({ message: 'No image available.' });
 });
 
 // Secondary static directories mounting for direct file paths
@@ -295,68 +307,7 @@ const upload = {
   fields: () => handleMulterUpload
 };
 
-const distinctProductGalleries = {
-  headphones: [
-    'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800',
-    'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800',
-    'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'
-  ],
-  watch: [
-    'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800',
-    'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800',
-    'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'
-  ],
-  backpack: [
-    'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800',
-    'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800',
-    'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'
-  ],
-  sneakers: [
-    'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800',
-    'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800',
-    'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'
-  ],
-  sunglasses: [
-    'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800',
-    'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800',
-    'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'
-  ],
-  keyboard: [
-    'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800',
-    'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800',
-    'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'
-  ],
-  earbuds: [
-    'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800',
-    'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800',
-    'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'
-  ],
-  mouse: [
-    'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800',
-    'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800',
-    'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'
-  ],
-  general: [
-    'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=800',
-    'https://images.unsplash.com/photo-1560343090-f0409e92791a?w=800',
-    'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=800'
-  ]
-};
 
-function getDistinctDefaultImages(name = '', category = '', id = 0) {
-  const text = `${name} ${category}`.toLowerCase();
-  let gallery = distinctProductGalleries.general;
-  if (text.includes('headphone') || text.includes('headset')) gallery = distinctProductGalleries.headphones;
-  else if (text.includes('watch') || text.includes('wearable')) gallery = distinctProductGalleries.watch;
-  else if (text.includes('backpack') || text.includes('bag') || text.includes('luggage')) gallery = distinctProductGalleries.backpack;
-  else if (text.includes('sneaker') || text.includes('shoe') || text.includes('footwear')) gallery = distinctProductGalleries.sneakers;
-  else if (text.includes('glass') || text.includes('aviator') || text.includes('opti')) gallery = distinctProductGalleries.sunglasses;
-  else if (text.includes('keyboard')) gallery = distinctProductGalleries.keyboard;
-  else if (text.includes('earbud') || text.includes('audio')) gallery = distinctProductGalleries.earbuds;
-  else if (text.includes('mouse')) gallery = distinctProductGalleries.mouse;
-
-  return gallery.slice(0, 4);
-}
 
 function isBase64Image(str) {
   if (typeof str !== 'string') return false;
@@ -2247,17 +2198,18 @@ function formatProductRecord(p, options = {}) {
     }
   }
 
-  // Deduplicate
-  imagesArray = Array.from(new Set(imagesArray.filter(Boolean)));
+  // Deduplicate and filter out any external demo/sample images (e.g. Unsplash demo URLs)
+  imagesArray = Array.from(new Set(imagesArray.filter(u => typeof u === 'string' && !u.toLowerCase().includes('unsplash.com'))));
 
-  // Fallback: If no valid images could be resolved, supply clean distinct category default images!
+  // If seller uploaded no images, use neutral "No image available" state
+  const placeholderUrl = `${baseUrl}/uploads/products/placeholder.jpg`;
+  const primaryImageUrl = imagesArray.length > 0 ? imagesArray[0] : placeholderUrl;
   if (imagesArray.length === 0) {
-    imagesArray = getDistinctDefaultImages(p.name, p.category, p.id).slice(0, 4);
+    imagesArray = [placeholderUrl];
+  } else {
+    imagesArray = imagesArray.slice(0, 4);
   }
 
-  // Strictly enforce seller multiple URL limit of 4 images
-  imagesArray = imagesArray.slice(0, 4);
-  const primaryImageUrl = imagesArray[0] || `${baseUrl}/uploads/products/placeholder.jpg`;
   const relativePaths = imagesArray.map(u => {
     const fn = path.basename(u.split('?')[0]);
     return u.includes('/uploads/products/') ? `uploads/products/${fn}` : u;
@@ -2396,6 +2348,19 @@ async function ensureProductPriceColumns(p) {
     try {
       await p.query("UPDATE products SET sku = CONCAT('SKU-', LPAD(id, 4, '0')) WHERE sku IS NULL OR sku = ''");
     } catch (e) {}
+    // 5. Cleanse any leftover external sample/demo images (e.g. Unsplash demo URLs) from database
+    try {
+      await p.query(`
+        UPDATE products 
+        SET image_url = 'https://knowlipop.shop/uploads/products/placeholder.jpg',
+            images = '["https://knowlipop.shop/uploads/products/placeholder.jpg"]'
+        WHERE image_url LIKE '%unsplash.com%' OR images LIKE '%unsplash.com%'
+      `);
+      await p.query(`
+        DELETE FROM product_images 
+        WHERE image_url LIKE '%unsplash.com%' OR relative_path LIKE '%unsplash.com%' OR file_name LIKE '%unsplash%'
+      `);
+    } catch (e) {}
     // Ensure product_images table exists
     try {
       await p.query(`
@@ -2422,14 +2387,14 @@ async function ensureProductPriceColumns(p) {
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', images: ['https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', 'https://images.unsplash.com/photo-1583394838336-acd977736f90?w=800', 'https://images.unsplash.com/photo-1484704849700-f032a568e944?w=800'], is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', images: ['https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800', 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=800', 'https://images.unsplash.com/photo-1579586337278-3befd40fd17a?w=800'], is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', images: ['https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=800', 'https://images.unsplash.com/photo-1622560480605-d83c853bc5c3?w=800', 'https://images.unsplash.com/photo-1546938576-6e6a64f317cc?w=800'], is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', images: ['https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800', 'https://images.unsplash.com/photo-1608231387042-66d1773070a5?w=800', 'https://images.unsplash.com/photo-1600185365926-3a2ce3cdb9eb?w=800'], is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', images: ['https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=800', 'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800', 'https://images.unsplash.com/photo-1577803645773-f96470509666?w=800'], is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', images: ['https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=800', 'https://images.unsplash.com/photo-1618384887929-16ec33fab9ef?w=800', 'https://images.unsplash.com/photo-1595225476474-87563907a212?w=800'], is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', images: ['https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800', 'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800', 'https://images.unsplash.com/photo-1572536147248-ac59a8abfa4b?w=800'], is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', images: ['https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=800', 'https://images.unsplash.com/photo-1615663245857-ac93bb7c39e7?w=800', 'https://images.unsplash.com/photo-1626218174358-7769486c4b79?w=800'], is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg', images: ['https://knowlipop.shop/uploads/products/placeholder.jpg'], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
@@ -2938,8 +2903,8 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
 
-  // Use seller's uploaded/provided images (up to 4 max). Only fall back to default gallery if seller provided zero images.
-  const finalImages = imgResult.hasImages ? imgResult.images : getDistinctDefaultImages(name, category, 0).slice(0, 4);
+  // Use seller's uploaded/provided images (up to 4 max). Never inject demo or sample images.
+  const finalImages = imgResult.hasImages ? imgResult.images.slice(0, 4) : [];
   const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
   const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
 
@@ -3363,7 +3328,7 @@ let fallbackOrders = [
         product_id: 1,
         seller_id: 1,
         product_name: 'Smart Wireless Headset Pro',
-        product_image: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500',
+        product_image: 'https://knowlipop.shop/uploads/products/placeholder.jpg',
         price: 2999.00,
         quantity: 2,
         subtotal: 5998.00
@@ -3374,7 +3339,7 @@ let fallbackOrders = [
         product_id: 5,
         seller_id: 1,
         product_name: 'Polarized Aviator Sunglasses',
-        product_image: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500',
+        product_image: 'https://knowlipop.shop/uploads/products/placeholder.jpg',
         price: 1299.00,
         quantity: 1,
         subtotal: 1299.00
@@ -4711,14 +4676,14 @@ const handleCreateOrder = async (req, res) => {
 
   // Fallback map for seed catalog products
   const defaultProductCatalogMap = {
-    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=500' },
-    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=500' },
-    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=500' },
-    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=500' },
-    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=500' },
-    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=500' },
-    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=500' },
-    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: 'https://images.unsplash.com/photo-1527864550417-7fd91fc51a46?w=500' }
+    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' },
+    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: 'https://knowlipop.shop/uploads/products/placeholder.jpg' }
   };
 
   // 1. Pre-query product catalog from MySQL to auto-resolve accurate prices, names, images, and seller_ids
