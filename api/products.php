@@ -167,7 +167,13 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
     $delivery_charge = $cleanPrice >= 500 ? 0.00 : 50.00;
     $delivery_text = $cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-    $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    if (!empty($host) && !str_contains($host, 'knowlipop.shop')) {
+        $proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $baseUrl = $proto . '://' . $host;
+    } else {
+        $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    }
     $normalizeUrl = function(?string $u) use ($baseUrl): ?string {
         if (!$u) return null;
         $t = trim($u);
@@ -176,6 +182,13 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             $t = trim(substr($t, 1, -1));
         }
         if (empty($t) || str_starts_with($t, 'blob:') || str_starts_with($t, 'file:') || str_starts_with($t, '/data/user/') || str_starts_with($t, '/var/mobile/')) return null;
+
+        // Check if string contains a product image filename anywhere (e.g. mangled/double URLs)
+        $fnMatch = [];
+        if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png))/i', $t, $fnMatch)) {
+            return $baseUrl . '/uploads/products/' . $fnMatch[1];
+        }
+
         if (str_starts_with($t, '//')) return 'https:' . $t;
         if (str_starts_with($t, 'http://') || str_starts_with($t, 'https://')) {
             if (str_starts_with($t, 'http://localhost') || str_starts_with($t, 'http://127.0.0.1')) {
@@ -301,6 +314,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'ratings_count' => $ratingsCount,
         'image_url' => $primaryImageUrl,
         'image' => $primaryImageUrl,
+        'url' => $primaryImageUrl,
         'product_image' => $primaryImageUrl,
         'thumbnail' => $primaryImageUrl,
         'photo' => $primaryImageUrl,
@@ -313,6 +327,16 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'photos' => $imagesArray,
         'image_paths' => $relativePaths,
         'relative_paths' => $relativePaths,
+        'gallery_items' => array_map(function($u, $i) use ($p, $relativePaths) {
+            return [
+                'id' => $i + 1,
+                'product_id' => (int) $p['id'],
+                'image_url' => $u,
+                'url' => $u,
+                'path' => $relativePaths[$i] ?? null,
+                'relative_path' => $relativePaths[$i] ?? null,
+            ];
+        }, $imagesArray, array_keys($imagesArray)),
         'is_active' => (bool) ($p['is_active'] ?? true),
         'created_at' => $p['created_at'] ?? null,
         'updated_at' => $p['updated_at'] ?? null,
@@ -455,13 +479,19 @@ function apiGetProducts(PDO $pdo): void
     }, $rawProducts);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
+        'data' => $products,
         'products' => [
             'current_page' => $page,
             'data' => $products,
             'total' => $total,
             'per_page' => $limit,
-            'last_page' => ceil($total / $limit),
-        ]
+            'last_page' => (int)ceil($total / $limit) ?: 1,
+        ],
+        'items' => $products,
+        'results' => $products,
+        'total' => $total,
     ]);
 }
 
@@ -487,7 +517,12 @@ function apiGetProduct(PDO $pdo, int $id): void
 
     $isSellerView = (isset($_GET['seller_view']) && ($_GET['seller_view'] === '1' || $_GET['seller_view'] === 'true'));
     $formatted = formatProductRecord($product, $isSellerView);
-    jsonResponse(['product' => $formatted]);
+    jsonResponse(array_merge([
+        'success' => true,
+        'status' => true,
+        'product' => $formatted,
+        'data' => $formatted,
+    ], $formatted));
 }
 
 function saveUploadedProductImages(array $input = [], ?string $fallback = null): array
@@ -1223,14 +1258,20 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
     }, $rawProducts);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
         'seller_id' => $targetSellerId,
+        'data' => $products,
         'products' => [
             'current_page' => $page,
             'data' => $products,
             'total' => $total,
             'per_page' => $limit,
             'last_page' => (int)ceil($total / $limit) ?: 1,
-        ]
+        ],
+        'items' => $products,
+        'results' => $products,
+        'total' => $total,
     ]);
 }
 

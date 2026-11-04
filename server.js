@@ -101,41 +101,64 @@ if (!fs.existsSync(avatarUploadDir)) {
 const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
 const ALLOWED_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
 
-// Serve existing files statically with CORS & caching headers
-app.use(['/uploads', '/public/uploads', '/storage/uploads'], (req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-}, express.static(path.resolve(__dirname, 'uploads'), {
-  maxAge: '30d',
-  immutable: true,
-  setHeaders: (res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+// Universal Static Image Serving & Double/Mangled URL Resolver
+// Matches any image file request regardless of whether frontend prepends /api, /storage, /images, double URLs, or port/host
+app.use((req, res, next) => {
+  const urlPath = req.path || req.url;
+
+  // Match any product image filename or avatar filename anywhere in the URL
+  const imgMatch = urlPath.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp))/i);
+  const isImageRoute = (
+    imgMatch ||
+    urlPath.startsWith('/uploads/') ||
+    urlPath.startsWith('/api/images/') ||
+    urlPath.startsWith('/api/products/images/') ||
+    urlPath.startsWith('/api/uploads/') ||
+    urlPath.startsWith('/storage/') ||
+    urlPath.startsWith('/images/') ||
+    urlPath.startsWith('/products/') ||
+    urlPath.startsWith('/public/uploads/') ||
+    urlPath.includes('/uploads/products/') ||
+    urlPath.includes('/uploads/avatars/')
+  );
+
+  if (!isImageRoute || !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return next();
   }
-}));
 
-// Fallback handlers & Direct Image Retrieval: If an image file does not exist on disk, NEVER return 404/blank!
-app.get([
-  '/uploads/products/:filename',
-  '/api/images/:filename',
-  '/api/products/images/:filename',
-  '/storage/uploads/products/:filename',
-  '/public/uploads/products/:filename'
-], (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
 
-  const safeFilename = path.basename(req.params.filename || '');
-  if (!safeFilename) return res.status(400).json({ message: 'Filename required.' });
+  let targetFilename = '';
+  const isAvatar = urlPath.includes('/avatars/') || (imgMatch && imgMatch[1].toLowerCase().startsWith('avatar_'));
 
-  const targetPath = path.join(uploadDir, safeFilename);
+  if (imgMatch) {
+    targetFilename = imgMatch[1];
+  } else {
+    targetFilename = path.basename(urlPath.split('?')[0]);
+  }
+
+  if (!targetFilename || ['uploads', 'products', 'avatars', 'images', 'storage', 'api'].includes(targetFilename.toLowerCase())) {
+    return next();
+  }
+
+  const searchDir = isAvatar ? avatarUploadDir : uploadDir;
+  let targetPath = path.join(searchDir, targetFilename);
+
+  // If not found in primary dir, check the other dir as well
+  if (!fs.existsSync(targetPath)) {
+    const altDir = isAvatar ? uploadDir : avatarUploadDir;
+    const altPath = path.join(altDir, targetFilename);
+    if (fs.existsSync(altPath)) {
+      targetPath = altPath;
+    }
+  }
+
   if (fs.existsSync(targetPath)) {
-    const ext = path.extname(safeFilename).toLowerCase();
+    const ext = path.extname(targetFilename).toLowerCase();
     const mimeMap = {
       '.jpg': 'image/jpeg',
       '.jpeg': 'image/jpeg',
@@ -147,6 +170,11 @@ app.get([
     res.setHeader('Content-Type', mimeMap[ext] || 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.sendFile(targetPath);
+  }
+
+  // Graceful Fallback if file does not exist on disk: NEVER return 404/blank
+  if (isAvatar) {
+    return res.redirect(302, 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400');
   }
 
   const placeholder = path.join(uploadDir, 'placeholder.jpg');
@@ -164,16 +192,22 @@ app.get([
   return res.redirect(302, 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800');
 });
 
-app.get('/uploads/avatars/:filename', (req, res) => {
+// Secondary static directories mounting for direct file paths
+app.use(['/uploads', '/public/uploads', '/storage/uploads', '/storage'], (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  const safeFilename = path.basename(req.params.filename || '');
-  const targetPath = path.join(avatarUploadDir, safeFilename);
-  if (fs.existsSync(targetPath)) {
-    return res.sendFile(targetPath);
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+}, express.static(path.resolve(__dirname, 'uploads'), {
+  maxAge: '30d',
+  immutable: true,
+  setHeaders: (res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
-  return res.redirect(302, 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400');
-});
+}));
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -2114,6 +2148,21 @@ function calculatePricingBreakdown(body = {}) {
   return resolveProductPricing(body);
 }
 
+// Dynamic Base URL helper: Auto-detects caller host so local frontend dev (localhost:3000, 10.0.2.2, 192.168.x.x) and production (knowlipop.shop) both load images seamlessly
+function getAppBaseUrl(req) {
+  if (req && req.get) {
+    const host = req.get('host');
+    if (host) {
+      if (host.includes('knowlipop.shop')) {
+        return 'https://knowlipop.shop';
+      }
+      const proto = req.protocol || (req.headers && req.headers['x-forwarded-proto']) || 'http';
+      return `${proto}://${host}`;
+    }
+  }
+  return (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+}
+
 function formatProductRecord(p, options = {}) {
   if (!p) return null;
 
@@ -2142,7 +2191,7 @@ function formatProductRecord(p, options = {}) {
   const deliveryCharge = cleanPrice >= 500 ? 0.00 : 50.00;
   const deliveryText = cleanPrice >= 500 ? 'FREE Delivery' : 'Standard Delivery (₹50)';
 
-  const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+  const baseUrl = options.baseUrl || getAppBaseUrl(options.req);
   const normalizeUrl = (u) => {
     if (!u || typeof u !== 'string') return null;
     let t = u.trim();
@@ -2151,6 +2200,13 @@ function formatProductRecord(p, options = {}) {
       t = t.slice(1, -1).trim();
     }
     if (!t || t.startsWith('blob:') || t.startsWith('file:') || t.startsWith('/data/user/') || t.startsWith('/var/mobile/')) return null;
+
+    // Check if string contains a product image filename anywhere (e.g. mangled/double URLs)
+    const fnMatch = t.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png))/i);
+    if (fnMatch) {
+      return `${baseUrl}/uploads/products/${fnMatch[1]}`;
+    }
+
     if (t.startsWith('//')) return `https:${t}`;
     if (t.startsWith('http://') || t.startsWith('https://')) {
       if (t.startsWith('http://localhost') || t.startsWith('http://127.0.0.1')) {
@@ -2162,9 +2218,6 @@ function formatProductRecord(p, options = {}) {
     if (t.startsWith('/uploads/') || t.startsWith('uploads/') || t.startsWith('/storage/') || t.startsWith('storage/') || t.startsWith('/public/uploads/') || t.startsWith('public/uploads/')) {
       const clean = t.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
       return `${baseUrl}/${clean}`;
-    }
-    if (/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(t) || /^placeholder\.(jpg|jpeg|png)$/i.test(t) || /^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp)$/i.test(t)) {
-      return `${baseUrl}/uploads/products/${t}`;
     }
     return t;
   };
@@ -2234,6 +2287,7 @@ function formatProductRecord(p, options = {}) {
     ratings_count: ratingsCount,
     image_url: primaryImageUrl,
     image: primaryImageUrl,
+    url: primaryImageUrl,
     product_image: primaryImageUrl,
     thumbnail: primaryImageUrl,
     photo: primaryImageUrl,
@@ -2246,6 +2300,14 @@ function formatProductRecord(p, options = {}) {
     photos: imagesArray,
     image_paths: relativePaths,
     relative_paths: relativePaths,
+    gallery_items: imagesArray.map((u, i) => ({
+      id: i + 1,
+      product_id: Number(p.id),
+      image_url: u,
+      url: u,
+      path: relativePaths[i] || null,
+      relative_path: relativePaths[i] || null
+    })),
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
     updated_at: p.updated_at || null
@@ -2403,27 +2465,39 @@ app.get('/api/products', async (req, res) => {
     const [products] = await pool.query(querySql, queryParams);
 
     // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
-    const formatted = products.map(p => formatProductRecord(p, { isSellerView: false }));
+    const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
 
     res.json({
+      success: true,
+      status: true,
+      data: formatted,
       products: {
         current_page: page,
         data: formatted,
         total,
         per_page: limit,
         last_page: Math.ceil(total / limit)
-      }
+      },
+      items: formatted,
+      results: formatted,
+      total
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isSellerView: false }));
+    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isSellerView: false, req }));
     res.json({
+      success: true,
+      status: true,
+      data: filtered,
       products: {
         current_page: 1,
         data: filtered,
         total: filtered.length,
         per_page: limit,
         last_page: 1
-      }
+      },
+      items: filtered,
+      results: filtered,
+      total: filtered.length
     });
   }
 });
@@ -2452,13 +2526,26 @@ app.get([
       return res.status(404).json({ message: 'Product not found.' });
     }
     const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
-    const product = formatProductRecord(rows[0], { isSellerView });
-    res.json({ product });
+    const product = formatProductRecord(rows[0], { isSellerView, req });
+    res.json({
+      success: true,
+      status: true,
+      product,
+      data: product,
+      ...product
+    });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
     if (found) {
       const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
-      return res.json({ product: formatProductRecord(found, { isSellerView }) });
+      const product = formatProductRecord(found, { isSellerView, req });
+      return res.json({
+        success: true,
+        status: true,
+        product,
+        data: product,
+        ...product
+      });
     }
     res.status(404).json({ message: 'Product not found.' });
   }
@@ -2643,13 +2730,17 @@ const handleProductImageReplacement = async (req, res) => {
     }
 
     const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
-    const formatted = formatProductRecord(updated[0], { isSellerView: true });
+    const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
 
     res.json({
+      success: true,
+      status: true,
       message: 'Product image updated successfully.',
       image_url: primaryUrl,
       images: newImages,
-      product: formatted
+      product: formatted,
+      data: formatted,
+      ...formatted
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to update product image.' });
@@ -2712,13 +2803,17 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
     }
 
     const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
-    const formatted = formatProductRecord(updated[0], { isSellerView: true });
+    const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
 
     res.json({
+      success: true,
+      status: true,
       message: 'Product image deleted successfully.',
       image_url: primaryUrl,
       images: currentImgs,
-      product: formatted
+      product: formatted,
+      data: formatted,
+      ...formatted
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to delete product image.' });
@@ -2770,8 +2865,15 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       [result.insertId]
     );
     // Seller created product: Seller view has NO commission feature!
-    const product = formatProductRecord(rows[0], { isSellerView: true });
-    res.status(201).json({ message: 'Product created.', product });
+    const product = formatProductRecord(rows[0], { isSellerView: true, req });
+    res.status(201).json({
+      success: true,
+      status: true,
+      message: 'Product created.',
+      product,
+      data: product,
+      ...product
+    });
   } catch (err) {
     const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => p.id)) + 1 : 9;
     const newProduct = formatProductRecord({
@@ -2790,9 +2892,16 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       image_url: finalPrimaryUrl,
       images: finalImages,
       is_active: true
-    }, { isSellerView: true });
+    }, { isSellerView: true, req });
     fallbackProducts.unshift(newProduct);
-    return res.status(201).json({ message: 'Product created.', product: newProduct });
+    return res.status(201).json({
+      success: true,
+      status: true,
+      message: 'Product created.',
+      product: newProduct,
+      data: newProduct,
+      ...newProduct
+    });
   }
 });
 
@@ -2838,29 +2947,41 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
     );
 
     // Seller view: Commission feature is deleted from seller field!
-    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true }));
+    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true, req }));
 
     res.json({
+      success: true,
+      status: true,
       seller_id: targetSellerId,
+      data: formatted,
       products: {
         current_page: page,
         data: formatted,
         total,
         per_page: limit,
         last_page: Math.ceil(total / limit) || 1
-      }
+      },
+      items: formatted,
+      results: formatted,
+      total
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p, { isSellerView: true }));
+    const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p, { isSellerView: true, req }));
     res.json({
+      success: true,
+      status: true,
       seller_id: targetSellerId,
+      data: filtered,
       products: {
         current_page: 1,
         data: filtered,
         total: filtered.length,
         per_page: limit,
         last_page: Math.ceil(filtered.length / limit) || 1
-      }
+      },
+      items: filtered,
+      results: filtered,
+      total: filtered.length
     });
   }
 });
@@ -2969,9 +3090,16 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       [req.params.id]
     );
     // Seller updated product: Seller view has NO commission feature!
-    const product = formatProductRecord(updated[0], { isSellerView: true });
+    const product = formatProductRecord(updated[0], { isSellerView: true, req });
 
-    res.json({ message: 'Product updated.', product });
+    res.json({
+      success: true,
+      status: true,
+      message: 'Product updated.',
+      product,
+      data: product,
+      ...product
+    });
   } catch (err) {
     const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
     if (idx !== -1) {
@@ -2994,7 +3122,15 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
         fallbackProducts[idx].image_url = imgResult.primaryImageUrl;
         fallbackProducts[idx].images = imgResult.images;
       }
-      return res.json({ message: 'Product updated.', product: formatProductRecord(fallbackProducts[idx], { isSellerView: true }) });
+      const updatedFallback = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
+      return res.json({
+        success: true,
+        status: true,
+        message: 'Product updated.',
+        product: updatedFallback,
+        data: updatedFallback,
+        ...updatedFallback
+      });
     }
     res.status(500).json({ message: 'Update failed.' });
   }

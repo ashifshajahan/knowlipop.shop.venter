@@ -50,62 +50,76 @@ if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
     exit;
 }
 
-// Static uploaded files handler (/uploads/products/..., /api/images/...)
-if (str_starts_with($requestUri, '/uploads/') || str_starts_with($requestUri, '/api/images/') || str_starts_with($requestUri, '/public/uploads/') || str_starts_with($requestUri, '/storage/uploads/')) {
+// Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /images/, /products/, double-URLs)
+$imgMatch = [];
+$hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp))/i', $requestUri, $imgMatch);
+$isImgPrefix = str_starts_with($requestUri, '/uploads/') || str_starts_with($requestUri, '/api/images/') || 
+               str_starts_with($requestUri, '/api/products/images/') || str_starts_with($requestUri, '/api/uploads/') || 
+               str_starts_with($requestUri, '/public/uploads/') || str_starts_with($requestUri, '/storage/') || 
+               str_starts_with($requestUri, '/images/') || str_starts_with($requestUri, '/products/') ||
+               str_contains($requestUri, '/uploads/products/') || str_contains($requestUri, '/uploads/avatars/');
+
+if ($hasImgFile || $isImgPrefix) {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
+    header('Access-Control-Allow-Headers: *');
     header('Cross-Origin-Resource-Policy: cross-origin');
     if ($method === 'OPTIONS') {
         http_response_code(204);
         exit;
     }
 
-    $cleanUri = parse_url($requestUri, PHP_URL_PATH);
-    if (str_starts_with($cleanUri, '/api/images/')) {
-        $cleanUri = '/uploads/products/' . substr($cleanUri, strlen('/api/images/'));
-    } elseif (str_starts_with($cleanUri, '/public/uploads/')) {
-        $cleanUri = '/uploads/' . substr($cleanUri, strlen('/public/uploads/'));
-    } elseif (str_starts_with($cleanUri, '/storage/uploads/')) {
-        $cleanUri = '/uploads/' . substr($cleanUri, strlen('/storage/uploads/'));
+    $fileName = !empty($imgMatch[1]) ? $imgMatch[1] : basename(parse_url($requestUri, PHP_URL_PATH));
+    $isAvatar = str_contains($requestUri, '/avatars/') || str_starts_with(strtolower($fileName), 'avatar_');
+
+    if (!empty($fileName) && !in_array(strtolower($fileName), ['uploads', 'products', 'avatars', 'images', 'storage', 'api'])) {
+        $subDir = $isAvatar ? '/uploads/avatars/' : '/uploads/products/';
+        $filePath = __DIR__ . $subDir . $fileName;
+
+        if (!file_exists($filePath) || !is_file($filePath)) {
+            $altDir = $isAvatar ? '/uploads/products/' : '/uploads/avatars/';
+            $altPath = __DIR__ . $altDir . $fileName;
+            if (file_exists($altPath) && is_file($altPath)) {
+                $filePath = $altPath;
+            }
+        }
+
+        if (file_exists($filePath) && is_file($filePath)) {
+            $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+            $mimes = [
+                'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+                'png' => 'image/png', 'webp' => 'image/webp',
+                'gif' => 'image/gif', 'svg' => 'image/svg+xml'
+            ];
+            header('Content-Type: ' . ($mimes[$ext] ?? 'image/jpeg'));
+            header('Cache-Control: public, max-age=31536000, immutable');
+            readfile($filePath);
+            exit;
+        }
     }
 
-    $filePath = __DIR__ . $cleanUri;
-    if (file_exists($filePath) && is_file($filePath)) {
-        $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-        $mimes = [
-            'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
-            'png' => 'image/png', 'webp' => 'image/webp',
-            'gif' => 'image/gif', 'svg' => 'image/svg+xml'
-        ];
-        header('Content-Type: ' . ($mimes[$ext] ?? 'application/octet-stream'));
-        header('Cache-Control: public, max-age=31536000, immutable');
-        readfile($filePath);
-        exit;
-    }
     // Reliable Fallback for missing uploaded images: Never return 404/blank!
-    if (str_starts_with($cleanUri, '/uploads/products/')) {
-        $placeholder = __DIR__ . '/uploads/products/placeholder.jpg';
-        if (file_exists($placeholder)) {
-            header('Content-Type: image/jpeg');
-            header('Cache-Control: public, max-age=86400');
-            readfile($placeholder);
-            exit;
-        }
-        $samplePng = __DIR__ . '/uploads/products/prod_1793598726521_793ff4ae.png';
-        if (file_exists($samplePng)) {
-            header('Content-Type: image/png');
-            header('Cache-Control: public, max-age=86400');
-            readfile($samplePng);
-            exit;
-        }
-        header('Location: https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', true, 302);
-        exit;
-    }
-    if (str_starts_with($cleanUri, '/uploads/avatars/')) {
+    if ($isAvatar) {
         header('Location: https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400', true, 302);
         exit;
     }
-    errorResponse('File not found.', [], 404);
+
+    $placeholder = __DIR__ . '/uploads/products/placeholder.jpg';
+    if (file_exists($placeholder)) {
+        header('Content-Type: image/jpeg');
+        header('Cache-Control: public, max-age=86400');
+        readfile($placeholder);
+        exit;
+    }
+    $samplePng = __DIR__ . '/uploads/products/prod_1793598726521_793ff4ae.png';
+    if (file_exists($samplePng)) {
+        header('Content-Type: image/png');
+        header('Cache-Control: public, max-age=86400');
+        readfile($samplePng);
+        exit;
+    }
+    header('Location: https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800', true, 302);
+    exit;
 }
 
 if ($requestUri === '/' || $requestUri === '') {
