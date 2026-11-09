@@ -271,12 +271,12 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
         }
     }
 
-    // Email is ONLY for admin users (regular sellers do not have/change email)
-    if ($isAdmin && !empty($email)) {
+    // Validate email if provided
+    if (!empty($email)) {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             $errors['email'] = ['The email address format is invalid.'];
         } else {
-            $chkEmail = $pdo->prepare("SELECT id FROM users WHERE email = :email AND id != :id LIMIT 1");
+            $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) AND id != :id LIMIT 1");
             $chkEmail->execute([':email' => $email, ':id' => $sellerId]);
             if ($chkEmail->fetch()) {
                 $errors['email'] = ['This email address is already in use by another account.'];
@@ -348,9 +348,9 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
         $updates[] = "phone = :phone";
         $params[':phone'] = $phone;
     }
-    if ($isAdmin && $email !== '') {
+    if ($email !== '') {
         $updates[] = "email = :email";
-        $params[':email'] = $email;
+        $params[':email'] = strtolower($email);
     }
     if (!empty($newPassword)) {
         $updates[] = "password = :password";

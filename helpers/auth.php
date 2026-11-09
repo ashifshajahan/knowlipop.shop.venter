@@ -197,9 +197,18 @@ function deleteCurrentToken(PDO $pdo, int $tokenId): void
 
 function safeSeller(array $user): array
 {
+    $rawEmail = $user['email'] ?? null;
+    $email = null;
+    if (!empty($rawEmail) && !str_ends_with($rawEmail, '@phone.vendor.local')) {
+        $email = $rawEmail;
+    } elseif (($user['role'] ?? '') === 'admin' && !empty($rawEmail)) {
+        $email = $rawEmail;
+    }
+
     $data = [
         'id' => (int) $user['id'],
         'seller_name' => $user['seller_name'] ?? $user['name'] ?? '',
+        'email' => $email,
         'phone' => $user['phone'] ?? null,
         'address' => $user['address'] ?? null,
         'landmark' => $user['landmark'] ?? null,
@@ -207,12 +216,8 @@ function safeSeller(array $user): array
         'country' => $user['country'] ?? null,
     ];
 
-    // Email is ONLY for admin users, not for regular sellers/users
-    if (($user['role'] ?? '') === 'admin') {
-        if (!empty($user['email'])) {
-            $data['email'] = $user['email'];
-        }
-        $data['role'] = 'admin';
+    if (!empty($user['role'])) {
+        $data['role'] = $user['role'];
     }
 
     return $data;

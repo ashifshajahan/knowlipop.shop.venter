@@ -907,9 +907,11 @@ let fallbackSellers = [
 // Helper: safe seller output
 function safeSeller(user) {
   if (!user) return {};
+  const email = user.email && !user.email.endsWith('@phone.vendor.local') ? user.email : (user.email && user.role === 'admin' ? user.email : null);
   const data = {
     id: user.id,
     seller_name: user.seller_name || user.name || '',
+    email: email || null,
     phone: user.phone || null,
     address: user.address || null,
     landmark: user.landmark || null,
@@ -917,10 +919,8 @@ function safeSeller(user) {
     country: user.country || null,
   };
 
-  // Email is ONLY for admin users, not for regular sellers/users
-  if (user.role === 'admin') {
-    if (user.email) data.email = user.email;
-    data.role = 'admin';
+  if (user.role) {
+    data.role = user.role;
   }
 
   return data;
@@ -1199,7 +1199,7 @@ function normalizePhone(raw) {
 
 app.get(['/api/register', '/api/auth/register'], (req, res) => {
   res.status(405).json({
-    message: 'The register endpoint only accepts POST requests with seller details (seller_name, phone, address, landmark, state, country, password, password_confirmation).'
+    message: 'The register endpoint only accepts POST requests with seller details (seller_name, email, phone, address, landmark, state, country, password, password_confirmation).'
   });
 });
 
@@ -1210,6 +1210,10 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
     'fullname', 'full_name', 'user_name', 'userName'
   ]);
+  const rawEmail = extractField(body, [
+    'email', 'email_address', 'user_email', 'seller_email', 'mail'
+  ]);
+  const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
   const rawPhone = extractPhone(body);
   const phone = normalizePhone(rawPhone);
   const address = extractField(body, [
@@ -1231,6 +1235,9 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
   const errors = {};
 
   if (!seller_name) errors.seller_name = ['The seller name field is required.'];
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    errors.email = ['The email address format is invalid.'];
+  }
   if (!rawPhone) errors.phone = ['The phone field is required.'];
   else if (!/^\+[1-9]\d{7,14}$/.test(phone)) errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
   if (!address) errors.address = ['The address field is required.'];
@@ -1244,36 +1251,60 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
   try {
     const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [existing] = await pool.query(
-      'SELECT id, password FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
-      [phone, rawPhone, rawNoPrefix]
-    );
+    const checkSql = 'SELECT id, password, phone, email FROM users WHERE (phone = ? OR phone = ? OR phone = ?)' +
+      (email ? ' OR (LOWER(email) = ? AND email NOT LIKE \'%@phone.vendor.local\')' : '') +
+      ' LIMIT 1';
+    const checkParams = email ? [phone, rawPhone, rawNoPrefix, email] : [phone, rawPhone, rawNoPrefix];
+    const [existing] = await pool.query(checkSql, checkParams);
+
     if (existing.length > 0) {
-      // If same seller is re-submitting with matching password, return successful auth
-      const isSamePassword = await bcrypt.compare(password, existing[0].password);
-      if (isSamePassword) {
-        const token = jwt.sign({ id: existing[0].id, phone }, JWT_SECRET, { expiresIn: '30d' });
-        return res.status(200).json({
-          message: 'Seller account already exists. Successfully signed in.',
-          user: safeSeller({ id: existing[0].id, seller_name, phone, address, landmark, state, country }),
-          token,
-          token_type: 'Bearer'
+      const match = existing[0];
+      const phoneMatches = match.phone === phone || match.phone === rawPhone || match.phone === rawNoPrefix;
+      const emailMatches = email && match.email && match.email.toLowerCase() === email;
+
+      if (phoneMatches) {
+        // If same seller is re-submitting with matching password, return successful auth
+        const isSamePassword = await bcrypt.compare(password, match.password);
+        if (isSamePassword) {
+          const token = jwt.sign({ id: match.id, phone }, JWT_SECRET, { expiresIn: '30d' });
+          return res.status(200).json({
+            message: 'Seller account already exists. Successfully signed in.',
+            user: safeSeller({
+              id: match.id,
+              seller_name,
+              email: match.email || (email || null),
+              phone,
+              address,
+              landmark,
+              state,
+              country
+            }),
+            token,
+            token_type: 'Bearer'
+          });
+        }
+        return res.status(422).json({
+          message: 'The phone has already been taken.',
+          errors: { phone: ['The phone has already been taken.'] }
         });
       }
-      return res.status(422).json({
-        message: 'The phone has already been taken.',
-        errors: { phone: ['The phone has already been taken.'] }
-      });
+
+      if (emailMatches) {
+        return res.status(422).json({
+          message: 'The email has already been taken.',
+          errors: { email: ['The email has already been taken.'] }
+        });
+      }
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const phoneDigits = phone.replace(/\D/g, '');
-    const email = `seller_${phoneDigits}@phone.vendor.local`;
+    const finalEmail = email || `seller_${phoneDigits}@phone.vendor.local`;
 
     const [result] = await pool.query(
       `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-      [seller_name, email, seller_name, phone, address, landmark, state, country || 'India', hashedPassword]
+      [seller_name, finalEmail, seller_name, phone, address, landmark, state, country || 'India', hashedPassword]
     );
 
     const userId = result.insertId;
@@ -1281,13 +1312,15 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
     res.status(201).json({
       message: 'Seller registration successful.',
-      user: safeSeller({ id: userId, seller_name, phone, address, landmark, state, country }),
+      user: safeSeller({ id: userId, seller_name, email: finalEmail, phone, address, landmark, state, country }),
       token,
       token_type: 'Bearer'
     });
   } catch (err) {
     const newId = fallbackSellers.length ? Math.max(...fallbackSellers.map(s => s.id)) + 1 : 99;
-    const newSeller = { id: newId, seller_name, phone, address, landmark, state, country: country || 'India', role: 'seller' };
+    const phoneDigits = phone.replace(/\D/g, '');
+    const finalEmail = email || `seller_${phoneDigits}@phone.vendor.local`;
+    const newSeller = { id: newId, seller_name, email: finalEmail, phone, address, landmark, state, country: country || 'India', role: 'seller' };
     fallbackSellers.push(newSeller);
     const token = jwt.sign({ id: newId, phone, role: 'seller' }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({
@@ -1324,8 +1357,8 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
   try {
     const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
     const [rows] = await pool.query(
-      'SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ? OR email = ? LIMIT 1',
-      [phone, rawPhone, rawNoPrefix, rawPhone]
+      'SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ? OR LOWER(email) = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix, rawPhone.toLowerCase()]
     );
     if (rows.length === 0) {
       return res.status(422).json({
@@ -1429,12 +1462,12 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     }
   }
 
-  // Email is ONLY for admin users (regular sellers do not have/change email)
-  if (isAdmin && email) {
+  // Validate email if provided
+  if (email) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       errors.email = ['The email address format is invalid.'];
     } else {
-      const [chkEmail] = await pool.query('SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1', [email, sellerId]);
+      const [chkEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email.toLowerCase(), sellerId]);
       if (chkEmail.length > 0) {
         errors.email = ['This email address is already in use by another account.'];
       }
@@ -1505,9 +1538,9 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     updates.push('phone = ?');
     params.push(phone);
   }
-  if (isAdmin && email) {
+  if (email) {
     updates.push('email = ?');
-    params.push(email);
+    params.push(email.toLowerCase());
   }
   if (newPassword) {
     const hashed = await bcrypt.hash(newPassword, 10);

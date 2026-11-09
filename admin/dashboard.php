@@ -49,27 +49,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if ($chk->fetch()) {
             $error = 'A seller with this phone number already exists.';
         } else {
-            $phoneDigits = preg_replace('/\D+/', '', $phone);
-            $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
-            $hashed = hashPassword($password);
+            $rawInputEmail = trim($_POST['email'] ?? '');
+            $email = '';
+            if (!empty($rawInputEmail)) {
+                if (!filter_var($rawInputEmail, FILTER_VALIDATE_EMAIL)) {
+                    $error = 'The email address format is invalid.';
+                } else {
+                    $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
+                    $chkEmail->execute([':email' => $rawInputEmail]);
+                    if ($chkEmail->fetch()) {
+                        $error = 'A seller with this email address already exists.';
+                    } else {
+                        $email = strtolower($rawInputEmail);
+                    }
+                }
+            }
 
-            $ins = $pdo->prepare("
-                INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-                VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
-            ");
-            $ins->execute([
-                ':name' => $name,
-                ':email' => $email,
-                ':seller_name' => $name,
-                ':phone' => $phone,
-                ':address' => $address,
-                ':landmark' => $landmark,
-                ':state' => $state,
-                ':country' => $country,
-                ':password' => $hashed,
-            ]);
+            if (empty($error)) {
+                if (empty($email)) {
+                    $phoneDigits = preg_replace('/\D+/', '', $phone);
+                    $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
+                }
+                $hashed = hashPassword($password);
 
-            $success = 'Seller account created successfully!';
+                $ins = $pdo->prepare("
+                    INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+                    VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
+                ");
+                $ins->execute([
+                    ':name' => $name,
+                    ':email' => $email,
+                    ':seller_name' => $name,
+                    ':phone' => $phone,
+                    ':address' => $address,
+                    ':landmark' => $landmark,
+                    ':state' => $state,
+                    ':country' => $country,
+                    ':password' => $hashed,
+                ]);
+
+                $success = 'Seller account created successfully!';
+            }
         }
     }
 }

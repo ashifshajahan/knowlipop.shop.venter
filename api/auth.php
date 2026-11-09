@@ -104,7 +104,7 @@ function extractConfirmPasswordPhp(array $input, string $password): string
 function apiRegister(PDO $pdo): void
 {
     if ($_SERVER['REQUEST_METHOD'] === 'GET' || $_SERVER['REQUEST_METHOD'] === 'HEAD') {
-        errorResponse('The register endpoint only accepts POST requests with seller details (seller_name, phone, address, landmark, state, country, password, password_confirmation).', [], 405);
+        errorResponse('The register endpoint only accepts POST requests with seller details (seller_name, email, phone, address, landmark, state, country, password, password_confirmation).', [], 405);
     }
 
     $input = getJsonInput();
@@ -113,6 +113,10 @@ function apiRegister(PDO $pdo): void
         'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
         'fullname', 'full_name', 'user_name', 'userName'
     ]);
+    $rawEmail = extractFieldPhp($input, [
+        'email', 'email_address', 'user_email', 'seller_email', 'mail'
+    ]);
+    $email = !empty($rawEmail) ? strtolower(trim($rawEmail)) : '';
     $rawPhone = extractPhonePhp($input);
     $phone = normalizePhonePhp($rawPhone);
     $address = extractFieldPhp($input, ['address', 'shop_address', 'shopAddress', 'business_address', 'street', 'location']);
@@ -126,6 +130,9 @@ function apiRegister(PDO $pdo): void
 
     if (empty($sellerName)) {
         $errors['seller_name'] = ['The seller name field is required.'];
+    }
+    if (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors['email'] = ['The email address format is invalid.'];
     }
     if (empty($rawPhone)) {
         $errors['phone'] = ['The phone field is required.'];
@@ -148,32 +155,50 @@ function apiRegister(PDO $pdo): void
     }
 
     $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
-    $checkStmt = $pdo->prepare("SELECT id, password FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
-    $checkStmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
+    $checkSql = "SELECT id, password, phone, email FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix)";
+    $checkParams = [':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix];
+    if (!empty($email)) {
+        $checkSql .= " OR (LOWER(email) = :email AND email NOT LIKE '%@phone.vendor.local')";
+        $checkParams[':email'] = $email;
+    }
+    $checkSql .= " LIMIT 1";
+
+    $checkStmt = $pdo->prepare($checkSql);
+    $checkStmt->execute($checkParams);
     $existing = $checkStmt->fetch();
     if ($existing) {
-        if (verifyPassword($password, $existing['password'])) {
-            $token = createToken($pdo, (int)$existing['id'], $phone);
-            jsonResponse([
-                'message' => 'Seller account already exists. Successfully signed in.',
-                'user' => safeSeller([
-                    'id' => $existing['id'],
-                    'seller_name' => $sellerName,
-                    'phone' => $phone,
-                    'address' => $address,
-                    'landmark' => $landmark,
-                    'state' => $state,
-                    'country' => $country
-                ]),
-                'token' => $token,
-                'token_type' => 'Bearer'
-            ], 200);
+        $emailMatches = !empty($email) && !empty($existing['email']) && strtolower($existing['email']) === $email;
+        $phoneMatches = ($existing['phone'] === $phone || $existing['phone'] === $rawPhone || $existing['phone'] === $rawNoPrefix);
+
+        if ($phoneMatches) {
+            if (verifyPassword($password, $existing['password'])) {
+                $token = createToken($pdo, (int)$existing['id'], $phone);
+                jsonResponse([
+                    'message' => 'Seller account already exists. Successfully signed in.',
+                    'user' => safeSeller([
+                        'id' => $existing['id'],
+                        'seller_name' => $sellerName,
+                        'email' => $existing['email'] ?? ($email ?: null),
+                        'phone' => $phone,
+                        'address' => $address,
+                        'landmark' => $landmark,
+                        'state' => $state,
+                        'country' => $country
+                    ]),
+                    'token' => $token,
+                    'token_type' => 'Bearer'
+                ], 200);
+            }
+            errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
         }
-        errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
+
+        if ($emailMatches) {
+            errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
+        }
     }
 
     $phoneDigits = preg_replace('/\D+/', '', $phone);
-    $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
+    $finalEmail = !empty($email) ? $email : ('seller_' . $phoneDigits . '@phone.vendor.local');
     $hashedPassword = hashPassword($password);
 
     $stmt = $pdo->prepare("
@@ -182,7 +207,7 @@ function apiRegister(PDO $pdo): void
     ");
     $stmt->execute([
         ':name' => $sellerName,
-        ':email' => $email,
+        ':email' => $finalEmail,
         ':seller_name' => $sellerName,
         ':phone' => $phone,
         ':address' => $address,
@@ -231,7 +256,7 @@ function apiLogin(PDO $pdo): void
     }
 
     $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix OR email = :rawEmail LIMIT 1");
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix OR LOWER(email) = LOWER(:rawEmail) LIMIT 1");
     $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':rawEmail' => $rawPhone]);
     $user = $stmt->fetch();
 
