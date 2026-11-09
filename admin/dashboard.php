@@ -269,47 +269,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
-// Stats
-$sellerCountStmt = $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'");
-$sellerCount = (int) $sellerCountStmt->fetchColumn();
+// Marketplace Stats
+try {
+    $sellerCount = (int) $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'")->fetchColumn();
+} catch (Throwable $e) { $sellerCount = 0; }
 
-// GST Verification Stats
-$gstCountsStmt = $pdo->query("
-    SELECT
-        COUNT(*) as total_gst,
-        SUM(CASE WHEN status = 'Pending' OR status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
-        SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
-        SUM(CASE WHEN status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
-    FROM seller_gst_details
-");
-$gstCounts = $gstCountsStmt->fetch();
-$pendingGstCount = (int) ($gstCounts['pending_gst'] ?? 0);
-$approvedGstCount = (int) ($gstCounts['approved_gst'] ?? 0);
-$rejectedGstCount = (int) ($gstCounts['rejected_gst'] ?? 0);
-$totalGstCount = (int) ($gstCounts['total_gst'] ?? 0);
+try {
+    $productCount = (int) $pdo->query("SELECT COUNT(*) FROM products WHERE is_active = 1")->fetchColumn();
+} catch (Throwable $e) { $productCount = 0; }
 
-// Fetch all sellers with GST details
+try {
+    $orderCount = (int) $pdo->query("SELECT COUNT(*) FROM orders")->fetchColumn();
+} catch (Throwable $e) { $orderCount = 0; }
+
+// PDF Document Verification Stats
+try {
+    $gstCountsStmt = $pdo->query("
+        SELECT
+            COUNT(*) as total_gst,
+            SUM(CASE WHEN status = 'Pending' OR status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
+            SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
+            SUM(CASE WHEN status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
+        FROM seller_gst_details
+    ");
+    $gstCounts = $gstCountsStmt ? $gstCountsStmt->fetch() : [];
+    $pendingGstCount = (int) ($gstCounts['pending_gst'] ?? 0);
+    $approvedGstCount = (int) ($gstCounts['approved_gst'] ?? 0);
+    $rejectedGstCount = (int) ($gstCounts['rejected_gst'] ?? 0);
+    $totalGstCount = (int) ($gstCounts['total_gst'] ?? 0);
+} catch (Throwable $e) {
+    $pendingGstCount = 0; $approvedGstCount = 0; $rejectedGstCount = 0; $totalGstCount = 0;
+}
+
+// Fetch all sellers with uploaded PDF documents
 $gstSellersStmt = $pdo->query("
-    SELECT g.*, u.seller_name, u.name as user_name, u.phone, u.email,
+    SELECT g.*, u.seller_name, u.name as user_name, u.phone, u.email, u.address as user_address, u.state as user_state,
            (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id) as doc_count,
-           (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count
+           (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
+           (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
+           (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
+           (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
     FROM seller_gst_details g
     JOIN users u ON g.seller_id = u.id
     ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
     LIMIT 100
 ");
-$gstSellers = $gstSellersStmt->fetchAll();
+$gstSellers = $gstSellersStmt ? $gstSellersStmt->fetchAll() : [];
 
-// Sellers list with product counts
+// Sellers list with product counts and document status
 $sellersStmt = $pdo->query("
     SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
-           (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
+           (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count,
+           (SELECT g.status FROM seller_gst_details g WHERE g.seller_id = u.id LIMIT 1) AS doc_status,
+           (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id
     FROM users u
     WHERE u.role = 'seller'
     ORDER BY u.id DESC
     LIMIT 50
 ");
-$sellers = $sellersStmt->fetchAll();
+$sellers = $sellersStmt ? $sellersStmt->fetchAll() : [];
+
+function formatBytesPhp($bytes): string {
+    if (!$bytes) return '0 KB';
+    if ($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
+    return round($bytes / 1024, 1) . ' KB';
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -374,8 +398,15 @@ $sellers = $sellersStmt->fetchAll();
         .btn-dl:hover { background: #334155; }
         .btn-approve { background: #16a34a; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
         .btn-approve:hover { background: #15803d; }
+        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-approve-sm:hover { background: #15803d; }
         .btn-reject { background: #dc2626; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
         .btn-reject:hover { background: #b91c1c; }
+        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-reject-sm:hover { background: #b91c1c; }
+        .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
+        .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
+        .search-box input:focus { border-color: #6366f1; }
         .log-row { padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; display: flex; justify-content: space-between; gap: 12px; }
         .log-time { color: #64748b; font-size: 12px; min-width: 130px; }
     </style>
@@ -395,96 +426,207 @@ $sellers = $sellersStmt->fetchAll();
         <?php if ($success): ?><div class="success"><?= htmlspecialchars($success) ?></div><?php endif; ?>
         <?php if ($error): ?><div class="error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
 
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 24px;">
             <section class="card">
-                <div style="color:#64748b; font-size:13px; font-weight:600;">Registered Sellers</div>
+                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
                 <div class="stat"><?= $sellerCount ?></div>
             </section>
-            <section class="card" style="border-left: 4px solid #f59e0b;">
-                <div style="color:#b45309; font-size:13px; font-weight:700;">Pending GST Review</div>
+            <section class="card">
+                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
+                <div class="stat" style="color:#2563eb;"><?= $productCount ?></div>
+            </section>
+            <section class="card">
+                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
+                <div class="stat" style="color:#0891b2;"><?= $orderCount ?></div>
+            </section>
+            <section class="card" style="border-left: 4px solid #f59e0b; background: <?= $pendingGstCount > 0 ? '#fffbeb' : '#fff' ?>;">
+                <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
+                    Pending PDF Reviews
+                    <?php if ($pendingGstCount > 0): ?>
+                        <span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>
+                    <?php endif; ?>
+                </div>
                 <div class="stat" style="color:#b45309;"><?= $pendingGstCount ?></div>
             </section>
             <section class="card" style="border-left: 4px solid #10b981;">
-                <div style="color:#15803d; font-size:13px; font-weight:700;">Approved GST</div>
+                <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
                 <div class="stat" style="color:#10b981;"><?= $approvedGstCount ?></div>
             </section>
             <section class="card" style="border-left: 4px solid #ef4444;">
-                <div style="color:#b91c1c; font-size:13px; font-weight:700;">Rejected GST</div>
+                <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Rejected Requests</div>
                 <div class="stat" style="color:#ef4444;"><?= $rejectedGstCount ?></div>
             </section>
         </div>
 
-        <section class="card">
-            <h2>Create seller account</h2>
-            <p class="muted">Phone number must include country code, e.g. +919876543210.</p>
-            <form method="POST" action="/admin">
-                <input type="hidden" name="action" value="create_seller">
-                <div class="grid">
-                    <div>
-                        <label>Seller name</label>
-                        <input name="seller_name" value="<?= htmlspecialchars($_POST['seller_name'] ?? '') ?>" required maxlength="120">
-                    </div>
-                    <div>
-                        <label>Phone (+country code)</label>
-                        <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" required placeholder="+919876543210">
-                    </div>
-                    <div>
-                        <label>Address</label>
-                        <input name="address" value="<?= htmlspecialchars($_POST['address'] ?? '') ?>" required>
-                    </div>
-                    <div>
-                        <label>Landmark</label>
-                        <input name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" required>
-                    </div>
-                    <div>
-                        <label>State</label>
-                        <input name="state" value="<?= htmlspecialchars($_POST['state'] ?? '') ?>" required>
-                    </div>
-                    <div>
-                        <label>Country</label>
-                        <input name="country" value="<?= htmlspecialchars($_POST['country'] ?? 'India') ?>" required>
-                    </div>
-                    <div>
-                        <label>Password (min 8 characters)</label>
-                        <input type="password" name="password" required minlength="8" autocomplete="new-password">
-                    </div>
-                    <div>
-                        <label>Confirm password</label>
-                        <input type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
-                    </div>
+        <!-- Section 1: Seller PDF Document Verification Hub (Primary Function) -->
+        <section class="card" id="gstSection">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
+                <div>
+                    <h2>Seller PDF Document Verification</h2>
+                    <p class="muted">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
                 </div>
-                <br>
-                <button type="submit">Create seller</button>
-            </form>
+                <div class="search-box">
+                    <input type="text" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
+                </div>
+            </div>
+
+            <div class="tabs-bar">
+                <button type="button" class="tab-btn active" onclick="filterGstRows('all', this)">All Documents (<?= $totalGstCount ?>)</button>
+                <button type="button" class="tab-btn" onclick="filterGstRows('pending', this)">
+                    Pending Review (<?= $pendingGstCount ?>)
+                    <?php if ($pendingGstCount > 0): ?><span style="background:#f59e0b; color:#fff; border-radius:999px; padding:1px 6px; font-size:11px; margin-left:4px;">●</span><?php endif; ?>
+                </button>
+                <button type="button" class="tab-btn" onclick="filterGstRows('approved', this)">Approved (<?= $approvedGstCount ?>)</button>
+                <button type="button" class="tab-btn" onclick="filterGstRows('rejected', this)">Rejected (<?= $rejectedGstCount ?>)</button>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:24%;">Seller</th>
+                        <th style="width:28%;">Uploaded PDF Document</th>
+                        <th style="width:16%;">Verification Status</th>
+                        <th style="width:14%;">Submitted</th>
+                        <th style="width:18%;">Admin Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="gstTableBody">
+                    <?php if (empty($gstSellers)): ?>
+                        <tr><td colspan="5" style="color:#94a3b8; text-align:center; padding:32px;">No sellers have uploaded verification documents yet.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($gstSellers as $g): ?>
+                            <?php
+                                $st = strtolower($g['status']);
+                                if ($st === 'resubmitted') $st = 'pending';
+                                $badgeClass = ($st === 'approved') ? 'badge-approved' : (($st === 'rejected') ? 'badge-rejected' : 'badge-pending');
+                                $sellerLabel = $g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id'];
+                                $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($g['email'] ?? ''));
+                            ?>
+                            <tr class="gst-row" data-status="<?= $st ?>" data-search="<?= htmlspecialchars($searchString) ?>">
+                                <td>
+                                    <strong style="font-size:15px; color:#1e1b4b;"><?= htmlspecialchars($sellerLabel) ?></strong>
+                                    <div style="font-size:12px; color:#64748b; margin-top:2px;">
+                                        <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #<?= (int)$g['seller_id'] ?></span>
+                                        <?= htmlspecialchars($g['phone'] ?? '') ?>
+                                    </div>
+                                    <?php if (!empty($g['email'])): ?>
+                                        <div style="font-size:12px; color:#94a3b8;"><?= htmlspecialchars($g['email']) ?></div>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if (!empty($g['latest_doc_id'])): ?>
+                                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                            <span class="badge-pdf">PDF</span>
+                                            <strong style="color:#334155; font-size:13px;"><?= htmlspecialchars($g['latest_doc_name'] ?: 'Certificate.pdf') ?></strong>
+                                            <span style="color:#94a3b8; font-size:11px;">(<?= formatBytesPhp($g['latest_doc_size']) ?>)</span>
+                                        </div>
+                                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center;">
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $g['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn-view" style="font-size:11px; padding:4px 10px;">
+                                                📄 1-Click Preview PDF
+                                            </a>
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $g['latest_doc_id'] ?>&mode=download" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Download PDF">
+                                                ⬇
+                                            </a>
+                                            <?php if ((int)$g['doc_count'] > 1): ?>
+                                                <span style="font-size:11px; color:#64748b; font-weight:600;">+<?= (int)$g['doc_count'] - 1 ?> more</span>
+                                            <?php endif; ?>
+                                        </div>
+                                    <?php else: ?>
+                                        <span style="color:#94a3b8; font-style:italic; font-size:13px;">No document attached</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <span class="<?= $badgeClass ?>">
+                                        <?= ($st === 'pending') ? '⏳ ' : (($st === 'approved') ? '✓ ' : '✕ ') ?>
+                                        <?= htmlspecialchars($g['status']) ?>
+                                    </span>
+                                    <?php if ($st === 'rejected' && !empty($g['rejection_reason'])): ?>
+                                        <div style="font-size:11px; color:#b91c1c; margin-top:4px; max-width:220px; line-height:1.3;" title="<?= htmlspecialchars($g['rejection_reason']) ?>">
+                                            <strong>Reason:</strong> <?= htmlspecialchars(strlen($g['rejection_reason']) > 55 ? substr($g['rejection_reason'], 0, 52) . '...' : $g['rejection_reason']) ?>
+                                        </div>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <div style="font-size:13px; color:#334155;"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 0, 10)) ?></div>
+                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 11, 5)) ?></div>
+                                </td>
+                                <td>
+                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                                        <?php if ($st !== 'approved'): ?>
+                                            <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Approve verification for <?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>?');">
+                                                <input type="hidden" name="action" value="approve_gst">
+                                                <input type="hidden" name="seller_id" value="<?= (int)$g['seller_id'] ?>">
+                                                <input type="hidden" name="notes" value="Approved by administrator">
+                                                <button type="submit" class="btn-approve-sm" title="Instant Approve">✓ Approve</button>
+                                            </form>
+                                        <?php endif; ?>
+
+                                        <?php if ($st !== 'rejected'): ?>
+                                            <button type="button" class="btn-reject-sm" onclick="openGstModalWithReject(<?= (int)$g['seller_id'] ?>, '<?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>')" title="Reject with Reason">✕ Reject</button>
+                                        <?php endif; ?>
+
+                                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, '<?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>')">Details & Logs</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
         </section>
 
-        <section class="card">
-            <h2>Seller Accounts</h2>
+        <!-- Section 2: Seller Accounts Overview with Verification Status -->
+        <section class="card" style="margin-top:24px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                <div>
+                    <h2>Seller Accounts</h2>
+                    <p class="muted">All registered sellers on Venter App with inventory counts and verification status.</p>
+                </div>
+            </div>
             <table>
                 <thead>
                     <tr>
                         <th>ID</th>
                         <th>Seller Name</th>
-                        <th>Phone</th>
-                        <th>State</th>
+                        <th>Contact</th>
+                        <th>Location</th>
                         <th>Products</th>
+                        <th>Document Status</th>
                         <th>Created</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if (empty($sellers)): ?>
-                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
+                        <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
                     <?php else: ?>
                         <?php foreach ($sellers as $s): ?>
+                            <?php
+                                $dSt = strtolower($s['doc_status'] ?? '');
+                                if ($dSt === 'resubmitted') $dSt = 'pending';
+                                $docBadgeClass = ($dSt === 'approved') ? 'badge-approved' : (($dSt === 'rejected') ? 'badge-rejected' : (($dSt === 'pending') ? 'badge-pending' : ''));
+                            ?>
                             <tr>
                                 <td>#<?= $s['id'] ?></td>
                                 <td>
                                     <strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong>
                                 </td>
-                                <td><?= htmlspecialchars($s['phone'] ?? '—') ?></td>
+                                <td>
+                                    <div><?= htmlspecialchars($s['phone'] ?? '—') ?></div>
+                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($s['email'] ?? '') ?></div>
+                                </td>
                                 <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
                                 <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
+                                <td>
+                                    <?php if (!empty($docBadgeClass)): ?>
+                                        <span class="<?= $docBadgeClass ?>"><?= htmlspecialchars($s['doc_status']) ?></span>
+                                        <?php if (!empty($s['latest_doc_id'])): ?>
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $s['latest_doc_id'] ?>&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>
+                                        <?php endif; ?>
+                                    <?php else: ?>
+                                        <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
+                                    <?php endif; ?>
+                                </td>
                                 <td><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
                                 <td>
                                     <button type="button" class="btn-sm" onclick='openSellerModal(<?= htmlspecialchars(json_encode($s, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>View / Edit</button>
@@ -496,69 +638,49 @@ $sellers = $sellersStmt->fetchAll();
             </table>
         </section>
 
-        <!-- Seller GST Verification Section -->
-        <section class="card" id="gstSection" style="margin-top: 24px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-                <div>
-                    <h2>Seller GST Verifications</h2>
-                    <p class="muted">Review uploaded GST registration certificates (PDF / JPG / PNG), inspect details, approve, or reject with reason.</p>
+        <!-- Section 3: Create Seller Account -->
+        <section class="card" style="margin-top:24px;">
+            <h2>Create New Seller Account</h2>
+            <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
+            <form method="POST" action="/admin">
+                <input type="hidden" name="action" value="create_seller">
+                <div class="grid">
+                    <div>
+                        <label>Seller / Shop Name</label>
+                        <input name="seller_name" value="<?= htmlspecialchars($_POST['seller_name'] ?? '') ?>" required maxlength="120" placeholder="e.g. Apex Electronics">
+                    </div>
+                    <div>
+                        <label>Phone (+country code)</label>
+                        <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" required placeholder="+919876543210">
+                    </div>
+                    <div>
+                        <label>Email Address</label>
+                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" placeholder="seller@example.com">
+                    </div>
+                    <div>
+                        <label>State</label>
+                        <input name="state" value="<?= htmlspecialchars($_POST['state'] ?? '') ?>" required placeholder="e.g. Karnataka">
+                    </div>
+                    <div>
+                        <label>Address</label>
+                        <input name="address" value="<?= htmlspecialchars($_POST['address'] ?? '') ?>" required placeholder="Shop address">
+                    </div>
+                    <div>
+                        <label>Landmark</label>
+                        <input name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" required placeholder="Nearest landmark">
+                    </div>
+                    <div>
+                        <label>Password (min 8 characters)</label>
+                        <input type="password" name="password" required minlength="8" autocomplete="new-password">
+                    </div>
+                    <div>
+                        <label>Confirm Password</label>
+                        <input type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
+                    </div>
                 </div>
-            </div>
-
-            <div class="tabs-bar">
-                <button type="button" class="tab-btn active" onclick="filterGstRows('all', this)">All Submissions (<?= $totalGstCount ?>)</button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('pending', this)">Pending Review (<?= $pendingGstCount ?>)</button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('approved', this)">Approved (<?= $approvedGstCount ?>)</button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('rejected', this)">Rejected (<?= $rejectedGstCount ?>)</button>
-            </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>Seller</th>
-                        <th>GSTIN</th>
-                        <th>Business Name</th>
-                        <th>State / PIN</th>
-                        <th>Documents</th>
-                        <th>Status</th>
-                        <th>Submitted At</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="gstTableBody">
-                    <?php if (empty($gstSellers)): ?>
-                        <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:28px;">No sellers have submitted GST details yet.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($gstSellers as $g): ?>
-                            <?php
-                                $st = strtolower($g['status']);
-                                if ($st === 'resubmitted') $st = 'pending';
-                                $badgeClass = ($st === 'approved') ? 'badge-approved' : (($st === 'rejected') ? 'badge-rejected' : 'badge-pending');
-                            ?>
-                            <tr class="gst-row" data-status="<?= $st ?>">
-                                <td>
-                                    <strong><?= htmlspecialchars($g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id']) ?></strong>
-                                    <div style="font-size:12px; color:#64748b;">ID: #<?= (int)$g['seller_id'] ?> &bull; <?= htmlspecialchars($g['phone'] ?? '') ?></div>
-                                </td>
-                                <td><span class="gstin-pill"><?= htmlspecialchars($g['gstin']) ?></span></td>
-                                <td><?= htmlspecialchars($g['business_name']) ?></td>
-                                <td><?= htmlspecialchars($g['state']) ?> <span style="color:#94a3b8; font-size:12px;">(<?= htmlspecialchars($g['pincode']) ?>)</span></td>
-                                <td>
-                                    <strong><?= (int)$g['doc_count'] ?></strong> file<?= (int)$g['doc_count'] !== 1 ? 's' : '' ?>
-                                    <?php if ((int)$g['pdf_count'] > 0): ?>
-                                        <span class="badge-pdf" title="Contains PDF Certificate">PDF</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td><span class="<?= $badgeClass ?>"><?= htmlspecialchars($g['status']) ?></span></td>
-                                <td><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 0, 16)) ?></td>
-                                <td>
-                                    <button type="button" class="btn-sm" style="background:#4f46e5;" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, '<?= htmlspecialchars(addslashes($g['seller_name'] ?? $g['user_name'] ?? 'Seller'), ENT_QUOTES) ?>')">Review & Verify</button>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
+                <br>
+                <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
+            </form>
         </section>
     </main>
 
@@ -746,7 +868,7 @@ $sellers = $sellersStmt->fetchAll();
             }
         }
 
-        // GST Verification Table Filter
+        // GST Verification Table Filter by Status
         function filterGstRows(status, btn) {
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             if (btn) btn.classList.add('active');
@@ -760,6 +882,32 @@ $sellers = $sellersStmt->fetchAll();
                     r.style.display = 'none';
                 }
             });
+        }
+
+        // Live Search Filter for GST PDF Table
+        function filterGstSearch(query) {
+            const q = (query || '').toLowerCase().trim();
+            const rows = document.querySelectorAll('.gst-row');
+            rows.forEach(r => {
+                const searchData = r.getAttribute('data-search') || '';
+                if (!q || searchData.includes(q)) {
+                    r.style.display = '';
+                } else {
+                    r.style.display = 'none';
+                }
+            });
+        }
+
+        // Quick Reject Shortcut
+        function openGstModalWithReject(sellerId, sellerName) {
+            openGstModal(sellerId, sellerName);
+            setTimeout(() => {
+                const b = document.getElementById('rejectBox');
+                if (b) {
+                    b.style.display = 'block';
+                    b.scrollIntoView({ behavior: 'smooth' });
+                }
+            }, 300);
         }
 
         // GST Review Modal
