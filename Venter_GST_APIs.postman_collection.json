@@ -169,9 +169,9 @@
               ]
             },
             "url": {
-              "raw": "{{baseUrl}}/api/seller/gst/upload",
+              "raw": "{{baseUrl}}/api/seller/gst/submit",
               "host": ["{{baseUrl}}"],
-              "path": ["api", "seller", "gst", "upload"]
+              "path": ["api", "seller", "gst", "submit"]
             },
             "description": "Uploads PDF document directly without requiring any form fields. Status automatically becomes Pending."
           }
