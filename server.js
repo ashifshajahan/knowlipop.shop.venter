@@ -6419,6 +6419,42 @@ app.post('/admin', async (req, res) => {
   res.redirect('/admin');
 });
 
+function resolveGstDocumentPath(doc) {
+  if (!doc) return null;
+  const fileName = doc.file_name || (doc.file_path ? path.basename(doc.file_path) : null);
+  const candidates = [
+    doc.file_path,
+    fileName ? path.join(gstUploadDir, fileName) : null,
+    fileName ? path.resolve(__dirname, 'uploads', 'secure_documents', 'gst', fileName) : null,
+    fileName ? path.resolve(process.cwd(), 'uploads', 'secure_documents', 'gst', fileName) : null,
+    fileName ? path.resolve(__dirname, 'uploads', fileName) : null,
+    doc.file_path ? path.resolve(process.cwd(), doc.file_path) : null,
+    doc.file_path ? path.resolve(__dirname, doc.file_path) : null
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {}
+  }
+
+  try {
+    if (fs.existsSync(gstUploadDir)) {
+      const files = fs.readdirSync(gstUploadDir);
+      if (fileName && files.includes(fileName)) {
+        return path.join(gstUploadDir, fileName);
+      }
+      if (doc.seller_id) {
+        const prefix = `gst_${doc.seller_id}_`;
+        const match = files.find(f => f.startsWith(prefix));
+        if (match) return path.join(gstUploadDir, match);
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
 // GET /admin/view_gst_doc - Preview or download document for admin
 app.get('/admin/view_gst_doc', async (req, res) => {
   const docId = parseInt(req.query.id, 10);
@@ -6427,18 +6463,35 @@ app.get('/admin/view_gst_doc', async (req, res) => {
 
   try {
     const [rows] = await pool.query('SELECT * FROM seller_gst_documents WHERE id = ? LIMIT 1', [docId]);
-    if (rows.length === 0 || !fs.existsSync(rows[0].file_path)) {
-      return res.status(404).send('Document file not found on server.');
+    if (rows.length === 0) {
+      return res.status(404).send('Document not found in database.');
     }
     const doc = rows[0];
-    const mimeType = doc.mime_type || 'application/octet-stream';
-    const fileName = doc.original_name || path.basename(doc.file_path);
+    const realPath = resolveGstDocumentPath(doc);
+    if (!realPath) {
+      let dirFiles = [];
+      try { dirFiles = fs.readdirSync(gstUploadDir); } catch(e) { dirFiles = [e.message]; }
+      return res.status(404).json({
+        error: 'Document file not found on disk.',
+        doc_id: doc.id,
+        db_file_path: doc.file_path,
+        db_file_name: doc.file_name,
+        gstUploadDir,
+        __dirname,
+        cwd: process.cwd(),
+        files_in_gstUploadDir: dirFiles
+      });
+    }
+
+    const mimeType = doc.mime_type || (doc.file_name && doc.file_name.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream');
+    const fileName = doc.original_name || path.basename(realPath);
     const disposition = mode === 'download' ? 'attachment' : 'inline';
     res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Length', fs.statSync(doc.file_path).size);
+    res.setHeader('Content-Length', fs.statSync(realPath).size);
     res.setHeader('Content-Disposition', `${disposition}; filename="${encodeURIComponent(fileName)}"`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    fs.createReadStream(doc.file_path).pipe(res);
+    res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+    fs.createReadStream(realPath).pipe(res);
   } catch (err) {
     res.status(500).send('Error streaming document: ' + err.message);
   }
@@ -7435,12 +7488,12 @@ async function logGstAction(p, { seller_id, gst_id = null, action, previous_stat
 
 // Stream document file
 function streamGstDocumentFile(res, doc, mode = 'preview') {
-  const filePath = doc.file_path;
-  if (!fs.existsSync(filePath)) {
+  const filePath = resolveGstDocumentPath(doc);
+  if (!filePath) {
     return res.status(404).json({ message: 'Document file not found on server.' });
   }
 
-  const mimeType = doc.mime_type || (doc.file_name.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream');
+  const mimeType = doc.mime_type || ((doc.file_name && doc.file_name.endsWith('.pdf')) ? 'application/pdf' : 'application/octet-stream');
   const filename = doc.original_name || path.basename(filePath);
   const disposition = mode === 'download' ? 'attachment' : 'inline';
 
