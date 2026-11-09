@@ -589,7 +589,7 @@ if ($requestUri === '/api/marketplace/commission-preview') {
 // Seller GST Document Upload & Management
 // ==========================================
 
-if ($requestUri === '/api/seller/gst/submit' || $requestUri === '/api/seller/gst') {
+if ($requestUri === '/api/seller/gst/submit' || $requestUri === '/api/seller/gst' || $requestUri === '/api/seller/gst/upload' || $requestUri === '/api/seller/gst/status') {
     if ($method === 'POST') {
         apiSellerSubmitGst($pdo);
     } elseif ($method === 'GET') {

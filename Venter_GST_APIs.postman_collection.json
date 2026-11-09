@@ -1,0 +1,306 @@
+{
+  "info": {
+    "_postman_id": "venter-pdf-gst-api-collection-2026",
+    "name": "Venter App - PDF Document Upload & Status Verification",
+    "description": "Simplified Seller PDF Upload (Zero Form Fields) & Status Verification on https://knowlipop.shop",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://knowlipop.shop",
+      "type": "string"
+    },
+    {
+      "key": "sellerToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "adminToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "sellerId",
+      "value": "104",
+      "type": "string"
+    },
+    {
+      "key": "documentId",
+      "value": "1",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Authentication",
+      "item": [
+        {
+          "name": "Seller Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.token) {",
+                  "    pm.collectionVariables.set('sellerToken', res.token);",
+                  "}",
+                  "if (res.user && res.user.id) {",
+                  "    pm.collectionVariables.set('sellerId', res.user.id.toString());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"seller_demo@knowlipop.shop\",\n  \"password\": \"Password123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "login"]
+            }
+          }
+        },
+        {
+          "name": "Admin Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.token) {",
+                  "    pm.collectionVariables.set('adminToken', res.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@vendor.app\",\n  \"password\": \"Admin123!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "login"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Seller PDF Upload & Status",
+      "item": [
+        {
+          "name": "1. Check Current Verification Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sellerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/seller/gst/status",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "seller", "gst", "status"]
+            },
+            "description": "Returns current status: Not Submitted, Pending, Approved, or Rejected. If rejected, shows rejection_reason."
+          }
+        },
+        {
+          "name": "2. Upload PDF Document Only (No fields required)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.document && res.document.id) {",
+                  "    pm.collectionVariables.set('documentId', res.document.id.toString());",
+                  "} else if (res.gst && res.gst.documents && res.gst.documents.length > 0) {",
+                  "    pm.collectionVariables.set('documentId', res.gst.documents[0].id.toString());",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sellerToken}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "document",
+                  "type": "file",
+                  "description": "Select PDF document file from your device (Max 5MB)"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/seller/gst/upload",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "seller", "gst", "upload"]
+            },
+            "description": "Uploads PDF document directly without requiring any form fields. Status automatically becomes Pending."
+          }
+        },
+        {
+          "name": "3. Preview Uploaded PDF Document",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sellerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/seller/gst/documents/{{documentId}}/preview",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "seller", "gst", "documents", "{{documentId}}", "preview"]
+            },
+            "description": "Streams PDF inline for viewing directly inside browser/Postman."
+          }
+        },
+        {
+          "name": "4. Download Uploaded PDF Document",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sellerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/seller/gst/documents/{{documentId}}/download",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "seller", "gst", "documents", "{{documentId}}", "download"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Admin Verification",
+      "item": [
+        {
+          "name": "1. Admin View Pending Verification Requests",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/sellers/gst/pending",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "admin", "sellers", "gst", "pending"]
+            }
+          }
+        },
+        {
+          "name": "2. Admin View Seller Verification Details & Document",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/sellers/gst/{{sellerId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "admin", "sellers", "gst", "{{sellerId}}"]
+            }
+          }
+        },
+        {
+          "name": "3. Admin Approve Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notes\": \"PDF document verified successfully.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/sellers/gst/{{sellerId}}/approve",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "admin", "sellers", "gst", "{{sellerId}}", "approve"]
+            }
+          }
+        },
+        {
+          "name": "4. Admin Reject Request (Mandatory Reason)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rejection_reason\": \"Uploaded PDF has blurred text. Please upload a clear original copy.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/sellers/gst/{{sellerId}}/reject",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "admin", "sellers", "gst", "{{sellerId}}", "reject"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

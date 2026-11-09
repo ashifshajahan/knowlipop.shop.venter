@@ -6578,11 +6578,11 @@ async function ensureGstTables(p) {
       CREATE TABLE IF NOT EXISTS seller_gst_details (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         seller_id BIGINT UNSIGNED NOT NULL,
-        gstin VARCHAR(20) NOT NULL,
-        business_name VARCHAR(255) NOT NULL,
-        business_address TEXT NOT NULL,
-        state VARCHAR(100) NOT NULL,
-        pincode VARCHAR(20) NOT NULL,
+        gstin VARCHAR(30) NULL DEFAULT NULL,
+        business_name VARCHAR(255) NULL DEFAULT NULL,
+        business_address TEXT NULL DEFAULT NULL,
+        state VARCHAR(100) NULL DEFAULT NULL,
+        pincode VARCHAR(20) NULL DEFAULT NULL,
         status VARCHAR(30) NOT NULL DEFAULT 'Pending',
         rejection_reason TEXT NULL DEFAULT NULL,
         verified_by BIGINT UNSIGNED NULL DEFAULT NULL,
@@ -6596,6 +6596,19 @@ async function ensureGstTables(p) {
         INDEX idx_gst_gstin (gstin)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    try {
+      await p.query(`
+        ALTER TABLE seller_gst_details
+        MODIFY gstin VARCHAR(30) NULL DEFAULT NULL,
+        MODIFY business_name VARCHAR(255) NULL DEFAULT NULL,
+        MODIFY business_address TEXT NULL DEFAULT NULL,
+        MODIFY state VARCHAR(100) NULL DEFAULT NULL,
+        MODIFY pincode VARCHAR(20) NULL DEFAULT NULL;
+      `);
+    } catch (ignoreAlter) {
+      // Ignore if columns are already modified
+    }
 
     await p.query(`
       CREATE TABLE IF NOT EXISTS seller_gst_documents (
@@ -6779,139 +6792,158 @@ function requireAdminRole(req, res, next) {
 
 // --- SELLER GST ENDPOINTS ---
 
-// POST /api/seller/gst/submit or /api/seller/gst
-app.post(['/api/seller/gst/submit', '/api/seller/gst'], authenticateToken, handleGstUpload, async (req, res) => {
-  await ensureGstTables(pool);
-  const sellerId = req.user.id;
-  const body = req.body || {};
-
-  const gstin = (extractField(body, ['gstin', 'gst_number', 'gstNumber', 'gst_registration_number']) || '').toUpperCase().trim();
-  const businessName = (extractField(body, ['business_name', 'businessName', 'registered_business_name', 'company_name', 'shop_name']) || '').trim();
-  const businessAddress = (extractField(body, ['business_address', 'businessAddress', 'address', 'shop_address']) || '').trim();
-  const state = (extractField(body, ['state', 'province', 'region']) || '').trim();
-  const pincode = (extractField(body, ['pincode', 'pin_code', 'pin', 'zip', 'postal_code']) || '').trim();
-
-  const errors = {};
-  if (!gstin) {
-    errors.gstin = ['The GSTIN field is required.'];
-  } else if (!validateGstin(gstin)) {
-    errors.gstin = ['The GSTIN format is invalid. It must be a valid 15-character alphanumeric Indian GSTIN (e.g. 22AAAAA0000A1Z5).'];
-  }
-
-  if (!businessName) errors.business_name = ['The registered business name field is required.'];
-  if (!businessAddress) errors.business_address = ['The business address field is required.'];
-  if (!state) errors.state = ['The state field is required.'];
-  if (!pincode) errors.pincode = ['The PIN code field is required.'];
-
-  if (gstin) {
-    const [chkGst] = await pool.query(
-      'SELECT seller_id FROM seller_gst_details WHERE gstin = ? AND seller_id != ? LIMIT 1',
-      [gstin, sellerId]
-    );
-    if (chkGst.length > 0) {
-      errors.gstin = ['This GSTIN is already registered by another seller account.'];
-    }
-  }
-
-  if (Object.keys(errors).length > 0) {
-    return res.status(422).json({ message: 'Validation error occurred.', errors });
-  }
-
-  try {
-    const [existingRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
-    const existing = existingRows[0] || null;
-
-    const prevStatus = existing ? existing.status : 'Not Submitted';
-    const newStatus = 'Pending';
-    const action = (prevStatus === 'Rejected') ? 'resubmitted' : (existing ? 'updated' : 'submitted');
-
-    let gstId = null;
-    if (existing) {
-      gstId = existing.id;
-      await pool.query(
-        `UPDATE seller_gst_details
-         SET gstin = ?, business_name = ?, business_address = ?, state = ?, pincode = ?, status = ?, rejection_reason = NULL, submitted_at = NOW(), updated_at = NOW()
-         WHERE id = ?`,
-        [gstin, businessName, businessAddress, state, pincode, newStatus, gstId]
-      );
-    } else {
-      const [insRes] = await pool.query(
-        `INSERT INTO seller_gst_details (seller_id, gstin, business_name, business_address, state, pincode, status, submitted_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())`,
-        [sellerId, gstin, businessName, businessAddress, state, pincode, newStatus]
-      );
-      gstId = insRes.insertId;
-    }
-
-    // Process uploaded documents from multer
+// POST /api/seller/gst/upload, /api/seller/gst/submit, /api/seller/gst, or /api/seller/gst/documents
+// Uploads seller PDF document directly without requiring any form fields
+app.post(
+  ['/api/seller/gst/upload', '/api/seller/gst/submit', '/api/seller/gst', '/api/seller/gst/documents'],
+  authenticateToken,
+  handleGstUpload,
+  async (req, res) => {
+    await ensureGstTables(pool);
+    const sellerId = req.user.id;
+    const body = req.body || {};
     const files = req.files || [];
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      const isPrimary = (i === 0) ? 1 : 0;
-      if (isPrimary === 1) {
-        await pool.query('UPDATE seller_gst_documents SET is_primary = 0 WHERE seller_id = ?', [sellerId]);
+
+    // Optional fields (none are required)
+    const gstin = (extractField(body, ['gstin', 'gst_number', 'gstNumber', 'gst_registration_number']) || '').toUpperCase().trim();
+    const businessName = (extractField(body, ['business_name', 'businessName', 'registered_business_name', 'company_name', 'shop_name']) || '').trim();
+    const businessAddress = (extractField(body, ['business_address', 'businessAddress', 'address', 'shop_address']) || '').trim();
+    const state = (extractField(body, ['state', 'province', 'region']) || '').trim();
+    const pincode = (extractField(body, ['pincode', 'pin_code', 'pin', 'zip', 'postal_code']) || '').trim();
+
+    try {
+      const [existingRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
+      const existing = existingRows[0] || null;
+
+      // If no file uploaded and no existing documents, reject
+      if (files.length === 0) {
+        const [existingDocs] = await pool.query('SELECT id FROM seller_gst_documents WHERE seller_id = ? LIMIT 1', [sellerId]);
+        if (existingDocs.length === 0) {
+          return res.status(422).json({
+            status: 'error',
+            message: 'Please select a PDF document file to upload.',
+            errors: { document: ['PDF document file is required.'] }
+          });
+        }
       }
-      await pool.query(
-        `INSERT INTO seller_gst_documents (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [
-          sellerId,
-          gstId,
-          isPrimary ? 'gst_certificate' : 'supporting_document',
-          f.originalname,
-          f.filename,
-          f.path,
-          f.size,
-          f.mimetype,
-          isPrimary
-        ]
-      );
-    }
 
-    const notes = (action === 'resubmitted')
-      ? 'Seller resubmitted updated GST registration details and documents.'
-      : 'Seller submitted GST registration details for admin verification.';
-    await logGstAction(pool, {
-      seller_id: sellerId,
-      gst_id: gstId,
-      action,
-      previous_status: prevStatus,
-      new_status: newStatus,
-      notes,
-      performed_by: sellerId,
-      performer_role: 'seller'
-    });
+      // Fetch seller profile to prefill seller_name, address, state if empty
+      const [sellerRows] = await pool.query('SELECT * FROM sellers WHERE id = ? LIMIT 1', [sellerId]);
+      const sellerProfile = sellerRows[0] || {};
 
-    const [allDocs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [sellerId]);
-    const [allLogs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC LIMIT 20', [sellerId]);
+      const finalGstin = gstin || (existing ? existing.gstin : null);
+      const finalBusinessName = businessName || (existing ? existing.business_name : null) || sellerProfile.seller_name || null;
+      const finalBusinessAddress = businessAddress || (existing ? existing.business_address : null) || sellerProfile.address || null;
+      const finalState = state || (existing ? existing.state : null) || sellerProfile.state || null;
+      const finalPincode = pincode || (existing ? existing.pincode : null);
 
-    res.status(200).json({
-      status: 'success',
-      message: 'GST details submitted successfully and are pending admin verification.',
-      gst: {
-        id: gstId,
+      const prevStatus = existing ? existing.status : 'Not Submitted';
+      const newStatus = 'Pending';
+      const action = (prevStatus === 'Rejected') ? 'resubmitted' : (existing ? 'updated' : 'submitted');
+
+      let gstId = null;
+      if (existing) {
+        gstId = existing.id;
+        await pool.query(
+          `UPDATE seller_gst_details
+           SET gstin = ?, business_name = ?, business_address = ?, state = ?, pincode = ?, status = ?, rejection_reason = NULL, submitted_at = NOW(), updated_at = NOW()
+           WHERE id = ?`,
+          [finalGstin, finalBusinessName, finalBusinessAddress, finalState, finalPincode, newStatus, gstId]
+        );
+      } else {
+        const [insRes] = await pool.query(
+          `INSERT INTO seller_gst_details (seller_id, gstin, business_name, business_address, state, pincode, status, submitted_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())`,
+          [sellerId, finalGstin, finalBusinessName, finalBusinessAddress, finalState, finalPincode, newStatus]
+        );
+        gstId = insRes.insertId;
+      }
+
+      // Process uploaded PDF/image document
+      let primaryDoc = null;
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const isPrimary = (i === 0) ? 1 : 0;
+        if (isPrimary === 1) {
+          await pool.query('UPDATE seller_gst_documents SET is_primary = 0 WHERE seller_id = ?', [sellerId]);
+        }
+        const [docRes] = await pool.query(
+          `INSERT INTO seller_gst_documents (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [
+            sellerId,
+            gstId,
+            isPrimary ? 'gst_certificate' : 'supporting_document',
+            f.originalname,
+            f.filename,
+            f.path,
+            f.size,
+            f.mimetype,
+            isPrimary
+          ]
+        );
+        if (isPrimary === 1) {
+          primaryDoc = {
+            id: docRes.insertId,
+            seller_id: sellerId,
+            gst_id: gstId,
+            document_type: 'gst_certificate',
+            original_name: f.originalname,
+            file_name: f.filename,
+            file_path: f.path,
+            file_size: f.size,
+            mime_type: f.mimetype,
+            is_primary: 1
+          };
+        }
+      }
+
+      const notes = (action === 'resubmitted')
+        ? 'Seller resubmitted updated PDF document after rejection.'
+        : 'Seller uploaded PDF document for admin verification.';
+
+      await logGstAction(pool, {
         seller_id: sellerId,
-        gstin,
-        business_name: businessName,
-        business_address: businessAddress,
-        state,
-        pincode,
-        status: newStatus,
-        rejection_reason: null,
-        submitted_at: new Date().toISOString(),
-        verified_at: null,
-        documents: allDocs.map(d => formatGstDocumentRecord(d, false)),
-        verification_history: allLogs
-      }
-    });
-  } catch (err) {
-    console.error('GST submit error:', err);
-    res.status(500).json({ error: 'Database error occurred while saving GST details.' });
-  }
-});
+        gst_id: gstId,
+        action,
+        previous_status: prevStatus,
+        new_status: newStatus,
+        notes,
+        performed_by: sellerId,
+        performer_role: 'seller'
+      });
 
-// GET /api/seller/gst
-app.get('/api/seller/gst', authenticateToken, async (req, res) => {
+      const [allDocs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [sellerId]);
+      const [allLogs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC LIMIT 20', [sellerId]);
+
+      res.status(200).json({
+        status: 'success',
+        message: 'PDF document uploaded successfully. Your verification request is currently Pending review.',
+        gst_status: 'Pending',
+        document: primaryDoc ? formatGstDocumentRecord(primaryDoc, false) : (allDocs[0] ? formatGstDocumentRecord(allDocs[0], false) : null),
+        gst: {
+          id: gstId,
+          seller_id: sellerId,
+          gstin: finalGstin,
+          business_name: finalBusinessName,
+          status: newStatus,
+          rejection_reason: null,
+          submitted_at: new Date().toISOString(),
+          verified_at: null,
+          documents: allDocs.map(d => formatGstDocumentRecord(d, false)),
+          verification_history: allLogs
+        }
+      });
+    } catch (err) {
+      console.error('GST upload error:', err);
+      res.status(500).json({ status: 'error', error: 'Database error occurred while uploading GST document.' });
+    }
+  }
+);
+
+// GET /api/seller/gst or /api/seller/gst/status
+// Allows user to view the current status of their verification request
+app.get(['/api/seller/gst', '/api/seller/gst/status'], authenticateToken, async (req, res) => {
   await ensureGstTables(pool);
   const sellerId = req.user.id;
 
@@ -6922,15 +6954,14 @@ app.get('/api/seller/gst', authenticateToken, async (req, res) => {
     if (!gst) {
       return res.json({
         status: 'success',
+        gst_status: 'Not Submitted',
+        message: 'No GST document has been uploaded yet. Please upload your GST PDF document.',
         has_submitted: false,
         gst: {
           status: 'Not Submitted',
           seller_id: sellerId,
           gstin: null,
           business_name: null,
-          business_address: null,
-          state: null,
-          pincode: null,
           rejection_reason: null,
           submitted_at: null,
           verified_at: null,
@@ -6943,17 +6974,23 @@ app.get('/api/seller/gst', authenticateToken, async (req, res) => {
     const [docs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [sellerId]);
     const [logs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC LIMIT 20', [sellerId]);
 
+    let statusMessage = 'Your GST document is currently pending admin verification.';
+    if (gst.status === 'Approved') {
+      statusMessage = 'Your GST document has been verified and Approved.';
+    } else if (gst.status === 'Rejected') {
+      statusMessage = `Your GST verification was Rejected: ${gst.rejection_reason || 'Document does not meet requirements'}. Please upload a corrected PDF document.`;
+    }
+
     res.json({
       status: 'success',
+      gst_status: gst.status,
+      message: statusMessage,
       has_submitted: true,
       gst: {
         id: gst.id,
         seller_id: sellerId,
         gstin: gst.gstin,
         business_name: gst.business_name,
-        business_address: gst.business_address,
-        state: gst.state,
-        pincode: gst.pincode,
         status: gst.status,
         rejection_reason: gst.rejection_reason,
         submitted_at: gst.submitted_at,
@@ -6963,89 +7000,8 @@ app.get('/api/seller/gst', authenticateToken, async (req, res) => {
       }
     });
   } catch (err) {
-    console.error('GST fetch error:', err);
-    res.status(500).json({ error: 'Database error occurred while fetching GST details.' });
-  }
-});
-
-// POST /api/seller/gst/documents
-app.post('/api/seller/gst/documents', authenticateToken, handleGstUpload, async (req, res) => {
-  await ensureGstTables(pool);
-  const sellerId = req.user.id;
-  const files = req.files || [];
-
-  if (files.length === 0) {
-    return res.status(422).json({
-      message: 'No document file was uploaded.',
-      errors: { document: ['Please select a document file to upload (PDF, JPG, or PNG).'] }
-    });
-  }
-
-  const f = files[0];
-  const docType = (req.body && req.body.document_type) || 'supporting_document';
-
-  try {
-    const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
-    const gst = gstRows[0] || null;
-    const gstId = gst ? gst.id : null;
-    const prevStatus = gst ? gst.status : 'Not Submitted';
-
-    const isPrimary = (docType === 'gst_certificate') ? 1 : 0;
-    if (isPrimary === 1) {
-      await pool.query('UPDATE seller_gst_documents SET is_primary = 0 WHERE seller_id = ?', [sellerId]);
-    }
-
-    const [docRes] = await pool.query(
-      `INSERT INTO seller_gst_documents (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-      [sellerId, gstId, docType, f.originalname, f.filename, f.path, f.size, f.mimetype, isPrimary]
-    );
-    const docId = docRes.insertId;
-
-    if (gst && prevStatus === 'Rejected') {
-      await pool.query('UPDATE seller_gst_details SET status = "Pending", rejection_reason = NULL, updated_at = NOW() WHERE id = ?', [gstId]);
-      await logGstAction(pool, {
-        seller_id: sellerId,
-        gst_id: gstId,
-        action: 'resubmitted',
-        previous_status: 'Rejected',
-        new_status: 'Pending',
-        notes: 'Seller uploaded new document after rejection.',
-        performed_by: sellerId,
-        performer_role: 'seller'
-      });
-    } else {
-      await logGstAction(pool, {
-        seller_id: sellerId,
-        gst_id: gstId,
-        action: 'document_uploaded',
-        previous_status: prevStatus,
-        new_status: prevStatus,
-        notes: `Uploaded document: ${f.originalname}`,
-        performed_by: sellerId,
-        performer_role: 'seller'
-      });
-    }
-
-    res.status(201).json({
-      status: 'success',
-      message: 'Document uploaded successfully.',
-      document: formatGstDocumentRecord({
-        id: docId,
-        seller_id: sellerId,
-        gst_id: gstId,
-        document_type: docType,
-        original_name: f.originalname,
-        file_name: f.filename,
-        file_size: f.size,
-        mime_type: f.mimetype,
-        is_primary: isPrimary,
-        created_at: new Date().toISOString()
-      }, false)
-    });
-  } catch (err) {
-    console.error('Upload GST doc error:', err);
-    res.status(500).json({ error: 'Database error occurred while saving document.' });
+    console.error('GST status fetch error:', err);
+    res.status(500).json({ status: 'error', error: 'Database error occurred while fetching GST status.' });
   }
 });
 

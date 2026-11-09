@@ -69,52 +69,24 @@ function apiSellerSubmitGst(PDO $pdo): void
         $input = $_POST;
     }
 
-    $gstin = strtoupper(trim(extractFieldPhp($input, ['gstin', 'gst_number', 'gstNumber', 'gst_registration_number'])));
-    $businessName = trim(extractFieldPhp($input, ['business_name', 'businessName', 'registered_business_name', 'company_name', 'shop_name']));
-    $businessAddress = trim(extractFieldPhp($input, ['business_address', 'businessAddress', 'address', 'shop_address']));
-    $state = trim(extractFieldPhp($input, ['state', 'province', 'region']));
-    $pincode = trim(extractFieldPhp($input, ['pincode', 'pin_code', 'pin', 'zip', 'postal_code']));
-
-    $errors = [];
-    if (empty($gstin)) {
-        $errors['gstin'] = ['The GSTIN field is required.'];
-    } elseif (!validateGstin($gstin)) {
-        $errors['gstin'] = ['The GSTIN format is invalid. It must be a valid 15-character alphanumeric Indian GSTIN (e.g. 22AAAAA0000A1Z5).'];
-    }
-
-    if (empty($businessName)) {
-        $errors['business_name'] = ['The registered business name field is required.'];
-    }
-    if (empty($businessAddress)) {
-        $errors['business_address'] = ['The business address field is required.'];
-    }
-    if (empty($state)) {
-        $errors['state'] = ['The state field is required.'];
-    }
-    if (empty($pincode)) {
-        $errors['pincode'] = ['The PIN code field is required.'];
-    }
-
-    // Check if another seller already registered this GSTIN
-    if (!empty($gstin)) {
-        $chkStmt = $pdo->prepare("SELECT seller_id FROM seller_gst_details WHERE gstin = :gstin AND seller_id != :seller_id LIMIT 1");
-        $chkStmt->execute([':gstin' => $gstin, ':seller_id' => $sellerId]);
-        if ($chkStmt->fetch()) {
-            $errors['gstin'] = ['This GSTIN is already registered by another seller account.'];
-        }
-    }
-
-    if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
-    }
+    $rawGstin = extractFieldPhp($input, ['gstin', 'gst_number', 'gstNumber', 'gst_registration_number']);
+    $rawBusinessName = extractFieldPhp($input, ['business_name', 'businessName', 'registered_business_name', 'company_name', 'shop_name']);
+    $rawBusinessAddress = extractFieldPhp($input, ['business_address', 'businessAddress', 'address', 'shop_address']);
+    $rawState = extractFieldPhp($input, ['state', 'province', 'region']);
+    $rawPincode = extractFieldPhp($input, ['pincode', 'pin_code', 'pin', 'zip', 'postal_code']);
 
     // Fetch existing GST record
     $fetchStmt = $pdo->prepare("SELECT * FROM seller_gst_details WHERE seller_id = :seller_id LIMIT 1");
     $fetchStmt->execute([':seller_id' => $sellerId]);
     $existing = $fetchStmt->fetch();
 
+    $gstin = !empty($rawGstin) ? strtoupper(trim($rawGstin)) : ($existing['gstin'] ?? null);
+    $businessName = !empty($rawBusinessName) ? trim($rawBusinessName) : ($existing['business_name'] ?? $user['seller_name'] ?? null);
+    $businessAddress = !empty($rawBusinessAddress) ? trim($rawBusinessAddress) : ($existing['business_address'] ?? $user['address'] ?? null);
+    $state = !empty($rawState) ? trim($rawState) : ($existing['state'] ?? $user['state'] ?? null);
+    $pincode = !empty($rawPincode) ? trim($rawPincode) : ($existing['pincode'] ?? null);
+
     $prevStatus = $existing ? $existing['status'] : 'Not Submitted';
-    // Rules: After submission, status becomes Pending (if was Rejected, it is a resubmission)
     $newStatus = 'Pending';
     $action = ($prevStatus === 'Rejected') ? 'resubmitted' : ($existing ? 'updated' : 'submitted');
 
@@ -124,7 +96,7 @@ function apiSellerSubmitGst(PDO $pdo): void
 
     // Check files array in various keys: certificate, document, file, gst_certificate, documents
     $filesToProcess = [];
-    $fileKeys = ['certificate', 'document', 'gst_certificate', 'file', 'gst_document', 'documents'];
+    $fileKeys = ['certificate', 'document', 'gst_certificate', 'file', 'gst_document', 'documents', 'pdf'];
     foreach ($fileKeys as $k) {
         if (!empty($_FILES[$k]['name'])) {
             if (is_array($_FILES[$k]['name'])) {
@@ -150,6 +122,17 @@ function apiSellerSubmitGst(PDO $pdo): void
                     'type_label' => ($k === 'document' || $k === 'file') ? 'supporting_document' : 'gst_certificate'
                 ];
             }
+        }
+    }
+
+    // Require file if no existing documents
+    if (empty($filesToProcess)) {
+        $chkDocs = $pdo->prepare("SELECT id FROM seller_gst_documents WHERE seller_id = :seller_id LIMIT 1");
+        $chkDocs->execute([':seller_id' => $sellerId]);
+        if (!$chkDocs->fetch()) {
+            errorResponse('Please select a PDF document file to upload.', [
+                'document' => ['PDF document file is required.']
+            ], 422);
         }
     }
 
@@ -277,7 +260,8 @@ function apiSellerSubmitGst(PDO $pdo): void
 
     jsonResponse([
         'status' => 'success',
-        'message' => 'GST details submitted successfully and are pending admin verification.',
+        'message' => 'PDF document uploaded successfully. Your verification request is currently Pending review.',
+        'gst_status' => $newStatus,
         'gst' => [
             'id' => $gstId,
             'seller_id' => $sellerId,
@@ -297,7 +281,7 @@ function apiSellerSubmitGst(PDO $pdo): void
 }
 
 /**
- * GET /api/seller/gst
+ * GET /api/seller/gst or /api/seller/gst/status
  * Returns current authenticated seller's GST details, documents, and verification history
  */
 function apiSellerGetGst(PDO $pdo): void
@@ -313,6 +297,8 @@ function apiSellerGetGst(PDO $pdo): void
     if (!$gst) {
         jsonResponse([
             'status' => 'success',
+            'gst_status' => 'Not Submitted',
+            'message' => 'No GST document has been uploaded yet. Please upload your GST PDF document.',
             'has_submitted' => false,
             'gst' => [
                 'status' => 'Not Submitted',
@@ -339,8 +325,17 @@ function apiSellerGetGst(PDO $pdo): void
     $logsStmt->execute([':seller_id' => $sellerId]);
     $logs = $logsStmt->fetchAll();
 
+    $statusMessage = 'Your GST document is currently pending admin verification.';
+    if ($gst['status'] === 'Approved') {
+        $statusMessage = 'Your GST document has been verified and Approved.';
+    } elseif ($gst['status'] === 'Rejected') {
+        $statusMessage = 'Your GST verification was Rejected: ' . ($gst['rejection_reason'] ?: 'Document does not meet requirements') . '. Please upload a corrected PDF document.';
+    }
+
     jsonResponse([
         'status' => 'success',
+        'gst_status' => $gst['status'],
+        'message' => $statusMessage,
         'has_submitted' => true,
         'gst' => [
             'id' => (int) $gst['id'],
@@ -816,3 +811,4 @@ function apiAdminViewGstDocument(PDO $pdo, int $docId, string $mode = 'preview')
 
     streamSecureDocument($doc, $mode);
 }
+

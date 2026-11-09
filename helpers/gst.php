@@ -15,11 +15,11 @@ function ensureGstTables(PDO $pdo): void
             CREATE TABLE IF NOT EXISTS `seller_gst_details` (
               `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
               `seller_id` BIGINT UNSIGNED NOT NULL,
-              `gstin` VARCHAR(20) NOT NULL,
-              `business_name` VARCHAR(255) NOT NULL,
-              `business_address` TEXT NOT NULL,
-              `state` VARCHAR(100) NOT NULL,
-              `pincode` VARCHAR(20) NOT NULL,
+              `gstin` VARCHAR(30) NULL DEFAULT NULL,
+              `business_name` VARCHAR(255) NULL DEFAULT NULL,
+              `business_address` TEXT NULL DEFAULT NULL,
+              `state` VARCHAR(100) NULL DEFAULT NULL,
+              `pincode` VARCHAR(20) NULL DEFAULT NULL,
               `status` VARCHAR(30) NOT NULL DEFAULT 'Pending',
               `rejection_reason` TEXT NULL DEFAULT NULL,
               `verified_by` BIGINT UNSIGNED NULL DEFAULT NULL,
@@ -33,6 +33,19 @@ function ensureGstTables(PDO $pdo): void
               INDEX `idx_gst_gstin` (`gstin`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
+
+        try {
+            $pdo->exec("
+                ALTER TABLE `seller_gst_details`
+                MODIFY `gstin` VARCHAR(30) NULL DEFAULT NULL,
+                MODIFY `business_name` VARCHAR(255) NULL DEFAULT NULL,
+                MODIFY `business_address` TEXT NULL DEFAULT NULL,
+                MODIFY `state` VARCHAR(100) NULL DEFAULT NULL,
+                MODIFY `pincode` VARCHAR(20) NULL DEFAULT NULL;
+            ");
+        } catch (Throwable $ignoreAlter) {
+            // Already altered or non-critical
+        }
 
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS `seller_gst_documents` (
@@ -199,3 +212,4 @@ function formatGstDocument(array $doc, bool $isAdmin = false): array
         'updated_at' => $doc['updated_at'] ?? $doc['created_at'],
     ];
 }
+
