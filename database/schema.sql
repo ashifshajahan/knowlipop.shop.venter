@@ -220,4 +220,63 @@ VALUES
 (2, 1, 5, 1, 'Polarized Aviator Sunglasses', 'https://knowlipop.shop/uploads/products/placeholder.jpg', 1299.00, 1, 1299.00)
 ON DUPLICATE KEY UPDATE `seller_id` = VALUES(`seller_id`), `quantity` = VALUES(`quantity`), `subtotal` = VALUES(`subtotal`);
 
+-- ======================================================
+-- Seller GST Document Upload & Admin Verification Schema
+-- ======================================================
+
+CREATE TABLE IF NOT EXISTS `seller_gst_details` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `gstin` VARCHAR(20) NOT NULL,
+  `business_name` VARCHAR(255) NOT NULL,
+  `business_address` TEXT NOT NULL,
+  `state` VARCHAR(100) NOT NULL,
+  `pincode` VARCHAR(20) NOT NULL,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'Pending',
+  `rejection_reason` TEXT NULL DEFAULT NULL,
+  `verified_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `verified_at` TIMESTAMP NULL DEFAULT NULL,
+  `submitted_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_gst_seller` (`seller_id`),
+  INDEX `idx_gst_status` (`status`),
+  INDEX `idx_gst_gstin` (`gstin`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_gst_documents` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `document_type` VARCHAR(50) NOT NULL DEFAULT 'gst_certificate',
+  `original_name` VARCHAR(255) NOT NULL,
+  `file_name` VARCHAR(255) NOT NULL,
+  `file_path` VARCHAR(255) NOT NULL,
+  `file_size` BIGINT UNSIGNED NOT NULL,
+  `mime_type` VARCHAR(100) NOT NULL,
+  `is_primary` TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_gstdoc_seller` (`seller_id`),
+  INDEX `idx_gstdoc_gst` (`gst_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_gst_verification_logs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `action` VARCHAR(40) NOT NULL,
+  `previous_status` VARCHAR(30) NULL DEFAULT NULL,
+  `new_status` VARCHAR(30) NOT NULL,
+  `notes` TEXT NULL DEFAULT NULL,
+  `performed_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `performer_role` VARCHAR(20) NOT NULL DEFAULT 'seller',
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_gstlog_seller` (`seller_id`),
+  INDEX `idx_gstlog_gst` (`gst_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 

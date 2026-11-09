@@ -216,6 +216,7 @@ require_once __DIR__ . '/api/payment.php';
 require_once __DIR__ . '/api/seller.php';
 require_once __DIR__ . '/api/orders.php';
 require_once __DIR__ . '/api/invoice.php';
+require_once __DIR__ . '/api/gst.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
@@ -582,6 +583,104 @@ if ($requestUri === '/api/seller/payouts') {
 if ($requestUri === '/api/marketplace/commission-preview') {
     if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
     apiCommissionPreview($pdo);
+}
+
+// ==========================================
+// Seller GST Document Upload & Management
+// ==========================================
+
+if ($requestUri === '/api/seller/gst/submit' || $requestUri === '/api/seller/gst') {
+    if ($method === 'POST') {
+        apiSellerSubmitGst($pdo);
+    } elseif ($method === 'GET') {
+        apiSellerGetGst($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/gst/documents') {
+    if ($method === 'POST') {
+        apiSellerUploadGstDocument($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/seller/gst/documents/(\d+)$#', $requestUri, $matches)) {
+    $docId = (int) $matches[1];
+    if ($method === 'DELETE') {
+        apiSellerDeleteGstDocument($pdo, $docId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/seller/gst/documents/(\d+)/(preview|download)$#', $requestUri, $matches)) {
+    $docId = (int) $matches[1];
+    $mode = $matches[2];
+    if ($method === 'GET') {
+        apiSellerViewGstDocument($pdo, $docId, $mode);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// ==========================================
+// Admin GST Verification Routes
+// ==========================================
+
+if ($requestUri === '/api/admin/sellers/gst/pending') {
+    if ($method === 'GET') {
+        apiAdminGetPendingGst($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/admin/sellers/gst') {
+    if ($method === 'GET') {
+        apiAdminGetSellersGst($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/sellers/gst/(\d+)$#', $requestUri, $matches)) {
+    $targetSellerId = (int) $matches[1];
+    if ($method === 'GET') {
+        apiAdminGetSellerGstDetail($pdo, $targetSellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/sellers/gst/(\d+)/approve$#', $requestUri, $matches)) {
+    $targetSellerId = (int) $matches[1];
+    if ($method === 'POST') {
+        apiAdminApproveGst($pdo, $targetSellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/sellers/gst/(\d+)/reject$#', $requestUri, $matches)) {
+    $targetSellerId = (int) $matches[1];
+    if ($method === 'POST') {
+        apiAdminRejectGst($pdo, $targetSellerId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/sellers/gst/documents/(\d+)/(preview|download)$#', $requestUri, $matches)) {
+    $docId = (int) $matches[1];
+    $mode = $matches[2];
+    if ($method === 'GET') {
+        apiAdminViewGstDocument($pdo, $docId, $mode);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
 // Buyer Orders & Order Items CRUD (supports /api/orders and /api/order)
