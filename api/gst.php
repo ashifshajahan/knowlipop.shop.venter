@@ -80,11 +80,11 @@ function apiSellerSubmitGst(PDO $pdo): void
     $fetchStmt->execute([':seller_id' => $sellerId]);
     $existing = $fetchStmt->fetch();
 
-    $gstin = !empty($rawGstin) ? strtoupper(trim($rawGstin)) : ($existing['gstin'] ?? null);
-    $businessName = !empty($rawBusinessName) ? trim($rawBusinessName) : ($existing['business_name'] ?? $user['seller_name'] ?? null);
-    $businessAddress = !empty($rawBusinessAddress) ? trim($rawBusinessAddress) : ($existing['business_address'] ?? $user['address'] ?? null);
-    $state = !empty($rawState) ? trim($rawState) : ($existing['state'] ?? $user['state'] ?? null);
-    $pincode = !empty($rawPincode) ? trim($rawPincode) : ($existing['pincode'] ?? null);
+    $gstin = !empty($rawGstin) ? strtoupper(trim($rawGstin)) : ($existing['gstin'] ?? '');
+    $businessName = !empty($rawBusinessName) ? trim($rawBusinessName) : ($existing['business_name'] ?? $user['seller_name'] ?? 'Seller Business');
+    $businessAddress = !empty($rawBusinessAddress) ? trim($rawBusinessAddress) : ($existing['business_address'] ?? $user['address'] ?? 'Address on file');
+    $state = !empty($rawState) ? trim($rawState) : ($existing['state'] ?? $user['state'] ?? 'State');
+    $pincode = !empty($rawPincode) ? trim($rawPincode) : ($existing['pincode'] ?? '000000');
 
     $prevStatus = $existing ? $existing['status'] : 'Not Submitted';
     $newStatus = 'Pending';

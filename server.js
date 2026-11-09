@@ -6831,11 +6831,11 @@ app.post(
       const [sellerRows] = await pool.query('SELECT * FROM sellers WHERE id = ? LIMIT 1', [sellerId]);
       const sellerProfile = sellerRows[0] || {};
 
-      const finalGstin = gstin || (existing ? existing.gstin : null);
-      const finalBusinessName = businessName || (existing ? existing.business_name : null) || sellerProfile.seller_name || null;
-      const finalBusinessAddress = businessAddress || (existing ? existing.business_address : null) || sellerProfile.address || null;
-      const finalState = state || (existing ? existing.state : null) || sellerProfile.state || null;
-      const finalPincode = pincode || (existing ? existing.pincode : null);
+      const finalGstin = gstin || (existing ? existing.gstin : null) || '';
+      const finalBusinessName = businessName || (existing ? existing.business_name : null) || sellerProfile.seller_name || 'Seller Business';
+      const finalBusinessAddress = businessAddress || (existing ? existing.business_address : null) || sellerProfile.address || 'Address on file';
+      const finalState = state || (existing ? existing.state : null) || sellerProfile.state || 'State';
+      const finalPincode = pincode || (existing ? existing.pincode : null) || '000000';
 
       const prevStatus = existing ? existing.status : 'Not Submitted';
       const newStatus = 'Pending';
@@ -6936,7 +6936,7 @@ app.post(
       });
     } catch (err) {
       console.error('GST upload error:', err);
-      res.status(500).json({ status: 'error', error: 'Database error occurred while uploading GST document.' });
+      res.status(500).json({ status: 'error', error: 'Database error occurred while uploading GST document.', details: err.message });
     }
   }
 );
