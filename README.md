@@ -59,8 +59,8 @@ The platform features built-in multi-vendor marketplace routing and privacy isol
 * `POST /api/logout` — Invalidate session
 
 ### Seller Profile & Directory
-* `GET /api/seller/profile` — Seller profile details based on Seller ID (`?seller_id={id}` or `?id={id}`) or Bearer token (contains: `id`, `seller_name`, `phone`, `address`, `landmark`, `state`, `country`; email is for admin only)
-* `PUT /api/seller/profile` — Edit authenticated seller profile (shop name, phone, address, landmark, state, country; `id` cannot be changed)
+* `GET /api/seller/profile` — Seller profile details based on Seller ID (`?seller_id={id}` or `?id={id}`) or Bearer token (contains: `id`, `seller_name`, `email`, `phone`, `address`, `landmark`, `state`, `country`)
+* `PUT /api/seller/profile` — Edit authenticated seller profile (shop name, email, phone, address, landmark, state, country; `id` cannot be changed)
 * `POST /api/seller/profile/update` — Convenient POST alias for editing profile
 * `POST /api/seller/change-password` — Separate password update endpoint requiring `current_password`, `new_password`, and `confirm_password`
 * `GET /api/sellers/{id}` — Seller profile based on Seller ID (e.g. `/api/sellers/1` or `/api/seller/1` or `/api/seller/profile/1`) — returns seller details only
