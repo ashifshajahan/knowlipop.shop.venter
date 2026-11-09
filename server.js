@@ -6828,7 +6828,7 @@ app.post(
       }
 
       // Fetch seller profile to prefill seller_name, address, state if empty
-      const [sellerRows] = await pool.query('SELECT * FROM sellers WHERE id = ? LIMIT 1', [sellerId]);
+      const [sellerRows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
       const sellerProfile = sellerRows[0] || {};
 
       const finalGstin = gstin || (existing ? existing.gstin : null) || '';
