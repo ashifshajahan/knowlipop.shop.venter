@@ -252,18 +252,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'in_stock' => $stock > 0,
         'rating' => $rating,
         'ratings_count' => $ratingsCount,
-        'image_url' => $primaryImageUrl,
-        'image' => $primaryImageUrl,
-        'relative_path' => $relativePaths[0] ?? null,
         'images' => $imagesArray,
-        'gallery_items' => array_map(function($u, $i) use ($p, $relativePaths) {
-            return [
-                'id' => $i + 1,
-                'product_id' => (int) $p['id'],
-                'image_url' => $u,
-                'relative_path' => $relativePaths[$i] ?? null,
-            ];
-        }, $imagesArray, array_keys($imagesArray)),
         'is_active' => (bool) ($p['is_active'] ?? true),
         'created_at' => $p['created_at'] ?? null,
         'updated_at' => $p['updated_at'] ?? null,
@@ -904,25 +893,14 @@ function apiUploadImage(PDO $pdo): void
     }, $res['images']);
 
     jsonResponse([
+        'success' => true,
+        'status' => true,
         'message' => 'Images uploaded successfully.',
-        'image_url' => $res['primaryImageUrl'],
-        'image' => $res['primaryImageUrl'],
-        'url' => $res['primaryImageUrl'],
-        'product_image' => $res['primaryImageUrl'],
-        'path' => '/uploads/products/' . $fileName,
-        'relative_path' => $relativePaths[0] ?? null,
-        'file_name' => $fileName,
         'images' => $res['images'],
-        'image_urls' => $res['images'],
-        'relative_paths' => $relativePaths,
         'product_id' => $targetProductId,
         'product' => $attachedProduct,
         'data' => [
-            'url' => $res['primaryImageUrl'],
-            'image_url' => $res['primaryImageUrl'],
-            'image' => $res['primaryImageUrl'],
-            'images' => $res['images'],
-            'relative_path' => $relativePaths[0] ?? null
+            'images' => $res['images']
         ],
         'limit' => 4,
         'total' => count($res['images'])
@@ -966,9 +944,7 @@ function apiGetProductImages(PDO $pdo, int $productId): void
         'success' => true,
         'status' => true,
         'product_id' => $productId,
-        'image_url' => $formatted['image_url'],
         'images' => $formatted['images'],
-        'gallery' => $galleryRows,
         'total' => count($formatted['images'])
     ]);
 }
@@ -1156,7 +1132,6 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
         'success' => true,
         'status' => true,
         'message' => 'Product image updated successfully.',
-        'image_url' => $primaryUrl,
         'images' => $newImages,
         'product' => $updated
     ]);
@@ -1241,7 +1216,6 @@ function apiDeleteProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile =
         'success' => true,
         'status' => true,
         'message' => 'Product image deleted successfully.',
-        'image_url' => $primaryUrl,
         'images' => $currentImgs,
         'product' => $updated
     ]);

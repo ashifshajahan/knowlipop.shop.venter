@@ -439,7 +439,7 @@ function resolveProductImages(req) {
 
     // Handle objects e.g. { url: "...", image_url: "...", src: "..." }
     if (typeof item === 'object') {
-      const cand = item.url || item.image_url || item.src || item.path || item.link || item.image || item.relative_path;
+      const cand = item.url || item.image_url || item.src || item.path || item.link || item.image || item.relative_path || item.image_path || item['image.path'] || item.imagePath;
       if (cand) {
         processCandidate(cand);
         return;
@@ -2336,16 +2336,7 @@ function formatProductRecord(p, options = {}) {
     in_stock: stock > 0,
     rating,
     ratings_count: ratingsCount,
-    image_url: primaryImageUrl,
-    image: primaryImageUrl,
-    relative_path: relativePaths[0] || null,
     images: finalImagesArray,
-    gallery_items: finalImagesArray.map((u, i) => ({
-      id: i + 1,
-      product_id: Number(p.id),
-      image_url: u,
-      relative_path: relativePaths[i] || null
-    })),
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
     updated_at: p.updated_at || null
@@ -2514,14 +2505,14 @@ async function ensureProductPriceColumns(p) {
 }
 
 let fallbackProducts = [
-  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, image_url: null, images: [], is_active: true },
-  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, image_url: null, images: [], is_active: true },
-  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, image_url: null, images: [], is_active: true },
-  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, image_url: null, images: [], is_active: true },
-  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, image_url: null, images: [], is_active: true },
-  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, image_url: null, images: [], is_active: true },
-  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, image_url: null, images: [], is_active: true },
-  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, image_url: null, images: [], is_active: true }
+  { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, images: [], is_active: true },
+  { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, images: [], is_active: true },
+  { id: 3, seller_id: 1, seller_name: 'Verified Seller', name: 'Vintage Leather Travel Backpack', description: 'Water-resistant genuine leather travel bag with 15.6 inch laptop sleeve and ergonomic straps.', price: '3299.00', seller_price: '3299.00', mrp: '4999.00', discount_percent: 34, sku: 'SKU-0003', category: 'Luggage', brand: 'UrbanCraft', rating: 4.6, ratings_count: 94, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 20, images: [], is_active: true },
+  { id: 4, seller_id: 1, seller_name: 'Verified Seller', name: 'Air Cushion Running Sneakers', description: 'Lightweight breathable sports shoes designed for marathon running and daily training.', price: '2499.00', seller_price: '2499.00', mrp: '3499.00', discount_percent: 29, sku: 'SKU-0004', category: 'Footwear', brand: 'AeroStep', rating: 4.5, ratings_count: 312, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 60, images: [], is_active: true },
+  { id: 5, seller_id: 1, seller_name: 'Verified Seller', name: 'Polarized Aviator Sunglasses', description: 'UV400 protection titanium frame sunglasses with anti-glare scratch resistant lenses.', price: '1299.00', seller_price: '1299.00', mrp: '1999.00', discount_percent: 35, sku: 'SKU-0005', category: 'Accessories', brand: 'OptiShield', rating: 4.4, ratings_count: 76, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 100, images: [], is_active: true },
+  { id: 6, seller_id: 1, seller_name: 'Verified Seller', name: 'RGB Mechanical Gaming Keyboard', description: 'Custom hot-swappable tactile blue switches with per-key RGB backlighting and aluminum frame.', price: '3999.00', seller_price: '3999.00', mrp: '5499.00', discount_percent: 27, sku: 'SKU-0006', category: 'Computers', brand: 'VortexKey', rating: 4.9, ratings_count: 420, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 25, images: [], is_active: true },
+  { id: 7, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Noise-Cancelling Studio Earbuds', description: 'Wireless stereo earbuds with deep bass and IPX5 water resistance.', price: '1899.00', seller_price: '1899.00', mrp: '2999.00', discount_percent: 37, sku: 'SKU-0007', category: 'Electronics', brand: 'SoundWave', rating: 4.5, ratings_count: 110, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 45, images: [], is_active: true },
+  { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, images: [], is_active: true }
 ];
 
 app.get('/api/products', async (req, res) => {
@@ -2714,25 +2705,14 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
   });
 
   res.status(201).json({
+    success: true,
+    status: true,
     message: 'Images uploaded successfully.',
-    image_url: imgResult.primaryImageUrl,
-    image: imgResult.primaryImageUrl,
-    url: imgResult.primaryImageUrl,
-    product_image: imgResult.primaryImageUrl,
-    path: `/uploads/products/${path.basename(imgResult.primaryImageUrl.split('?')[0])}`,
-    relative_path: relativePaths[0] || null,
-    file_name: path.basename(imgResult.primaryImageUrl.split('?')[0]),
     images: imgResult.images,
-    image_urls: imgResult.images,
-    relative_paths: relativePaths,
     product_id: targetProductId || null,
     product: attachedProduct,
     data: {
-      url: imgResult.primaryImageUrl,
-      image_url: imgResult.primaryImageUrl,
-      image: imgResult.primaryImageUrl,
-      images: imgResult.images,
-      relative_path: relativePaths[0] || null
+      images: imgResult.images
     },
     limit: 4,
     count: imgResult.images.length
@@ -2789,9 +2769,7 @@ app.get('/api/products/:id/images', async (req, res) => {
       success: true,
       status: true,
       product_id: prodId,
-      image_url: images[0] || null,
       images,
-      gallery: galleryList,
       total: images.length
     });
   } catch (err) {
@@ -2987,7 +2965,6 @@ const handleProductImageReplacement = async (req, res) => {
       success: true,
       status: true,
       message: 'Product image updated successfully.',
-      image_url: primaryUrl,
       images: newImages,
       product: formatted,
       data: formatted
@@ -3070,7 +3047,6 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
       success: true,
       status: true,
       message: 'Product image deleted successfully.',
-      image_url: primaryUrl,
       images: currentImgs,
       product: formatted,
       data: formatted
@@ -3205,7 +3181,6 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       seller_price: pricing.seller_price,
       price: pricing.price,
       stock: parseInt(stock, 10),
-      image_url: finalPrimaryUrl,
       images: finalImages,
       is_active: true
     }, { isSellerView: true, req });
@@ -3480,7 +3455,6 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
       if (imgResult.hasImages && imgResult.images.length > 0) {
-        fallbackProducts[idx].image_url = imgResult.primaryImageUrl;
         fallbackProducts[idx].images = imgResult.images;
       }
       const updatedFallback = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
