@@ -51,6 +51,14 @@ function getBearerToken(): ?string
 
     if ($authHeader && preg_match('/Bearer\s+(\S+)/i', $authHeader, $matches)) {
         return $matches[1];
+    } elseif ($authHeader && !preg_match('/\s/', trim($authHeader))) {
+        return trim($authHeader);
+    } elseif (!empty($_GET['token'])) {
+        return trim($_GET['token']);
+    } elseif (!empty($_COOKIE['admin_token'])) {
+        return trim($_COOKIE['admin_token']);
+    } elseif (!empty($_COOKIE['token'])) {
+        return trim($_COOKIE['token']);
     }
 
     return null;

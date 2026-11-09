@@ -125,16 +125,7 @@ function apiSellerSubmitGst(PDO $pdo): void
         }
     }
 
-    // Require file if no existing documents
-    if (empty($filesToProcess)) {
-        $chkDocs = $pdo->prepare("SELECT id FROM seller_gst_documents WHERE seller_id = :seller_id LIMIT 1");
-        $chkDocs->execute([':seller_id' => $sellerId]);
-        if (!$chkDocs->fetch()) {
-            errorResponse('Please select a PDF document file to upload.', [
-                'document' => ['PDF document file is required.']
-            ], 422);
-        }
-    }
+    // Files are optional on submit (can upload PDF directly or submit GST details via JSON)
 
     // Validate uploaded files
     foreach ($filesToProcess as $f) {
