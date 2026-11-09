@@ -6297,9 +6297,79 @@ DB_PASSWORD=Xtragclub_vendor2026</pre>
 });
 
 app.post('/admin', async (req, res) => {
+  await ensureGstTables(pool);
   try {
     const body = req.body || {};
-    if (body.action === 'edit_seller') {
+    const action = body.action;
+
+    if (action === 'approve_gst') {
+      const sellerId = parseInt(body.seller_id, 10);
+      const notes = (body.notes || 'Approved by administrator').trim();
+      const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
+      if (gstRows.length > 0) {
+        const prevStatus = gstRows[0].status;
+        await pool.query(
+          'UPDATE seller_gst_details SET status = "Approved", rejection_reason = NULL, verified_by = 1, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+          [gstRows[0].id]
+        );
+        await logGstAction(pool, {
+          seller_id: sellerId,
+          gst_id: gstRows[0].id,
+          action: 'approved',
+          previous_status: prevStatus,
+          new_status: 'Approved',
+          notes,
+          performed_by: 1,
+          performer_role: 'admin'
+        });
+      }
+    } else if (action === 'reject_gst') {
+      const sellerId = parseInt(body.seller_id, 10);
+      const reason = (body.rejection_reason || '').trim();
+      if (reason) {
+        const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
+        if (gstRows.length > 0) {
+          const prevStatus = gstRows[0].status;
+          await pool.query(
+            'UPDATE seller_gst_details SET status = "Rejected", rejection_reason = ?, verified_by = 1, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+            [reason, gstRows[0].id]
+          );
+          await logGstAction(pool, {
+            seller_id: sellerId,
+            gst_id: gstRows[0].id,
+            action: 'rejected',
+            previous_status: prevStatus,
+            new_status: 'Rejected',
+            notes: reason,
+            performed_by: 1,
+            performer_role: 'admin'
+          });
+        }
+      }
+    } else if (action === 'create_seller') {
+      const name = (body.seller_name || '').trim();
+      const phone = (body.phone || '').trim();
+      const address = (body.address || '').trim();
+      const landmark = (body.landmark || '').trim();
+      const state = (body.state || '').trim();
+      const country = (body.country || 'India').trim();
+      const password = body.password || '';
+      const confirmPassword = body.password_confirmation || '';
+      let email = (body.email || '').trim().toLowerCase();
+
+      if (name && phone && address && password && password.length >= 8 && password === confirmPassword) {
+        if (!email) {
+          const digits = phone.replace(/\D+/g, '');
+          email = `seller_${digits}@phone.vendor.local`;
+        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        await pool.query(
+          `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
+          [name, email, name, phone, address, landmark, state, country, hashedPassword]
+        );
+      }
+    } else if (action === 'edit_seller') {
       const sellerId = parseInt(body.seller_id, 10);
       const name = (body.seller_name || '').trim();
       const phone = (body.phone || '').trim();
@@ -6336,101 +6406,534 @@ app.post('/admin', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error('Admin edit error:', err);
+    console.error('Admin POST action error:', err);
   }
   res.redirect('/admin');
 });
 
+// GET /admin/view_gst_doc - Preview or download document for admin
+app.get('/admin/view_gst_doc', async (req, res) => {
+  const docId = parseInt(req.query.id, 10);
+  const mode = req.query.mode === 'download' ? 'download' : 'preview';
+  if (!docId) return res.status(400).send('Invalid document ID');
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM seller_gst_documents WHERE id = ? LIMIT 1', [docId]);
+    if (rows.length === 0 || !fs.existsSync(rows[0].file_path)) {
+      return res.status(404).send('Document file not found on server.');
+    }
+    const doc = rows[0];
+    const mimeType = doc.mime_type || 'application/octet-stream';
+    const fileName = doc.original_name || path.basename(doc.file_path);
+    const disposition = mode === 'download' ? 'attachment' : 'inline';
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', fs.statSync(doc.file_path).size);
+    res.setHeader('Content-Disposition', `${disposition}; filename="${encodeURIComponent(fileName)}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    fs.createReadStream(doc.file_path).pipe(res);
+  } catch (err) {
+    res.status(500).send('Error streaming document: ' + err.message);
+  }
+});
+
+// GET /admin/get_gst_details - Fetch seller GST details and documents for review modal
+app.get('/admin/get_gst_details', async (req, res) => {
+  const targetId = parseInt(req.query.seller_id, 10);
+  if (!targetId) return res.status(400).json({ status: 'error', message: 'Missing seller_id' });
+
+  try {
+    const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [targetId]);
+    const [docs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [targetId]);
+    const [logs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC', [targetId]);
+
+    res.json({
+      status: 'success',
+      gst: gstRows[0] || null,
+      documents: docs.map(d => formatGstDocumentRecord(d, true)),
+      logs
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// GET /admin - Upgraded Admin Dashboard tailored to project
 app.get('/admin', async (req, res) => {
+  await ensureGstTables(pool);
   try {
     const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
-    const [sellers] = await pool.query(`
-      SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
-             (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
-      FROM users u
-      WHERE u.role = "seller"
-      ORDER BY u.id DESC
-      LIMIT 50
-    `);
 
-  res.send(`
+    let productCount = 0;
+    try {
+      const [[p]] = await pool.query('SELECT COUNT(*) as cnt FROM products WHERE is_active = 1');
+      productCount = p.cnt;
+    } catch (e) {}
+
+    let orderCount = 0;
+    try {
+      const [[o]] = await pool.query('SELECT COUNT(*) as cnt FROM orders');
+      orderCount = o.cnt;
+    } catch (e) {}
+
+    let metrics = { total_gst: 0, pending_gst: 0, approved_gst: 0, rejected_gst: 0 };
+    try {
+      const [[m]] = await pool.query(`
+        SELECT
+          COUNT(*) as total_gst,
+          SUM(CASE WHEN status = 'Pending' OR status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
+          SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
+          SUM(CASE WHEN status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
+        FROM seller_gst_details
+      `);
+      metrics = m || metrics;
+    } catch (e) {}
+
+    let gstSellers = [];
+    try {
+      const [rows] = await pool.query(`
+        SELECT g.*, u.seller_name, u.name as user_name, u.phone, u.email, u.address as user_address, u.state as user_state,
+               (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id) as doc_count,
+               (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
+               (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
+               (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
+               (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
+        FROM seller_gst_details g
+        JOIN users u ON g.seller_id = u.id
+        ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
+        LIMIT 100
+      `);
+      gstSellers = rows;
+    } catch (e) {}
+
+    let sellers = [];
+    try {
+      const [rows] = await pool.query(`
+        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
+               (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count,
+               (SELECT g.status FROM seller_gst_details g WHERE g.seller_id = u.id LIMIT 1) AS doc_status,
+               (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id
+        FROM users u
+        WHERE u.role = 'seller'
+        ORDER BY u.id DESC
+        LIMIT 50
+      `);
+      sellers = rows;
+    } catch (e) {}
+
+    function formatBytes(bytes) {
+      if (!bytes) return '0 KB';
+      if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+      return (bytes / 1024).toFixed(1) + ' KB';
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/[&<>'"]/g, tag => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;'
+      }[tag] || tag));
+    }
+
+    const pendingGstCount = Number(metrics.pending_gst || 0);
+    const approvedGstCount = Number(metrics.approved_gst || 0);
+    const rejectedGstCount = Number(metrics.rejected_gst || 0);
+    const totalGstCount = Number(metrics.total_gst || 0);
+
+    res.send(`
     <!doctype html>
     <html lang="en">
     <head>
-      <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Vendor Admin Dashboard</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Vendor Admin Dashboard — Venter App</title>
       <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
         .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; }
         .brand { font-size: 21px; font-weight: 800; }
-        .wrap { max-width: 1050px; margin: 32px auto; padding: 0 18px; }
+        .wrap { max-width: 1100px; margin: 32px auto; padding: 0 18px; }
         .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-        .stat { font-size: 32px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
+        .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
-        p.muted { color: #64748b; font-size: 14px; }
+        p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
         label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
         input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
         input:focus { border-color: #6366f1; }
-        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 12px 20px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
+        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
         button:hover, .btn:hover { background: #4a3cb8; }
         table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
-        th { color: #64748b; font-weight: 600; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
+        th { color: #64748b; font-weight: 600; font-size: 13px; }
         .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
-        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }
         .btn-sm:hover { background: #4f46e5; }
+        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-approve-sm:hover { background: #15803d; }
+        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-reject-sm:hover { background: #b91c1c; }
         .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        .badge-pending { background: #fef3c7; color: #b45309; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
+        .badge-approved { background: #dcfce7; color: #15803d; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
+        .badge-rejected { background: #fee2e2; color: #b91c1c; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
+        .badge-pdf { background: #fee2e2; color: #dc2626; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #fca5a5; }
+        .badge-img { background: #e0f2fe; color: #0284c7; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #bae6fd; }
+        .tabs-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; flex-wrap: wrap; }
+        .tab-btn { background: #f1f5f9; color: #475569; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; transition: all .2s; }
+        .tab-btn.active { background: #4f46e5; color: #fff; }
+        .btn-view { background: #0284c7; color: white; padding: 5px 11px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px; }
+        .btn-view:hover { background: #0369a1; }
+        .btn-dl { background: #475569; color: white; padding: 5px 9px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
+        .btn-dl:hover { background: #334155; }
+        .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
+        .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
+        .search-box input:focus { border-color: #6366f1; }
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
         .modal-overlay.active { display: flex; }
-        .modal-box { background: #fff; width: 92%; max-width: 650px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
+        .modal-box { background: #fff; width: 92%; max-width: 740px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
         .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
         .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
         .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
         .modal-body { padding: 24px; }
-        .info-pill { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
-        .info-pill-item { font-size: 12px; color: #64748b; }
-        .info-pill-item strong { display: block; font-size: 14px; color: #1e293b; margin-top: 2px; }
+        .doc-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+        .log-row { padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; display: flex; justify-content: space-between; gap: 12px; }
       </style>
     </head>
     <body>
       <header class="top">
-        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
-        <div><a href="/admin/login" class="logout-btn">Sign out</a></div>
+        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></div>
+        <div style="display:flex; align-items:center; gap:16px;">
+          <span style="font-size:14px; opacity:.9;">admin@vendor.app</span>
+          <a href="/admin/logout" class="logout-btn">Sign out</a>
+        </div>
       </header>
+
       <main class="wrap">
         <h1>Dashboard</h1>
-        <div class="grid">
+        <p class="muted">Manage your marketplace sellers, PDF document verifications, and compliance.</p>
+
+        <!-- KPI Metrics Grid -->
+        <div class="grid" style="margin-bottom: 24px;">
           <section class="card">
-            <div style="color:#64748b; font-size:13px; font-weight:600;">Registered Sellers</div>
+            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
             <div class="stat">${count}</div>
           </section>
+          <section class="card">
+            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
+            <div class="stat" style="color:#2563eb;">${productCount}</div>
+          </section>
+          <section class="card">
+            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
+            <div class="stat" style="color:#0891b2;">${orderCount}</div>
+          </section>
+          <section class="card" style="border-left: 4px solid #f59e0b; background:${pendingGstCount > 0 ? '#fffbeb' : '#fff'};">
+            <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
+              Pending PDF Reviews
+              ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>' : ''}
+            </div>
+            <div class="stat" style="color:#b45309;">${pendingGstCount}</div>
+          </section>
+          <section class="card" style="border-left: 4px solid #10b981;">
+            <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
+            <div class="stat" style="color:#10b981;">${approvedGstCount}</div>
+          </section>
+          <section class="card" style="border-left: 4px solid #ef4444;">
+            <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Rejected Requests</div>
+            <div class="stat" style="color:#ef4444;">${rejectedGstCount}</div>
+          </section>
         </div>
-        <section class="card">
-          <h2>Seller Accounts</h2>
+
+        <!-- Section 1: Seller PDF Document Verification Hub (Primary Function) -->
+        <section class="card" id="gstSection">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
+            <div>
+              <h2>Seller PDF Document Verification</h2>
+              <p class="muted">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
+            </div>
+            <div class="search-box">
+              <input type="text" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
+            </div>
+          </div>
+
+          <div class="tabs-bar">
+            <button type="button" class="tab-btn active" onclick="filterGstRows('all', this)">All Documents (${totalGstCount})</button>
+            <button type="button" class="tab-btn" onclick="filterGstRows('pending', this)">
+              Pending Review (${pendingGstCount})
+              ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:#fff; border-radius:999px; padding:1px 6px; font-size:11px; margin-left:4px;">●</span>' : ''}
+            </button>
+            <button type="button" class="tab-btn" onclick="filterGstRows('approved', this)">Approved (${approvedGstCount})</button>
+            <button type="button" class="tab-btn" onclick="filterGstRows('rejected', this)">Rejected (${rejectedGstCount})</button>
+          </div>
+
           <table>
-            <thead><tr><th>ID</th><th>Seller Name</th><th>Phone</th><th>State</th><th>Products</th><th>Created</th><th>Actions</th></tr></thead>
-            <tbody>
-              ${sellers.map(s => `
-                <tr>
-                  <td>#${s.id}</td>
-                  <td>
-                    <strong>${s.seller_name || s.name}</strong>
-                  </td>
-                  <td>${s.phone || '—'}</td>
-                  <td>${s.state || '—'}</td>
-                  <td><span class="badge-prod">${s.products_count || 0} items</span></td>
-                  <td>${String(s.created_at).slice(0, 10)}</td>
-                  <td>
-                    <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
-                  </td>
-                </tr>
-              `).join('')}
+            <thead>
+              <tr>
+                <th style="width:24%;">Seller</th>
+                <th style="width:28%;">Uploaded PDF Document</th>
+                <th style="width:16%;">Verification Status</th>
+                <th style="width:14%;">Submitted</th>
+                <th style="width:18%;">Admin Actions</th>
+              </tr>
+            </thead>
+            <tbody id="gstTableBody">
+              ${gstSellers.length === 0 ? `
+                <tr><td colspan="5" style="color:#94a3b8; text-align:center; padding:32px;">No sellers have uploaded verification documents yet.</td></tr>
+              ` : gstSellers.map(g => {
+                let st = (g.status || 'Pending').toLowerCase();
+                if (st === 'resubmitted') st = 'pending';
+                const badgeClass = (st === 'approved') ? 'badge-approved' : ((st === 'rejected') ? 'badge-rejected' : 'badge-pending');
+                const sellerLabel = g.seller_name || g.user_name || 'Seller #' + g.seller_id;
+                const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (g.email || '')).toLowerCase();
+                const latestDocId = g.latest_doc_id;
+
+                return `
+                  <tr class="gst-row" data-status="${st}" data-search="${escapeHtml(searchString)}">
+                    <td>
+                      <strong style="font-size:15px; color:#1e1b4b;">${escapeHtml(sellerLabel)}</strong>
+                      <div style="font-size:12px; color:#64748b; margin-top:2px;">
+                        <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #${g.seller_id}</span>
+                        ${escapeHtml(g.phone || '')}
+                      </div>
+                      ${g.email ? `<div style="font-size:12px; color:#94a3b8;">${escapeHtml(g.email)}</div>` : ''}
+                    </td>
+                    <td>
+                      ${latestDocId ? `
+                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                          <span class="badge-pdf">PDF</span>
+                          <strong style="color:#334155; font-size:13px;">${escapeHtml(g.latest_doc_name || 'Certificate.pdf')}</strong>
+                          <span style="color:#94a3b8; font-size:11px;">(${formatBytes(g.latest_doc_size)})</span>
+                        </div>
+                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center;">
+                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn-view">
+                            📄 1-Click Preview PDF
+                          </a>
+                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=download" class="btn-dl" title="Download PDF">
+                            ⬇
+                          </a>
+                          ${g.doc_count > 1 ? `<span style="font-size:11px; color:#64748b; font-weight:600;">+${g.doc_count - 1} more</span>` : ''}
+                        </div>
+                      ` : `
+                        <span style="color:#94a3b8; font-style:italic; font-size:13px;">No document attached</span>
+                      `}
+                    </td>
+                    <td>
+                      <span class="${badgeClass}">
+                        ${st === 'pending' ? '⏳ ' : (st === 'approved' ? '✓ ' : '✕ ')}
+                        ${escapeHtml(g.status || 'Pending')}
+                      </span>
+                      ${st === 'rejected' && g.rejection_reason ? `
+                        <div style="font-size:11px; color:#b91c1c; margin-top:4px; max-width:220px; line-height:1.3;" title="${escapeHtml(g.rejection_reason)}">
+                          <strong>Reason:</strong> ${escapeHtml(g.rejection_reason.length > 55 ? g.rejection_reason.slice(0, 52) + '...' : g.rejection_reason)}
+                        </div>
+                      ` : ''}
+                    </td>
+                    <td>
+                      <div style="font-size:13px; color:#334155;">${String(g.submitted_at || g.updated_at || '').slice(0, 10)}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${String(g.submitted_at || g.updated_at || '').slice(11, 16)}</div>
+                    </td>
+                    <td>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                        ${st !== 'approved' ? `
+                          <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Approve verification for ${escapeHtml(sellerLabel)}?');">
+                            <input type="hidden" name="action" value="approve_gst">
+                            <input type="hidden" name="seller_id" value="${g.seller_id}">
+                            <input type="hidden" name="notes" value="Approved by administrator">
+                            <button type="submit" class="btn-approve-sm" title="Instant Approve">✓ Approve</button>
+                          </form>
+                        ` : ''}
+
+                        ${st !== 'rejected' ? `
+                          <button type="button" class="btn-reject-sm" onclick="openGstModalWithReject(${g.seller_id}, '${escapeHtml(sellerLabel).replace(/'/g, "\\'")}')" title="Reject with Reason">✕ Reject</button>
+                        ` : ''}
+
+                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" onclick="openGstModal(${g.seller_id}, '${escapeHtml(sellerLabel).replace(/'/g, "\\'")}')">Details & Logs</button>
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
             </tbody>
           </table>
         </section>
+
+        <!-- Section 2: Seller Accounts Overview with Document Status -->
+        <section class="card" style="margin-top:24px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+            <div>
+              <h2>Seller Accounts</h2>
+              <p class="muted">All registered sellers on Venter App with inventory counts and verification status.</p>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Seller Name</th>
+                <th>Contact</th>
+                <th>Location</th>
+                <th>Products</th>
+                <th>Document Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sellers.length === 0 ? `
+                <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
+              ` : sellers.map(s => {
+                let dSt = (s.doc_status || '').toLowerCase();
+                if (dSt === 'resubmitted') dSt = 'pending';
+                const docBadgeClass = (dSt === 'approved') ? 'badge-approved' : ((dSt === 'rejected') ? 'badge-rejected' : ((dSt === 'pending') ? 'badge-pending' : ''));
+
+                return `
+                  <tr>
+                    <td>#${s.id}</td>
+                    <td>
+                      <strong>${escapeHtml(s.seller_name || s.name)}</strong>
+                    </td>
+                    <td>
+                      <div>${escapeHtml(s.phone || '—')}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(s.email || '')}</div>
+                    </td>
+                    <td>${escapeHtml(s.state || '—')}</td>
+                    <td><span class="badge-prod">${s.products_count || 0} items</span></td>
+                    <td>
+                      ${docBadgeClass ? `
+                        <span class="${docBadgeClass}">${escapeHtml(s.doc_status)}</span>
+                        ${s.latest_doc_id ? `<a href="/admin/view_gst_doc?id=${s.latest_doc_id}&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>` : ''}
+                      ` : `
+                        <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
+                      `}
+                    </td>
+                    <td>${String(s.created_at || '').slice(0, 10)}</td>
+                    <td>
+                      <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Section 3: Create Seller Account -->
+        <section class="card" style="margin-top:24px;">
+          <h2>Create New Seller Account</h2>
+          <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
+          <form method="POST" action="/admin">
+            <input type="hidden" name="action" value="create_seller">
+            <div class="grid">
+              <div>
+                <label>Seller / Shop Name</label>
+                <input name="seller_name" required maxlength="120" placeholder="e.g. Apex Electronics">
+              </div>
+              <div>
+                <label>Phone (+country code)</label>
+                <input name="phone" required placeholder="+919876543210">
+              </div>
+              <div>
+                <label>Email Address</label>
+                <input type="email" name="email" placeholder="seller@example.com">
+              </div>
+              <div>
+                <label>State</label>
+                <input name="state" required placeholder="e.g. Karnataka">
+              </div>
+              <div>
+                <label>Address</label>
+                <input name="address" required placeholder="Shop address">
+              </div>
+              <div>
+                <label>Landmark</label>
+                <input name="landmark" required placeholder="Nearest landmark">
+              </div>
+              <div>
+                <label>Password (min 8 characters)</label>
+                <input type="password" name="password" required minlength="8" autocomplete="new-password">
+              </div>
+              <div>
+                <label>Confirm Password</label>
+                <input type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
+              </div>
+            </div>
+            <br>
+            <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
+          </form>
+        </section>
       </main>
+
+      <!-- GST Review & Verification Modal -->
+      <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
+        <div class="modal-box">
+          <div class="modal-header">
+            <h3 id="gstModalTitle">Document Verification Review</h3>
+            <button type="button" class="modal-close" onclick="closeGstModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div id="gstModalLoading" style="text-align:center; padding:32px; color:#64748b;">
+              Loading details & documents...
+            </div>
+
+            <div id="gstModalContent" style="display:none;">
+              <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:18px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+                  <strong style="font-size:16px; color:#1e1b4b;" id="modalSellerName">—</strong>
+                  <div id="modalGstStatus">—</div>
+                </div>
+                <div style="font-size:13px; color:#64748b;">
+                  <div><strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span></div>
+                </div>
+
+                <div id="rejectionAlertBox" style="display:none; background:#fee2e2; border-left:4px solid #ef4444; padding:12px; border-radius:6px; margin-top:12px;">
+                  <strong style="color:#b91c1c; font-size:13px;">Rejection Reason:</strong>
+                  <div id="modalRejectionReason" style="color:#7f1d1d; font-size:13px; margin-top:4px;">—</div>
+                </div>
+              </div>
+
+              <h4 style="margin: 18px 0 10px; color:#1e1b4b;">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
+              <div id="modalDocumentsList" style="margin-bottom: 24px;"></div>
+
+              <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
+                <h4 style="margin: 0 0 12px; color:#1e1b4b;">Admin Verification Actions</h4>
+                
+                <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+                  <form method="POST" action="/admin" onsubmit="return confirm('Are you sure you want to APPROVE this seller document verification?');">
+                    <input type="hidden" name="action" value="approve_gst">
+                    <input type="hidden" name="seller_id" id="approveSellerId">
+                    <input type="hidden" name="notes" value="Approved by administrator">
+                    <button type="submit" class="btn-approve-sm" style="padding:10px 18px; font-size:14px;">Approve Document</button>
+                  </form>
+
+                  <button type="button" class="btn-reject-sm" style="padding:10px 18px; font-size:14px;" onclick="toggleRejectBox()">Reject Document...</button>
+                </div>
+
+                <!-- Reject Box -->
+                <div id="rejectBox" style="display:none; background:#fef2f2; border:1px solid #fecaca; border-radius:10px; padding:16px; margin-top:14px;">
+                  <form method="POST" action="/admin">
+                    <input type="hidden" name="action" value="reject_gst">
+                    <input type="hidden" name="seller_id" id="rejectSellerId">
+                    <label style="margin-top:0; color:#991b1b; font-weight:700;">Mandatory Rejection Reason <span style="color:#ef4444;">*</span></label>
+                    <textarea name="rejection_reason" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry text, expired certificate)..."></textarea>
+                    <div style="display:flex; gap:10px; margin-top:10px;">
+                      <button type="submit" class="btn-reject-sm" style="padding:8px 16px;">Confirm Rejection</button>
+                      <button type="button" onclick="toggleRejectBox()" style="background:#e2e8f0; color:#334155;" class="btn">Cancel</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+
+              <!-- Verification Audit Logs -->
+              <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:24px;">
+                <h4 style="margin: 0 0 10px; color:#1e1b4b;">Verification Audit Trail</h4>
+                <div id="modalLogsList" style="max-height:160px; overflow-y:auto; border:1px solid #f1f5f9; border-radius:8px; padding:0 12px; background:#fafafa;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <!-- Seller Profile & Edit Modal -->
       <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
@@ -6440,9 +6943,9 @@ app.get('/admin', async (req, res) => {
             <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
           </div>
           <div class="modal-body">
-            <div class="info-pill" style="grid-template-columns: repeat(2, 1fr);">
-              <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
-              <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; padding:12px; border-radius:8px; margin-bottom:18px; display:grid; grid-template-columns:repeat(2, 1fr); gap:12px;">
+              <div style="font-size:12px; color:#64748b;">Seller ID<strong style="display:block; font-size:14px; color:#1e293b; margin-top:2px;" id="viewSellerId">—</strong></div>
+              <div style="font-size:12px; color:#64748b;">Registered On<strong style="display:block; font-size:14px; color:#1e293b; margin-top:2px;" id="viewCreatedAt">—</strong></div>
             </div>
 
             <form method="POST" action="/admin">
@@ -6529,6 +7032,166 @@ app.get('/admin', async (req, res) => {
           if (e.target.id === 'sellerModal') {
             closeSellerModal();
           }
+        }
+
+        function filterGstRows(status, btn) {
+          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          if (btn) btn.classList.add('active');
+
+          const rows = document.querySelectorAll('.gst-row');
+          rows.forEach(r => {
+            const rStatus = r.getAttribute('data-status');
+            if (status === 'all' || rStatus === status) {
+              r.style.display = '';
+            } else {
+              r.style.display = 'none';
+            }
+          });
+        }
+
+        function filterGstSearch(query) {
+          const q = (query || '').toLowerCase().trim();
+          const rows = document.querySelectorAll('.gst-row');
+          rows.forEach(r => {
+            const searchData = r.getAttribute('data-search') || '';
+            if (!q || searchData.includes(q)) {
+              r.style.display = '';
+            } else {
+              r.style.display = 'none';
+            }
+          });
+        }
+
+        function openGstModalWithReject(sellerId, sellerName) {
+          openGstModal(sellerId, sellerName);
+          setTimeout(() => {
+            const b = document.getElementById('rejectBox');
+            if (b) {
+              b.style.display = 'block';
+              b.scrollIntoView({ behavior: 'smooth' });
+            }
+          }, 300);
+        }
+
+        function openGstModal(sellerId, sellerName) {
+          document.getElementById('gstModalTitle').innerText = 'Verification Review — ' + (sellerName || 'Seller #' + sellerId);
+          document.getElementById('approveSellerId').value = sellerId;
+          document.getElementById('rejectSellerId').value = sellerId;
+          document.getElementById('rejectBox').style.display = 'none';
+
+          document.getElementById('gstModalLoading').style.display = 'block';
+          document.getElementById('gstModalContent').style.display = 'none';
+          document.getElementById('gstReviewModal').classList.add('active');
+
+          fetch('/admin/get_gst_details?seller_id=' + sellerId)
+            .then(res => res.json())
+            .then(data => {
+              document.getElementById('gstModalLoading').style.display = 'none';
+              document.getElementById('gstModalContent').style.display = 'block';
+
+              const g = data.gst || {};
+              const docs = data.documents || [];
+              const logs = data.logs || [];
+
+              document.getElementById('modalSellerName').innerText = sellerName + ' (#' + sellerId + ')';
+              document.getElementById('modalSubmittedAt').innerText = (g.submitted_at || g.created_at || '—').slice(0, 16);
+              document.getElementById('modalVerifiedAt').innerText = (g.verified_at || '—').slice(0, 16);
+
+              const st = (g.status || 'Pending').toLowerCase();
+              let badgeHtml = '<span class="badge-pending">' + (g.status || 'Pending') + '</span>';
+              if (st === 'approved') badgeHtml = '<span class="badge-approved">' + g.status + '</span>';
+              if (st === 'rejected') badgeHtml = '<span class="badge-rejected">' + g.status + '</span>';
+              document.getElementById('modalGstStatus').innerHTML = badgeHtml;
+
+              const rejBox = document.getElementById('rejectionAlertBox');
+              if (g.rejection_reason) {
+                rejBox.style.display = 'block';
+                document.getElementById('modalRejectionReason').innerText = g.rejection_reason;
+              } else {
+                rejBox.style.display = 'none';
+              }
+
+              document.getElementById('modalDocCount').innerText = docs.length;
+              const docsContainer = document.getElementById('modalDocumentsList');
+              if (docs.length === 0) {
+                docsContainer.innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">No documents uploaded by this seller yet.</div>';
+              } else {
+                let docsHtml = '';
+                docs.forEach(d => {
+                  const isPdf = d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf');
+                  const typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
+                  const primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
+
+                  docsHtml += \`
+                    <div class="doc-card">
+                      <div>
+                        <div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px;">
+                          \${typeBadge} \${escapeHtml(d.original_name)} \${primaryTag}
+                        </div>
+                        <div style="font-size:12px; color:#64748b; margin-top:4px;">
+                          \${d.file_size_formatted || ''} &bull; Uploaded \${d.created_at ? d.created_at.slice(0, 10) : ''}
+                        </div>
+                      </div>
+                      <div style="display:flex; gap:8px;">
+                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=preview" target="_blank" class="btn-view">📄 Preview PDF</a>
+                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=download" class="btn-dl">⬇ Download</a>
+                      </div>
+                    </div>
+                  \`;
+                });
+                docsContainer.innerHTML = docsHtml;
+              }
+
+              const logsContainer = document.getElementById('modalLogsList');
+              if (logs.length === 0) {
+                logsContainer.innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">No history logs recorded yet.</div>';
+              } else {
+                let logsHtml = '';
+                logs.forEach(l => {
+                  logsHtml += \`
+                    <div class="log-row">
+                      <div style="color:#64748b; font-size:12px; min-width:130px;">\${escapeHtml((l.created_at || '').slice(0, 16))}</div>
+                      <div style="flex:1;">
+                        <strong>\${escapeHtml(l.action.toUpperCase())}</strong>
+                        <span style="color:#64748b;">(\${escapeHtml(l.performer_role || 'seller')}):</span>
+                        \${escapeHtml(l.notes || '')}
+                      </div>
+                      <div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">\${escapeHtml(l.new_status)}</span></div>
+                    </div>
+                  \`;
+                });
+                logsContainer.innerHTML = logsHtml;
+              }
+            })
+            .catch(err => {
+              document.getElementById('gstModalLoading').innerText = 'Failed to load details: ' + err.message;
+            });
+        }
+
+        function closeGstModal() {
+          document.getElementById('gstReviewModal').classList.remove('active');
+        }
+
+        function toggleRejectBox() {
+          const b = document.getElementById('rejectBox');
+          b.style.display = (b.style.display === 'none' || !b.style.display) ? 'block' : 'none';
+        }
+
+        function handleGstOverlayClick(e) {
+          if (e.target.id === 'gstReviewModal') {
+            closeGstModal();
+          }
+        }
+
+        function escapeHtml(str) {
+          if (!str) return '';
+          return String(str).replace(/[&<>'"]/g, tag => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            "'": '&#39;',
+            '"': '&quot;'
+          }[tag] || tag));
         }
       </script>
     </body>
