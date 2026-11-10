@@ -166,7 +166,7 @@
                 "register"
               ]
             },
-            "description": "Registers a new seller and returns a JWT Bearer token."
+            "description": "Registers a new seller (accepts email or phone, both together, or a single identifier/email_or_phone field) and returns a JWT Bearer token."
           },
           "event": [
             {
@@ -219,7 +219,7 @@
                 "login"
               ]
             },
-            "description": "Authenticates a seller with required email, phone, and password, returning a JWT token."
+            "description": "Authenticates a seller with email or phone (email only, phone only, both matching, or a single identifier/login/email_or_phone field) and password, returning a JWT token."
           },
           "event": [
             {

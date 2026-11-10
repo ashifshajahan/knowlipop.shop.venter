@@ -16,14 +16,28 @@ $pdo = new PDO("sqlite:{$dbFile}");
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
 $_POST = $post;
+$GLOBALS['_CUSTOM_JSON_INPUT'] = $post;
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../api/auth.php';
 require_once __DIR__ . '/../api/orders.php';
 require_once __DIR__ . '/../api/products.php';
 
 try {
     switch ($action) {
+        case 'auth_register':
+            apiRegister($pdo);
+            break;
+
+        case 'auth_login':
+            apiLogin($pdo);
+            break;
+
+        case 'auth_me':
+            apiMe($pdo);
+            break;
+
         case 'get_seller_orders':
             $routeSellerId = $post['route_seller_id'] ?? null;
             apiGetSellerOrders($pdo, $routeSellerId);

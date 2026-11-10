@@ -216,11 +216,11 @@ if ($requestUri === '/api/health') {
 $pdo = getDatabaseConnection();
 
 // Authentication
-if ($requestUri === '/api/register') {
+if ($requestUri === '/api/register' || $requestUri === '/api/auth/register') {
     apiRegister($pdo);
 }
 
-if ($requestUri === '/api/login') {
+if ($requestUri === '/api/login' || $requestUri === '/api/auth/login') {
     apiLogin($pdo);
 }
 

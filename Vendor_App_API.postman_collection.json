@@ -213,7 +213,7 @@
                 "register"
               ]
             },
-            "description": "Registers a new seller with required email and dynamically generated phone. Automatically saves returned Bearer token into {{token}}."
+            "description": "Registers a new seller with email or phone (both or a single identifier/email_or_phone field also supported). Automatically saves returned Bearer token into {{token}}."
           },
           "response": []
         },
@@ -270,7 +270,7 @@
                 "login"
               ]
             },
-            "description": "Logs in the seller with required email, phone, and password and saves JWT Bearer token into {{token}}."
+            "description": "Logs in the seller with email or phone (both, email only, phone only, or a single identifier/login/email_or_phone field) and password, and saves JWT Bearer token into {{token}}."
           },
           "response": []
         },

@@ -71,7 +71,8 @@
               "raw": "{{baseUrl}}/api/login",
               "host": ["{{baseUrl}}"],
               "path": ["api", "login"]
-            }
+            },
+            "description": "Authenticates a seller using email or phone (email only, phone only, both, or single identifier/login/email_or_phone field) + password."
           }
         },
         {

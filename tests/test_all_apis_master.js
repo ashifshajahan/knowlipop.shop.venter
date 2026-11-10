@@ -106,21 +106,166 @@ async function runMasterTestSuite() {
   // -----------------------------------------------------------------
   console.log('\n--- Category 2: Authentication & Session ---');
 
+  const ts = Date.now();
   const testPhone = `+9198765${Math.floor(10000 + Math.random() * 90000)}`;
-  const testEmail = `superelec_${Date.now()}_${Math.floor(Math.random() * 1000)}@example.com`;
-  const missingEmailRes = await dispatch(app, {
+  const testEmail = `superelec_${ts}_${Math.floor(Math.random() * 1000)}@example.com`;
+
+  const missingContactRes = await dispatch(app, {
     method: 'POST',
     url: '/api/register',
     body: {
-      seller_name: 'Missing Email Shop',
-      phone: testPhone,
+      seller_name: 'Missing Contact Shop',
       address: 'Shop 102, Electronic City',
       password: 'Password123!',
       password_confirmation: 'Password123!'
     }
   });
-  assert(missingEmailRes.status === 422 && missingEmailRes.body.errors && missingEmailRes.body.errors.email, 'POST /api/register rejects missing email with 422');
+  assert(
+    missingContactRes.status === 422 && missingContactRes.body.errors && missingContactRes.body.errors.email_or_phone,
+    'POST /api/register rejects missing email AND phone with 422'
+  );
 
+  const invalidIdentifierRegRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/register',
+    body: {
+      seller_name: 'Bad Identifier Shop',
+      identifier: 'not-email-or-phone',
+      address: 'Shop 102, Electronic City',
+      password: 'Password123!',
+      password_confirmation: 'Password123!'
+    }
+  });
+  assert(
+    invalidIdentifierRegRes.status === 422 && invalidIdentifierRegRes.body.errors && invalidIdentifierRegRes.body.errors.email_or_phone,
+    'POST /api/register rejects invalid single identifier with 422'
+  );
+
+  // 2A. Email-only registration & login (phone omitted)
+  const emailOnlyAddr = `emailonly_${ts}_${Math.floor(Math.random() * 1000)}@example.com`;
+  const regEmailOnlyRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/register',
+    body: {
+      seller_name: 'Email Only Mart',
+      email: emailOnlyAddr,
+      address: '44 Web Lane',
+      password: 'Password123!',
+      password_confirmation: 'Password123!'
+    }
+  });
+  assert(
+    regEmailOnlyRes.status === 201 &&
+      regEmailOnlyRes.body.token &&
+      regEmailOnlyRes.body.user.email === emailOnlyAddr &&
+      !regEmailOnlyRes.body.user.phone,
+    'POST /api/register (email-only registration returns 201 with null phone & JWT token)'
+  );
+
+  const loginEmailOnlyRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      email: emailOnlyAddr,
+      password: 'Password123!'
+    }
+  });
+  assert(
+    loginEmailOnlyRes.status === 200 &&
+      loginEmailOnlyRes.body.token &&
+      loginEmailOnlyRes.body.user.email === emailOnlyAddr,
+    'POST /api/login (email-only credentials return 200 with JWT token)'
+  );
+
+  const loginEmailIdentifierRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      identifier: emailOnlyAddr,
+      password: 'Password123!'
+    }
+  });
+  assert(
+    loginEmailIdentifierRes.status === 200 && loginEmailIdentifierRes.body.token,
+    'POST /api/login (single identifier field with email returns 200)'
+  );
+
+  const meEmailOnlyRes = await dispatch(app, {
+    method: 'GET',
+    url: '/api/me',
+    headers: { authorization: `Bearer ${regEmailOnlyRes.body.token}` }
+  });
+  assert(
+    meEmailOnlyRes.status === 200 && meEmailOnlyRes.body.user && meEmailOnlyRes.body.user.email === emailOnlyAddr,
+    'GET /api/me (email-only seller preserves email and omits phone)'
+  );
+
+  const dupEmailRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/register',
+    body: {
+      seller_name: 'Duplicate Email Mart',
+      email: emailOnlyAddr,
+      address: '45 Web Lane',
+      password: 'Password123!'
+    }
+  });
+  assert(
+    dupEmailRes.status === 422 && dupEmailRes.body.errors && dupEmailRes.body.errors.email,
+    'POST /api/register rejects duplicate email with 422'
+  );
+
+  // 2B. Phone-only registration & login (email omitted; synthetic email hidden)
+  const phoneOnlyNum = `+9197654${Math.floor(10000 + Math.random() * 90000)}`;
+  const regPhoneOnlyRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/register',
+    body: {
+      seller_name: 'Phone Only Mart',
+      phone: phoneOnlyNum,
+      address: '88 Mobile Street',
+      password: 'Password123!',
+      password_confirmation: 'Password123!'
+    }
+  });
+  assert(
+    regPhoneOnlyRes.status === 201 &&
+      regPhoneOnlyRes.body.token &&
+      regPhoneOnlyRes.body.user.phone === phoneOnlyNum &&
+      regPhoneOnlyRes.body.user.email === null,
+    'POST /api/register (phone-only registration returns 201 with null public email & JWT token)'
+  );
+
+  const loginPhoneOnlyRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      phone: phoneOnlyNum,
+      password: 'Password123!'
+    }
+  });
+  assert(
+    loginPhoneOnlyRes.status === 200 &&
+      loginPhoneOnlyRes.body.token &&
+      loginPhoneOnlyRes.body.user.phone === phoneOnlyNum &&
+      loginPhoneOnlyRes.body.user.email === null,
+    'POST /api/login (phone-only credentials return 200 without leaking synthetic email)'
+  );
+
+  const loginPhoneSingleFieldRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      login: phoneOnlyNum.slice(-10),
+      password: 'Password123!'
+    }
+  });
+  assert(
+    loginPhoneSingleFieldRes.status === 200 && loginPhoneSingleFieldRes.body.token,
+    'POST /api/login (single login field with 10-digit phone returns 200)'
+  );
+
+  // 2C. Both email & phone registration + login permutations
   const regRes = await dispatch(app, {
     method: 'POST',
     url: '/api/register',
@@ -136,27 +281,46 @@ async function runMasterTestSuite() {
       password_confirmation: 'Password123!'
     }
   });
-  assert(regRes.status === 201 && regRes.body.token && regRes.body.user.email === testEmail, 'POST /api/register (Seller registration returns 201 with required email & JWT token)');
+  assert(
+    regRes.status === 201 &&
+      regRes.body.token &&
+      regRes.body.user.email === testEmail &&
+      regRes.body.user.phone === testPhone,
+    'POST /api/register (Seller registration with both email & phone returns 201 & JWT token)'
+  );
 
-  const loginMissingEmailRes = await dispatch(app, {
-    method: 'POST',
-    url: '/api/login',
-    body: {
-      phone: testPhone,
-      password: 'Password123!'
-    }
-  });
-  assert(loginMissingEmailRes.status === 422 && loginMissingEmailRes.body.errors && loginMissingEmailRes.body.errors.email, 'POST /api/login rejects missing email with 422');
-
-  const loginMissingPhoneRes = await dispatch(app, {
+  const loginMismatchRes = await dispatch(app, {
     method: 'POST',
     url: '/api/login',
     body: {
       email: testEmail,
+      phone: '+919999900001',
       password: 'Password123!'
     }
   });
-  assert(loginMissingPhoneRes.status === 422 && loginMissingPhoneRes.body.errors && loginMissingPhoneRes.body.errors.phone, 'POST /api/login rejects missing phone with 422');
+  assert(loginMismatchRes.status === 422, 'POST /api/login rejects mismatched email + wrong phone with 422');
+
+  const loginWrongPassRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      email: testEmail,
+      password: 'WrongPassword1!'
+    }
+  });
+  assert(loginWrongPassRes.status === 422, 'POST /api/login rejects incorrect password with 422');
+
+  const loginMissingContactRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      password: 'Password123!'
+    }
+  });
+  assert(
+    loginMissingContactRes.status === 422 && loginMissingContactRes.body.errors && loginMissingContactRes.body.errors.email_or_phone,
+    'POST /api/login rejects missing email and phone with 422'
+  );
 
   const loginRes = await dispatch(app, {
     method: 'POST',
@@ -167,7 +331,7 @@ async function runMasterTestSuite() {
       password: 'Password123!'
     }
   });
-  assert(loginRes.status === 200 && loginRes.body.token, 'POST /api/login (Seller login with email + phone returns 200 with JWT token)');
+  assert(loginRes.status === 200 && loginRes.body.token, 'POST /api/login (Seller login with matching email + phone returns 200 with JWT token)');
   const dynamicToken = loginRes.body.token;
 
   const meRes = await dispatch(app, {

@@ -278,7 +278,7 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
 
     // Validate email if provided
     if (!empty($email)) {
-        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        if (!isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         } else {
             $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) AND id != :id LIMIT 1");

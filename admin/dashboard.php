@@ -136,36 +136,60 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 // Handle create seller
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_seller') {
     $name = trim($_POST['seller_name'] ?? '');
-    $phone = trim($_POST['phone'] ?? '');
+    $rawPhone = trim($_POST['phone'] ?? '');
+    $phone = '';
+    if ($rawPhone !== '') {
+        $strP = preg_replace('/[\s\-\(\)]/', '', $rawPhone);
+        if (str_starts_with($strP, '+')) {
+            $phone = $strP;
+        } elseif (preg_match('/^\d{10}$/', $strP)) {
+            $phone = '+91' . $strP;
+        } elseif (preg_match('/^91\d{10}$/', $strP)) {
+            $phone = '+' . $strP;
+        } else {
+            $phone = '+' . $strP;
+        }
+    }
     $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
-    $landmark = trim($_POST['landmark'] ?? '');
+    $landmark = trim($_POST['landmark'] ?? '') ?: 'None';
     $state = trim($_POST['state'] ?? '');
     $country = trim($_POST['country'] ?? 'India');
     $password = $_POST['password'] ?? '';
     $confirmPassword = $_POST['password_confirmation'] ?? '';
 
-    if (empty($name) || empty($email) || empty($phone) || empty($address) || empty($landmark) || empty($state) || empty($password)) {
-        $error = 'All seller fields including Email Address are required.';
-    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+    if (empty($name) || (empty($email) && empty($rawPhone)) || empty($address) || empty($state) || empty($password)) {
+        $error = 'Seller name, email or phone number, address, state, and password are required.';
+    } elseif ($email !== '' && (str_ends_with($email, '@phone.vendor.local') || !filter_var($email, FILTER_VALIDATE_EMAIL))) {
         $error = 'The email address format is invalid.';
-    } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+    } elseif ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
         $error = 'Phone must be in international format with country code (e.g. +919876543210).';
     } elseif (strlen($password) < 8) {
         $error = 'Password must be at least 8 characters.';
     } elseif ($password !== $confirmPassword) {
         $error = 'Password confirmation does not match.';
     } else {
-        $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
-        $chk->execute([':phone' => $phone]);
-        $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
-        $chkEmail->execute([':email' => $email]);
-        if ($chk->fetch()) {
+        $dupPhone = false;
+        if ($phone !== '') {
+            $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
+            $chk->execute([':phone' => $phone]);
+            $dupPhone = (bool) $chk->fetch();
+        }
+        $dupEmail = false;
+        if ($email !== '') {
+            $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
+            $chkEmail->execute([':email' => $email]);
+            $dupEmail = (bool) $chkEmail->fetch();
+        }
+        if ($dupPhone) {
             $error = 'A seller with this phone number already exists.';
-        } elseif ($chkEmail->fetch()) {
+        } elseif ($dupEmail) {
             $error = 'A seller with this email address already exists.';
         } else {
             $hashed = hashPassword($password);
+            $digits = preg_replace('/\D+/', '', $phone) ?: (string) time();
+            $dbEmail = $email !== '' ? $email : "seller_{$digits}@phone.vendor.local";
+            $dbPhone = $phone !== '' ? $phone : null;
 
             $ins = $pdo->prepare("
                 INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
@@ -173,9 +197,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             ");
             $ins->execute([
                 ':name' => $name,
-                ':email' => $email,
+                ':email' => $dbEmail,
                 ':seller_name' => $name,
-                ':phone' => $phone,
+                ':phone' => $dbPhone,
                 ':address' => $address,
                 ':landmark' => $landmark,
                 ':state' => $state,
@@ -192,7 +216,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'edit_seller') {
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $name = trim($_POST['seller_name'] ?? '');
-    $phone = trim($_POST['phone'] ?? '');
+    $rawPhone = trim($_POST['phone'] ?? '');
+    $phone = '';
+    if ($rawPhone !== '') {
+        $strP = preg_replace('/[\s\-\(\)]/', '', $rawPhone);
+        if (str_starts_with($strP, '+')) {
+            $phone = $strP;
+        } elseif (preg_match('/^\d{10}$/', $strP)) {
+            $phone = '+91' . $strP;
+        } elseif (preg_match('/^91\d{10}$/', $strP)) {
+            $phone = '+' . $strP;
+        } else {
+            $phone = '+' . $strP;
+        }
+    }
     $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '');
@@ -202,16 +239,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $newPassword = $_POST['new_password'] ?? $_POST['password'] ?? '';
     $confirmPassword = $_POST['confirm_password'] ?? '';
 
-    if (empty($sellerId) || empty($name) || empty($phone) || empty($address) || empty($state)) {
-        $error = 'Seller ID, name, phone, address, and state are required.';
-    } elseif (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+    if (empty($sellerId) || empty($name) || (empty($rawPhone) && empty($email)) || empty($address) || empty($state)) {
+        $error = 'Seller ID, name, email or phone number, address, and state are required.';
+    } elseif (!empty($email) && (str_ends_with($email, '@phone.vendor.local') || !filter_var($email, FILTER_VALIDATE_EMAIL))) {
         $error = 'The email address format is invalid.';
-    } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+    } elseif ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
         $error = 'Phone must be in international format with country code (e.g. +919876543210).';
     } else {
-        $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone AND id != :id LIMIT 1");
-        $chk->execute([':phone' => $phone, ':id' => $sellerId]);
-        if ($chk->fetch()) {
+        $dupPhone = false;
+        if ($phone !== '') {
+            $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone AND id != :id LIMIT 1");
+            $chk->execute([':phone' => $phone, ':id' => $sellerId]);
+            $dupPhone = (bool) $chk->fetch();
+        }
+        if ($dupPhone) {
             $error = 'This phone number is already registered to another account.';
         } else {
             if (!empty($email)) {
@@ -248,7 +289,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     ':id' => $sellerId,
                     ':name' => $name,
                     ':seller_name' => $name,
-                    ':phone' => $phone,
+                    ':phone' => $phone !== '' ? $phone : null,
                     ':address' => $address,
                     ':landmark' => $landmark,
                     ':state' => $state,
@@ -653,7 +694,8 @@ function formatBytesPhp($bytes): string {
                                 if ($st === 'resubmitted') $st = 'pending';
                                 $badgeClass = ($st === 'approved') ? 'badge-approved' : (($st === 'rejected') ? 'badge-rejected' : 'badge-pending');
                                 $sellerLabel = $g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id'];
-                                $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($g['email'] ?? ''));
+                                $displayGstEmail = getPublicSellerEmailPhp($g['email'] ?? null);
+                                $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($displayGstEmail ?? ''));
                             ?>
                             <tr class="gst-row" data-status="<?= $st ?>" data-search="<?= htmlspecialchars($searchString) ?>">
                                 <td>
@@ -662,8 +704,8 @@ function formatBytesPhp($bytes): string {
                                         <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #<?= (int)$g['seller_id'] ?></span>
                                         <?= htmlspecialchars($g['phone'] ?? '') ?>
                                     </div>
-                                    <?php if (!empty($g['email'])): ?>
-                                        <div style="font-size:12px; color:#94a3b8;"><?= htmlspecialchars($g['email']) ?></div>
+                                    <?php if (!empty($displayGstEmail)): ?>
+                                        <div style="font-size:12px; color:#94a3b8;"><?= htmlspecialchars($displayGstEmail) ?></div>
                                     <?php endif; ?>
                                 </td>
                                 <td>
@@ -766,7 +808,7 @@ function formatBytesPhp($bytes): string {
                                 </td>
                                 <td>
                                     <div><?= htmlspecialchars($s['phone'] ?? '—') ?></div>
-                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($s['email'] ?? '') ?></div>
+                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(getPublicSellerEmailPhp($s['email'] ?? null) ?? '') ?></div>
                                 </td>
                                 <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
                                 <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
@@ -955,7 +997,7 @@ function formatBytesPhp($bytes): string {
         <!-- Section 5: Create Seller Account -->
         <section class="card" style="margin-top:24px;">
             <h2>Create New Seller Account</h2>
-            <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
+            <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with international country code, e.g. +919876543210).</p>
             <form method="POST" action="/admin">
                 <input type="hidden" name="action" value="create_seller">
                 <div class="grid">
@@ -965,11 +1007,11 @@ function formatBytesPhp($bytes): string {
                     </div>
                     <div>
                         <label>Phone (+country code)</label>
-                        <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" required placeholder="+919876543210">
+                        <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" placeholder="+919876543210">
                     </div>
                     <div>
-                        <label>Email Address *</label>
-                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" required placeholder="seller@example.com">
+                        <label>Email Address</label>
+                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" placeholder="seller@example.com">
                     </div>
                     <div>
                         <label>State</label>
@@ -981,7 +1023,7 @@ function formatBytesPhp($bytes): string {
                     </div>
                     <div>
                         <label>Landmark</label>
-                        <input name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" required placeholder="Nearest landmark">
+                        <input name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" placeholder="Nearest landmark">
                     </div>
                     <div>
                         <label>Password (min 8 characters)</label>
@@ -1150,7 +1192,7 @@ function formatBytesPhp($bytes): string {
                         </div>
                         <div>
                             <label>Phone (+country code)</label>
-                            <input name="phone" id="formPhone" required placeholder="+919876543210">
+                            <input name="phone" id="formPhone" placeholder="+919876543210">
                         </div>
                         <div style="grid-column: 1 / -1;">
                             <label>Email Address</label>

@@ -52,8 +52,8 @@ The platform features built-in multi-vendor marketplace routing and privacy isol
 * `GET /api/health` — Hostinger MySQL connectivity check
 
 ### Authentication
-* `POST /api/register` — Seller registration (requires `seller_name`, `email`, `phone`, `address`, `password`; returns JWT Bearer token)
-* `POST /api/login` — Seller login (requires `email`, `phone`, `password`; returns JWT Bearer token)
+* `POST /api/register` — Seller registration (requires `seller_name`, `address`, `password`, and either `email` or `phone` — both or single `identifier`/`email_or_phone` field also accepted; returns JWT Bearer token)
+* `POST /api/login` — Seller login (requires `email` or `phone` — both or single `identifier`/`login`/`email_or_phone` field also accepted — plus `password`; returns JWT Bearer token)
 * `GET /api/me` — Authenticated seller profile (`Authorization: Bearer <token>`)
 * `PUT /api/me` — Edit authenticated seller profile
 * `POST /api/logout` — Invalidate session

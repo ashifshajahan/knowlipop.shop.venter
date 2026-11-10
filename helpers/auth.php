@@ -92,15 +92,21 @@ function verifyJwtToken(string $token, string $secret): ?array
     return $payload;
 }
 
-function createToken(PDO $pdo, int $userId, string $phone = '', string $name = 'vendor-app'): string
+function createToken(PDO $pdo, int $userId, ?string $phone = null, string $name = 'vendor-app', ?string $email = null, string $role = 'seller'): string
 {
     $secret = getJwtSecret();
+    $cleanPhone = ($phone !== null && trim($phone) !== '') ? trim($phone) : null;
+    $cleanEmail = ($email !== null && trim($email) !== '' && !str_ends_with(strtolower(trim($email)), '@phone.vendor.local'))
+        ? strtolower(trim($email))
+        : null;
 
     // Standard JWT token matching Node.js
     $header = rtrim(strtr(base64_encode(json_encode(['alg' => 'HS256', 'typ' => 'JWT'])), '+/', '-_'), '=');
     $payload = rtrim(strtr(base64_encode(json_encode([
         'id' => $userId,
-        'phone' => $phone,
+        'email' => $cleanEmail,
+        'phone' => $cleanPhone,
+        'role' => $role ?: 'seller',
         'iat' => time(),
         'exp' => time() + (30 * 86400)
     ])), '+/', '-_'), '=');
@@ -112,14 +118,14 @@ function createToken(PDO $pdo, int $userId, string $phone = '', string $name = '
         $tokenHash = hash('sha256', $jwtToken);
         $stmt = $pdo->prepare("
             INSERT INTO personal_access_tokens (tokenable_type, tokenable_id, name, token, abilities, created_at, updated_at)
-            VALUES ('App\\\\Models\\\\User', :user_id, :name, :token, '[\"*\"]', NOW(), NOW())
+            VALUES ('App\\\\Models\\\\User', :user_id, :name, :token, '[\"*\"]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ");
         $stmt->execute([
             ':user_id' => $userId,
             ':name' => $name,
             ':token' => $tokenHash,
         ]);
-    } catch (Exception $e) {
+    } catch (Throwable $e) {
         // Silently continue if table not present
     }
 
@@ -148,6 +154,7 @@ function getAuthenticatedUserOptional(PDO $pdo): ?array
             return [
                 'id' => (int)$jwtPayload['id'],
                 'role' => $jwtPayload['role'] ?? ((int)$jwtPayload['id'] === 1 ? 'admin' : 'seller'),
+                'email' => $jwtPayload['email'] ?? null,
                 'phone' => $jwtPayload['phone'] ?? null,
                 'name' => $jwtPayload['name'] ?? 'Verified Seller',
                 'seller_name' => $jwtPayload['seller_name'] ?? 'Verified Seller',
@@ -203,21 +210,28 @@ function deleteCurrentToken(PDO $pdo, int $tokenId): void
     }
 }
 
+function getPublicSellerEmailPhp(?string $rawEmail, string $role = 'seller'): ?string
+{
+    if ($rawEmail === null) return null;
+    $trimmed = trim($rawEmail);
+    if ($trimmed === '') return null;
+    if (str_ends_with(strtolower($trimmed), '@phone.vendor.local') && $role !== 'admin') {
+        return null;
+    }
+    return $trimmed;
+}
+
 function safeSeller(array $user): array
 {
-    $rawEmail = $user['email'] ?? null;
-    $email = null;
-    if (!empty($rawEmail) && !str_ends_with($rawEmail, '@phone.vendor.local')) {
-        $email = $rawEmail;
-    } elseif (($user['role'] ?? '') === 'admin' && !empty($rawEmail)) {
-        $email = $rawEmail;
-    }
+    $role = $user['role'] ?? 'seller';
+    $email = getPublicSellerEmailPhp($user['email'] ?? null, $role);
+    $rawPhone = isset($user['phone']) ? trim((string)$user['phone']) : '';
 
     $data = [
         'id' => (int) $user['id'],
         'seller_name' => $user['seller_name'] ?? $user['name'] ?? '',
         'email' => $email,
-        'phone' => $user['phone'] ?? null,
+        'phone' => $rawPhone !== '' ? $rawPhone : null,
         'address' => $user['address'] ?? null,
         'landmark' => $user['landmark'] ?? null,
         'state' => $user['state'] ?? null,

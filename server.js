@@ -1235,7 +1235,9 @@ async function ensureUserAvatarColumn(p) {
 // Helper: safe seller output
 function safeSeller(user) {
   if (!user) return {};
-  const email = user.email && !user.email.endsWith('@phone.vendor.local') ? user.email : (user.email && user.role === 'admin' ? user.email : null);
+  const email = user.email && !String(user.email).endsWith('@phone.vendor.local')
+    ? user.email
+    : (user.email && user.role === 'admin' ? user.email : null);
   const data = {
     id: user.id,
     seller_name: user.seller_name || user.name || '',
@@ -1285,12 +1287,14 @@ async function authenticateToken(req, res, next) {
         return next();
       }
     } catch (dbErr) {
-      // In offline / fallback mode when DB is not reachable, authenticate using decoded JWT payload
-      req.user = {
+      // In offline / fallback mode when DB is not reachable, authenticate using fallbackSellers or decoded JWT payload
+      const fb = fallbackSellers.find(s => Number(s.id) === Number(decoded.id));
+      req.user = fb || {
         id: decoded.id,
         role: decoded.role || (decoded.id === 1 ? 'admin' : 'seller'),
+        email: decoded.email || null,
         phone: decoded.phone || null,
-        name: decoded.name || 'Verified Seller',
+        name: decoded.name || decoded.seller_name || 'Verified Seller',
         seller_name: decoded.seller_name || decoded.name || 'Verified Seller'
       };
       return next();
@@ -1300,16 +1304,18 @@ async function authenticateToken(req, res, next) {
     // If not valid JWT, check personal_access_tokens table
     const parts = token.split('|');
     if (parts.length === 2) {
-      const crypto = require('crypto');
-      const hash = crypto.createHash('sha256').update(parts[1]).digest('hex');
-      const [tokenRows] = await pool.query(
-        'SELECT u.* FROM personal_access_tokens pat JOIN users u ON pat.tokenable_id = u.id WHERE pat.id = ? AND pat.token = ? LIMIT 1',
-        [parts[0], hash]
-      );
-      if (tokenRows.length > 0) {
-        req.user = tokenRows[0];
-        return next();
-      }
+      try {
+        const crypto = require('crypto');
+        const hash = crypto.createHash('sha256').update(parts[1]).digest('hex');
+        const [tokenRows] = await pool.query(
+          'SELECT u.* FROM personal_access_tokens pat JOIN users u ON pat.tokenable_id = u.id WHERE pat.id = ? AND pat.token = ? LIMIT 1',
+          [parts[0], hash]
+        );
+        if (tokenRows.length > 0) {
+          req.user = tokenRows[0];
+          return next();
+        }
+      } catch (patErr) {}
     }
     return res.status(401).json({ message: 'Unauthenticated.' });
   }
@@ -1482,7 +1488,7 @@ function extractPhone(body) {
   let raw = extractField(body, candidates, '');
   if (!raw) {
     for (const key of Object.keys(body)) {
-      if (/^(seller|user)?_?(phone|mobile|contact|tel)/i.test(key)) {
+      if (/^(seller|user)?_?(phone|mobile|contact|tel)/i.test(key) && !/^contact_?(id|email|type|name|person)/i.test(key)) {
         const val = body[key];
         if (val !== undefined && val !== null && String(val).trim() !== '') {
           raw = String(val).trim();
@@ -1537,9 +1543,98 @@ function normalizePhone(raw) {
   return '+' + str;
 }
 
+function isValidEmailAddress(email) {
+  if (!email || typeof email !== 'string') return false;
+  const trimmed = email.trim().toLowerCase();
+  if (!trimmed || trimmed.endsWith('@phone.vendor.local')) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed);
+}
+
+function makeSyntheticPhoneEmail(phone) {
+  const digits = String(phone || '').replace(/\D+/g, '') || Date.now().toString();
+  return `seller_${digits}@phone.vendor.local`;
+}
+
+function getPublicSellerEmail(rawEmail, role = 'seller') {
+  if (!rawEmail) return null;
+  const str = String(rawEmail).trim();
+  if (!str) return null;
+  if (str.endsWith('@phone.vendor.local') && role !== 'admin') return null;
+  return str;
+}
+
+function matchesPhoneRecord(storedPhone, phone, rawPhone, rawNoPrefix) {
+  if (!storedPhone) return false;
+  const cleanStored = String(storedPhone).trim();
+  if (!cleanStored) return false;
+  if (phone && cleanStored === phone) return true;
+  if (rawPhone && cleanStored === rawPhone) return true;
+  if (rawNoPrefix && cleanStored.replace(/^\+91/, '').replace(/^\+/, '') === rawNoPrefix) return true;
+  return false;
+}
+
+function extractAuthIdentifiers(body, options = {}) {
+  const { allowUsername = false } = options;
+  let rawEmail = extractField(body, [
+    'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
+    'user_email', 'seller_email', 'business_email', 'mail'
+  ], '');
+  let rawPhone = extractPhone(body);
+
+  const singleCandidates = [
+    'identifier', 'login', 'login_id', 'loginId',
+    'email_or_phone', 'emailOrPhone', 'phone_or_email', 'phoneOrEmail',
+    'contact_id', 'contactId', 'user_identifier', 'userIdentifier',
+    'account', 'credential', 'auth_id', 'authId'
+  ];
+  if (allowUsername) {
+    singleCandidates.push('username', 'user_name', 'userName');
+  } else if (!rawEmail && !rawPhone) {
+    // Allow username on register only when explicit contact fields were omitted
+    singleCandidates.push('username');
+  }
+
+  const rawIdentifier = extractField(body, singleCandidates, '');
+  let identifierError = '';
+
+  const dialCode = body && (body.country_code || body.countryCode || body.dial_code || body.dialCode);
+  const attachDialCode = (val) => {
+    const trimmed = String(val || '').trim();
+    if (!trimmed) return '';
+    if (dialCode && !trimmed.startsWith('+')) {
+      return String(dialCode).trim() + trimmed;
+    }
+    return trimmed;
+  };
+
+  if (!rawEmail && !rawPhone && rawIdentifier) {
+    if (rawIdentifier.includes('@')) {
+      rawEmail = rawIdentifier;
+    } else if (/^\+?[\d\s\-().]+$/.test(rawIdentifier)) {
+      rawPhone = attachDialCode(rawIdentifier);
+    } else {
+      identifierError = 'Please provide a valid email address or phone number.';
+    }
+  }
+
+  // Handle single-input forms wired only to `email` or `phone`
+  if (!rawEmail && rawPhone && rawPhone.includes('@')) {
+    rawEmail = rawPhone;
+    rawPhone = '';
+  } else if (!rawPhone && rawEmail && !rawEmail.includes('@') && /^\+?[\d\s\-().]{7,20}$/.test(rawEmail)) {
+    rawPhone = attachDialCode(rawEmail);
+    rawEmail = '';
+  }
+
+  const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
+  const phone = rawPhone ? normalizePhone(rawPhone) : '';
+
+  return { rawEmail, email, rawPhone, phone, rawIdentifier, identifierError };
+}
+
 app.get(['/api/register', '/api/auth/register'], (req, res) => {
   res.status(405).json({
-    message: 'The register endpoint only accepts POST requests with seller details (seller_name, email, phone, address, landmark, state, country, password, password_confirmation).'
+    message: 'The register endpoint only accepts POST requests with seller details (seller_name, email or phone, address, landmark, state, country, password, password_confirmation).'
   });
 });
 
@@ -1550,13 +1645,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
     'fullname', 'full_name', 'user_name', 'userName'
   ]);
-  const rawEmail = extractField(body, [
-    'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
-    'user_email', 'seller_email', 'business_email', 'mail'
-  ]);
-  const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
-  const rawPhone = extractPhone(body);
-  const phone = normalizePhone(rawPhone);
+  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
   const address = extractField(body, [
     'address', 'shop_address', 'shopAddress', 'business_address', 'street', 'location'
   ]);
@@ -1576,13 +1665,25 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
   const errors = {};
 
   if (!seller_name) errors.seller_name = ['The seller name field is required.'];
-  if (!email) {
-    errors.email = ['The email field is required.'];
-  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    errors.email = ['The email address format is invalid.'];
+
+  if (identifierError) {
+    errors.email_or_phone = [identifierError];
+    errors.email = [identifierError];
+    errors.phone = [identifierError];
+  } else if (!email && !rawPhone) {
+    const contactMsg = 'Please provide an email address or phone number.';
+    errors.email_or_phone = [contactMsg];
+    errors.email = [contactMsg];
+    errors.phone = [contactMsg];
+  } else {
+    if (email && !isValidEmailAddress(email)) {
+      errors.email = ['The email address format is invalid.'];
+    }
+    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    }
   }
-  if (!rawPhone) errors.phone = ['The phone field is required.'];
-  else if (!/^\+[1-9]\d{7,14}$/.test(phone)) errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+
   if (!address) errors.address = ['The address field is required.'];
   if (!password) errors.password = ['The password field is required.'];
   else if (password.length < 8) errors.password = ['The password must be at least 8 characters.'];
@@ -1592,19 +1693,26 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     return res.status(422).json({ message: 'Validation error occurred.', errors });
   }
 
-  try {
-    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [phoneRows] = await pool.query(
-      'SELECT id, password, phone, email FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
-      [phone, rawPhone, rawNoPrefix]
-    );
-    const [emailRows] = await pool.query(
-      'SELECT id, password, phone, email FROM users WHERE LOWER(email) = ? LIMIT 1',
-      [email]
-    );
+  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
 
-    const phoneMatch = phoneRows[0] || null;
-    const emailMatch = emailRows[0] || null;
+  try {
+    let phoneMatch = null;
+    if (phone) {
+      const [phoneRows] = await pool.query(
+        'SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+        [phone, rawPhone, rawNoPrefix]
+      );
+      phoneMatch = phoneRows[0] || null;
+    }
+
+    let emailMatch = null;
+    if (email) {
+      const [emailRows] = await pool.query(
+        'SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1',
+        [email]
+      );
+      emailMatch = emailRows[0] || null;
+    }
 
     if (phoneMatch) {
       const isSamePassword = await bcrypt.compare(password, phoneMatch.password);
@@ -1615,23 +1723,35 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
             errors: { email: ['The email has already been taken.'] }
           });
         }
+        const existingPublicEmail = getPublicSellerEmail(phoneMatch.email, phoneMatch.role || 'seller');
+        if (email && existingPublicEmail && existingPublicEmail.toLowerCase() !== email) {
+          return res.status(422).json({
+            message: 'The phone has already been taken.',
+            errors: { phone: ['The phone has already been taken.'] }
+          });
+        }
         let resolvedEmail = phoneMatch.email;
-        if (!resolvedEmail || String(resolvedEmail).endsWith('@phone.vendor.local')) {
+        if (email && (!resolvedEmail || String(resolvedEmail).endsWith('@phone.vendor.local'))) {
           await pool.query('UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?', [email, phoneMatch.id]);
           resolvedEmail = email;
         }
-        const token = jwt.sign({ id: phoneMatch.id, phone }, JWT_SECRET, { expiresIn: '30d' });
+        const publicEmail = getPublicSellerEmail(resolvedEmail, phoneMatch.role || 'seller');
+        const token = jwt.sign(
+          { id: phoneMatch.id, email: publicEmail, phone: phoneMatch.phone || phone, role: phoneMatch.role || 'seller', seller_name },
+          JWT_SECRET,
+          { expiresIn: '30d' }
+        );
         return res.status(200).json({
           message: 'Seller account already exists. Successfully signed in.',
           user: safeSeller({
-            id: phoneMatch.id,
-            seller_name,
+            ...phoneMatch,
+            seller_name: seller_name || phoneMatch.seller_name || phoneMatch.name,
             email: resolvedEmail,
-            phone,
-            address,
-            landmark,
-            state,
-            country
+            phone: phoneMatch.phone || phone,
+            address: address || phoneMatch.address,
+            landmark: landmark || phoneMatch.landmark,
+            state: state || phoneMatch.state,
+            country: country || phoneMatch.country
           }),
           token,
           token_type: 'Bearer'
@@ -1651,39 +1771,114 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    const dbEmail = email || makeSyntheticPhoneEmail(phone);
+    const dbPhone = phone || null;
 
     const [result] = await pool.query(
       `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-      [seller_name, email, seller_name, phone, address, landmark, state, country || 'India', hashedPassword]
+      [seller_name, dbEmail, seller_name, dbPhone, address, landmark, state, country || 'India', hashedPassword]
     );
 
     const userId = result.insertId;
-    const token = jwt.sign({ id: userId, phone }, JWT_SECRET, { expiresIn: '30d' });
+    const publicEmail = email || null;
+    const token = jwt.sign(
+      { id: userId, email: publicEmail, phone: dbPhone, role: 'seller', seller_name },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
 
     res.status(201).json({
       message: 'Seller registration successful.',
-      user: safeSeller({ id: userId, seller_name, email, phone, address, landmark, state, country }),
+      user: safeSeller({
+        id: userId,
+        seller_name,
+        email: dbEmail,
+        phone: dbPhone,
+        address,
+        landmark,
+        state,
+        country: country || 'India',
+        role: 'seller'
+      }),
       token,
       token_type: 'Bearer'
     });
   } catch (err) {
-    if (fallbackSellers.some(s => String(s.phone || '') === phone)) {
+    const phoneMatchFb = phone
+      ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))
+      : null;
+    const emailMatchFb = email
+      ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === email)
+      : null;
+
+    if (phoneMatchFb) {
+      const samePass = phoneMatchFb._password !== undefined && phoneMatchFb._password === password;
+      if (samePass) {
+        if (emailMatchFb && Number(emailMatchFb.id) !== Number(phoneMatchFb.id)) {
+          return res.status(422).json({
+            message: 'The email has already been taken.',
+            errors: { email: ['The email has already been taken.'] }
+          });
+        }
+        const existingPublicEmail = getPublicSellerEmail(phoneMatchFb.email, phoneMatchFb.role || 'seller');
+        if (email && existingPublicEmail && existingPublicEmail.toLowerCase() !== email) {
+          return res.status(422).json({
+            message: 'The phone has already been taken.',
+            errors: { phone: ['The phone has already been taken.'] }
+          });
+        }
+        if (email && (!phoneMatchFb.email || String(phoneMatchFb.email).endsWith('@phone.vendor.local'))) {
+          phoneMatchFb.email = email;
+        }
+        const publicEmail = getPublicSellerEmail(phoneMatchFb.email, phoneMatchFb.role || 'seller');
+        const token = jwt.sign(
+          { id: phoneMatchFb.id, email: publicEmail, phone: phoneMatchFb.phone || phone, role: phoneMatchFb.role || 'seller', seller_name: phoneMatchFb.seller_name },
+          JWT_SECRET,
+          { expiresIn: '30d' }
+        );
+        return res.status(200).json({
+          message: 'Seller account already exists. Successfully signed in.',
+          user: safeSeller(phoneMatchFb),
+          token,
+          token_type: 'Bearer'
+        });
+      }
       return res.status(422).json({
         message: 'The phone has already been taken.',
         errors: { phone: ['The phone has already been taken.'] }
       });
     }
-    if (fallbackSellers.some(s => String(s.email || '').toLowerCase() === email)) {
+
+    if (emailMatchFb) {
       return res.status(422).json({
         message: 'The email has already been taken.',
         errors: { email: ['The email has already been taken.'] }
       });
     }
+
     const newId = fallbackSellers.length ? Math.max(...fallbackSellers.map(s => s.id)) + 1 : 99;
-    const newSeller = { id: newId, seller_name, email, phone, address, landmark, state, country: country || 'India', role: 'seller' };
+    const storedEmail = email || makeSyntheticPhoneEmail(phone);
+    const storedPhone = phone || null;
+    const newSeller = {
+      id: newId,
+      name: seller_name,
+      seller_name,
+      email: storedEmail,
+      phone: storedPhone,
+      address,
+      landmark,
+      state,
+      country: country || 'India',
+      role: 'seller',
+      _password: password
+    };
     fallbackSellers.push(newSeller);
-    const token = jwt.sign({ id: newId, phone, role: 'seller' }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign(
+      { id: newId, email: email || null, phone: storedPhone, role: 'seller', seller_name },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
     res.status(201).json({
       message: 'Seller registration successful.',
       user: safeSeller(newSeller),
@@ -1695,78 +1890,81 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
 app.get(['/api/login', '/api/auth/login'], (req, res) => {
   res.status(405).json({
-    message: 'The login endpoint only accepts POST requests with credentials (email, phone, password).'
+    message: 'The login endpoint only accepts POST requests with credentials (email or phone, and password).'
   });
 });
 
 app.post(['/api/login', '/api/auth/login'], async (req, res) => {
   const body = req.body || {};
-  const rawEmail = extractField(body, [
-    'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
-    'user_email', 'seller_email', 'business_email', 'mail'
-  ], '');
-  const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
-  const rawPhone = extractPhone(body);
-  const phone = normalizePhone(rawPhone);
+  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: true });
   const password = extractPassword(body);
 
   const errors = {};
-  if (!email) {
-    errors.email = ['The email field is required.'];
-  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    errors.email = ['The email address format is invalid.'];
+  if (identifierError) {
+    errors.email_or_phone = [identifierError];
+    errors.email = [identifierError];
+    errors.phone = [identifierError];
+  } else if (!email && !rawPhone) {
+    const contactMsg = 'The email or phone field is required.';
+    errors.email_or_phone = [contactMsg];
+    errors.email = [contactMsg];
+    errors.phone = [contactMsg];
+  } else {
+    if (email && !isValidEmailAddress(email)) {
+      errors.email = ['The email address format is invalid.'];
+    }
+    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    }
   }
+
   if (!password) {
     errors.password = ['The password field is required.'];
   }
 
   if (Object.keys(errors).length > 0) {
-    if (!rawPhone) errors.phone = ['The phone field is required.'];
     return res.status(422).json({
       message: 'Validation error occurred.',
       errors
     });
   }
 
+  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
+  const invalidCredsMsg = 'The supplied login credentials (email/phone or password) are incorrect.';
+  const invalidCredsErrors = {
+    email_or_phone: [invalidCredsMsg],
+    email: [invalidCredsMsg],
+    phone: [invalidCredsMsg]
+  };
+
   try {
-    // Allow admin REST API authentication via email + password when admin has no phone in payload
-    if (!rawPhone) {
-      const [adminRows] = await pool.query(
-        'SELECT * FROM users WHERE LOWER(email) = ? AND role = "admin" LIMIT 1',
+    let rows = [];
+    if (email && rawPhone) {
+      [rows] = await pool.query(
+        'SELECT * FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1',
+        [phone, rawPhone, rawNoPrefix, email]
+      );
+    } else if (email) {
+      [rows] = await pool.query(
+        'SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1',
         [email]
       );
-      if (adminRows.length > 0 && (await bcrypt.compare(password, adminRows[0].password))) {
-        const adminUser = adminRows[0];
-        const token = jwt.sign(
-          { id: adminUser.id, phone: adminUser.phone || null, role: 'admin', email: adminUser.email },
-          JWT_SECRET,
-          { expiresIn: '30d' }
+      if (rows.length === 0 && email === 'admin@venter.app') {
+        [rows] = await pool.query(
+          'SELECT * FROM users WHERE LOWER(email) = "admin@vendor.app" AND role = "admin" LIMIT 1'
         );
-        return res.json({
-          message: 'Login successful.',
-          user: safeSeller(adminUser),
-          token,
-          token_type: 'Bearer'
-        });
       }
-      return res.status(422).json({
-        message: 'Validation error occurred.',
-        errors: { phone: ['The phone field is required.'] }
-      });
+    } else {
+      [rows] = await pool.query(
+        'SELECT * FROM users WHERE (phone = ? OR phone = ? OR phone = ?) LIMIT 1',
+        [phone, rawPhone, rawNoPrefix]
+      );
     }
 
-    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [rows] = await pool.query(
-      'SELECT * FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1',
-      [phone, rawPhone, rawNoPrefix, email]
-    );
     if (rows.length === 0) {
       return res.status(422).json({
-        message: 'The supplied email, phone number, or password is incorrect.',
-        errors: {
-          email: ['The supplied email, phone number, or password is incorrect.'],
-          phone: ['The supplied email, phone number, or password is incorrect.']
-        }
+        message: invalidCredsMsg,
+        errors: invalidCredsErrors
       });
     }
 
@@ -1774,15 +1972,23 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
       return res.status(422).json({
-        message: 'The supplied email, phone number, or password is incorrect.',
-        errors: {
-          email: ['The supplied email, phone number, or password is incorrect.'],
-          phone: ['The supplied email, phone number, or password is incorrect.']
-        }
+        message: invalidCredsMsg,
+        errors: invalidCredsErrors
       });
     }
 
-    const token = jwt.sign({ id: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '30d' });
+    const publicEmail = getPublicSellerEmail(user.email, user.role || 'seller');
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: publicEmail,
+        phone: user.phone || null,
+        role: user.role || 'seller',
+        seller_name: user.seller_name || user.name || ''
+      },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
 
     res.json({
       message: 'Login successful.',
@@ -1791,65 +1997,66 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
       token_type: 'Bearer'
     });
   } catch (err) {
-    if (!rawPhone) {
-      const adminFallback = fallbackSellers.find(s => s.role === 'admin' && String(s.email || '').toLowerCase() === email);
-      if (adminFallback && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
-        const token = jwt.sign(
-          { id: adminFallback.id, phone: adminFallback.phone || null, role: 'admin', email: adminFallback.email },
-          JWT_SECRET,
-          { expiresIn: '30d' }
-        );
-        return res.json({
-          message: 'Login successful.',
-          user: safeSeller(adminFallback),
-          token,
-          token_type: 'Bearer'
-        });
+    const normalizedEmailLookup = email === 'admin@venter.app' ? 'admin@vendor.app' : email;
+    const emailMatchFb = email
+      ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === normalizedEmailLookup || String(s.email || '').toLowerCase() === email)
+      : null;
+    const phoneMatchFb = rawPhone
+      ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))
+      : null;
+
+    let matchedUser = null;
+    if (email && rawPhone) {
+      if (emailMatchFb && phoneMatchFb && Number(emailMatchFb.id) === Number(phoneMatchFb.id)) {
+        matchedUser = emailMatchFb;
       }
+    } else if (email) {
+      matchedUser = emailMatchFb;
+    } else if (rawPhone) {
+      matchedUser = phoneMatchFb;
+    }
+
+    if (!matchedUser) {
       return res.status(422).json({
-        message: 'Validation error occurred.',
-        errors: { phone: ['The phone field is required.'] }
+        message: invalidCredsMsg,
+        errors: invalidCredsErrors
       });
     }
 
-    if (email && rawPhone && password) {
-      const phoneMatch = fallbackSellers.find(s => s.phone === phone || s.phone === rawPhone);
-      const emailMatch = fallbackSellers.find(s => String(s.email || '').toLowerCase() === email);
-      if (phoneMatch && String(phoneMatch.email || '').toLowerCase() !== email) {
-        return res.status(422).json({
-          message: 'The supplied email, phone number, or password is incorrect.',
-          errors: {
-            email: ['The supplied email, phone number, or password is incorrect.'],
-            phone: ['The supplied email, phone number, or password is incorrect.']
-          }
-        });
-      }
-      if (!phoneMatch && emailMatch) {
-        return res.status(422).json({
-          message: 'The supplied email, phone number, or password is incorrect.',
-          errors: {
-            email: ['The supplied email, phone number, or password is incorrect.'],
-            phone: ['The supplied email, phone number, or password is incorrect.']
-          }
-        });
-      }
-      const fallbackUser = phoneMatch || {
-        id: 1,
-        role: 'seller',
-        seller_name: 'Verified Seller',
-        email,
-        phone: phone || rawPhone
-      };
-      const token = jwt.sign({ id: fallbackUser.id, phone: fallbackUser.phone, role: fallbackUser.role }, JWT_SECRET, { expiresIn: '30d' });
-      return res.json({
-        message: 'Login successful.',
-        user: safeSeller(fallbackUser),
-        token,
-        token_type: 'Bearer'
+    let passwordValid = false;
+    if (matchedUser._password !== undefined) {
+      passwordValid = matchedUser._password === password;
+    } else if (matchedUser.role === 'admin') {
+      passwordValid = password === 'Admin123!';
+    } else {
+      passwordValid = password === 'Password123!';
+    }
+
+    if (!passwordValid) {
+      return res.status(422).json({
+        message: invalidCredsMsg,
+        errors: invalidCredsErrors
       });
     }
-    console.error('Login Error:', err);
-    res.status(500).json({ error: 'Database error occurred during login.' });
+
+    const publicEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller');
+    const token = jwt.sign(
+      {
+        id: matchedUser.id,
+        email: publicEmail,
+        phone: matchedUser.phone || null,
+        role: matchedUser.role || 'seller',
+        seller_name: matchedUser.seller_name || matchedUser.name || ''
+      },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    return res.json({
+      message: 'Login successful.',
+      user: safeSeller(matchedUser),
+      token,
+      token_type: 'Bearer'
+    });
   }
 });
 
@@ -1900,24 +2107,36 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
     } else {
       const rawNoPrefix = rawPhone.replace(/^\+91|^\+/, '');
-      const [chkPhone] = await pool.query(
-        'SELECT id FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND id != ? LIMIT 1',
-        [phone, rawPhone, rawNoPrefix, sellerId]
-      );
-      if (chkPhone.length > 0) {
-        errors.phone = ['This phone number is already registered to another account.'];
+      try {
+        const [chkPhone] = await pool.query(
+          'SELECT id FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND id != ? LIMIT 1',
+          [phone, rawPhone, rawNoPrefix, sellerId]
+        );
+        if (chkPhone.length > 0) {
+          errors.phone = ['This phone number is already registered to another account.'];
+        }
+      } catch (e) {
+        if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))) {
+          errors.phone = ['This phone number is already registered to another account.'];
+        }
       }
     }
   }
 
   // Validate email if provided
   if (email) {
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (!isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     } else {
-      const [chkEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email.toLowerCase(), sellerId]);
-      if (chkEmail.length > 0) {
-        errors.email = ['This email address is already in use by another account.'];
+      try {
+        const [chkEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email.toLowerCase(), sellerId]);
+        if (chkEmail.length > 0) {
+          errors.email = ['This email address is already in use by another account.'];
+        }
+      } catch (e) {
+        if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && String(s.email || '').toLowerCase() === email.toLowerCase())) {
+          errors.email = ['This email address is already in use by another account.'];
+        }
       }
     }
   }
@@ -2017,14 +2236,17 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
     sellerData = safeSeller(refreshed[0]);
   } catch (err) {
-    sellerData = safeSeller({
-      ...existing,
+    Object.assign(existing, {
       ...(sellerName ? { seller_name: sellerName } : {}),
+      ...(name ? { name } : {}),
       ...(address ? { address } : {}),
       ...(landmark ? { landmark } : {}),
       ...(state ? { state } : {}),
-      ...(country ? { country } : {})
+      ...(country ? { country } : {}),
+      ...(phone ? { phone } : {}),
+      ...(email ? { email: email.toLowerCase() } : {})
     });
+    sellerData = safeSeller(existing);
   }
 
   res.json({
@@ -7792,38 +8014,45 @@ app.post('/admin', async (req, res) => {
       }
     } else if (action === 'create_seller') {
       const name = (body.seller_name || '').trim();
-      const phone = (body.phone || '').trim();
+      const rawAdminPhone = (body.phone || '').trim();
+      const phone = rawAdminPhone ? normalizePhone(rawAdminPhone) : '';
       const email = (body.email || '').trim().toLowerCase();
       const address = (body.address || '').trim();
-      const landmark = (body.landmark || '').trim();
+      const landmark = (body.landmark || '').trim() || 'None';
       const state = (body.state || '').trim();
       const country = (body.country || 'India').trim();
       const password = body.password || '';
       const confirmPassword = body.password_confirmation || '';
 
-      if (!name || !phone || !email || !address || !landmark || !state || !password) {
-        feedbackErr = 'All seller fields including Email Address are required.';
-      } else if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+      if (!name || (!phone && !email) || !address || !state || !password) {
+        feedbackErr = 'Seller name, email or phone number, address, state, and password are required.';
+      } else if (rawAdminPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
         feedbackErr = 'Phone must be in international format with country code (e.g. +919876543210).';
-      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      } else if (email && !isValidEmailAddress(email)) {
         feedbackErr = 'Please enter a valid email address.';
       } else if (password.length < 8) {
         feedbackErr = 'Password must be at least 8 characters.';
       } else if (password !== confirmPassword) {
         feedbackErr = 'Password confirmation does not match.';
       } else {
-        const [dupPhone] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
-        const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+        const dupPhone = phone
+          ? (await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]))[0]
+          : [];
+        const dupEmail = email
+          ? (await pool.query('SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1', [email]))[0]
+          : [];
         if (dupPhone.length > 0) {
           feedbackErr = 'A seller with this phone number already exists.';
         } else if (dupEmail.length > 0) {
           feedbackErr = 'A seller with this email address already exists.';
         } else {
           const hashedPassword = await bcrypt.hash(password, 10);
+          const dbEmail = email || makeSyntheticPhoneEmail(phone);
+          const dbPhone = phone || null;
           await pool.query(
             `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-            [name, email, name, phone, address, landmark, state, country, hashedPassword]
+            [name, dbEmail, name, dbPhone, address, landmark, state, country, hashedPassword]
           );
           feedbackMsg = `Seller "${name}" created.`;
         }
@@ -7831,7 +8060,8 @@ app.post('/admin', async (req, res) => {
     } else if (action === 'edit_seller') {
       const sellerId = parseInt(body.seller_id, 10);
       const name = (body.seller_name || '').trim();
-      const phone = (body.phone || '').trim();
+      const rawAdminPhone = (body.phone || '').trim();
+      const phone = rawAdminPhone ? normalizePhone(rawAdminPhone) : '';
       const email = (body.email || '').trim().toLowerCase();
       const address = (body.address || '').trim();
       const landmark = (body.landmark || '').trim();
@@ -7841,12 +8071,20 @@ app.post('/admin', async (req, res) => {
       const newPassword = body.new_password || body.password || '';
       const confirmPassword = body.confirm_password || '';
 
-      if (!sellerId || !name || !phone || !address || !state) {
-        feedbackErr = 'Seller ID, name, phone, address, and state are required.';
-      } else if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      if (!sellerId || !name || (!phone && !email) || !address || !state) {
+        feedbackErr = 'Seller ID, name, email or phone number, address, and state are required.';
+      } else if (rawAdminPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+        feedbackErr = 'Phone must be in international format with country code (e.g. +919876543210).';
+      } else if (email && !isValidEmailAddress(email)) {
         feedbackErr = 'Please enter a valid email address.';
       } else {
-        if (email) {
+        if (phone) {
+          const [dupPhone] = await pool.query('SELECT id FROM users WHERE phone = ? AND id != ? LIMIT 1', [phone, sellerId]);
+          if (dupPhone.length > 0) {
+            feedbackErr = 'This phone number is already registered to another account.';
+          }
+        }
+        if (!feedbackErr && email) {
           const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email, sellerId]);
           if (dupEmail.length > 0) {
             feedbackErr = 'This email address is already used by another account.';
@@ -7866,7 +8104,7 @@ app.post('/admin', async (req, res) => {
           }
 
           const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
-          const params = [name, name, phone, address, landmark, state, country];
+          const params = [name, name, phone || null, address, landmark, state, country];
           if (email) {
             updates.push('email = ?');
             params.push(email);
@@ -8423,7 +8661,8 @@ app.get('/admin', async (req, res) => {
                 if (st === 'resubmitted') st = 'pending';
                 const badgeClass = (st === 'approved') ? 'badge-approved' : ((st === 'rejected') ? 'badge-rejected' : 'badge-pending');
                 const sellerLabel = g.seller_name || g.user_name || 'Seller #' + g.seller_id;
-                const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (g.email || '')).toLowerCase();
+                const displayGstEmail = getPublicSellerEmail(g.email);
+                const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (displayGstEmail || '')).toLowerCase();
                 const latestDocId = g.latest_doc_id;
                 const subDate = formatDateStr(g.submitted_at || g.updated_at);
 
@@ -8435,7 +8674,7 @@ app.get('/admin', async (req, res) => {
                         <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #${g.seller_id}</span>
                         ${escapeHtml(g.phone || '')}
                       </div>
-                      ${g.email ? `<div style="font-size:12px; color:#94a3b8;">${escapeHtml(g.email)}</div>` : ''}
+                      ${displayGstEmail ? `<div style="font-size:12px; color:#94a3b8;">${escapeHtml(displayGstEmail)}</div>` : ''}
                     </td>
                     <td>
                       ${latestDocId ? `
@@ -8538,7 +8777,7 @@ app.get('/admin', async (req, res) => {
                     </td>
                     <td>
                       <div>${escapeHtml(s.phone || '—')}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(s.email || '')}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(getPublicSellerEmail(s.email) || '')}</div>
                     </td>
                     <td>${escapeHtml(s.state || '—')}</td>
                     <td><span class="badge-prod">${s.products_count || 0} items</span></td>
@@ -8711,7 +8950,7 @@ app.get('/admin', async (req, res) => {
         <!-- Section 5: Create Seller Account -->
         <section class="card" style="margin-top:24px;">
           <h2>Create New Seller Account</h2>
-          <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
+          <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with country code, e.g. +919876543210).</p>
           <form method="POST" action="/admin">
             <input type="hidden" name="action" value="create_seller">
             <div class="grid">
@@ -8721,11 +8960,11 @@ app.get('/admin', async (req, res) => {
               </div>
               <div>
                 <label>Phone (+country code)</label>
-                <input name="phone" required placeholder="+919876543210">
+                <input name="phone" placeholder="+919876543210">
               </div>
               <div>
-                <label>Email Address *</label>
-                <input type="email" name="email" required placeholder="seller@example.com">
+                <label>Email Address</label>
+                <input type="email" name="email" placeholder="seller@example.com">
               </div>
               <div>
                 <label>State</label>
@@ -8737,7 +8976,7 @@ app.get('/admin', async (req, res) => {
               </div>
               <div>
                 <label>Landmark</label>
-                <input name="landmark" required placeholder="Nearest landmark">
+                <input name="landmark" placeholder="Nearest landmark">
               </div>
               <div>
                 <label>Password (min 8 characters)</label>
@@ -8903,7 +9142,7 @@ app.get('/admin', async (req, res) => {
                 </div>
                 <div>
                   <label>Phone (+country code)</label>
-                  <input name="phone" id="formPhone" required placeholder="+919876543210">
+                  <input name="phone" id="formPhone" placeholder="+919876543210">
                 </div>
                 <div style="grid-column: 1 / -1;">
                   <label>Email Address</label>
