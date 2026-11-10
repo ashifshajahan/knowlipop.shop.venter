@@ -349,6 +349,56 @@
       font-size: 16px;
     }
 
+    .category-pills-bar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      width: 100%;
+    }
+
+    .cat-pill {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 7px 14px;
+      border-radius: 999px;
+      font-family: var(--font-main);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
+    .cat-pill:hover {
+      border-color: var(--primary);
+      color: #fff;
+    }
+
+    .cat-pill.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+      box-shadow: 0 4px 12px var(--primary-glow);
+    }
+
+    .product-cat-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      color: #c4b5fd;
+      background: rgba(139, 92, 246, 0.16);
+      border: 1px solid rgba(139, 92, 246, 0.32);
+      padding: 2px 8px;
+      border-radius: 999px;
+      margin-bottom: 6px;
+      align-self: flex-start;
+    }
+
     /* Product Grid */
     .product-grid {
       display: grid;
@@ -1412,7 +1462,10 @@
             <div class="search-box">
               <span class="search-icon">🔍</span>
               <input type="text" id="catalog-search" class="search-input"
-                placeholder="Search products by name or description..." oninput="handleCatalogSearch(this.value)">
+                placeholder="Search products by name, category, or description..." oninput="handleCatalogSearch(this.value)">
+            </div>
+            <div class="category-pills-bar" id="category-pills-bar">
+              <!-- Populated dynamically from GET /api/categories -->
             </div>
           </div>
 
@@ -1872,6 +1925,15 @@
     ];
 
     let allProducts = [...starterProducts];
+    let allCategories = [
+      { id: 1, name: 'Electronics', slug: 'electronics', icon: '📱' },
+      { id: 2, name: 'Fashion', slug: 'fashion', icon: '👕' },
+      { id: 3, name: 'Home & Kitchen', slug: 'home-kitchen', icon: '🏠' },
+      { id: 4, name: 'Beauty & Personal Care', slug: 'beauty-personal-care', icon: '✨' },
+      { id: 5, name: 'Grocery', slug: 'grocery', icon: '🛒' }
+    ];
+    let selectedCategoryFilter = 'all';
+    let catalogSearchQuery = '';
     let cartDraft = {}; // key: productId, value: { product, quantity }
     let allOrders = [];
     let currentStatusFilter = 'all';
@@ -1881,10 +1943,51 @@
     // 2. Lifecycle Boot
     document.addEventListener('DOMContentLoaded', async () => {
       await checkBackendHealth();
+      await fetchCategoriesList();
       await fetchProductsCatalog();
       await refreshOrdersList();
       renderCartDraft();
     });
+
+    async function fetchCategoriesList() {
+      try {
+        const res = await fetch('/api/categories');
+        if (res.ok) {
+          const data = await res.json();
+          const list = data.data || data.categories || [];
+          if (Array.isArray(list) && list.length > 0) {
+            allCategories = list;
+          }
+        }
+      } catch (e) {
+        console.warn('Using starter categories list.');
+      }
+      renderCategoryPills();
+    }
+
+    function renderCategoryPills() {
+      const bar = document.getElementById('category-pills-bar');
+      if (!bar) return;
+      const isAll = selectedCategoryFilter === 'all';
+      let html = `<button type="button" class="cat-pill ${isAll ? 'active' : ''}" onclick="selectCategoryFilter('all')">🏷️ All Categories</button>`;
+      allCategories.forEach(cat => {
+        const active = selectedCategoryFilter !== 'all' && Number(selectedCategoryFilter.id) === Number(cat.id);
+        const iconHtml = cat.icon ? `<span>${escapeHtml(cat.icon)}</span>` : '';
+        html += `<button type="button" class="cat-pill ${active ? 'active' : ''}" onclick="selectCategoryFilter(${Number(cat.id)})">${iconHtml}<span>${escapeHtml(cat.name)}</span></button>`;
+      });
+      bar.innerHTML = html;
+    }
+
+    window.selectCategoryFilter = function(catIdOrAll) {
+      if (catIdOrAll === 'all') {
+        selectedCategoryFilter = 'all';
+      } else {
+        const found = allCategories.find(c => Number(c.id) === Number(catIdOrAll));
+        selectedCategoryFilter = found || 'all';
+      }
+      renderCategoryPills();
+      applyCatalogFilters();
+    };
 
     // Check Backend Connection
     async function checkBackendHealth() {
@@ -1919,7 +2022,7 @@
       } catch (e) {
         console.warn('Could not fetch products from API, using default starter products.');
       }
-      renderProductsGrid(allProducts);
+      applyCatalogFilters();
       populateCatalogPickerSelect();
     }
 
@@ -1998,6 +2101,7 @@
                 <span>★</span> <span>${ratingVal}</span> <span style="color: var(--text-muted); font-size: 10px;">(${ratingsCountVal})</span>
               </div>
             </div>
+            <div class="product-cat-badge">🏷️ ${escapeHtml(p.category || 'General')}</div>
             <div class="product-title">${escapeHtml(p.name)}</div>
             <div class="product-desc">${escapeHtml(p.description || '')}</div>
             <div class="product-meta" style="margin-top: 8px;">
@@ -2037,12 +2141,29 @@
       });
     }
 
-    function handleCatalogSearch(query) {
-      const q = query.toLowerCase().trim();
-      const filtered = allProducts.filter(p =>
-        p.name.toLowerCase().includes(q) || (p.description && p.description.toLowerCase().includes(q))
-      );
+    function applyCatalogFilters() {
+      const q = (catalogSearchQuery || '').toLowerCase().trim();
+      const filtered = allProducts.filter(p => {
+        if (selectedCategoryFilter !== 'all') {
+          const matchesId = p.category_id && Number(p.category_id) === Number(selectedCategoryFilter.id);
+          const pCatLower = String(p.category || '').toLowerCase();
+          const matchesName = pCatLower === String(selectedCategoryFilter.name || '').toLowerCase() || pCatLower === String(selectedCategoryFilter.slug || '').toLowerCase();
+          if (!matchesId && !matchesName) return false;
+        }
+        if (q) {
+          const inName = String(p.name || '').toLowerCase().includes(q);
+          const inDesc = String(p.description || '').toLowerCase().includes(q);
+          const inCat = String(p.category || '').toLowerCase().includes(q);
+          if (!inName && !inDesc && !inCat) return false;
+        }
+        return true;
+      });
       renderProductsGrid(filtered);
+    }
+
+    function handleCatalogSearch(query) {
+      catalogSearchQuery = query || '';
+      applyCatalogFilters();
     }
 
     // 4. Cart & List Quantity Management

@@ -1232,6 +1232,7 @@ app.get('/', (req, res) => {
           • POST /api/register<br>
           • POST /api/login<br>
           • GET /api/products<br>
+          • GET /api/categories<br>
           • GET /admin/login
         </div>
       </div>
@@ -2575,6 +2576,7 @@ function formatProductRecord(p, options = {}) {
   const ratingsCount = (p.ratings_count !== undefined && p.ratings_count !== null && !isNaN(parseInt(p.ratings_count, 10))) ? parseInt(p.ratings_count, 10) : 15;
   const sku = p.sku || `SKU-${String(p.id || 1).padStart(4, '0')}`;
   const category = p.category || 'General';
+  const categoryId = (p.category_id !== undefined && p.category_id !== null && !isNaN(Number(p.category_id))) ? Number(p.category_id) : null;
   const brand = p.brand || 'Generic';
 
   const record = {
@@ -2585,6 +2587,7 @@ function formatProductRecord(p, options = {}) {
     description: p.description || null,
     sku,
     category,
+    category_id: categoryId,
     brand,
     stock,
     in_stock: stock > 0,
@@ -2659,7 +2662,9 @@ async function ensureProductPriceColumns(p) {
     await addColumnIfNotExists('mrp', 'mrp DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER price');
     await addColumnIfNotExists('sku', 'sku VARCHAR(100) NULL AFTER mrp');
     await addColumnIfNotExists('category', 'category VARCHAR(100) NULL AFTER sku');
-    await addColumnIfNotExists('brand', 'brand VARCHAR(100) NULL AFTER category');
+    await addColumnIfNotExists('category_id', 'category_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER category');
+    await addColumnIfNotExists('brand', 'brand VARCHAR(100) NULL AFTER category_id');
+    await ensureProductCategoriesTable(p);
     await addColumnIfNotExists('rating', 'rating DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER brand');
     await addColumnIfNotExists('ratings_count', 'ratings_count INT NOT NULL DEFAULT 15 AFTER rating');
     await addColumnIfNotExists('images', 'images LONGTEXT NULL DEFAULT NULL AFTER image_url');
@@ -2760,6 +2765,169 @@ async function ensureProductPriceColumns(p) {
   }
 }
 
+const DEFAULT_STARTER_CATEGORIES = [
+  { id: 1, name: 'Electronics', slug: 'electronics', description: 'Smartphones, headphones, gadgets & tech accessories', icon: '📱', image_url: null, sort_order: 1, is_active: true },
+  { id: 2, name: 'Fashion', slug: 'fashion', description: 'Apparel, footwear, bags, sunglasses & style essentials', icon: '👕', image_url: null, sort_order: 2, is_active: true },
+  { id: 3, name: 'Home & Kitchen', slug: 'home-kitchen', description: 'Appliances, cookware, home decor & living essentials', icon: '🏠', image_url: null, sort_order: 3, is_active: true },
+  { id: 4, name: 'Beauty & Personal Care', slug: 'beauty-personal-care', description: 'Skincare, grooming, wellness & cosmetics', icon: '✨', image_url: null, sort_order: 4, is_active: true },
+  { id: 5, name: 'Grocery', slug: 'grocery', description: 'Daily staples, snacks, beverages & household essentials', icon: '🛒', image_url: null, sort_order: 5, is_active: true }
+];
+
+let fallbackCategories = DEFAULT_STARTER_CATEGORIES.map(c => ({ ...c }));
+const categoriesInitializedPools = new WeakSet();
+
+function toCategorySlug(name) {
+  const s = String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, ' ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return s || 'category';
+}
+
+async function ensureUniqueCategorySlug(p, baseSlug, excludeId = null) {
+  let candidate = baseSlug || 'category';
+  let suffix = 2;
+  while (true) {
+    const [rows] = excludeId !== null
+      ? await p.query('SELECT id FROM categories WHERE slug = ? AND id != ? LIMIT 1', [candidate, excludeId])
+      : await p.query('SELECT id FROM categories WHERE slug = ? LIMIT 1', [candidate]);
+    if (rows.length === 0) return candidate;
+    candidate = `${baseSlug}-${suffix}`;
+    suffix++;
+    if (suffix > 200) return `${baseSlug}-${Date.now()}`;
+  }
+}
+
+async function ensureProductCategoriesTable(p) {
+  if (!p) return;
+  if (typeof p === 'object' && categoriesInitializedPools.has(p)) return;
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS categories (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        name VARCHAR(100) NOT NULL,
+        slug VARCHAR(120) NOT NULL UNIQUE,
+        description VARCHAR(255) NULL DEFAULT NULL,
+        icon VARCHAR(60) NULL DEFAULT NULL,
+        image_url LONGTEXT NULL DEFAULT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_categories_active (is_active),
+        INDEX idx_categories_sort (sort_order)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    try {
+      const [cols] = await p.query("SHOW COLUMNS FROM products LIKE 'category_id'");
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE products ADD COLUMN category_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER category');
+        try {
+          await p.query('ALTER TABLE products ADD INDEX idx_products_category (category_id)');
+        } catch (idxErr) {}
+      }
+    } catch (colErr) {}
+
+    const [[{ cnt }]] = await p.query('SELECT COUNT(*) as cnt FROM categories');
+    if (Number(cnt || 0) === 0) {
+      for (const cat of DEFAULT_STARTER_CATEGORIES) {
+        await p.query(
+          `INSERT INTO categories (id, name, slug, description, icon, sort_order, is_active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [cat.id, cat.name, cat.slug, cat.description, cat.icon, cat.sort_order, cat.is_active ? 1 : 0]
+        );
+      }
+    }
+
+    try {
+      await p.query(`
+        UPDATE products p
+        JOIN categories c ON (LOWER(TRIM(p.category)) = LOWER(TRIM(c.name)) OR LOWER(TRIM(p.category)) = LOWER(TRIM(c.slug)))
+        SET p.category_id = c.id, p.category = c.name
+        WHERE p.category_id IS NULL AND p.category IS NOT NULL AND TRIM(p.category) != ''
+      `);
+    } catch (syncErr) {}
+
+    if (typeof p === 'object') categoriesInitializedPools.add(p);
+  } catch (err) {
+    // ignore transient DB init errors
+  }
+}
+
+function formatCategoryRecord(row, overrideCount = null) {
+  if (!row) return null;
+  const productsCount = overrideCount !== null ? Number(overrideCount) : Number(row.products_count || 0);
+  return {
+    id: Number(row.id),
+    name: String(row.name || ''),
+    slug: String(row.slug || ''),
+    description: row.description || null,
+    icon: row.icon || null,
+    image_url: row.image_url || null,
+    sort_order: Number(row.sort_order || 0),
+    is_active: row.is_active !== undefined ? Boolean(Number(row.is_active)) : true,
+    products_count: productsCount,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null
+  };
+}
+
+async function findCategoryByIdOrSlug(p, idOrSlug) {
+  const trimmed = String(idOrSlug || '').trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const [byId] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [parseInt(trimmed, 10)]);
+    if (byId.length > 0) return byId[0];
+  }
+  const [bySlug] = await p.query('SELECT * FROM categories WHERE LOWER(slug) = LOWER(?) OR LOWER(name) = LOWER(?) LIMIT 1', [trimmed, trimmed]);
+  return bySlug[0] || null;
+}
+
+async function resolveProductCategoryInput(p, body, isCreate = false) {
+  await ensureProductCategoriesTable(p);
+  const hasCatId = body && body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '';
+  const hasCatName = body && (body.category !== undefined || body.category_name !== undefined || body.category_slug !== undefined);
+
+  if (hasCatId) {
+    const numId = parseInt(body.category_id, 10);
+    if (isNaN(numId) || numId <= 0) {
+      return { provided: true, error: 'Category ID must be a positive integer.' };
+    }
+    const [rows] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [numId]);
+    if (rows.length === 0) {
+      return { provided: true, error: 'Selected category was not found.' };
+    }
+    return { provided: true, category: String(rows[0].name), category_id: Number(rows[0].id), error: null };
+  }
+
+  if (hasCatName) {
+    const raw = String(body.category !== undefined ? body.category : (body.category_name !== undefined ? body.category_name : body.category_slug)).trim();
+    if (!raw) {
+      return { provided: true, category: 'General', category_id: null, error: null };
+    }
+    if (/^\d+$/.test(raw)) {
+      const [rows] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [parseInt(raw, 10)]);
+      if (rows.length > 0) {
+        return { provided: true, category: String(rows[0].name), category_id: Number(rows[0].id), error: null };
+      }
+    }
+    const [matched] = await p.query('SELECT * FROM categories WHERE LOWER(name) = LOWER(?) OR LOWER(slug) = LOWER(?) LIMIT 1', [raw, raw]);
+    if (matched.length > 0) {
+      return { provided: true, category: String(matched[0].name), category_id: Number(matched[0].id), error: null };
+    }
+    return { provided: true, category: raw, category_id: null, error: null };
+  }
+
+  if (isCreate) {
+    return { provided: true, category: 'General', category_id: null, error: null };
+  }
+  return { provided: false, category: null, category_id: null, error: null };
+}
+
 let fallbackProducts = [
   { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, images: [], is_active: true },
   { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, images: [], is_active: true },
@@ -2771,6 +2939,470 @@ let fallbackProducts = [
   { id: 8, seller_id: 2, seller_name: 'Verified Seller 2', name: 'Ergonomic Vertical Mouse Pro', description: 'Rechargeable wireless ergonomic mouse with adjustable DPI and silent clicks.', price: '1499.00', seller_price: '1499.00', mrp: '2299.00', discount_percent: 35, sku: 'SKU-0008', category: 'Computers', brand: 'ErgoTech', rating: 4.3, ratings_count: 65, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 30, images: [], is_active: true }
 ];
 
+// ==========================================
+// 3A. Product Categories CRUD & Assignment
+// ==========================================
+
+app.get(['/api/categories', '/api/product-categories', '/api/products/categories', '/api/seller/categories'], async (req, res) => {
+  const includeInactive = ['1', 'true', 'yes'].includes(String(req.query.include_inactive || req.query.all || '').toLowerCase());
+  const search = String(req.query.search || req.query.q || '').trim();
+
+  try {
+    await ensureProductCategoriesTable(pool);
+    let where = 'WHERE 1=1';
+    const params = [];
+    if (!includeInactive) {
+      where += ' AND c.is_active = 1';
+    }
+    if (search) {
+      where += ' AND (c.name LIKE ? OR c.description LIKE ? OR c.slug LIKE ?)';
+      const s = `%${search}%`;
+      params.push(s, s, s);
+    }
+
+    const [rows] = await pool.query(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+       FROM categories c
+       ${where}
+       ORDER BY c.sort_order ASC, c.id ASC`,
+      params
+    );
+
+    const formatted = rows.map(r => formatCategoryRecord(r));
+    res.json({
+      success: true,
+      status: true,
+      data: formatted,
+      categories: formatted,
+      total: formatted.length
+    });
+  } catch (err) {
+    const searchLower = search.toLowerCase();
+    const list = fallbackCategories.filter(c => {
+      if (!includeInactive && !c.is_active) return false;
+      if (searchLower && !c.name.toLowerCase().includes(searchLower) && !String(c.description || '').toLowerCase().includes(searchLower)) return false;
+      return true;
+    }).map(c => formatCategoryRecord(c, fallbackProducts.filter(p => String(p.category || '').toLowerCase() === c.name.toLowerCase() || Number(p.category_id) === c.id).length));
+    res.json({
+      success: true,
+      status: true,
+      data: list,
+      categories: list,
+      total: list.length
+    });
+  }
+});
+
+app.get('/api/admin/categories', authenticateToken, requireAdminRole, async (req, res) => {
+  const includeInactive = req.query.include_inactive === undefined ? true : ['1', 'true', 'yes'].includes(String(req.query.include_inactive).toLowerCase());
+  try {
+    await ensureProductCategoriesTable(pool);
+    const where = includeInactive ? '' : 'WHERE c.is_active = 1';
+    const [rows] = await pool.query(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+       FROM categories c
+       ${where}
+       ORDER BY c.sort_order ASC, c.id ASC`
+    );
+    const formatted = rows.map(r => formatCategoryRecord(r));
+    res.json({ success: true, status: true, data: formatted, categories: formatted, total: formatted.length });
+  } catch (err) {
+    const formatted = fallbackCategories.map(c => formatCategoryRecord(c));
+    res.json({ success: true, status: true, data: formatted, categories: formatted, total: formatted.length });
+  }
+});
+
+app.get(['/api/categories/:id/products', '/api/product-categories/:id/products', '/api/products/categories/:id/products'], async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
+  const offset = (page - 1) * limit;
+  const search = String(req.query.search || req.query.q || '').trim();
+
+  try {
+    await ensureProductPriceColumns(pool);
+    const cat = await findCategoryByIdOrSlug(pool, req.params.id);
+    if (!cat) return res.status(404).json({ message: 'Category not found.' });
+
+    let where = 'WHERE p.is_active = 1 AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+    const params = [cat.id, cat.name];
+    if (search) {
+      where += ' AND (p.name LIKE ? OR p.description LIKE ?)';
+      const s = `%${search}%`;
+      params.push(s, s);
+    }
+
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
+    const [rows] = await pool.query(
+      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       ${where}
+       ORDER BY p.id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: false, req }));
+    const catFormatted = formatCategoryRecord(cat, total);
+    res.json({
+      success: true,
+      status: true,
+      category: catFormatted,
+      data: formatted,
+      total,
+      current_page: page,
+      per_page: limit,
+      last_page: Math.ceil(total / limit) || 1,
+      pagination: { current_page: page, per_page: limit, total, last_page: Math.ceil(total / limit) || 1 }
+    });
+  } catch (err) {
+    const foundCat = fallbackCategories.find(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase() || c.name.toLowerCase() === String(req.params.id).toLowerCase());
+    if (!foundCat) return res.status(404).json({ message: 'Category not found.' });
+    const searchLower = search.toLowerCase();
+    const matched = fallbackProducts.filter(p => {
+      const catMatch = Number(p.category_id) === Number(foundCat.id) || String(p.category || '').toLowerCase() === foundCat.name.toLowerCase();
+      if (!catMatch) return false;
+      if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
+      return true;
+    }).map(p => formatProductRecord(p, { isSellerView: false, req }));
+    res.json({
+      success: true,
+      status: true,
+      category: formatCategoryRecord(foundCat, matched.length),
+      data: matched,
+      total: matched.length,
+      current_page: 1,
+      per_page: limit,
+      last_page: 1,
+      pagination: { current_page: 1, per_page: limit, total: matched.length, last_page: 1 }
+    });
+  }
+});
+
+app.get(['/api/categories/:id', '/api/product-categories/:id', '/api/products/categories/:id'], async (req, res) => {
+  try {
+    await ensureProductCategoriesTable(pool);
+    const cat = await findCategoryByIdOrSlug(pool, req.params.id);
+    if (!cat) return res.status(404).json({ message: 'Category not found.' });
+    const [[{ cnt }]] = await pool.query(
+      'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
+      [cat.id, cat.name]
+    );
+    const formatted = formatCategoryRecord(cat, cnt);
+    res.json({ success: true, status: true, data: formatted, category: formatted });
+  } catch (err) {
+    const found = fallbackCategories.find(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase());
+    if (!found) return res.status(404).json({ message: 'Category not found.' });
+    const formatted = formatCategoryRecord(found);
+    res.json({ success: true, status: true, data: formatted, category: formatted });
+  }
+});
+
+async function handleCreateCategoryRequest(req, res) {
+  const body = req.body || {};
+  const name = String(body.name !== undefined ? body.name : (body.category_name || '')).trim();
+  if (!name) {
+    return res.status(422).json({
+      message: 'Validation error occurred.',
+      errors: { name: ['The category name field is required.'] }
+    });
+  }
+  if (name.length > 100) {
+    return res.status(422).json({
+      message: 'Validation error occurred.',
+      errors: { name: ['The category name may not exceed 100 characters.'] }
+    });
+  }
+
+  try {
+    await ensureProductCategoriesTable(pool);
+    const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [name]);
+    if (dup.length > 0) {
+      return res.status(422).json({
+        message: 'A category with this name already exists.',
+        errors: { name: ['A category with this name already exists.'] }
+      });
+    }
+
+    const baseSlug = body.slug ? toCategorySlug(body.slug) : toCategorySlug(name);
+    const slug = await ensureUniqueCategorySlug(pool, baseSlug);
+    const description = body.description !== undefined && String(body.description).trim() !== '' ? String(body.description).trim() : null;
+    const icon = body.icon !== undefined && String(body.icon).trim() !== '' ? String(body.icon).trim() : null;
+    const imageUrl = body.image_url !== undefined && String(body.image_url).trim() !== '' ? String(body.image_url).trim() : null;
+    let sortOrder = 0;
+    if (body.sort_order !== undefined && !isNaN(parseInt(body.sort_order, 10))) {
+      sortOrder = parseInt(body.sort_order, 10);
+    } else {
+      const [[{ maxSort }]] = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
+      sortOrder = Number(maxSort || 0) + 1;
+    }
+    const isActive = body.is_active === undefined ? 1 : (['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase()) ? 0 : 1);
+
+    const [ins] = await pool.query(
+      `INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [name, slug, description, icon, imageUrl, sortOrder, isActive]
+    );
+    const cat = await findCategoryByIdOrSlug(pool, String(ins.insertId));
+    const formatted = formatCategoryRecord(cat, 0);
+    res.status(201).json({
+      success: true,
+      status: true,
+      message: 'Category created.',
+      data: formatted,
+      category: formatted
+    });
+  } catch (err) {
+    const newId = fallbackCategories.length ? Math.max(...fallbackCategories.map(c => c.id)) + 1 : 6;
+    const created = formatCategoryRecord({
+      id: newId,
+      name,
+      slug: toCategorySlug(name),
+      description: body.description || null,
+      icon: body.icon || '🏷️',
+      image_url: body.image_url || null,
+      sort_order: fallbackCategories.length + 1,
+      is_active: true
+    }, 0);
+    fallbackCategories.push(created);
+    res.status(201).json({ success: true, status: true, message: 'Category created.', data: created, category: created });
+  }
+}
+
+async function handleUpdateCategoryRequest(req, res) {
+  const body = req.body || {};
+  try {
+    await ensureProductCategoriesTable(pool);
+    const existing = await findCategoryByIdOrSlug(pool, req.params.id);
+    if (!existing) return res.status(404).json({ message: 'Category not found.' });
+
+    const catId = Number(existing.id);
+    const oldName = String(existing.name);
+    const updates = [];
+    const params = [];
+    let newName = oldName;
+    let nameChanged = false;
+
+    const incomingName = body.name !== undefined ? body.name : body.category_name;
+    if (incomingName !== undefined) {
+      const trimmed = String(incomingName).trim();
+      if (!trimmed) {
+        return res.status(422).json({ message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } });
+      }
+      if (trimmed.length > 100) {
+        return res.status(422).json({ message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } });
+      }
+      const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [trimmed, catId]);
+      if (dup.length > 0) {
+        return res.status(422).json({ message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } });
+      }
+      updates.push('name = ?');
+      params.push(trimmed);
+      newName = trimmed;
+      nameChanged = (oldName !== newName);
+    }
+
+    if (body.slug !== undefined && String(body.slug).trim() !== '') {
+      const slug = await ensureUniqueCategorySlug(pool, toCategorySlug(body.slug), catId);
+      updates.push('slug = ?');
+      params.push(slug);
+    } else if (nameChanged) {
+      const slug = await ensureUniqueCategorySlug(pool, toCategorySlug(newName), catId);
+      updates.push('slug = ?');
+      params.push(slug);
+    }
+
+    if (body.description !== undefined) {
+      const d = String(body.description || '').trim();
+      updates.push('description = ?');
+      params.push(d || null);
+    }
+    if (body.icon !== undefined) {
+      const ic = String(body.icon || '').trim();
+      updates.push('icon = ?');
+      params.push(ic || null);
+    }
+    if (body.image_url !== undefined) {
+      const im = String(body.image_url || '').trim();
+      updates.push('image_url = ?');
+      params.push(im || null);
+    }
+    if (body.sort_order !== undefined && !isNaN(parseInt(body.sort_order, 10))) {
+      updates.push('sort_order = ?');
+      params.push(parseInt(body.sort_order, 10));
+    }
+    if (body.is_active !== undefined) {
+      const activeBit = ['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase()) ? 0 : 1;
+      updates.push('is_active = ?');
+      params.push(activeBit);
+    }
+
+    if (updates.length > 0) {
+      updates.push('updated_at = NOW()');
+      params.push(catId);
+      await pool.query(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`, params);
+    }
+
+    let updatedProductsCount = 0;
+    if (nameChanged) {
+      try {
+        const [syncRes] = await pool.query(
+          'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
+          [newName, catId, catId, oldName]
+        );
+        updatedProductsCount = Number(syncRes.affectedRows || 0);
+      } catch (e) {}
+    }
+
+    const fresh = await findCategoryByIdOrSlug(pool, String(catId));
+    const [[{ cnt }]] = await pool.query(
+      'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
+      [catId, fresh.name]
+    );
+    const formatted = formatCategoryRecord(fresh, cnt);
+    res.json({
+      success: true,
+      status: true,
+      message: 'Category updated.',
+      updated_products_count: updatedProductsCount,
+      data: formatted,
+      category: formatted
+    });
+  } catch (err) {
+    const idx = fallbackCategories.findIndex(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase());
+    if (idx === -1) return res.status(404).json({ message: 'Category not found.' });
+    const oldName = fallbackCategories[idx].name;
+    if (body.name) {
+      fallbackCategories[idx].name = String(body.name).trim();
+      fallbackCategories[idx].slug = toCategorySlug(fallbackCategories[idx].name);
+      for (const p of fallbackProducts) {
+        if (String(p.category || '').toLowerCase() === oldName.toLowerCase() || Number(p.category_id) === fallbackCategories[idx].id) {
+          p.category = fallbackCategories[idx].name;
+          p.category_id = fallbackCategories[idx].id;
+        }
+      }
+    }
+    if (body.description !== undefined) fallbackCategories[idx].description = body.description;
+    if (body.icon !== undefined) fallbackCategories[idx].icon = body.icon;
+    if (body.is_active !== undefined) fallbackCategories[idx].is_active = !['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase());
+    const formatted = formatCategoryRecord(fallbackCategories[idx]);
+    res.json({ success: true, status: true, message: 'Category updated.', data: formatted, category: formatted });
+  }
+}
+
+async function handleDeleteCategoryRequest(req, res) {
+  try {
+    await ensureProductCategoriesTable(pool);
+    const existing = await findCategoryByIdOrSlug(pool, req.params.id);
+    if (!existing) return res.status(404).json({ message: 'Category not found.' });
+    const catId = Number(existing.id);
+
+    try {
+      await pool.query(
+        "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
+        [catId, existing.name]
+      );
+    } catch (e) {}
+
+    await pool.query('DELETE FROM categories WHERE id = ?', [catId]);
+    res.json({ success: true, status: true, message: 'Category deleted.' });
+  } catch (err) {
+    const before = fallbackCategories.length;
+    fallbackCategories = fallbackCategories.filter(c => String(c.id) !== String(req.params.id));
+    if (fallbackCategories.length === before) return res.status(404).json({ message: 'Category not found.' });
+    res.json({ success: true, status: true, message: 'Category deleted.' });
+  }
+}
+
+app.post(['/api/categories', '/api/product-categories', '/api/products/categories'], authenticateToken, handleCreateCategoryRequest);
+app.post('/api/admin/categories', authenticateToken, requireAdminRole, handleCreateCategoryRequest);
+
+app.all([
+  '/api/categories/:id',
+  '/api/categories/:id/update',
+  '/api/product-categories/:id',
+  '/api/product-categories/:id/update',
+  '/api/products/categories/:id',
+  '/api/products/categories/:id/update'
+], authenticateToken, (req, res, next) => {
+  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
+  return handleUpdateCategoryRequest(req, res);
+});
+
+app.all(['/api/admin/categories/:id', '/api/admin/categories/:id/update'], authenticateToken, requireAdminRole, (req, res, next) => {
+  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
+  return handleUpdateCategoryRequest(req, res);
+});
+
+app.delete(['/api/categories/:id', '/api/product-categories/:id', '/api/products/categories/:id'], authenticateToken, handleDeleteCategoryRequest);
+app.delete('/api/admin/categories/:id', authenticateToken, requireAdminRole, handleDeleteCategoryRequest);
+
+app.all([
+  '/api/products/:id/category',
+  '/api/product/:id/category',
+  '/api/seller/products/:id/category',
+  '/api/seller/product/:id/category'
+], authenticateToken, async (req, res, next) => {
+  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
+  try {
+    await ensureProductPriceColumns(pool);
+    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
+    if (req.user.role !== 'admin' && Number(rows[0].seller_id) !== Number(req.user.id)) {
+      return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+    }
+    const catRes = await resolveProductCategoryInput(pool, req.body || {}, false);
+    if (!catRes.provided) {
+      return res.status(422).json({ message: 'Please provide category or category_id.', errors: { category: ['Please provide category or category_id.'] } });
+    }
+    if (catRes.error) {
+      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+    }
+    await pool.query('UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE id = ?', [catRes.category, catRes.category_id, req.params.id]);
+    const [updated] = await pool.query(
+      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.id = ?`,
+      [req.params.id]
+    );
+    const product = formatProductRecord(updated[0], { isSellerView: true, req });
+    res.json({ success: true, status: true, message: 'Product category updated.', product, data: product });
+  } catch (err) {
+    const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
+    if (idx === -1) return res.status(404).json({ message: 'Product not found.' });
+    if (req.user.role !== 'admin' && Number(fallbackProducts[idx].seller_id) !== Number(req.user.id)) {
+      return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+    }
+    const body = req.body || {};
+    if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '') {
+      const matched = fallbackCategories.find(c => String(c.id) === String(body.category_id).trim());
+      if (!matched) {
+        return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+      }
+      fallbackProducts[idx].category_id = matched.id;
+      fallbackProducts[idx].category = matched.name;
+    } else if (body.category !== undefined || body.category_name !== undefined || body.category_slug !== undefined) {
+      const raw = String(body.category ?? body.category_name ?? body.category_slug ?? '').trim();
+      const matched = fallbackCategories.find(c => String(c.id) === raw || c.name.toLowerCase() === raw.toLowerCase() || c.slug.toLowerCase() === raw.toLowerCase());
+      fallbackProducts[idx].category = matched ? matched.name : (raw || 'General');
+      fallbackProducts[idx].category_id = matched ? matched.id : null;
+    } else {
+      return res.status(422).json({ message: 'Please provide category or category_id.', errors: { category: ['Please provide category or category_id.'] } });
+    }
+    const product = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
+    res.json({ success: true, status: true, message: 'Product category updated.', product, data: product });
+  }
+});
+
 app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
@@ -2778,6 +3410,7 @@ app.get('/api/products', async (req, res) => {
   const sellerId = req.query.seller_id ? parseInt(req.query.seller_id, 10) : null;
   const search = (req.query.search || req.query.q || '').toString().trim();
   const category = (req.query.category || '').toString().trim();
+  const categoryIdParam = (req.query.category_id || '').toString().trim();
 
   try {
     await ensureProductPriceColumns(pool);
@@ -2793,14 +3426,29 @@ app.get('/api/products', async (req, res) => {
       const s = `%${search}%`;
       whereParams.push(s, s, s);
     }
-    if (category) {
-      whereSql += ' AND p.category = ?';
-      whereParams.push(category);
+    if (categoryIdParam && /^\d+$/.test(categoryIdParam)) {
+      const catRow = await findCategoryByIdOrSlug(pool, categoryIdParam);
+      if (catRow) {
+        whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+        whereParams.push(Number(catRow.id), catRow.name);
+      } else {
+        whereSql += ' AND p.category_id = ?';
+        whereParams.push(parseInt(categoryIdParam, 10));
+      }
+    } else if (category) {
+      const catRow = await findCategoryByIdOrSlug(pool, category);
+      if (catRow) {
+        whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+        whereParams.push(Number(catRow.id), catRow.name);
+      } else {
+        whereSql += ' AND LOWER(p.category) = LOWER(?)';
+        whereParams.push(category);
+      }
     }
 
     const countSql = `SELECT COUNT(*) as total FROM products p ${whereSql}`;
     const querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
@@ -2831,9 +3479,20 @@ app.get('/api/products', async (req, res) => {
     });
   } catch (err) {
     const searchLower = search.toLowerCase();
+    const matchedCatObj = categoryIdParam
+      ? fallbackCategories.find(c => String(c.id) === categoryIdParam)
+      : (category ? fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase() || String(c.id) === category) : null);
     const filtered = fallbackProducts.filter(p => {
       if (sellerId && p.seller_id !== sellerId) return false;
-      if (category && String(p.category || '').toLowerCase() !== category.toLowerCase()) return false;
+      if (categoryIdParam) {
+        const matchesId = Number(p.category_id) === Number(categoryIdParam);
+        const matchesName = matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase();
+        if (!matchesId && !matchesName) return false;
+      } else if (category) {
+        const matchesDirect = String(p.category || '').toLowerCase() === category.toLowerCase();
+        const matchesObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
+        if (!matchesDirect && !matchesObj) return false;
+      }
       if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
       return true;
     }).map(p => formatProductRecord(p, { isSellerView: false, req }));
@@ -2866,7 +3525,7 @@ app.get([
     await ensureProductPriceColumns(pool);
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
@@ -3404,7 +4063,8 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
 
   const pricing = resolveProductPricing(body);
   const sku = (body.sku || '').toString().trim() || null;
-  const category = (body.category || '').toString().trim() || 'General';
+  let category = (body.category || '').toString().trim() || 'General';
+  let categoryId = null;
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
 
@@ -3438,10 +4098,16 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
 
   try {
     await ensureProductPriceColumns(pool);
+    const catRes = await resolveProductCategoryInput(pool, body, true);
+    if (catRes.error) {
+      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+    }
+    category = catRes.category;
+    categoryId = catRes.category_id;
     const [result] = await pool.query(
-      `INSERT INTO products (seller_id, name, description, sku, category, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-      [req.user.id, name, description, sku, category, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson]
+      `INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
+      [req.user.id, name, description, sku, category, categoryId, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson]
     );
 
     // Sync permanent records in product_images table in MySQL
@@ -3459,7 +4125,7 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
@@ -3477,6 +4143,12 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       data: product
     });
   } catch (err) {
+    const fbCatMatch = (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '')
+      ? fallbackCategories.find(c => String(c.id) === String(body.category_id).trim())
+      : fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase());
+    if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '' && !fbCatMatch) {
+      return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+    }
     const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => p.id)) + 1 : 9;
     const newProduct = formatProductRecord({
       id: newId,
@@ -3485,7 +4157,8 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       name,
       description,
       sku,
-      category,
+      category: fbCatMatch ? fbCatMatch.name : category,
+      category_id: fbCatMatch ? fbCatMatch.id : categoryId,
       brand,
       mrp,
       seller_price: pricing.seller_price,
@@ -3532,10 +4205,32 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       params.push(s, s);
     }
 
+    const sCat = String(req.query.category || '').trim();
+    const sCatId = String(req.query.category_id || '').trim();
+    if (sCatId && /^\d+$/.test(sCatId)) {
+      const catRow = await findCategoryByIdOrSlug(pool, sCatId);
+      if (catRow) {
+        where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+        params.push(Number(catRow.id), catRow.name);
+      } else {
+        where += ' AND p.category_id = ?';
+        params.push(parseInt(sCatId, 10));
+      }
+    } else if (sCat) {
+      const catRow = await findCategoryByIdOrSlug(pool, sCat);
+      if (catRow) {
+        where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+        params.push(Number(catRow.id), catRow.name);
+      } else {
+        where += ' AND LOWER(p.category) = LOWER(?)';
+        params.push(sCat);
+      }
+    }
+
     const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
     const [rows] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
@@ -3566,7 +4261,22 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       }
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => p.seller_id === targetSellerId).map(p => formatProductRecord(p, { isSellerView: true, req }));
+    const sCat = String(req.query.category || '').trim();
+    const sCatId = String(req.query.category_id || '').trim();
+    const matchedCatObj = sCatId
+      ? fallbackCategories.find(c => String(c.id) === sCatId)
+      : (sCat ? fallbackCategories.find(c => c.name.toLowerCase() === sCat.toLowerCase() || c.slug.toLowerCase() === sCat.toLowerCase() || String(c.id) === sCat) : null);
+    const filtered = fallbackProducts.filter(p => {
+      if (p.seller_id !== targetSellerId) return false;
+      if (sCatId) {
+        if (Number(p.category_id) !== Number(sCatId) && !(matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase())) return false;
+      } else if (sCat) {
+        const direct = String(p.category || '').toLowerCase() === sCat.toLowerCase();
+        const byObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
+        if (!direct && !byObj) return false;
+      }
+      return true;
+    }).map(p => formatProductRecord(p, { isSellerView: true, req }));
     res.json({
       success: true,
       status: true,
@@ -3586,7 +4296,13 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
   }
 });
 
-app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, upload.any(), async (req, res, next) => {
+app.all([
+  '/api/products/:id',
+  '/api/product/:id',
+  '/api/products/update/:id',
+  '/api/seller/products/:id',
+  '/api/seller/product/:id'
+], authenticateToken, upload.any(), async (req, res, next) => {
   if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
   let existing = [];
   try {
@@ -3641,10 +4357,6 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
   if (body.sku !== undefined) {
     updates.push('sku = ?');
     params.push(body.sku.toString().trim());
-  }
-  if (body.category !== undefined) {
-    updates.push('category = ?');
-    params.push(body.category.toString().trim());
   }
   if (body.brand !== undefined) {
     updates.push('brand = ?');
@@ -3719,6 +4431,15 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
   }
 
   try {
+    const catRes = await resolveProductCategoryInput(pool, body, false);
+    if (catRes.error) {
+      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+    }
+    if (catRes.provided) {
+      updates.push('category = ?', 'category_id = ?');
+      params.push(catRes.category, catRes.category_id);
+    }
+
     if (updates.length > 0) {
       updates.push('updated_at = NOW()');
       params.push(req.params.id);
@@ -3733,7 +4454,7 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
 
     const [updated] = await pool.query(
       `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
@@ -3766,7 +4487,19 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
         fallbackProducts[idx].mrp = parseFloat(body.mrp).toFixed(2);
       }
       if (body.sku !== undefined) fallbackProducts[idx].sku = body.sku.toString().trim();
-      if (body.category !== undefined) fallbackProducts[idx].category = body.category.toString().trim();
+      if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '') {
+        const matchedCat = fallbackCategories.find(c => String(c.id) === String(body.category_id).trim());
+        if (!matchedCat) {
+          return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+        }
+        fallbackProducts[idx].category_id = matchedCat.id;
+        fallbackProducts[idx].category = matchedCat.name;
+      } else if (body.category !== undefined) {
+        const rawC = body.category.toString().trim();
+        const matchedCat = fallbackCategories.find(c => String(c.id) === rawC || c.name.toLowerCase() === rawC.toLowerCase() || c.slug.toLowerCase() === rawC.toLowerCase());
+        fallbackProducts[idx].category = matchedCat ? matchedCat.name : (rawC || 'General');
+        fallbackProducts[idx].category_id = matchedCat ? matchedCat.id : null;
+      }
       if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
       if (imgResult.hasImages && imgResult.images.length > 0) {
@@ -6607,6 +7340,9 @@ DB_PASSWORD=Xtragclub_vendor2026</pre>
 
 app.post('/admin', async (req, res) => {
   await ensureGstTables(pool);
+  await ensureProductCategoriesTable(pool);
+  let feedbackMsg = null;
+  let feedbackErr = null;
   try {
     const body = req.body || {};
     const action = body.action;
@@ -6631,6 +7367,7 @@ app.post('/admin', async (req, res) => {
           performed_by: 1,
           performer_role: 'admin'
         });
+        feedbackMsg = `Seller #${sellerId} document verification approved.`;
       }
     } else if (action === 'reject_gst') {
       const sellerId = parseInt(body.seller_id, 10);
@@ -6653,7 +7390,100 @@ app.post('/admin', async (req, res) => {
             performed_by: 1,
             performer_role: 'admin'
           });
+          feedbackMsg = `Seller #${sellerId} verification rejected.`;
         }
+      }
+    } else if (action === 'add_category') {
+      const catName = String(body.name || '').trim();
+      const catDesc = String(body.description || '').trim();
+      const catIcon = String(body.icon || '').trim() || '🏷️';
+      const catActive = (body.is_active === undefined || body.is_active === '1' || body.is_active === 'on' || body.is_active === true) ? 1 : 0;
+      if (!catName) {
+        feedbackErr = 'Category name is required.';
+      } else {
+        const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [catName]);
+        if (dup.length > 0) {
+          feedbackErr = `Category "${catName}" already exists.`;
+        } else {
+          let sortOrder = parseInt(body.sort_order, 10);
+          if (isNaN(sortOrder)) {
+            const [[{ maxSort }]] = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
+            sortOrder = Number(maxSort || 0) + 1;
+          }
+          const slug = await ensureUniqueCategorySlug(pool, toCategorySlug(catName));
+          await pool.query(
+            'INSERT INTO categories (name, slug, description, icon, sort_order, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())',
+            [catName, slug, catDesc || null, catIcon, sortOrder, catActive]
+          );
+          feedbackMsg = `Category "${catName}" added successfully.`;
+        }
+      }
+    } else if (action === 'edit_category') {
+      const catId = parseInt(body.category_id, 10);
+      const catName = String(body.name || '').trim();
+      const catDesc = String(body.description || '').trim();
+      const catIcon = String(body.icon || '').trim();
+      const catSort = isNaN(parseInt(body.sort_order, 10)) ? 0 : parseInt(body.sort_order, 10);
+      const catActive = (body.is_active === '1' || body.is_active === 'on' || body.is_active === true) ? 1 : 0;
+      if (!catId || !catName) {
+        feedbackErr = 'Category ID and name are required.';
+      } else {
+        const [existingRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [catId]);
+        if (existingRows.length === 0) {
+          feedbackErr = `Category #${catId} not found.`;
+        } else {
+          const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [catName, catId]);
+          if (dup.length > 0) {
+            feedbackErr = `Another category named "${catName}" already exists.`;
+          } else {
+            const oldName = String(existingRows[0].name || '');
+            const newSlug = oldName !== catName
+              ? await ensureUniqueCategorySlug(pool, toCategorySlug(catName), catId)
+              : existingRows[0].slug;
+            await pool.query(
+              'UPDATE categories SET name = ?, slug = ?, description = ?, icon = ?, sort_order = ?, is_active = ?, updated_at = NOW() WHERE id = ?',
+              [catName, newSlug, catDesc || null, catIcon || null, catSort, catActive, catId]
+            );
+            if (oldName !== catName) {
+              await pool.query(
+                'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
+                [catName, catId, catId, oldName]
+              );
+            }
+            feedbackMsg = `Category #${catId} updated to "${catName}".`;
+          }
+        }
+      }
+    } else if (action === 'delete_category') {
+      const catId = parseInt(body.category_id, 10);
+      const [existingRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [catId]);
+      if (existingRows.length > 0) {
+        const oldName = existingRows[0].name;
+        await pool.query(
+          "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
+          [catId, oldName]
+        );
+        await pool.query('DELETE FROM categories WHERE id = ?', [catId]);
+        feedbackMsg = `Category "${oldName}" deleted.`;
+      } else {
+        feedbackErr = `Category #${catId} not found.`;
+      }
+    } else if (action === 'update_product_category') {
+      const prodId = parseInt(body.product_id, 10);
+      const targetCatId = parseInt(body.category_id, 10);
+      if (prodId > 0 && targetCatId > 0) {
+        const [catRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [targetCatId]);
+        if (catRows.length > 0) {
+          await pool.query(
+            'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE id = ?',
+            [catRows[0].name, Number(catRows[0].id), prodId]
+          );
+          feedbackMsg = `Product #${prodId} category changed to "${catRows[0].name}".`;
+        } else {
+          feedbackErr = 'Selected category not found.';
+        }
+      } else {
+        feedbackErr = 'Please select a valid product and category.';
       }
     } else if (action === 'create_seller') {
       const name = (body.seller_name || '').trim();
@@ -6677,6 +7507,7 @@ app.post('/admin', async (req, res) => {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
           [name, email, name, phone, address, landmark, state, country, hashedPassword]
         );
+        feedbackMsg = `Seller "${name}" created.`;
       }
     } else if (action === 'edit_seller') {
       const sellerId = parseInt(body.seller_id, 10);
@@ -6712,10 +7543,18 @@ app.post('/admin', async (req, res) => {
         updates.push('updated_at = NOW()');
         params.push(sellerId);
         await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+        feedbackMsg = `Seller #${sellerId} updated.`;
       }
     }
   } catch (err) {
     console.error('Admin POST action error:', err);
+    feedbackErr = err.message || 'Action failed.';
+  }
+  if (feedbackErr) {
+    return res.redirect('/admin?err=' + encodeURIComponent(feedbackErr));
+  }
+  if (feedbackMsg) {
+    return res.redirect('/admin?msg=' + encodeURIComponent(feedbackMsg));
   }
   res.redirect('/admin');
 });
@@ -6958,6 +7797,8 @@ app.get('/admin/get_gst_details', async (req, res) => {
 // GET /admin - Upgraded Admin Dashboard tailored to project
 app.get('/admin', async (req, res) => {
   await ensureGstTables(pool);
+  await ensureProductPriceColumns(pool);
+  await ensureProductCategoriesTable(pool);
   try {
     const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
 
@@ -6965,6 +7806,33 @@ app.get('/admin', async (req, res) => {
     try {
       const [[p]] = await pool.query('SELECT COUNT(*) as cnt FROM products WHERE is_active = 1');
       productCount = p.cnt;
+    } catch (e) {}
+
+    let categoryCount = 0;
+    let categoriesList = [];
+    try {
+      const [[cCnt]] = await pool.query('SELECT COUNT(*) as cnt FROM categories WHERE is_active = 1');
+      categoryCount = Number(cCnt.cnt || 0);
+      const [cRows] = await pool.query(`
+        SELECT c.*,
+               (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+        FROM categories c
+        ORDER BY c.sort_order ASC, c.id ASC
+      `);
+      categoriesList = cRows;
+    } catch (e) {}
+
+    let adminProducts = [];
+    try {
+      const [pRows] = await pool.query(`
+        SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
+               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        ORDER BY p.id DESC
+        LIMIT 80
+      `);
+      adminProducts = pRows;
     } catch (e) {}
 
     let orderCount = 0;
@@ -7065,6 +7933,8 @@ app.get('/admin', async (req, res) => {
     const approvedGstCount = Number(metrics.approved_gst || 0);
     const rejectedGstCount = Number(metrics.rejected_gst || 0);
     const totalGstCount = Number(metrics.total_gst || 0);
+    const flashMsg = req.query.msg ? String(req.query.msg) : '';
+    const flashErr = req.query.err ? String(req.query.err) : '';
 
     res.send(`
     <!doctype html>
@@ -7137,7 +8007,10 @@ app.get('/admin', async (req, res) => {
 
       <main class="wrap">
         <h1>Dashboard</h1>
-        <p class="muted">Manage your marketplace sellers, PDF document verifications, and compliance.</p>
+        <p class="muted">Manage your marketplace sellers, product categories, PDF document verifications, and compliance.</p>
+
+        ${flashMsg ? `<div style="background:#ecfdf5; color:#047857; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashMsg)}</div>` : ''}
+        ${flashErr ? `<div style="background:#fef2f2; color:#b91c1c; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashErr)}</div>` : ''}
 
         <!-- KPI Metrics Grid -->
         <div class="grid" style="margin-bottom: 24px;">
@@ -7148,6 +8021,10 @@ app.get('/admin', async (req, res) => {
           <section class="card">
             <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
             <div class="stat" style="color:#2563eb;">${productCount}</div>
+          </section>
+          <section class="card">
+            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
+            <div class="stat" style="color:#7c3aed;">${categoryCount}</div>
           </section>
           <section class="card">
             <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
@@ -7348,7 +8225,154 @@ app.get('/admin', async (req, res) => {
           </table>
         </section>
 
-        <!-- Section 3: Create Seller Account -->
+        <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
+        <section class="card" id="categoriesSection" style="margin-top:24px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+            <div>
+              <h2>Product Categories (Editable)</h2>
+              <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+            </div>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Category Name</th>
+                <th>Slug</th>
+                <th>Description</th>
+                <th>Products</th>
+                <th>Order</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${categoriesList.length === 0 ? `
+                <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
+              ` : categoriesList.map(cat => `
+                <tr>
+                  <td>#${cat.id}</td>
+                  <td>
+                    <span style="font-size:16px; margin-right:4px;">${escapeHtml(cat.icon || '🏷️')}</span>
+                    <strong>${escapeHtml(cat.name)}</strong>
+                  </td>
+                  <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:12px;">${escapeHtml(cat.slug)}</code></td>
+                  <td style="color:#64748b; font-size:13px; max-width:260px;">${escapeHtml(cat.description || '—')}</td>
+                  <td><span class="badge-prod">${Number(cat.products_count || 0)} items</span></td>
+                  <td>${Number(cat.sort_order || 0)}</td>
+                  <td>
+                    ${Number(cat.is_active) ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
+                  </td>
+                  <td>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                      <button type="button" class="btn-sm" data-cat="${escapeHtml(JSON.stringify(cat))}" onclick="openCategoryModal(this)">Edit</button>
+                      <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Delete this category? Linked products will fall back to General.');">
+                        <input type="hidden" name="action" value="delete_category">
+                        <input type="hidden" name="category_id" value="${cat.id}">
+                        <button type="submit" class="btn-reject-sm">Delete</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+
+          <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
+            <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
+            <form method="POST" action="/admin">
+              <input type="hidden" name="action" value="add_category">
+              <div class="grid">
+                <div>
+                  <label>Category Name *</label>
+                  <input name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+                </div>
+                <div>
+                  <label>Icon (Emoji)</label>
+                  <input name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                </div>
+                <div>
+                  <label>Description</label>
+                  <input name="description" maxlength="255" placeholder="Short description">
+                </div>
+                <div>
+                  <label>Sort Order</label>
+                  <input type="number" name="sort_order" value="${categoriesList.length + 1}">
+                </div>
+              </div>
+              <div style="margin-top:10px; display:flex; align-items:center; gap:14px;">
+                <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer;">
+                  <input type="checkbox" name="is_active" value="1" checked style="width:auto;"> Active
+                </label>
+                <button type="submit" style="background:#4f46e5;">+ Add Category</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- Section 4: Products - Edit Category -->
+        <section class="card" id="productCategoriesSection" style="margin-top:24px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+            <div>
+              <h2>Products — Edit Category</h2>
+              <p class="muted">Reassign or update the category of any product directly.</p>
+            </div>
+            <div class="search-box">
+              <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search product or category...">
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Product</th>
+                <th>Seller</th>
+                <th>Price</th>
+                <th>Current Category</th>
+                <th>Change Category</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${adminProducts.length === 0 ? `
+                <tr><td colspan="6" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet.</td></tr>
+              ` : adminProducts.map(ap => {
+                const pSearch = ((ap.name || '') + ' ' + (ap.category || '') + ' ' + (ap.seller_name || '')).toLowerCase();
+                let hasMatch = false;
+                const optionsHtml = categoriesList.map(catOpt => {
+                  const matched = (ap.category_id && Number(ap.category_id) === Number(catOpt.id)) || (String(ap.category || '').toLowerCase() === String(catOpt.name || '').toLowerCase());
+                  if (matched) hasMatch = true;
+                  return `<option value="${catOpt.id}" ${matched ? 'selected' : ''}>${escapeHtml(catOpt.name)}</option>`;
+                }).join('');
+                return `
+                  <tr class="prod-cat-row" data-search="${escapeHtml(pSearch)}">
+                    <td>#${ap.id}</td>
+                    <td>
+                      <strong>${escapeHtml(ap.name)}</strong>
+                      <div style="font-size:11px; color:#64748b;">Stock: ${Number(ap.stock || 0)}</div>
+                    </td>
+                    <td>${escapeHtml(ap.seller_name)}</td>
+                    <td>₹${Number(ap.price || 0).toFixed(2)}</td>
+                    <td><span class="badge-prod">${escapeHtml(ap.category || 'General')}</span></td>
+                    <td>
+                      <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
+                        <input type="hidden" name="action" value="update_product_category">
+                        <input type="hidden" name="product_id" value="${ap.id}">
+                        <select name="category_id" required style="padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                          ${!hasMatch ? '<option value="" disabled selected>-- Select Category --</option>' : ''}
+                          ${optionsHtml}
+                        </select>
+                        <button type="submit" class="btn-sm">Save</button>
+                      </form>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Section 5: Create Seller Account -->
         <section class="card" style="margin-top:24px;">
           <h2>Create New Seller Account</h2>
           <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
@@ -7476,6 +8500,50 @@ app.get('/admin', async (req, res) => {
         </div>
       </div>
 
+      <!-- Edit Category Modal -->
+      <div id="editCategoryModal" class="modal-overlay" onclick="if(event.target.id==='editCategoryModal') closeCategoryModal();">
+        <div class="modal-box">
+          <div class="modal-header">
+            <h3 id="catModalTitle">Edit Category</h3>
+            <button type="button" class="modal-close" onclick="closeCategoryModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <form method="POST" action="/admin">
+              <input type="hidden" name="action" value="edit_category">
+              <input type="hidden" name="category_id" id="editCatId">
+              <div class="grid">
+                <div>
+                  <label>Category Name *</label>
+                  <input name="name" id="editCatName" required maxlength="100">
+                </div>
+                <div>
+                  <label>Icon (Emoji)</label>
+                  <input name="icon" id="editCatIcon" maxlength="20">
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Description</label>
+                  <input name="description" id="editCatDesc" maxlength="255">
+                </div>
+                <div>
+                  <label>Sort Order</label>
+                  <input type="number" name="sort_order" id="editCatSort">
+                </div>
+                <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
+                  <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
+                    <input type="checkbox" name="is_active" id="editCatActive" value="1" style="width:auto;"> Category Active
+                  </label>
+                </div>
+              </div>
+              <br>
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <button type="submit">Save Category Changes</button>
+                <button type="button" onclick="closeCategoryModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
       <!-- Seller Profile & Edit Modal -->
       <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
         <div class="modal-box">
@@ -7545,6 +8613,30 @@ app.get('/admin', async (req, res) => {
       </div>
 
       <script>
+        function openCategoryModal(btnOrObj) {
+          var cat = (btnOrObj && btnOrObj.getAttribute) ? JSON.parse(btnOrObj.getAttribute('data-cat')) : btnOrObj;
+          document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' — ' + (cat.name || '');
+          document.getElementById('editCatId').value = cat.id;
+          document.getElementById('editCatName').value = cat.name || '';
+          document.getElementById('editCatIcon').value = cat.icon || '';
+          document.getElementById('editCatDesc').value = cat.description || '';
+          document.getElementById('editCatSort').value = cat.sort_order !== undefined ? cat.sort_order : 0;
+          document.getElementById('editCatActive').checked = Boolean(Number(cat.is_active));
+          document.getElementById('editCategoryModal').classList.add('active');
+        }
+
+        function closeCategoryModal() {
+          document.getElementById('editCategoryModal').classList.remove('active');
+        }
+
+        function filterAdminProductSearch(query) {
+          var q = (query || '').toLowerCase().trim();
+          document.querySelectorAll('.prod-cat-row').forEach(function(r) {
+            var s = r.getAttribute('data-search') || '';
+            r.style.display = (!q || s.indexOf(q) !== -1) ? '' : 'none';
+          });
+        }
+
         function openSellerModal(seller) {
           document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
           document.getElementById('viewSellerId').innerText = '#' + seller.id;

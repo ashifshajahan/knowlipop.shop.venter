@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS `products` (
   `name` VARCHAR(150) NOT NULL,
   `sku` VARCHAR(100) NULL DEFAULT NULL,
   `category` VARCHAR(100) NULL DEFAULT 'General',
+  `category_id` BIGINT UNSIGNED NULL DEFAULT NULL,
   `brand` VARCHAR(100) NULL DEFAULT NULL,
   `description` TEXT NULL DEFAULT NULL,
   `seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
@@ -65,8 +66,36 @@ CREATE TABLE IF NOT EXISTS `products` (
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   INDEX `idx_products_seller` (`seller_id`),
+  INDEX `idx_products_category` (`category_id`),
   INDEX `idx_products_active` (`is_active`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ======================================================
+-- Product Categories Table (5 Default Editable Categories)
+-- ======================================================
+
+CREATE TABLE IF NOT EXISTS `categories` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `name` VARCHAR(100) NOT NULL,
+  `slug` VARCHAR(120) NOT NULL UNIQUE,
+  `description` VARCHAR(255) NULL DEFAULT NULL,
+  `icon` VARCHAR(60) NULL DEFAULT NULL,
+  `image_url` LONGTEXT NULL DEFAULT NULL,
+  `sort_order` INT NOT NULL DEFAULT 0,
+  `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_categories_active` (`is_active`),
+  INDEX `idx_categories_sort` (`sort_order`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO `categories` (`id`, `name`, `slug`, `description`, `icon`, `sort_order`, `is_active`) VALUES
+(1, 'Electronics', 'electronics', 'Smartphones, headphones, gadgets & tech accessories', '📱', 1, 1),
+(2, 'Fashion', 'fashion', 'Apparel, footwear, bags, sunglasses & style essentials', '👕', 2, 1),
+(3, 'Home & Kitchen', 'home-kitchen', 'Appliances, cookware, home decor & living essentials', '🏠', 3, 1),
+(4, 'Beauty & Personal Care', 'beauty-personal-care', 'Skincare, grooming, wellness & cosmetics', '✨', 4, 1),
+(5, 'Grocery', 'grocery', 'Daily staples, snacks, beverages & household essentials', '🛒', 5, 1);
 
 CREATE TABLE IF NOT EXISTS `password_reset_otps` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

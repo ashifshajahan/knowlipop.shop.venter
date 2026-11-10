@@ -6,6 +6,7 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/categories.php';
 
 function resolveProductPricing(array $input, ?array $existingRow = null): array
 {
@@ -247,6 +248,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
         'description' => $p['description'] ?? null,
         'sku' => $sku,
         'category' => $category,
+        'category_id' => !empty($p['category_id']) ? (int) $p['category_id'] : null,
         'brand' => $brand,
         'stock' => $stock,
         'in_stock' => $stock > 0,
@@ -306,7 +308,9 @@ function ensureProductPriceColumns(PDO $pdo): void
         $addColumnIfNotExists('mrp', '`mrp` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `price`');
         $addColumnIfNotExists('sku', '`sku` VARCHAR(100) NULL AFTER `mrp`');
         $addColumnIfNotExists('category', '`category` VARCHAR(100) NULL AFTER `sku`');
-        $addColumnIfNotExists('brand', '`brand` VARCHAR(100) NULL AFTER `category`');
+        $addColumnIfNotExists('category_id', '`category_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `category`');
+        $addColumnIfNotExists('brand', '`brand` VARCHAR(100) NULL AFTER `category_id`');
+        ensureProductCategoriesTable($pdo);
         $addColumnIfNotExists('rating', '`rating` DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER `brand`');
         $addColumnIfNotExists('ratings_count', '`ratings_count` INT NOT NULL DEFAULT 15 AFTER `rating`');
         $addColumnIfNotExists('images', '`images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`');
@@ -379,6 +383,7 @@ function apiGetProducts(PDO $pdo): void
     $sellerId = !empty($_GET['seller_id']) ? (int) $_GET['seller_id'] : null;
     $search = trim((string) ($_GET['search'] ?? ($_GET['q'] ?? '')));
     $category = trim((string) ($_GET['category'] ?? ''));
+    $categoryIdParam = trim((string) ($_GET['category_id'] ?? ''));
 
     $where = "WHERE p.is_active = 1";
     $params = [];
@@ -393,9 +398,26 @@ function apiGetProducts(PDO $pdo): void
         $params[':search_q2'] = $sLike;
         $params[':search_q3'] = $sLike;
     }
-    if ($category !== '') {
-        $where .= " AND p.category = :category";
-        $params[':category'] = $category;
+    if ($categoryIdParam !== '' && ctype_digit($categoryIdParam)) {
+        $catRow = findCategoryByIdOrSlugPhp($pdo, $categoryIdParam);
+        if ($catRow) {
+            $where .= " AND (p.category_id = :cat_id OR LOWER(p.category) = LOWER(:cat_name))";
+            $params[':cat_id'] = (int) $catRow['id'];
+            $params[':cat_name'] = $catRow['name'];
+        } else {
+            $where .= " AND p.category_id = :cat_id";
+            $params[':cat_id'] = (int) $categoryIdParam;
+        }
+    } elseif ($category !== '') {
+        $catRow = findCategoryByIdOrSlugPhp($pdo, $category);
+        if ($catRow) {
+            $where .= " AND (p.category_id = :cat_id OR LOWER(p.category) = LOWER(:cat_name))";
+            $params[':cat_id'] = (int) $catRow['id'];
+            $params[':cat_name'] = $catRow['name'];
+        } else {
+            $where .= " AND LOWER(p.category) = LOWER(:category)";
+            $params[':category'] = $category;
+        }
     }
 
     $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
@@ -407,7 +429,7 @@ function apiGetProducts(PDO $pdo): void
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
@@ -452,7 +474,7 @@ function apiGetProduct(PDO $pdo, int $id): void
     ensureProductPriceColumns($pdo);
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
@@ -1412,13 +1434,18 @@ function apiCreateProduct(PDO $pdo): void
 
     $pricing = resolveProductPricing($input);
     $sku = trim((string)($input['sku'] ?? '')) ?: null;
-    $category = trim((string)($input['category'] ?? '')) ?: 'General';
+    $catRes = resolveProductCategoryPhp($pdo, $input, true);
+    if (!empty($catRes['error'])) {
+        errorResponse('Validation error occurred.', $catRes['error'], 422);
+    }
+    $category = $catRes['category'];
+    $categoryId = $catRes['category_id'];
     $brand = trim((string)($input['brand'] ?? '')) ?: 'Generic';
     $mrp = (float) $pricing['mrp'];
 
     $stmt = $pdo->prepare("
-        INSERT INTO products (seller_id, name, description, sku, category, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :sku, :category, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
+        INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
@@ -1426,6 +1453,7 @@ function apiCreateProduct(PDO $pdo): void
         ':description' => $input['description'] ?? null,
         ':sku' => $sku,
         ':category' => $category,
+        ':category_id' => $categoryId,
         ':brand' => $brand,
         ':mrp' => number_format($mrp, 2, '.', ''),
         ':seller_price' => number_format($pricing['seller_price'], 2, '.', ''),
@@ -1443,7 +1471,7 @@ function apiCreateProduct(PDO $pdo): void
     syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $finalImages, $imgResult['filesInfo'] ?? []);
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
@@ -1492,13 +1520,37 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
         $params[':s2'] = '%' . trim($_GET['search']) . '%';
     }
 
+    $sCat = trim((string) ($_GET['category'] ?? ''));
+    $sCatId = trim((string) ($_GET['category_id'] ?? ''));
+    if ($sCatId !== '' && ctype_digit($sCatId)) {
+        $cRow = findCategoryByIdOrSlugPhp($pdo, $sCatId);
+        if ($cRow) {
+            $where .= " AND (p.category_id = :cat_id OR LOWER(p.category) = LOWER(:cat_name))";
+            $params[':cat_id'] = (int) $cRow['id'];
+            $params[':cat_name'] = $cRow['name'];
+        } else {
+            $where .= " AND p.category_id = :cat_id";
+            $params[':cat_id'] = (int) $sCatId;
+        }
+    } elseif ($sCat !== '') {
+        $cRow = findCategoryByIdOrSlugPhp($pdo, $sCat);
+        if ($cRow) {
+            $where .= " AND (p.category_id = :cat_id OR LOWER(p.category) = LOWER(:cat_name))";
+            $params[':cat_id'] = (int) $cRow['id'];
+            $params[':cat_name'] = $cRow['name'];
+        } else {
+            $where .= " AND LOWER(p.category) = LOWER(:cat_name)";
+            $params[':cat_name'] = $sCat;
+        }
+    }
+
     $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
     $countStmt->execute($params);
     $total = (int)$countStmt->fetchColumn();
 
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
@@ -1592,9 +1644,15 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $updates[] = "sku = :sku";
         $params[':sku'] = trim((string)$input['sku']);
     }
-    if (isset($input['category'])) {
+    $catRes = resolveProductCategoryPhp($pdo, $input, false);
+    if (!empty($catRes['error'])) {
+        errorResponse('Validation error occurred.', $catRes['error'], 422);
+    }
+    if (!empty($catRes['provided'])) {
         $updates[] = "category = :category";
-        $params[':category'] = trim((string)$input['category']);
+        $params[':category'] = $catRes['category'];
+        $updates[] = "category_id = :category_id";
+        $params[':category_id'] = $catRes['category_id'];
     }
     if (isset($input['brand'])) {
         $updates[] = "brand = :brand";
@@ -1677,7 +1735,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
+               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p

@@ -63,6 +63,35 @@ async function runMigration() {
     // ignore
   }
 
+  // Ensure products table has category_id column
+  try {
+    const [cols] = await conn.query('SHOW COLUMNS FROM products LIKE "category_id"');
+    if (cols.length === 0) {
+      await conn.query('ALTER TABLE products ADD COLUMN category_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER category');
+      console.log('✅ Added missing column category_id to products');
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // Ensure default 5 product categories are seeded if categories table is empty
+  try {
+    const [[catCnt]] = await conn.query('SELECT COUNT(*) as cnt FROM categories');
+    if ((catCnt?.cnt || 0) === 0) {
+      await conn.query(`
+        INSERT INTO categories (id, name, slug, description, icon, sort_order, is_active) VALUES
+        (1, 'Electronics', 'electronics', 'Smartphones, headphones, gadgets & tech accessories', '📱', 1, 1),
+        (2, 'Fashion', 'fashion', 'Apparel, footwear, bags, sunglasses & style essentials', '👕', 2, 1),
+        (3, 'Home & Kitchen', 'home-kitchen', 'Appliances, cookware, home decor & living essentials', '🏠', 3, 1),
+        (4, 'Beauty & Personal Care', 'beauty-personal-care', 'Skincare, grooming, wellness & cosmetics', '✨', 4, 1),
+        (5, 'Grocery', 'grocery', 'Daily staples, snacks, beverages & household essentials', '🛒', 5, 1)
+      `);
+      console.log('✅ Seeded 5 starter product categories');
+    }
+  } catch (e) {
+    // ignore
+  }
+
   // Ensure admin user password matches Admin123!
   const adminHash = await bcrypt.hash('Admin123!', 10);
   await conn.query(

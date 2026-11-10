@@ -20,9 +20,11 @@ if (empty($_SESSION['admin_logged_in'])) {
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../helpers/auth.php';
 require_once __DIR__ . '/../helpers/gst.php';
+require_once __DIR__ . '/../api/categories.php';
 
 $pdo = getDatabaseConnection();
 ensureGstTables($pdo);
+ensureProductCategoriesTable($pdo);
 $success = null;
 $error = null;
 
@@ -271,6 +273,126 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// Handle Add Category
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add_category') {
+    $catName = trim((string) ($_POST['name'] ?? ''));
+    $catDesc = trim((string) ($_POST['description'] ?? ''));
+    $catIcon = trim((string) ($_POST['icon'] ?? '🏷️')) ?: '🏷️';
+    $catSort = is_numeric($_POST['sort_order'] ?? null) ? (int) $_POST['sort_order'] : ((int) $pdo->query("SELECT COALESCE(MAX(sort_order), 0) FROM categories")->fetchColumn() + 1);
+    $catActive = isset($_POST['is_active']) ? 1 : 0;
+
+    if ($catName === '') {
+        $error = 'Category name is required.';
+    } else {
+        $dup = $pdo->prepare("SELECT id FROM categories WHERE LOWER(name) = LOWER(:name) LIMIT 1");
+        $dup->execute([':name' => $catName]);
+        if ($dup->fetch()) {
+            $error = 'A category with this name already exists.';
+        } else {
+            $slug = ensureUniqueCategorySlugPhp($pdo, toCategorySlugPhp($catName));
+            $insCat = $pdo->prepare("INSERT INTO categories (name, slug, description, icon, sort_order, is_active, created_at, updated_at) VALUES (:name, :slug, :desc, :icon, :sort, :active, NOW(), NOW())");
+            $insCat->execute([
+                ':name' => $catName,
+                ':slug' => $slug,
+                ':desc' => $catDesc !== '' ? $catDesc : null,
+                ':icon' => $catIcon,
+                ':sort' => $catSort,
+                ':active' => $catActive,
+            ]);
+            $success = "Category \"{$catName}\" added successfully!";
+        }
+    }
+}
+
+// Handle Edit Category (cascades name change to products)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'edit_category') {
+    $catId = (int) ($_POST['category_id'] ?? 0);
+    $catName = trim((string) ($_POST['name'] ?? ''));
+    $catDesc = trim((string) ($_POST['description'] ?? ''));
+    $catIcon = trim((string) ($_POST['icon'] ?? ''));
+    $catSort = is_numeric($_POST['sort_order'] ?? null) ? (int) $_POST['sort_order'] : 0;
+    $catActive = isset($_POST['is_active']) ? 1 : 0;
+
+    if ($catId <= 0 || $catName === '') {
+        $error = 'Category ID and name are required.';
+    } else {
+        $currStmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+        $currStmt->execute([':id' => $catId]);
+        $existingCat = $currStmt->fetch(PDO::FETCH_ASSOC);
+        if (!$existingCat) {
+            $error = "Category #{$catId} not found.";
+        } else {
+            $dup = $pdo->prepare("SELECT id FROM categories WHERE LOWER(name) = LOWER(:name) AND id != :id LIMIT 1");
+            $dup->execute([':name' => $catName, ':id' => $catId]);
+            if ($dup->fetch()) {
+                $error = 'Another category with this name already exists.';
+            } else {
+                $oldName = $existingCat['name'];
+                $newSlug = ($oldName !== $catName)
+                    ? ensureUniqueCategorySlugPhp($pdo, toCategorySlugPhp($catName), $catId)
+                    : $existingCat['slug'];
+
+                $updCat = $pdo->prepare("
+                    UPDATE categories
+                    SET name = :name, slug = :slug, description = :desc, icon = :icon, sort_order = :sort, is_active = :active, updated_at = NOW()
+                    WHERE id = :id
+                ");
+                $updCat->execute([
+                    ':name' => $catName,
+                    ':slug' => $newSlug,
+                    ':desc' => $catDesc !== '' ? $catDesc : null,
+                    ':icon' => $catIcon !== '' ? $catIcon : null,
+                    ':sort' => $catSort,
+                    ':active' => $catActive,
+                    ':id' => $catId,
+                ]);
+
+                if ($oldName !== $catName) {
+                    $syncProd = $pdo->prepare("UPDATE products SET category = :new_name, category_id = :cid, updated_at = NOW() WHERE category_id = :match_cid OR LOWER(category) = LOWER(:old_name)");
+                    $syncProd->execute([':new_name' => $catName, ':cid' => $catId, ':match_cid' => $catId, ':old_name' => $oldName]);
+                }
+                $success = "Category #{$catId} (\"{$catName}\") updated successfully!";
+            }
+        }
+    }
+}
+
+// Handle Delete Category
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete_category') {
+    $catId = (int) ($_POST['category_id'] ?? 0);
+    $currStmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+    $currStmt->execute([':id' => $catId]);
+    $existingCat = $currStmt->fetch(PDO::FETCH_ASSOC);
+    if ($existingCat) {
+        $pdo->prepare("UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = :cid OR LOWER(category) = LOWER(:cname)")
+            ->execute([':cid' => $catId, ':cname' => $existingCat['name']]);
+        $pdo->prepare("DELETE FROM categories WHERE id = :id")->execute([':id' => $catId]);
+        $success = "Category \"{$existingCat['name']}\" deleted.";
+    } else {
+        $error = "Category #{$catId} not found.";
+    }
+}
+
+// Handle Assign / Edit Product Category
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update_product_category') {
+    $prodId = (int) ($_POST['product_id'] ?? 0);
+    $targetCatId = (int) ($_POST['category_id'] ?? 0);
+    if ($prodId > 0 && $targetCatId > 0) {
+        $cStmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+        $cStmt->execute([':id' => $targetCatId]);
+        $catRow = $cStmt->fetch(PDO::FETCH_ASSOC);
+        if ($catRow) {
+            $pdo->prepare("UPDATE products SET category = :cat, category_id = :cid, updated_at = NOW() WHERE id = :pid")
+                ->execute([':cat' => $catRow['name'], ':cid' => (int) $catRow['id'], ':pid' => $prodId]);
+            $success = "Product #{$prodId} category updated to \"{$catRow['name']}\"!";
+        } else {
+            $error = 'Selected category not found.';
+        }
+    } else {
+        $error = 'Please choose a valid product and category.';
+    }
+}
+
 // Marketplace Stats
 try {
     $sellerCount = (int) $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'")->fetchColumn();
@@ -279,6 +401,32 @@ try {
 try {
     $productCount = (int) $pdo->query("SELECT COUNT(*) FROM products WHERE is_active = 1")->fetchColumn();
 } catch (Throwable $e) { $productCount = 0; }
+
+try {
+    $categoryCount = (int) $pdo->query("SELECT COUNT(*) FROM categories WHERE is_active = 1")->fetchColumn();
+} catch (Throwable $e) { $categoryCount = 0; }
+
+try {
+    $categoriesListStmt = $pdo->query("
+        SELECT c.*,
+               (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+        FROM categories c
+        ORDER BY c.sort_order ASC, c.id ASC
+    ");
+    $categoriesList = $categoriesListStmt ? $categoriesListStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+} catch (Throwable $e) { $categoriesList = []; }
+
+try {
+    $adminProductsStmt = $pdo->query("
+        SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
+               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        FROM products p
+        LEFT JOIN users u ON p.seller_id = u.id
+        ORDER BY p.id DESC
+        LIMIT 80
+    ");
+    $adminProducts = $adminProductsStmt ? $adminProductsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+} catch (Throwable $e) { $adminProducts = []; }
 
 try {
     $orderCount = (int) $pdo->query("SELECT COUNT(*) FROM orders")->fetchColumn();
@@ -436,6 +584,10 @@ function formatBytesPhp($bytes): string {
             <section class="card">
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
                 <div class="stat" style="color:#2563eb;"><?= $productCount ?></div>
+            </section>
+            <section class="card">
+                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
+                <div class="stat" style="color:#7c3aed;"><?= $categoryCount ?></div>
             </section>
             <section class="card">
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
@@ -640,7 +792,168 @@ function formatBytesPhp($bytes): string {
             </table>
         </section>
 
-        <!-- Section 3: Create Seller Account -->
+        <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
+        <section class="card" id="categoriesSection" style="margin-top:24px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+                <div>
+                    <h2>Product Categories (Editable)</h2>
+                    <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Category Name</th>
+                        <th>Slug</th>
+                        <th>Description</th>
+                        <th>Products</th>
+                        <th>Order</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($categoriesList)): ?>
+                        <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($categoriesList as $cat): ?>
+                            <tr>
+                                <td>#<?= (int)$cat['id'] ?></td>
+                                <td>
+                                    <span style="font-size:16px; margin-right:4px;"><?= htmlspecialchars($cat['icon'] ?? '🏷️') ?></span>
+                                    <strong><?= htmlspecialchars($cat['name']) ?></strong>
+                                </td>
+                                <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:12px;"><?= htmlspecialchars($cat['slug']) ?></code></td>
+                                <td style="color:#64748b; font-size:13px; max-width:260px;"><?= htmlspecialchars($cat['description'] ?? '—') ?></td>
+                                <td><span class="badge-prod"><?= (int)($cat['products_count'] ?? 0) ?> products</span></td>
+                                <td><?= (int)($cat['sort_order'] ?? 0) ?></td>
+                                <td>
+                                    <?php if (!empty($cat['is_active'])): ?>
+                                        <span class="badge-approved">Active</span>
+                                    <?php else: ?>
+                                        <span class="badge-rejected">Inactive</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <div style="display:flex; gap:6px; align-items:center;">
+                                        <button type="button" class="btn-sm" onclick='openCategoryModal(<?= htmlspecialchars(json_encode($cat, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>Edit</button>
+                                        <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Delete category <?= htmlspecialchars(addslashes($cat['name']), ENT_QUOTES) ?>? Products will be moved to General.');">
+                                            <input type="hidden" name="action" value="delete_category">
+                                            <input type="hidden" name="category_id" value="<?= (int)$cat['id'] ?>">
+                                            <button type="submit" class="btn-reject-sm">Delete</button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+
+            <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
+                <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
+                <form method="POST" action="/admin">
+                    <input type="hidden" name="action" value="add_category">
+                    <div class="grid">
+                        <div>
+                            <label>Category Name *</label>
+                            <input name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+                        </div>
+                        <div>
+                            <label>Icon (Emoji)</label>
+                            <input name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                        </div>
+                        <div>
+                            <label>Description</label>
+                            <input name="description" maxlength="255" placeholder="Short description">
+                        </div>
+                        <div>
+                            <label>Sort Order</label>
+                            <input type="number" name="sort_order" value="<?= count($categoriesList) + 1 ?>">
+                        </div>
+                    </div>
+                    <div style="margin-top:10px; display:flex; align-items:center; gap:14px;">
+                        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer;">
+                            <input type="checkbox" name="is_active" value="1" checked style="width:auto;"> Active
+                        </label>
+                        <button type="submit" style="background:#4f46e5;">+ Add Category</button>
+                    </div>
+                </form>
+            </div>
+        </section>
+
+        <!-- Section 4: Assign / Edit Product Category -->
+        <section class="card" id="productCategoriesSection" style="margin-top:24px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+                <div>
+                    <h2>Products — Edit Category</h2>
+                    <p class="muted">Reassign or update the category of any active product directly.</p>
+                </div>
+                <div class="search-box">
+                    <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search product or current category...">
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Product</th>
+                        <th>Seller</th>
+                        <th>Price</th>
+                        <th>Current Category</th>
+                        <th>Change Category</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($adminProducts)): ?>
+                        <tr><td colspan="6" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($adminProducts as $ap): ?>
+                            <?php $pSearch = strtolower(($ap['name'] ?? '') . ' ' . ($ap['category'] ?? '') . ' ' . ($ap['seller_name'] ?? '')); ?>
+                            <tr class="prod-cat-row" data-search="<?= htmlspecialchars($pSearch) ?>">
+                                <td>#<?= (int)$ap['id'] ?></td>
+                                <td>
+                                    <strong><?= htmlspecialchars($ap['name']) ?></strong>
+                                    <div style="font-size:11px; color:#64748b;">Stock: <?= (int)$ap['stock'] ?></div>
+                                </td>
+                                <td><?= htmlspecialchars($ap['seller_name']) ?></td>
+                                <td>₹<?= number_format((float)$ap['price'], 2) ?></td>
+                                <td><span class="badge-prod"><?= htmlspecialchars($ap['category'] ?: 'General') ?></span></td>
+                                <td>
+                                    <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
+                                        <input type="hidden" name="action" value="update_product_category">
+                                        <input type="hidden" name="product_id" value="<?= (int)$ap['id'] ?>">
+                                        <select name="category_id" required style="padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                                            <?php
+                                                $hasSelectedCat = false;
+                                                foreach ($categoriesList as $catOptCheck) {
+                                                    if ((int)($ap['category_id'] ?? 0) === (int)$catOptCheck['id'] || strcasecmp((string)$ap['category'], (string)$catOptCheck['name']) === 0) {
+                                                        $hasSelectedCat = true;
+                                                        break;
+                                                    }
+                                                }
+                                            ?>
+                                            <?php if (!$hasSelectedCat): ?>
+                                                <option value="" disabled selected>-- Select Category --</option>
+                                            <?php endif; ?>
+                                            <?php foreach ($categoriesList as $catOpt): ?>
+                                                <?php $selected = ((int)($ap['category_id'] ?? 0) === (int)$catOpt['id'] || strcasecmp((string)$ap['category'], (string)$catOpt['name']) === 0) ? 'selected' : ''; ?>
+                                                <option value="<?= (int)$catOpt['id'] ?>" <?= $selected ?>><?= htmlspecialchars($catOpt['name']) ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                        <button type="submit" class="btn-sm">Save</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Section 5: Create Seller Account -->
         <section class="card" style="margin-top:24px;">
             <h2>Create New Seller Account</h2>
             <p class="muted">Add a new merchant to Venter App manually. Phone number must include international country code, e.g. +919876543210.</p>
@@ -770,6 +1083,50 @@ function formatBytesPhp($bytes): string {
         </div>
     </div>
 
+    <!-- Edit Category Modal -->
+    <div id="editCategoryModal" class="modal-overlay" onclick="if(event.target.id==='editCategoryModal') closeCategoryModal();">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h3 id="catModalTitle">Edit Category</h3>
+                <button type="button" class="modal-close" onclick="closeCategoryModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form method="POST" action="/admin">
+                    <input type="hidden" name="action" value="edit_category">
+                    <input type="hidden" name="category_id" id="editCatId">
+                    <div class="grid">
+                        <div>
+                            <label>Category Name *</label>
+                            <input name="name" id="editCatName" required maxlength="100">
+                        </div>
+                        <div>
+                            <label>Icon (Emoji)</label>
+                            <input name="icon" id="editCatIcon" maxlength="20">
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Description</label>
+                            <input name="description" id="editCatDesc" maxlength="255">
+                        </div>
+                        <div>
+                            <label>Sort Order</label>
+                            <input type="number" name="sort_order" id="editCatSort">
+                        </div>
+                        <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
+                            <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
+                                <input type="checkbox" name="is_active" id="editCatActive" value="1" style="width:auto;"> Category Active
+                            </label>
+                        </div>
+                    </div>
+                    <br>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <button type="submit">Save Category Changes</button>
+                        <button type="button" onclick="closeCategoryModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <!-- Seller Profile & Edit Modal -->
     <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
         <div class="modal-box">
@@ -840,6 +1197,29 @@ function formatBytesPhp($bytes): string {
     </div>
 
     <script>
+        function openCategoryModal(cat) {
+            document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' — ' + (cat.name || '');
+            document.getElementById('editCatId').value = cat.id;
+            document.getElementById('editCatName').value = cat.name || '';
+            document.getElementById('editCatIcon').value = cat.icon || '';
+            document.getElementById('editCatDesc').value = cat.description || '';
+            document.getElementById('editCatSort').value = cat.sort_order !== undefined ? cat.sort_order : 0;
+            document.getElementById('editCatActive').checked = Boolean(Number(cat.is_active));
+            document.getElementById('editCategoryModal').classList.add('active');
+        }
+
+        function closeCategoryModal() {
+            document.getElementById('editCategoryModal').classList.remove('active');
+        }
+
+        function filterAdminProductSearch(query) {
+            const q = (query || '').toLowerCase().trim();
+            document.querySelectorAll('.prod-cat-row').forEach(r => {
+                const s = r.getAttribute('data-search') || '';
+                r.style.display = (!q || s.includes(q)) ? '' : 'none';
+            });
+        }
+
         function openSellerModal(seller) {
             document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
             document.getElementById('viewSellerId').innerText = '#' + seller.id;
