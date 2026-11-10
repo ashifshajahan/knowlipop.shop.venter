@@ -1221,67 +1221,7 @@ function convertImageViaNodePhp(string $rawBytes): ?string
     if (!function_exists('proc_open')) return null;
 
     $js = <<<'NODEJS'
-const sharp = require('sharp');
-const bmpJs = require('bmp-js');
-const heicDecode = require('heic-decode');
-const chunks = [];
-process.stdin.on('data', (c) => chunks.push(c));
-process.stdin.on('end', async () => {
-  try {
-    const buf = Buffer.concat(chunks);
-    if (buf.length < 10 || buf.length > 15 * 1024 * 1024) process.exit(1);
-    const isSvg = !buf.subarray(0, 512).includes(0) && (() => {
-      const h = buf.subarray(0, 512).toString('utf8').trimStart().replace(/^\uFEFF/, '').toLowerCase();
-      return h.startsWith('<svg') || (h.startsWith('<?xml') && h.includes('<svg'));
-    })();
-    const brand = (buf.length >= 16 && buf.toString('ascii', 4, 8) === 'ftyp') ? buf.toString('ascii', 8, 12).toLowerCase() : null;
-    const decodeBmp = async (b) => {
-      const w = b.readInt32LE(18), h = Math.abs(b.readInt32LE(22));
-      if (w <= 0 || h <= 0 || w > 25000 || h > 25000 || w * h > 100000000) throw new Error('bmp bounds');
-      const d = bmpJs.decode(b);
-      const abgr = d.data, rgba = Buffer.allocUnsafe(abgr.length);
-      let hasA = false;
-      if (d.bitPP === 32) { for (let i = 0; i < abgr.length; i += 4) { if (abgr[i] !== 0) { hasA = true; break; } } }
-      for (let i = 0; i < abgr.length; i += 4) {
-        rgba[i] = abgr[i + 3]; rgba[i + 1] = abgr[i + 2]; rgba[i + 2] = abgr[i + 1];
-        rgba[i + 3] = (d.bitPP === 32 && hasA) ? abgr[i] : 255;
-      }
-      return sharp(rgba, { raw: { width: d.width, height: d.height, channels: 4 } }).webp({ quality: 85, effort: 4 }).toBuffer();
-    };
-    let out;
-    if (isSvg) {
-      out = await sharp(buf, { failOn: 'none', density: 150, limitInputPixels: 100000000 }).webp({ quality: 85, effort: 4 }).toBuffer();
-    } else if (buf[0] === 0x42 && buf[1] === 0x4D) {
-      out = await decodeBmp(buf);
-    } else if (buf.length >= 22 && buf.readUInt16LE(0) === 0 && buf.readUInt16LE(2) === 1) {
-      const cnt = buf.readUInt16LE(4);
-      let best = null, score = -1;
-      for (let i = 0; i < cnt && i < 64 && 6 + i * 16 + 16 <= buf.length; i++) {
-        const o = 6 + i * 16, w = buf[o] || 256, h = buf[o + 1] || 256, bpp = buf.readUInt16LE(o + 6);
-        const sz = buf.readUInt32LE(o + 8), off = buf.readUInt32LE(o + 12);
-        if (sz >= 8 && off + sz <= buf.length && (w * h * 64 + bpp) > score) { score = w * h * 64 + bpp; best = buf.subarray(off, off + sz); }
-      }
-      if (!best) throw new Error('ico');
-      if (best.length >= 8 && best.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
-        out = await sharp(best, { failOn: 'none', limitInputPixels: 100000000 }).webp({ quality: 85, effort: 4 }).toBuffer();
-      } else if (best.length >= 40 && best.readUInt32LE(0) === 40) {
-        const w = best.readInt32LE(4), dh = best.readInt32LE(8), hh = Math.floor(Math.abs(dh) / 2), bpp = best.readUInt16LE(14), cu = best.readUInt32LE(32);
-        const pc = bpp <= 8 ? (cu > 0 ? cu : (1 << bpp)) : 0;
-        const hdr = Buffer.alloc(14); hdr.write('BM', 0, 2, 'ascii'); hdr.writeUInt32LE(14 + best.length, 2); hdr.writeUInt32LE(14 + 40 + pc * 4, 10);
-        const dib = Buffer.from(best); dib.writeInt32LE(dh < 0 ? -hh : hh, 8);
-        out = await decodeBmp(Buffer.concat([hdr, dib]));
-      } else throw new Error('ico payload');
-    } else if (brand && ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) {
-      const dec = await heicDecode({ buffer: buf });
-      const raw = Buffer.from(dec.data.buffer, dec.data.byteOffset, dec.data.byteLength);
-      out = await sharp(raw, { raw: { width: dec.width, height: dec.height, channels: 4 } }).webp({ quality: 85, effort: 4 }).toBuffer();
-    } else {
-      out = await sharp(buf, { failOn: 'none', animated: true, limitInputPixels: 100000000 }).rotate().webp({ quality: 85, effort: 4 }).toBuffer();
-    }
-    if (!out || out.length < 12 || out.toString('ascii', 0, 4) !== 'RIFF' || out.toString('ascii', 8, 12) !== 'WEBP') process.exit(1);
-    process.stdout.write(out);
-  } catch (e) { process.stderr.write(String(e && e.message || e)); process.exit(1); }
-});
+require('./helpers/webp_converter').convertStdinToWebp();
 NODEJS;
 
     $candidates = [];

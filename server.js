@@ -8,9 +8,12 @@ const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const multer = require('multer');
-const sharp = require('sharp');
-const bmpJs = require('bmp-js');
-const heicDecode = require('heic-decode');
+const {
+  isWebpBuffer,
+  bufferLooksLikeSupportedImage,
+  convertImageBufferToWebp,
+  getConverterCapabilities
+} = require('./helpers/webp_converter');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -367,204 +370,7 @@ app.use(
   express.static(path.resolve(__dirname, 'uploads'), mediaStaticOpts)
 );
 
-function isWebpBuffer(buf) {
-  return Buffer.isBuffer(buf) && buf.length >= 12 &&
-    buf.toString('ascii', 0, 4) === 'RIFF' &&
-    buf.toString('ascii', 8, 12) === 'WEBP';
-}
-
-function isSvgBuffer(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 10) return false;
-  const headSlice = buf.subarray(0, Math.min(buf.length, 512));
-  if (headSlice.includes(0)) return false;
-  const head = headSlice.toString('utf8').trimStart().replace(/^\uFEFF/, '').toLowerCase();
-  return head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'));
-}
-
-function isSafeSvgBuffer(buf) {
-  const fullText = buf.toString('utf8');
-  return !/<script[\s>]|<!entity|javascript:|vbscript:|<foreignobject|\son[a-z]+\s*=/i.test(fullText);
-}
-
-function getIsobmffBrand(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 16) return null;
-  if (buf.toString('ascii', 4, 8) !== 'ftyp') return null;
-  return buf.toString('ascii', 8, 12).toLowerCase();
-}
-
-function extractIcoPayload(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 22) return null;
-  if (buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1) return null;
-  const count = buf.readUInt16LE(4);
-  if (count < 1 || count > 64 || 6 + count * 16 > buf.length) return null;
-  let best = null;
-  let bestScore = -1;
-  for (let i = 0; i < count; i++) {
-    const entryOffset = 6 + i * 16;
-    const w = buf[entryOffset] === 0 ? 256 : buf[entryOffset];
-    const h = buf[entryOffset + 1] === 0 ? 256 : buf[entryOffset + 1];
-    const bpp = buf.readUInt16LE(entryOffset + 6);
-    const bytesInRes = buf.readUInt32LE(entryOffset + 8);
-    const imageOffset = buf.readUInt32LE(entryOffset + 12);
-    if (bytesInRes < 8 || imageOffset + bytesInRes > buf.length) continue;
-    const score = (w * h * 64) + bpp;
-    if (score > bestScore) {
-      bestScore = score;
-      best = buf.subarray(imageOffset, imageOffset + bytesInRes);
-    }
-  }
-  if (!best) return null;
-  if (best.length >= 8 && best.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
-    return best;
-  }
-  // Convert BITMAPINFOHEADER DIB inside ICO into a standard BM file buffer
-  if (best.length >= 40 && best.readUInt32LE(0) === 40) {
-    const width = best.readInt32LE(4);
-    const doubleHeight = best.readInt32LE(8);
-    const height = Math.floor(Math.abs(doubleHeight) / 2);
-    const bpp = best.readUInt16LE(14);
-    const colorsUsed = best.readUInt32LE(32);
-    if (width > 0 && height > 0) {
-      const paletteCount = bpp <= 8 ? (colorsUsed > 0 ? colorsUsed : (1 << bpp)) : 0;
-      const header = Buffer.alloc(14);
-      header.write('BM', 0, 2, 'ascii');
-      header.writeUInt32LE(14 + best.length, 2);
-      header.writeUInt32LE(14 + 40 + paletteCount * 4, 10);
-      const patchedDib = Buffer.from(best);
-      patchedDib.writeInt32LE(doubleHeight < 0 ? -height : height, 8);
-      return Buffer.concat([header, patchedDib]);
-    }
-  }
-  return null;
-}
-
-async function decodeBmpToWebp(bmpBuffer) {
-  if (!Buffer.isBuffer(bmpBuffer) || bmpBuffer.length < 26 || bmpBuffer[0] !== 0x42 || bmpBuffer[1] !== 0x4D) {
-    throw new Error('Invalid BMP image.');
-  }
-  const bmpWidth = bmpBuffer.readInt32LE(18);
-  const bmpHeight = Math.abs(bmpBuffer.readInt32LE(22));
-  if (bmpWidth <= 0 || bmpHeight <= 0 || bmpWidth > 25000 || bmpHeight > 25000 || (bmpWidth * bmpHeight) > 100000000) {
-    throw new Error('BMP dimensions out of allowed range.');
-  }
-  const decoded = bmpJs.decode(bmpBuffer);
-  if (!decoded || !decoded.data || decoded.width <= 0 || decoded.height <= 0) {
-    throw new Error('Failed to decode BMP pixels.');
-  }
-  const abgr = decoded.data;
-  const rgba = Buffer.allocUnsafe(abgr.length);
-  let hasAlpha = false;
-  if (decoded.bitPP === 32) {
-    for (let i = 0; i < abgr.length; i += 4) {
-      if (abgr[i] !== 0) {
-        hasAlpha = true;
-        break;
-      }
-    }
-  }
-  for (let i = 0; i < abgr.length; i += 4) {
-    rgba[i] = abgr[i + 3];
-    rgba[i + 1] = abgr[i + 2];
-    rgba[i + 2] = abgr[i + 1];
-    rgba[i + 3] = (decoded.bitPP === 32 && hasAlpha) ? abgr[i] : 255;
-  }
-  return sharp(rgba, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
-    .webp({ quality: 85, effort: 4 })
-    .toBuffer();
-}
-
-async function convertImageBufferToWebp(inputBuffer, meta = {}) {
-  if (!Buffer.isBuffer(inputBuffer) || inputBuffer.length < 10) {
-    throw new Error('Image buffer is empty or too small.');
-  }
-  if (inputBuffer.length > 15 * 1024 * 1024) {
-    throw new Error('Image exceeds maximum 15MB size limit.');
-  }
-
-  let webpBuffer = null;
-
-  // 1. SVG vector image
-  if (isSvgBuffer(inputBuffer) || (meta.mimeType && meta.mimeType.toLowerCase().includes('svg'))) {
-    if (!isSvgBuffer(inputBuffer)) {
-      throw new Error('Invalid SVG image content.');
-    }
-    if (!isSafeSvgBuffer(inputBuffer)) {
-      throw new Error('SVG contains prohibited active content.');
-    }
-    webpBuffer = await sharp(inputBuffer, { failOn: 'none', density: 150, limitInputPixels: 100000000 })
-      .webp({ quality: 85, effort: 4 })
-      .toBuffer();
-  }
-  // 2. BMP bitmap image
-  else if (inputBuffer[0] === 0x42 && inputBuffer[1] === 0x4D) {
-    webpBuffer = await decodeBmpToWebp(inputBuffer);
-  }
-  // 3. ICO icon container
-  else if (inputBuffer.length >= 22 && inputBuffer.readUInt16LE(0) === 0 && inputBuffer.readUInt16LE(2) === 1) {
-    const icoInner = extractIcoPayload(inputBuffer);
-    if (!icoInner) {
-      throw new Error('Unsupported or invalid ICO image.');
-    }
-    if (icoInner[0] === 0x42 && icoInner[1] === 0x4D) {
-      webpBuffer = await decodeBmpToWebp(icoInner);
-    } else {
-      webpBuffer = await sharp(icoInner, { failOn: 'none', limitInputPixels: 100000000 })
-        .webp({ quality: 85, effort: 4 })
-        .toBuffer();
-    }
-  }
-  // 4. HEIC / HEIF (iOS camera photos) vs AVIF
-  else {
-    const brand = getIsobmffBrand(inputBuffer);
-    if (brand && ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) {
-      const decoded = await heicDecode({ buffer: inputBuffer });
-      if (!decoded || !decoded.data || !decoded.width || !decoded.height) {
-        throw new Error('Failed to decode HEIC/HEIF image.');
-      }
-      const rawBuf = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
-      webpBuffer = await sharp(rawBuf, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
-        .webp({ quality: 85, effort: 4 })
-        .toBuffer();
-    } else {
-      // 5. JPEG, PNG, WEBP, GIF, TIFF, AVIF (auto-rotates EXIF & preserves alpha/animation)
-      webpBuffer = await sharp(inputBuffer, { failOn: 'none', animated: true, limitInputPixels: 100000000 })
-        .rotate()
-        .webp({ quality: 85, effort: 4 })
-        .toBuffer();
-    }
-  }
-
-  if (!isWebpBuffer(webpBuffer)) {
-    throw new Error('Image conversion did not produce valid WEBP output.');
-  }
-  return webpBuffer;
-}
-
-function bufferLooksLikeSupportedImage(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < 10) return false;
-  // JPEG
-  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true;
-  // PNG
-  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return true;
-  // GIF
-  const head6 = buf.toString('ascii', 0, 6);
-  if (head6 === 'GIF87a' || head6 === 'GIF89a') return true;
-  // WEBP
-  if (isWebpBuffer(buf)) return true;
-  // BMP
-  if (buf[0] === 0x42 && buf[1] === 0x4D) return true;
-  // TIFF (II* or MM*)
-  if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2A && buf[3] === 0x00) ||
-      (buf[0] === 0x4D && buf[1] === 0x4D && buf[2] === 0x00 && buf[3] === 0x2A)) return true;
-  // ICO
-  if (buf.readUInt16LE(0) === 0 && buf.readUInt16LE(2) === 1 && buf.length >= 22) return true;
-  // AVIF / HEIC / HEIF
-  const brand = getIsobmffBrand(buf);
-  if (brand && ['avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) return true;
-  // SVG
-  if (isSvgBuffer(buf)) return true;
-  return false;
-}
+// Product image conversion and magic-byte validation helpers are loaded from ./helpers/webp_converter
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -1584,6 +1390,9 @@ app.get('/api/health', async (req, res) => {
     status: dbStatus === 'connected' ? 'ok' : 'degraded',
     app: 'Vendor App API',
     engine: 'Node.js (Express)',
+    ...(req.query && (req.query.check_image === '1' || req.query.check_image === 'true')
+      ? { image_pipeline: getConverterCapabilities() }
+      : {}),
     database: {
       status: dbStatus,
       host: dbHost,

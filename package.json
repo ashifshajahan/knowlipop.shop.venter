@@ -11,18 +11,27 @@
     "seed:admin": "node database/seed-admin.js"
   },
   "dependencies": {
+    "@jsquash/avif": "^2.1.1",
+    "@resvg/resvg-wasm": "^2.6.2",
     "bcryptjs": "^2.4.3",
     "bmp-js": "^0.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "heic-decode": "^2.1.0",
+    "jpeg-js": "^0.4.4",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.5.0",
     "mysql2": "^3.9.7",
-    "sharp": "^0.35.5"
+    "omggif": "^1.0.10",
+    "pngjs": "^7.0.0",
+    "utif": "^3.1.0",
+    "webp-wasm": "^1.0.6"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.33.5"
   }
 }
