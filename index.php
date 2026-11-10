@@ -73,18 +73,9 @@ if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefi
     $isAvatar = str_contains($requestUri, '/avatars/') || str_starts_with(strtolower($fileName), 'avatar_');
 
     if (!empty($fileName) && !in_array(strtolower($fileName), ['uploads', 'products', 'avatars', 'images', 'storage', 'api'])) {
-        $subDir = $isAvatar ? '/uploads/avatars/' : '/uploads/products/';
-        $filePath = __DIR__ . $subDir . $fileName;
+        $filePath = resolveUploadedMediaPathPhp($fileName, $isAvatar);
 
-        if (!file_exists($filePath) || !is_file($filePath)) {
-            $altDir = $isAvatar ? '/uploads/products/' : '/uploads/avatars/';
-            $altPath = __DIR__ . $altDir . $fileName;
-            if (file_exists($altPath) && is_file($altPath)) {
-                $filePath = $altPath;
-            }
-        }
-
-        if (file_exists($filePath) && is_file($filePath)) {
+        if ($filePath && file_exists($filePath) && is_file($filePath)) {
             $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
             $mimes = [
                 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
@@ -98,43 +89,24 @@ if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefi
         }
     }
 
-    // Reliable Fallback for missing uploaded images: NEVER redirect to external sample/demo URLs
+    // File not found on disk: Never redirect to external sample/demo URLs or automatic placeholders
     if ($isAvatar) {
-        $avatarPlaceholder = __DIR__ . '/uploads/avatars/placeholder.jpg';
-        if (file_exists($avatarPlaceholder)) {
+        $avatarPlaceholder = resolveUploadedMediaPathPhp('placeholder.jpg', true);
+        if ($avatarPlaceholder && file_exists($avatarPlaceholder)) {
             header('Content-Type: image/jpeg');
             header('Cache-Control: public, max-age=86400');
             readfile($avatarPlaceholder);
             exit;
         }
-        $genericPlaceholder = __DIR__ . '/uploads/products/placeholder.jpg';
-        if (file_exists($genericPlaceholder)) {
-            header('Content-Type: image/jpeg');
-            header('Cache-Control: public, max-age=86400');
-            readfile($genericPlaceholder);
-            exit;
-        }
         http_response_code(404);
-        echo json_encode(['message' => 'Avatar not found.']);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['message' => 'Avatar image not found.']);
         exit;
     }
 
-    $placeholder = __DIR__ . '/uploads/products/placeholder.jpg';
-    if (file_exists($placeholder)) {
-        header('Content-Type: image/jpeg');
-        header('Cache-Control: public, max-age=86400');
-        readfile($placeholder);
-        exit;
-    }
-    $samplePng = __DIR__ . '/uploads/products/prod_1793598726521_793ff4ae.png';
-    if (file_exists($samplePng)) {
-        header('Content-Type: image/png');
-        header('Cache-Control: public, max-age=86400');
-        readfile($samplePng);
-        exit;
-    }
     http_response_code(404);
-    echo json_encode(['message' => 'No image available.']);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['message' => 'Product image not found.']);
     exit;
 }
 
@@ -458,7 +430,7 @@ if ($requestUri === '/api/seller/notifications/unread-count' || $requestUri === 
     }
 }
 
-if ($requestUri === '/api/seller/notifications/mark-all-read' || $requestUri === '/api/notifications/read-all' || $requestUri === '/api/notifications/mark-all-read') {
+if ($requestUri === '/api/seller/notifications/mark-all-read' || $requestUri === '/api/seller/notifications/read-all' || $requestUri === '/api/notifications/read-all' || $requestUri === '/api/notifications/mark-all-read') {
     if ($method === 'PUT' || $method === 'POST') {
         apiMarkAllNotificationsRead($pdo);
     } else {

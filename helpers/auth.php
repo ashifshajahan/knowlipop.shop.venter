@@ -222,6 +222,7 @@ function safeSeller(array $user): array
         'landmark' => $user['landmark'] ?? null,
         'state' => $user['state'] ?? null,
         'country' => $user['country'] ?? null,
+        'avatar_url' => $user['avatar_url'] ?? null,
     ];
 
     if (!empty($user['role'])) {

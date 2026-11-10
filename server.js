@@ -87,15 +87,155 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
-// File Upload & Image Storage Configuration
-const uploadDir = path.resolve(__dirname, 'uploads', 'products');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+// File Upload & Persistent Image Storage Configuration
+function getPersistentMediaDir(subFolder = 'products') {
+  const safeSub = subFolder === 'avatars' ? 'avatars' : 'products';
+  const candidates = [];
+  if (process.env.MEDIA_UPLOAD_DIR) {
+    candidates.push(path.resolve(process.env.MEDIA_UPLOAD_DIR, safeSub));
+  }
+  if (isHostinger) {
+    candidates.push(`/home/u999617803/domains/knowlipop.shop/venter_uploads/${safeSub}`);
+    candidates.push(`/home/u999617803/venter_uploads/${safeSub}`);
+    if (__dirname.includes('hbuilds')) {
+      candidates.push(path.resolve(__dirname, '..', '..', '..', '..', 'venter_uploads', safeSub));
+      candidates.push(path.resolve(__dirname, '..', '..', '..', 'venter_uploads', safeSub));
+    }
+  }
+  candidates.push(path.resolve(__dirname, 'uploads', safeSub));
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      }
+      const probe = path.join(dir, '.write_probe');
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      return dir;
+    } catch (err) {
+      console.warn(`[Media Storage] Candidate dir unavailable (${dir}):`, err.message);
+    }
+  }
+
+  const fallback = path.resolve(__dirname, 'uploads', safeSub);
+  if (!fs.existsSync(fallback)) {
+    fs.mkdirSync(fallback, { recursive: true, mode: 0o755 });
+  }
+  return fallback;
 }
 
-const avatarUploadDir = path.resolve(__dirname, 'uploads', 'avatars');
-if (!fs.existsSync(avatarUploadDir)) {
-  fs.mkdirSync(avatarUploadDir, { recursive: true, mode: 0o755 });
+const uploadDir = getPersistentMediaDir('products');
+const avatarUploadDir = getPersistentMediaDir('avatars');
+console.log('[Media Storage] Active product upload directory:', uploadDir);
+console.log('[Media Storage] Active avatar upload directory:', avatarUploadDir);
+
+function resolveUploadedMediaPath(fileName, isAvatar = false) {
+  const safeName = path.basename(String(fileName || '').split('?')[0]);
+  if (!safeName || safeName === '.' || safeName === '..') return null;
+
+  const primaryDir = isAvatar ? avatarUploadDir : uploadDir;
+  const altDir = isAvatar ? uploadDir : avatarUploadDir;
+  const localProductsDir = path.resolve(__dirname, 'uploads', 'products');
+  const localAvatarsDir = path.resolve(__dirname, 'uploads', 'avatars');
+  const primarySub = isAvatar ? 'avatars' : 'products';
+  const altSub = isAvatar ? 'products' : 'avatars';
+
+  const candidates = [
+    path.join(primaryDir, safeName),
+    path.join(altDir, safeName),
+    isAvatar ? path.join(localAvatarsDir, safeName) : path.join(localProductsDir, safeName),
+    isAvatar ? path.join(localProductsDir, safeName) : path.join(localAvatarsDir, safeName),
+    path.resolve(process.cwd(), 'uploads', primarySub, safeName),
+    path.resolve(process.cwd(), 'uploads', altSub, safeName),
+    `/home/u999617803/domains/knowlipop.shop/venter_uploads/${primarySub}/${safeName}`,
+    `/home/u999617803/domains/knowlipop.shop/venter_uploads/${altSub}/${safeName}`,
+    `/home/u999617803/venter_uploads/${primarySub}/${safeName}`,
+    `/home/u999617803/venter_uploads/${altSub}/${safeName}`,
+    `/home/u999617803/domains/knowlipop.shop/public_html/uploads/${primarySub}/${safeName}`,
+    `/home/u999617803/domains/knowlipop.shop/public_html/uploads/${altSub}/${safeName}`
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+        return p;
+      }
+    } catch (e) {}
+  }
+
+  // Recover uploaded images from sibling Hostinger build versions into persistent storage
+  const versionsRoot = '/home/u999617803/domains/knowlipop.shop/hbuilds/versions';
+  try {
+    if (fs.existsSync(versionsRoot)) {
+      const versions = fs.readdirSync(versionsRoot);
+      for (const ver of versions) {
+        for (const sub of [primarySub, altSub]) {
+          const oldPath = path.join(versionsRoot, ver, 'nodejs', 'uploads', sub, safeName);
+          if (fs.existsSync(oldPath) && fs.statSync(oldPath).isFile()) {
+            const destDir = sub === 'avatars' ? avatarUploadDir : uploadDir;
+            const destPath = path.join(destDir, safeName);
+            try {
+              if (!fs.existsSync(destPath)) {
+                fs.copyFileSync(oldPath, destPath);
+                try { fs.chmodSync(destPath, 0o644); } catch (ignoreChmod) {}
+              }
+              return fs.existsSync(destPath) ? destPath : oldPath;
+            } catch (copyErr) {
+              return oldPath;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+function migrateLegacyMediaToPersistent() {
+  const sourceRoots = [
+    path.resolve(__dirname, 'uploads')
+  ];
+  if (isHostinger) {
+    sourceRoots.push('/home/u999617803/domains/knowlipop.shop/public_html/uploads');
+    const versionsRoot = '/home/u999617803/domains/knowlipop.shop/hbuilds/versions';
+    try {
+      if (fs.existsSync(versionsRoot)) {
+        for (const ver of fs.readdirSync(versionsRoot)) {
+          sourceRoots.push(path.join(versionsRoot, ver, 'nodejs', 'uploads'));
+        }
+      }
+    } catch (e) {}
+  }
+
+  for (const root of sourceRoots) {
+    for (const sub of ['products', 'avatars']) {
+      const srcDir = path.join(root, sub);
+      const destDir = sub === 'avatars' ? avatarUploadDir : uploadDir;
+      if (path.resolve(srcDir) === path.resolve(destDir)) continue;
+      try {
+        if (!fs.existsSync(srcDir) || !fs.statSync(srcDir).isDirectory()) continue;
+        for (const file of fs.readdirSync(srcDir)) {
+          if (!/\.(jpg|jpeg|png|webp|gif|svg)$/i.test(file)) continue;
+          const srcFile = path.join(srcDir, file);
+          const destFile = path.join(destDir, file);
+          try {
+            if (!fs.existsSync(destFile) && fs.statSync(srcFile).isFile()) {
+              fs.copyFileSync(srcFile, destFile);
+              try { fs.chmodSync(destFile, 0o644); } catch (ignoreChmod) {}
+            }
+          } catch (ignoreCopy) {}
+        }
+      } catch (ignoreDir) {}
+    }
+  }
+}
+
+try {
+  migrateLegacyMediaToPersistent();
+} catch (migrateErr) {
+  console.warn('[Media Storage] Startup migration warning:', migrateErr.message);
 }
 
 const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
@@ -107,7 +247,7 @@ app.use((req, res, next) => {
   const urlPath = req.path || req.url;
 
   // Match any product image filename or avatar filename anywhere in the URL
-  const imgMatch = urlPath.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp))/i);
+  const imgMatch = urlPath.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
   const isImageRoute = (
     imgMatch ||
     urlPath.startsWith('/uploads/') ||
@@ -145,19 +285,9 @@ app.use((req, res, next) => {
     return next();
   }
 
-  const searchDir = isAvatar ? avatarUploadDir : uploadDir;
-  let targetPath = path.join(searchDir, targetFilename);
+  const targetPath = resolveUploadedMediaPath(targetFilename, isAvatar);
 
-  // If not found in primary dir, check the other dir as well
-  if (!fs.existsSync(targetPath)) {
-    const altDir = isAvatar ? uploadDir : avatarUploadDir;
-    const altPath = path.join(altDir, targetFilename);
-    if (fs.existsSync(altPath)) {
-      targetPath = altPath;
-    }
-  }
-
-  if (fs.existsSync(targetPath)) {
+  if (targetPath && fs.existsSync(targetPath)) {
     const ext = path.extname(targetFilename).toLowerCase();
     const mimeMap = {
       '.jpg': 'image/jpeg',
@@ -174,8 +304,8 @@ app.use((req, res, next) => {
 
   // File not found on disk: Never redirect to external sample/demo URLs or automatic placeholders
   if (isAvatar) {
-    const avatarPlaceholder = path.join(avatarUploadDir, 'placeholder.jpg');
-    if (fs.existsSync(avatarPlaceholder)) {
+    const avatarPlaceholder = resolveUploadedMediaPath('placeholder.jpg', true) || path.join(avatarUploadDir, 'placeholder.jpg');
+    if (avatarPlaceholder && fs.existsSync(avatarPlaceholder)) {
       res.setHeader('Content-Type', 'image/jpeg');
       res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.sendFile(avatarPlaceholder);
@@ -187,21 +317,28 @@ app.use((req, res, next) => {
 });
 
 // Secondary static directories mounting for direct file paths
-app.use(['/uploads', '/public/uploads', '/storage/uploads', '/storage'], (req, res, next) => {
+const mediaStaticCors = (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
-}, express.static(path.resolve(__dirname, 'uploads'), {
+};
+const mediaStaticOpts = {
   maxAge: '30d',
   immutable: true,
   setHeaders: (res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
-}));
+};
+app.use(
+  ['/uploads', '/public/uploads', '/storage/uploads', '/storage'],
+  mediaStaticCors,
+  express.static(path.dirname(uploadDir), mediaStaticOpts),
+  express.static(path.resolve(__dirname, 'uploads'), mediaStaticOpts)
+);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -320,7 +457,7 @@ function isBase64Image(str) {
   return false;
 }
 
-function saveBase64Image(dataString) {
+function saveBase64Image(dataString, req = null) {
   if (typeof dataString !== 'string') return null;
   const trimmed = dataString.trim();
   if (!isBase64Image(trimmed)) return null;
@@ -354,7 +491,7 @@ function saveBase64Image(dataString) {
     const fullPath = path.join(uploadDir, filename);
     fs.writeFileSync(fullPath, buffer);
     try { fs.chmodSync(fullPath, 0o644); } catch (e) {}
-    const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
+    const baseUrl = getAppBaseUrl(req);
     return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
   } catch (err) {
     console.error('Failed to save base64 image:', err);
@@ -385,7 +522,7 @@ function dedupeImagesByFilename(list) {
 }
 
 function resolveProductImages(req) {
-  const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
+  const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
   const collected = [];
   const filesInfo = [];
   const seenKeys = new Set();
@@ -511,7 +648,7 @@ function resolveProductImages(req) {
 
       // Base64 data URI or raw base64 string
       if (isBase64Image(trimmed)) {
-        const saved = saveBase64Image(trimmed);
+        const saved = saveBase64Image(trimmed, req);
         if (saved) {
           addCollected(saved, {
             file_name: path.basename(saved),
@@ -653,7 +790,7 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
         fileSize = matched.file_size;
         mimeType = matched.mime_type;
       } else {
-        const localPath = path.join(uploadDir, fileName);
+        const localPath = resolveUploadedMediaPath(fileName, false) || path.join(uploadDir, fileName);
         if (fs.existsSync(localPath)) {
           try {
             const stat = fs.statSync(localPath);
@@ -732,11 +869,18 @@ async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null
     }
 
     // Safe to delete physical file
-    const localPath = path.join(uploadDir, safeName);
-    if (fs.existsSync(localPath)) {
-      fs.unlinkSync(localPath);
-      return true;
+    const deleteTargets = [
+      path.join(uploadDir, safeName),
+      path.join(__dirname, 'uploads', 'products', safeName)
+    ];
+    let deleted = false;
+    for (const target of deleteTargets) {
+      if (fs.existsSync(target)) {
+        fs.unlinkSync(target);
+        deleted = true;
+      }
     }
+    return deleted;
   } catch (e) {
     console.error('Error during safe file delete:', e);
   }
@@ -751,37 +895,90 @@ function resolveProductImage(req) {
 // Avatar Storage Configuration
 
 const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, avatarUploadDir),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(avatarUploadDir)) {
+      fs.mkdirSync(avatarUploadDir, { recursive: true, mode: 0o755 });
+    }
+    cb(null, avatarUploadDir);
+  },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+    let ext = path.extname(file.originalname || '').toLowerCase();
+    if (!ALLOWED_IMAGE_EXTS.includes(ext)) {
+      if (file.mimetype === 'image/png') ext = '.png';
+      else if (file.mimetype === 'image/webp') ext = '.webp';
+      else ext = '.jpg';
+    }
     cb(null, `avatar_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
   }
 });
-const avatarUpload = multer({
+const rawAvatarUpload = multer({
   storage: avatarStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }
+  fileFilter: imageFileFilter,
+  limits: { fileSize: 10 * 1024 * 1024, files: 2 }
 });
 
+function handleAvatarUploadMiddleware(req, res, next) {
+  rawAvatarUpload.any()(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(422).json({
+          message: 'Avatar file size exceeds maximum limit of 10MB.',
+          errors: { avatar: ['The avatar image size must not exceed 10MB.'] }
+        });
+      }
+      return res.status(422).json({
+        message: err.message || 'Avatar upload validation failed.',
+        errors: { avatar: [err.message || 'Invalid avatar image file.'] }
+      });
+    }
+    if (req.files && Array.isArray(req.files)) {
+      for (const f of req.files) {
+        if (f && f.path) {
+          try { fs.chmodSync(f.path, 0o644); } catch (e) {}
+        }
+      }
+    }
+    if (req.file && req.file.path) {
+      try { fs.chmodSync(req.file.path, 0o644); } catch (e) {}
+    }
+    next();
+  });
+}
+
+const avatarUpload = {
+  any: () => handleAvatarUploadMiddleware,
+  single: () => handleAvatarUploadMiddleware
+};
+
 function resolveAvatarImage(req) {
-  const baseUrl = process.env.APP_URL || 'https://knowlipop.shop';
-  if (req.file) {
-    return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${req.file.filename}`;
+  const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
+  if (req.file && req.file.filename) {
+    return `${baseUrl}/uploads/avatars/${req.file.filename}`;
   }
-  if (req.files && req.files.length > 0) {
-    return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${req.files[0].filename}`;
+  if (req.files && req.files.length > 0 && req.files[0].filename) {
+    return `${baseUrl}/uploads/avatars/${req.files[0].filename}`;
   }
   const body = req.body || {};
   const base64Candidate = body.avatar || body.image || body.profile_image || body.avatar_base64;
   if (base64Candidate && typeof base64Candidate === 'string' && base64Candidate.startsWith('data:image/')) {
-    const matches = base64Candidate.match(/^data:image\/(\w+);base64,(.+)$/);
+    const matches = base64Candidate.match(/^data:image\/(\w+);base64,(.+)$/is);
     if (matches) {
       let ext = matches[1].toLowerCase();
       if (ext === 'jpeg') ext = 'jpg';
-      if (!['jpg', 'png', 'webp', 'gif', 'svg'].includes(ext)) ext = 'png';
-      const buffer = Buffer.from(matches[2], 'base64');
-      const filename = `avatar_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
-      fs.writeFileSync(path.join(avatarUploadDir, filename), buffer);
-      return `${baseUrl.replace(/\/$/, '')}/uploads/avatars/${filename}`;
+      if (!['jpg', 'png', 'webp'].includes(ext)) ext = 'png';
+      try {
+        const buffer = Buffer.from(matches[2].replace(/\s+/g, ''), 'base64');
+        if (buffer.length > 10 && buffer.length <= 10 * 1024 * 1024) {
+          if (!fs.existsSync(avatarUploadDir)) {
+            fs.mkdirSync(avatarUploadDir, { recursive: true, mode: 0o755 });
+          }
+          const filename = `avatar_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+          const fullPath = path.join(avatarUploadDir, filename);
+          fs.writeFileSync(fullPath, buffer);
+          try { fs.chmodSync(fullPath, 0o644); } catch (e) {}
+          return `${baseUrl}/uploads/avatars/${filename}`;
+        }
+      } catch (e) {}
     }
   }
   if (body.avatar_url && typeof body.avatar_url === 'string' && (body.avatar_url.startsWith('http://') || body.avatar_url.startsWith('https://'))) {
@@ -905,6 +1102,18 @@ let fallbackSellers = [
   { id: 7, name: 'Seller Seven Shop', seller_name: 'Verified Seller 7', phone: '+919633426257', role: 'seller', address: 'Bazaar Street', landmark: 'Near City Mall', state: 'Maharashtra', country: 'India', products_count: 2 }
 ];
 
+let userAvatarColEnsured = false;
+async function ensureUserAvatarColumn(p) {
+  if (userAvatarColEnsured || !p) return;
+  try {
+    const [cols] = await p.query("SHOW COLUMNS FROM users LIKE 'avatar_url'");
+    if (cols.length === 0) {
+      await p.query('ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER country');
+    }
+    userAvatarColEnsured = true;
+  } catch (e) {}
+}
+
 // Helper: safe seller output
 function safeSeller(user) {
   if (!user) return {};
@@ -918,6 +1127,7 @@ function safeSeller(user) {
     landmark: user.landmark || null,
     state: user.state || null,
     country: user.country || null,
+    avatar_url: user.avatar_url || null,
   };
 
   if (user.role) {
@@ -1558,6 +1768,7 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   }
   if (avatarUrl) {
     try {
+      await ensureUserAvatarColumn(pool);
       const [cols] = await pool.query('SHOW COLUMNS FROM users LIKE "avatar_url"');
       if (cols.length > 0) {
         updates.push('avatar_url = ?');
@@ -1730,9 +1941,10 @@ app.get('/api/sellers', async (req, res) => {
   }
 
   try {
+    await ensureUserAvatarColumn(pool);
     const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM users ${where}`, params);
     const [rows] = await pool.query(
-      `SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.role, u.created_at, u.updated_at,
+      `SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, u.created_at, u.updated_at,
               (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
        FROM users u
        ${where}
@@ -2378,6 +2590,8 @@ function formatProductRecord(p, options = {}) {
     in_stock: stock > 0,
     rating,
     ratings_count: ratingsCount,
+    image_url: primaryImageUrl,
+    image: primaryImageUrl,
     images: finalImagesArray,
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
@@ -2559,35 +2773,43 @@ let fallbackProducts = [
 
 app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
-  const limit = 20;
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
   const offset = (page - 1) * limit;
   const sellerId = req.query.seller_id ? parseInt(req.query.seller_id, 10) : null;
+  const search = (req.query.search || req.query.q || '').toString().trim();
+  const category = (req.query.category || '').toString().trim();
 
   try {
     await ensureProductPriceColumns(pool);
-    let countSql = 'SELECT COUNT(*) as total FROM products WHERE is_active = 1';
-    let querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+    let whereSql = 'WHERE p.is_active = 1';
+    const whereParams = [];
+
+    if (sellerId !== null && !isNaN(sellerId)) {
+      whereSql += ' AND p.seller_id = ?';
+      whereParams.push(sellerId);
+    }
+    if (search) {
+      whereSql += ' AND (p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)';
+      const s = `%${search}%`;
+      whereParams.push(s, s, s);
+    }
+    if (category) {
+      whereSql += ' AND p.category = ?';
+      whereParams.push(category);
+    }
+
+    const countSql = `SELECT COUNT(*) as total FROM products p ${whereSql}`;
+    const querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.sku, p.category, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.is_active = 1`;
-    const countParams = [];
-    const queryParams = [];
+       ${whereSql}
+       ORDER BY p.id DESC LIMIT ? OFFSET ?`;
 
-    if (sellerId !== null && !isNaN(sellerId)) {
-      countSql += ' AND seller_id = ?';
-      countParams.push(sellerId);
-      querySql += ' AND p.seller_id = ?';
-      queryParams.push(sellerId);
-    }
-
-    querySql += ' ORDER BY p.id DESC LIMIT ? OFFSET ?';
-    queryParams.push(limit, offset);
-
-    const [[{ total }]] = await pool.query(countSql, countParams);
-    const [products] = await pool.query(querySql, queryParams);
+    const [[{ total }]] = await pool.query(countSql, whereParams);
+    const [products] = await pool.query(querySql, [...whereParams, limit, offset]);
 
     // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
     const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
@@ -2608,7 +2830,13 @@ app.get('/api/products', async (req, res) => {
       }
     });
   } catch (err) {
-    const filtered = fallbackProducts.filter(p => !sellerId || p.seller_id === sellerId).map(p => formatProductRecord(p, { isSellerView: false, req }));
+    const searchLower = search.toLowerCase();
+    const filtered = fallbackProducts.filter(p => {
+      if (sellerId && p.seller_id !== sellerId) return false;
+      if (category && String(p.category || '').toLowerCase() !== category.toLowerCase()) return false;
+      if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
+      return true;
+    }).map(p => formatProductRecord(p, { isSellerView: false, req }));
     res.json({
       success: true,
       status: true,
@@ -2705,7 +2933,7 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
         existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
       } catch (e) {}
 
-      let combinedImgs = isReplace ? imgResult.images : Array.from(new Set([...existingImgs, ...imgResult.images]));
+      let combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
       if (combinedImgs.length > 4) {
         return res.status(422).json({
           message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
@@ -2726,8 +2954,14 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
       // Sync permanent records in product_images table in MySQL
       await syncProductImagesRecord(pool, sellerId, targetProductId, combinedImgs, imgResult.filesInfo);
 
-      const [updatedRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
-      attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true });
+      const [updatedRows] = await pool.query(
+        `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE p.id = ? LIMIT 1`,
+        [targetProductId]
+      );
+      attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true, req });
     } catch (dbErr) {
       console.error('[Upload Product Attach Error]:', dbErr.message);
       return res.status(500).json({ message: 'Failed to update product images in database: ' + dbErr.message });
@@ -2750,10 +2984,14 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
     success: true,
     status: true,
     message: 'Images uploaded successfully.',
+    image_url: imgResult.primaryImageUrl,
+    image: imgResult.primaryImageUrl,
     images: imgResult.images,
     product_id: targetProductId || null,
     product: attachedProduct,
     data: {
+      image_url: imgResult.primaryImageUrl,
+      image: imgResult.primaryImageUrl,
       images: imgResult.images
     },
     limit: 4,
@@ -2770,21 +3008,23 @@ app.get('/api/products/:id/images', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
 
     const p = rows[0];
-    const baseUrl = (process.env.APP_URL || 'https://knowlipop.shop').replace(/\/$/, '');
-    let images = parseImagesJson(p.images || p.image_url).map(u => {
-      if (!u || u.includes('placeholder') || u.includes('unsplash.com')) return null;
+    const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
+    const normalizeImgUrl = (u) => {
+      if (!u || typeof u !== 'string' || u.includes('placeholder') || u.includes('unsplash.com')) return null;
       const fn = path.basename(u.split('?')[0]);
-      return u.includes('/uploads/products/') || /^prod_/.test(fn) ? `${baseUrl}/uploads/products/${fn}` : u;
-    }).filter(Boolean);
+      return (u.includes('/uploads/products/') || /^prod_/i.test(fn)) ? `${baseUrl}/uploads/products/${fn}` : u;
+    };
 
+    let images = parseImagesJson(p.images || p.image_url).map(normalizeImgUrl).filter(Boolean);
     images = dedupeImagesByFilename(images);
 
     const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
     for (const r of piRows) {
-      if (r.image_url && !r.image_url.includes('placeholder') && !r.image_url.includes('unsplash.com')) {
-        const k = getImageBasename(r.image_url);
+      const norm = normalizeImgUrl(r.image_url);
+      if (norm) {
+        const k = getImageBasename(norm);
         if (images.length < 4 && !images.some(img => getImageBasename(img) === k)) {
-          images.push(r.image_url);
+          images.push(norm);
         }
       }
     }
@@ -2799,7 +3039,7 @@ app.get('/api/products/:id/images', async (req, res) => {
       seenGalleryKeys.add(k);
       galleryList.push({
         id: Number(r.id),
-        image_url: r.image_url,
+        image_url: normalizeImgUrl(r.image_url) || r.image_url,
         relative_path: r.relative_path,
         file_name: r.file_name,
         file_size: r.file_size ? Number(r.file_size) : null,
@@ -2807,10 +3047,13 @@ app.get('/api/products/:id/images', async (req, res) => {
       });
     }
 
+    const primaryUrl = images[0] || null;
     res.json({
       success: true,
       status: true,
       product_id: prodId,
+      image_url: primaryUrl,
+      image: primaryUrl,
       images,
       total: images.length
     });
@@ -2947,13 +3190,14 @@ const handleProductImageReplacement = async (req, res) => {
         if (!currentImgs.includes(img)) currentImgs.push(img);
       }
     }
-    if (currentImgs.length > 4) {
+    const dedupedIndexed = dedupeImagesByFilename(currentImgs);
+    if (dedupedIndexed.length > 4) {
       return res.status(422).json({
-        message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length} images.`,
+        message: `Maximum 4 images allowed per product. Currently has ${dedupedIndexed.length} images.`,
         limit: 4
       });
     }
-    newImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
+    newImages = dedupedIndexed;
   } else if (isExplicitReplace) {
     // Explicit replace without index: replace primary (index 0)
     if (currentImgs.length > 0) replacedUrls.push(currentImgs[0]);
@@ -2963,7 +3207,14 @@ const handleProductImageReplacement = async (req, res) => {
         if (!currentImgs.includes(imgResult.images[i])) currentImgs.push(imgResult.images[i]);
       }
     }
-    newImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
+    const dedupedExplicit = dedupeImagesByFilename(currentImgs);
+    if (dedupedExplicit.length > 4) {
+      return res.status(422).json({
+        message: `Maximum 4 images allowed per product. Currently has ${dedupedExplicit.length} images.`,
+        limit: 4
+      });
+    }
+    newImages = dedupedExplicit;
   } else {
     // DEFAULT FOR POST /api/products/:id/images and upload: ADD / APPEND to gallery up to 4 images!
     // Appends new uploaded images to current gallery slots so seller can have multiple images (1/4, 2/4, 3/4, 4/4)
@@ -3000,13 +3251,21 @@ const handleProductImageReplacement = async (req, res) => {
       }
     }
 
-    const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    const [updated] = await pool.query(
+      `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.id = ? LIMIT 1`,
+      [prodId]
+    );
     const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
 
     res.json({
       success: true,
       status: true,
       message: 'Product image updated successfully.',
+      image_url: primaryUrl,
+      image: primaryUrl,
       images: newImages,
       product: formatted,
       data: formatted
@@ -3054,8 +3313,9 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
 
   if (targetFilename) {
     const safeTarget = path.basename(targetFilename.split('?')[0]);
-    removedUrl = currentImgs.find(u => u.includes(safeTarget));
-    currentImgs = currentImgs.filter(u => !u.includes(safeTarget));
+    const targetLower = safeTarget.toLowerCase();
+    removedUrl = currentImgs.find(u => u.includes(safeTarget) || getImageBasename(u) === targetLower);
+    currentImgs = currentImgs.filter(u => !u.includes(safeTarget) && getImageBasename(u) !== targetLower);
   } else if (req.body?.image_index !== undefined || req.query?.image_index !== undefined) {
     const idx = parseInt(req.body?.image_index ?? req.query?.image_index, 10);
     if (idx >= 0 && idx < currentImgs.length) {
@@ -3082,13 +3342,21 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
       await safeDeleteLocalImageFile(pool, removedFn, prodId);
     }
 
-    const [updated] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+    const [updated] = await pool.query(
+      `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+       FROM products p
+       LEFT JOIN users u ON p.seller_id = u.id
+       WHERE p.id = ? LIMIT 1`,
+      [prodId]
+    );
     const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
 
     res.json({
       success: true,
       status: true,
       message: 'Product image deleted successfully.',
+      image_url: primaryUrl,
+      image: primaryUrl,
       images: currentImgs,
       product: formatted,
       data: formatted
@@ -3413,13 +3681,18 @@ app.all(['/api/products/:id', '/api/products/update/:id'], authenticateToken, up
       } else {
         currentImgs.push(imgResult.primaryImageUrl);
       }
-      finalImages = dedupeImagesByFilename(currentImgs).slice(0, 4);
-      if (finalImages.length > 4) {
+      const dedupedIndexed = dedupeImagesByFilename(currentImgs);
+      if (dedupedIndexed.length > 4) {
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
+      finalImages = dedupedIndexed;
     } else if (body.images && (Array.isArray(body.images) || (typeof body.images === 'string' && body.images.trim().startsWith('[')))) {
       // Client explicitly passed the full list of images to retain
-      finalImages = dedupeImagesByFilename(imgResult.images).slice(0, 4);
+      const dedupedExplicit = dedupeImagesByFilename(imgResult.images);
+      if (dedupedExplicit.length > 4) {
+        return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
+      }
+      finalImages = dedupedExplicit;
     } else {
       // Files uploaded without explicit replacement array: preserve existing images and append newly uploaded files up to 4
       const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
@@ -3989,8 +4262,12 @@ const handleGetSellerOrders = async (req, res) => {
     let itemsByOrder = {};
     if (orderIds.length > 0) {
       const [allItems] = await pool.query(
-        `SELECT oi.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        `SELECT oi.*,
+                p.image_url AS catalog_image_url,
+                p.images AS catalog_images,
+                COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
          FROM order_items oi
+         LEFT JOIN products p ON oi.product_id = p.id
          LEFT JOIN users u ON oi.seller_id = u.id
          WHERE oi.order_id IN (?) AND oi.seller_id = ?
          ORDER BY oi.id ASC`,
@@ -3999,6 +4276,8 @@ const handleGetSellerOrders = async (req, res) => {
       for (const it of allItems) {
         const oid = Number(it.order_id);
         if (!itemsByOrder[oid]) itemsByOrder[oid] = [];
+        const catalogGallery = parseImagesJson(it.catalog_images);
+        const pImg = it.product_image || it.catalog_image_url || catalogGallery[0] || null;
         itemsByOrder[oid].push({
           ...it,
           id: Number(it.id),
@@ -4006,6 +4285,8 @@ const handleGetSellerOrders = async (req, res) => {
           product_id: it.product_id ? Number(it.product_id) : null,
           seller_id: targetSellerId,
           seller_name: it.seller_name || 'Verified Seller',
+          product_image: pImg,
+          image_url: pImg,
           price: parseFloat(it.price),
           unit_price: parseFloat(it.price),
           quantity: Number(it.quantity),
@@ -4173,6 +4454,7 @@ const handleGetOrders = async (req, res) => {
           `SELECT oi.*,
                   COALESCE(NULLIF(oi.product_name, 'Product'), p.name, oi.product_name, 'Product') AS resolved_product_name,
                   COALESCE(oi.product_image, p.image_url) AS resolved_product_image,
+                  p.images AS catalog_images,
                   CASE WHEN oi.price > 0 THEN oi.price ELSE COALESCE(p.price, 0) END AS resolved_price,
                   COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
            FROM order_items oi
@@ -4189,7 +4471,8 @@ const handleGetOrders = async (req, res) => {
           const itemQty = Number(it.quantity) || 1;
           const itemSubtotal = (parseFloat(it.subtotal) > 0) ? parseFloat(it.subtotal) : Math.round(itemPrice * itemQty * 100) / 100;
           const pName = it.resolved_product_name || it.product_name || 'Product';
-          const pImg = it.resolved_product_image || it.product_image || null;
+          const catalogGallery = parseImagesJson(it.catalog_images);
+          const pImg = it.resolved_product_image || it.product_image || catalogGallery[0] || null;
 
           itemsByOrder[oid].push({
             ...it,
@@ -4320,6 +4603,7 @@ const handleGetOrderDetail = async (req, res) => {
       `SELECT oi.*,
               COALESCE(NULLIF(oi.product_name, 'Product'), p.name, oi.product_name, 'Product') AS resolved_product_name,
               COALESCE(oi.product_image, p.image_url) AS resolved_product_image,
+              p.images AS catalog_images,
               CASE WHEN oi.price > 0 THEN oi.price ELSE COALESCE(p.price, 0) END AS resolved_price,
               COALESCE(u.seller_name, u.name, 'Direct Marketplace') AS seller_name
        FROM order_items oi
@@ -4334,7 +4618,8 @@ const handleGetOrderDetail = async (req, res) => {
       const itemQty = Number(i.quantity) || 1;
       const itemSubtotal = (parseFloat(i.subtotal) > 0) ? parseFloat(i.subtotal) : Math.round(itemPrice * itemQty * 100) / 100;
       const pName = i.resolved_product_name || i.product_name || 'Product';
-      const pImg = i.resolved_product_image || i.product_image || null;
+      const catalogGallery = parseImagesJson(i.catalog_images);
+      const pImg = i.resolved_product_image || i.product_image || catalogGallery[0] || null;
 
       return {
         ...i,
@@ -4924,8 +5209,8 @@ app.get(['/api/seller/notifications', '/api/notifications'], authenticateToken, 
 app.get(['/api/seller/notifications/unread-count', '/api/notifications/unread-count'], authenticateToken, handleGetUnreadNotificationsCount);
 app.put(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
 app.post(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
-app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all'], authenticateToken, handleMarkAllNotificationsRead);
-app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
+app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
+app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
 app.post(['/api/seller/fcm-token', '/api/fcm-token', '/api/device-token', '/api/notifications/token'], authenticateToken, handleRegisterDeviceToken);
 
 app.post(['/api/seller/orders/:id/accept', '/api/sellers/:seller_id/orders/:id/accept'], authenticateToken, handleSellerAcceptOrder);
@@ -4961,6 +5246,18 @@ app.get(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/s
 app.get(['/api/orders', '/api/order'], handleGetOrders);
 app.get(['/api/orders/:id', '/api/order/:id'], handleGetOrderDetail);
 
+// Fallback map for seed catalog products (shared by handleCreateOrder & handleOrderUpdate)
+const defaultProductCatalogMap = {
+  1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: null },
+  2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: null },
+  3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: null },
+  4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: null },
+  5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: null },
+  6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: null },
+  7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: null },
+  8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: null }
+};
+
 // POST /api/orders and /api/order
 const handleCreateOrder = async (req, res) => {
   const body = req.body || {};
@@ -4985,18 +5282,6 @@ const handleCreateOrder = async (req, res) => {
     return res.status(422).json({ message: 'Validation error.', errors });
   }
 
-  // Fallback map for seed catalog products
-  const defaultProductCatalogMap = {
-    1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: null },
-    2: { id: 2, seller_id: 1, name: 'Ultra HD 4K Smart Watch', price: 4499.00, image_url: null },
-    3: { id: 3, seller_id: 1, name: 'Vintage Leather Travel Backpack', price: 3299.00, image_url: null },
-    4: { id: 4, seller_id: 1, name: 'Air Cushion Running Sneakers', price: 2499.00, image_url: null },
-    5: { id: 5, seller_id: 1, name: 'Polarized Aviator Sunglasses', price: 1299.00, image_url: null },
-    6: { id: 6, seller_id: 1, name: 'RGB Mechanical Gaming Keyboard', price: 3999.00, image_url: null },
-    7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: null },
-    8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: null }
-  };
-
   // 1. Pre-query product catalog from MySQL to auto-resolve accurate prices, names, images, and seller_ids
   const productIds = items
     .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
@@ -5005,7 +5290,7 @@ const handleCreateOrder = async (req, res) => {
   let productCatalogMap = {};
   if (productIds.length > 0) {
     try {
-      const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url FROM products WHERE id IN (?)', [productIds]);
+      const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url, images FROM products WHERE id IN (?)', [productIds]);
       for (const pr of pRows) {
         productCatalogMap[pr.id] = pr;
       }
@@ -5030,7 +5315,8 @@ const handleCreateOrder = async (req, res) => {
     }
 
     const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
-    const image = item.product_image || item.image_url || item.image || (catalogItem ? catalogItem.image_url : null);
+    const catalogGallery = catalogItem && catalogItem.images ? parseImagesJson(catalogItem.images) : [];
+    const image = item.product_image || item.image_url || item.image || (catalogItem ? (catalogItem.image_url || catalogGallery[0] || null) : null);
     const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
     const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
     subtotal += lineSubtotal;
@@ -5365,7 +5651,7 @@ const handleOrderUpdate = async (req, res) => {
       let pMap = {};
       if (pIds.length > 0) {
         try {
-          const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url FROM products WHERE id IN (?)', [pIds]);
+          const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url, images FROM products WHERE id IN (?)', [pIds]);
           for (const pr of pRows) {
             pMap[pr.id] = pr;
           }
@@ -5389,7 +5675,8 @@ const handleOrderUpdate = async (req, res) => {
         }
 
         const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
-        const image = item.product_image || item.image_url || item.image || (catalogItem ? catalogItem.image_url : null);
+        const catalogGallery = catalogItem && catalogItem.images ? parseImagesJson(catalogItem.images) : [];
+        const image = item.product_image || item.image_url || item.image || (catalogItem ? (catalogItem.image_url || catalogGallery[0] || null) : null);
         const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
         const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
         subtotal += lineSubtotal;
@@ -5641,13 +5928,15 @@ const handleOrderUpdate = async (req, res) => {
         const qty = Math.max(1, parseInt(it.quantity || it.qty || 1, 10));
         const line = Math.round(price * qty * 100) / 100;
         newSubtotal += line;
+        const fbImg = it.product_image || it.image_url || it.image || null;
         return {
           id: it.id || i + 1,
           order_id: orderId,
           product_id: it.product_id || it.id || null,
           seller_id: it.seller_id || current.seller_id || 1,
           product_name: it.product_name || it.name || 'Product',
-          product_image: it.product_image || it.image_url || it.image || null,
+          product_image: fbImg,
+          image_url: fbImg,
           price,
           quantity: qty,
           subtotal: line
@@ -5693,6 +5982,7 @@ const handleOrderUpdate = async (req, res) => {
 
 app.put(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
 app.patch(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
+app.post(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
 
 // DELETE /api/orders/:id and /api/order/:id (also supports seller routes)
 const handleDeleteOrder = async (req, res) => {
@@ -5797,7 +6087,18 @@ function numberToWords(amount) {
   return res + ' Only';
 }
 
+function escapeHtmlServer(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function generateInvoiceHtml(order, items, provider, serverUrl) {
+  const esc = escapeHtmlServer;
   const subtotal = parseFloat(order.subtotal || 0);
   const delivery = parseFloat(order.delivery_fee || 0);
   const discount = parseFloat(order.discount || 0);
@@ -5818,7 +6119,7 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Invoice - ${order.order_number} - ${provider.shop_name}</title>
+  <title>Invoice - ${esc(order.order_number)} - ${esc(provider.shop_name)}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
@@ -5873,7 +6174,7 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
   <div class="action-bar">
     <div>
       <span style="font-size: 14px; font-weight: 800;">📄 Provider Tax Invoice</span>
-      <span style="font-size: 12px; color: #64748b; margin-left: 8px;">Order #${order.order_number}</span>
+      <span style="font-size: 12px; color: #64748b; margin-left: 8px;">Order #${esc(order.order_number)}</span>
     </div>
     <div style="display: flex; gap: 10px;">
       <a href="/test-buyer" class="btn btn-back">← Back to Hub</a>
@@ -5883,36 +6184,36 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
   </div>
 
   <div class="invoice-sheet">
-    <div class="watermark">${stampText}</div>
+    <div class="watermark">${esc(stampText)}</div>
     <div class="invoice-header">
       <div>
         <div class="provider-brand">
           <div class="provider-icon">🏢</div>
           <div>
-            <div class="provider-name">${provider.shop_name}</div>
+            <div class="provider-name">${esc(provider.shop_name)}</div>
             <div style="font-size: 12px; font-weight: 700; color: #4f46e5;">Official Marketplace Provider</div>
           </div>
         </div>
         <div class="provider-address">
-          ${provider.address}<br>
-          ${provider.landmark ? provider.landmark + ', ' : ''}${provider.state}, ${provider.country}<br>
-          Phone: ${provider.phone} | Email: ${provider.email}
+          ${esc(provider.address)}<br>
+          ${provider.landmark ? esc(provider.landmark) + ', ' : ''}${esc(provider.state)}, ${esc(provider.country)}<br>
+          Phone: ${esc(provider.phone)} | Email: ${esc(provider.email)}
         </div>
         <div class="tax-reg-info">
-          GSTIN: <strong>${provider.gstin}</strong> | PAN: <strong>${provider.pan}</strong><br>
-          Server Portal: <strong>${serverUrl}</strong>
+          GSTIN: <strong>${esc(provider.gstin)}</strong> | PAN: <strong>${esc(provider.pan)}</strong><br>
+          Server Portal: <strong>${esc(serverUrl)}</strong>
         </div>
       </div>
       <div class="invoice-meta">
         <div class="invoice-title">TAX INVOICE</div>
-        <div class="invoice-num">${invoiceNum}</div>
+        <div class="invoice-num">${esc(invoiceNum)}</div>
         <div class="invoice-dates">
-          <div>Invoice Date: <strong>${invDate}</strong></div>
-          <div>Order Ref: <strong>#${order.order_number}</strong></div>
-          <div>Payment: <strong style="text-transform: uppercase;">${order.payment_method || 'cod'}</strong></div>
+          <div>Invoice Date: <strong>${esc(invDate)}</strong></div>
+          <div>Order Ref: <strong>#${esc(order.order_number)}</strong></div>
+          <div>Payment: <strong style="text-transform: uppercase;">${esc(order.payment_method || 'cod')}</strong></div>
         </div>
         <div>
-          <span class="status-stamp" style="${stampClass}">${stampText}</span>
+          <span class="status-stamp" style="${stampClass}">${esc(stampText)}</span>
         </div>
       </div>
     </div>
@@ -5920,21 +6221,21 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
     <div class="parties-grid">
       <div>
         <div class="party-col-title">Sold & Fulfilled By (Provider)</div>
-        <div class="party-name">${provider.shop_name}</div>
+        <div class="party-name">${esc(provider.shop_name)}</div>
         <div class="party-details">
-          ${provider.address}<br>
-          ${provider.state}, ${provider.country}<br>
-          Phone: ${provider.phone}
+          ${esc(provider.address)}<br>
+          ${esc(provider.state)}, ${esc(provider.country)}<br>
+          Phone: ${esc(provider.phone)}
         </div>
       </div>
       <div>
         <div class="party-col-title">Billed & Delivered To (Buyer)</div>
-        <div class="party-name">${order.buyer_name}</div>
+        <div class="party-name">${esc(order.buyer_name)}</div>
         <div class="party-details">
-          ${order.shipping_address}<br>
-          ${order.landmark ? 'Landmark: ' + order.landmark + '<br>' : ''}
-          ${order.city ? order.city + '<br>' : ''}
-          Phone: ${order.buyer_phone}
+          ${esc(order.shipping_address)}<br>
+          ${order.landmark ? 'Landmark: ' + esc(order.landmark) + '<br>' : ''}
+          ${order.city ? esc(order.city) + '<br>' : ''}
+          Phone: ${esc(order.buyer_phone)}
         </div>
       </div>
     </div>
@@ -5955,13 +6256,13 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
           <tr>
             <td class="text-center" style="color: #64748b;">${idx + 1}</td>
             <td>
-              <div style="font-weight: 700; color: #0f172a;">${it.product_name}</div>
-              <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8;">SKU: PROD-${it.product_id || (idx + 1)}</div>
+              <div style="font-weight: 700; color: #0f172a;">${esc(it.product_name)}</div>
+              <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8;">SKU: PROD-${esc(it.product_id || (idx + 1))}</div>
             </td>
             <td class="text-center" style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #64748b;">851830</td>
-            <td class="text-right price-mono">₹${parseFloat(it.price).toFixed(2)}</td>
-            <td class="text-center price-mono" style="font-weight: 700;">${it.quantity}</td>
-            <td class="text-right price-mono" style="font-weight: 700;">₹${parseFloat(it.subtotal).toFixed(2)}</td>
+            <td class="text-right price-mono">₹${parseFloat(it.price || 0).toFixed(2)}</td>
+            <td class="text-center price-mono" style="font-weight: 700;">${Number(it.quantity || 1)}</td>
+            <td class="text-right price-mono" style="font-weight: 700;">₹${parseFloat(it.subtotal || 0).toFixed(2)}</td>
           </tr>
         `).join('')}
       </tbody>
@@ -5978,9 +6279,9 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
         <div style="margin-top: 20px; padding-top: 12px; border-top: 1px dashed #cbd5e1; display: flex; align-items: center; gap: 16px;">
           <div class="signature-seal">VERIFIED<br>PROVIDER<br>SEAL</div>
           <div style="font-size: 11px;">
-            <strong>${provider.shop_name}</strong><br>
+            <strong>${esc(provider.shop_name)}</strong><br>
             Authorized Digital Signature<br>
-            <span style="color: #94a3b8;">Digitally validated on ${invDate}</span>
+            <span style="color: #94a3b8;">Digitally validated on ${esc(invDate)}</span>
           </div>
         </div>
       </div>
@@ -6009,16 +6310,16 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
             <span class="val">₹${total.toFixed(2)}</span>
           </div>
           <div class="amount-words">
-            <strong>In Words:</strong> ${words}
+            <strong>In Words:</strong> ${esc(words)}
           </div>
         </div>
       </div>
     </div>
 
     <div class="invoice-footer">
-      This is an electronically generated tax invoice issued by <strong>${provider.shop_name}</strong>.<br>
-      Verification: <strong>${verificationUrl}</strong> | Server Portal: <strong>${serverUrl}</strong><br>
-      For billing support or tax queries, contact ${provider.email} or call ${provider.phone}.
+      This is an electronically generated tax invoice issued by <strong>${esc(provider.shop_name)}</strong>.<br>
+      Verification: <strong>${esc(verificationUrl)}</strong> | Server Portal: <strong>${esc(serverUrl)}</strong><br>
+      For billing support or tax queries, contact ${esc(provider.email)} or call ${esc(provider.phone)}.
     </div>
   </div>
 
@@ -6029,7 +6330,7 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'Invoice-${order.order_number}.html';
+      a.download = ${JSON.stringify('Invoice-' + String(order.order_number || order.id) + '.html')};
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -6129,7 +6430,7 @@ const handleGetInvoice = async (req, res) => {
   }
 
   if (!order) {
-    return res.status(404).send('<h3>Invoice Not Found: Order ' + rawParam + ' does not exist.</h3><p><a href="/test-buyer">Back to Hub</a></p>');
+    return res.status(404).send('<h3>Invoice Not Found: Order ' + escapeHtmlServer(rawParam) + ' does not exist.</h3><p><a href="/test-buyer">Back to Hub</a></p>');
   }
 
   const optUser = req.user || getOptionalUser(req);

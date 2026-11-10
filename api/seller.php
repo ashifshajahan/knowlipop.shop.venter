@@ -36,12 +36,15 @@ function ensureUserColumns(PDO $pdo): void
 
 function saveUploadedAvatarImage(?string $fallback = null): ?string
 {
-    $uploadDir = __DIR__ . '/../uploads/avatars/';
-    if (!is_dir($uploadDir)) {
-        @mkdir($uploadDir, 0755, true);
-    }
+    $uploadDir = getPersistentMediaDirPhp('avatars');
 
-    $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    if (!empty($host) && !str_contains($host, 'knowlipop.shop')) {
+        $proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $baseUrl = $proto . '://' . $host;
+    } else {
+        $baseUrl = rtrim(getenv('APP_URL') ?: 'https://knowlipop.shop', '/');
+    }
 
     // 1. Check $_FILES for multipart/form-data upload
     $fileFields = ['avatar', 'image', 'profile_image', 'photo', 'picture', 'file'];
@@ -56,6 +59,7 @@ function saveUploadedAvatarImage(?string $fallback = null): ?string
             $filename = 'avatar_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
             $destination = $uploadDir . $filename;
             if (move_uploaded_file($tmp, $destination)) {
+                @chmod($destination, 0644);
                 return $baseUrl . '/uploads/avatars/' . $filename;
             }
         }
@@ -71,9 +75,10 @@ function saveUploadedAvatarImage(?string $fallback = null): ?string
             if (!in_array($ext, ['jpg', 'png', 'webp', 'gif', 'svg'])) $ext = 'png';
 
             $data = base64_decode($matches[2]);
-            if ($data !== false) {
+            if ($data !== false && strlen($data) > 10 && strlen($data) <= 10 * 1024 * 1024) {
                 $filename = 'avatar_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
                 file_put_contents($uploadDir . $filename, $data);
+                @chmod($uploadDir . $filename, 0644);
                 return $baseUrl . '/uploads/avatars/' . $filename;
             }
         }
@@ -178,7 +183,7 @@ function apiGetSellersList(PDO $pdo): void
     $total = (int) $countStmt->fetchColumn();
 
     $sql = "
-        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.role, u.created_at, u.updated_at,
+        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, u.created_at, u.updated_at,
                (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
         FROM users u
         {$where}

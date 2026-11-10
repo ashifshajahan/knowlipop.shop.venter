@@ -296,8 +296,10 @@ function apiGetSellerOrders(PDO $pdo, ?int $routeSellerId = null): void
     if (!empty($orderIds)) {
         $inPlaceholders = implode(',', array_fill(0, count($orderIds), '?'));
         $itemStmt = $pdo->prepare("
-            SELECT oi.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+            SELECT oi.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                   p.image_url AS catalog_image_url, p.images AS catalog_images
             FROM `order_items` oi
+            LEFT JOIN `products` p ON oi.product_id = p.id
             LEFT JOIN `users` u ON oi.seller_id = u.id
             WHERE oi.order_id IN ($inPlaceholders) AND oi.seller_id = ?
             ORDER BY oi.id ASC
@@ -308,6 +310,13 @@ function apiGetSellerOrders(PDO $pdo, ?int $routeSellerId = null): void
 
         foreach ($allItems as $it) {
             $oid = (int)$it['order_id'];
+            $pImg = $it['product_image'] ?: ($it['catalog_image_url'] ?? null);
+            if (empty($pImg) && !empty($it['catalog_images'])) {
+                $dec = json_decode($it['catalog_images'], true);
+                if (is_array($dec) && !empty($dec[0])) {
+                    $pImg = $dec[0];
+                }
+            }
             $itemsByOrder[$oid][] = [
                 'id' => (int)$it['id'],
                 'order_id' => $oid,
@@ -315,7 +324,8 @@ function apiGetSellerOrders(PDO $pdo, ?int $routeSellerId = null): void
                 'seller_id' => (int)$it['seller_id'],
                 'seller_name' => $it['seller_name'] ?? 'Verified Seller',
                 'product_name' => $it['product_name'],
-                'product_image' => $it['product_image'],
+                'product_image' => $pImg,
+                'image_url' => $pImg,
                 'price' => (float)$it['price'],
                 'quantity' => (int)$it['quantity'],
                 'subtotal' => (float)$it['subtotal'],
@@ -473,6 +483,7 @@ function apiGetOrders(PDO $pdo): void
                 SELECT i.*, 
                        COALESCE(NULLIF(i.product_name, 'Product'), p.name, i.product_name, 'Product') AS resolved_product_name,
                        COALESCE(i.product_image, p.image_url) AS resolved_product_image,
+                       p.images AS catalog_images,
                        CASE WHEN i.price > 0 THEN i.price ELSE COALESCE(p.price, 0) END AS resolved_price,
                        COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
                 FROM `order_items` i
@@ -487,6 +498,12 @@ function apiGetOrders(PDO $pdo): void
                 $oid = (int)$it['order_id'];
                 $pName = $it['resolved_product_name'] ?? $it['product_name'] ?? 'Product';
                 $pImg = $it['resolved_product_image'] ?? $it['product_image'] ?? null;
+                if (empty($pImg) && !empty($it['catalog_images'])) {
+                    $dec = json_decode($it['catalog_images'], true);
+                    if (is_array($dec) && !empty($dec[0])) {
+                        $pImg = $dec[0];
+                    }
+                }
                 $iPrice = (float)($it['resolved_price'] ?? $it['price'] ?? 0);
                 $iQty = max(1, (int)($it['quantity'] ?? 1));
                 $iSubtotal = (float)$it['subtotal'] > 0 ? (float)$it['subtotal'] : round($iPrice * $iQty, 2);
@@ -610,6 +627,7 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
         SELECT i.*, 
                COALESCE(NULLIF(i.product_name, 'Product'), p.name, i.product_name, 'Product') AS resolved_product_name,
                COALESCE(i.product_image, p.image_url) AS resolved_product_image,
+               p.images AS catalog_images,
                CASE WHEN i.price > 0 THEN i.price ELSE COALESCE(p.price, 0) END AS resolved_price,
                COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
         FROM `order_items` i
@@ -624,6 +642,12 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
     foreach ($allItems as &$item) {
         $pName = $item['resolved_product_name'] ?? $item['product_name'] ?? 'Product';
         $pImg = $item['resolved_product_image'] ?? $item['product_image'] ?? null;
+        if (empty($pImg) && !empty($item['catalog_images'])) {
+            $dec = json_decode($item['catalog_images'], true);
+            if (is_array($dec) && !empty($dec[0])) {
+                $pImg = $dec[0];
+            }
+        }
         $iPrice = (float)($item['resolved_price'] ?? $item['price'] ?? 0);
         $iQty = max(1, (int)($item['quantity'] ?? 1));
         $iSubtotal = (float)$item['subtotal'] > 0 ? (float)$item['subtotal'] : round($iPrice * $iQty, 2);
@@ -825,7 +849,7 @@ function apiCreateOrder(PDO $pdo): void
     if (!empty($productIds)) {
         $inPlaceholders = implode(',', array_fill(0, count($productIds), '?'));
         try {
-            $pStmt = $pdo->prepare("SELECT id, seller_id, name, price, image_url FROM `products` WHERE id IN ($inPlaceholders)");
+            $pStmt = $pdo->prepare("SELECT id, seller_id, name, price, image_url, images FROM `products` WHERE id IN ($inPlaceholders)");
             $pStmt->execute($productIds);
             while ($row = $pStmt->fetch(PDO::FETCH_ASSOC)) {
                 $productMap[(int)$row['id']] = $row;
@@ -845,9 +869,17 @@ function apiCreateOrder(PDO $pdo): void
             if (empty($pi['price']) || $pi['price'] <= 0) {
                 $pi['price'] = (float)$prod['price'];
             }
-            if (empty($pi['product_image']) && !empty($prod['image_url'])) {
-                $pi['product_image'] = $prod['image_url'];
+            if (empty($pi['product_image'])) {
+                if (!empty($prod['image_url'])) {
+                    $pi['product_image'] = $prod['image_url'];
+                } elseif (!empty($prod['images'])) {
+                    $decImgs = json_decode($prod['images'], true);
+                    if (is_array($decImgs) && !empty($decImgs[0])) {
+                        $pi['product_image'] = $decImgs[0];
+                    }
+                }
             }
+            $pi['image_url'] = $pi['product_image'];
         } elseif (!empty($pi['product_id']) && in_array((int)$pi['product_id'], [7, 8], true)) {
             $pi['seller_id'] = 2;
         } elseif (empty($pi['seller_id']) && !empty($input['seller_id'])) {
@@ -1124,7 +1156,7 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
         if (!empty($productIds)) {
             $inPlaceholders = implode(',', array_fill(0, count($productIds), '?'));
             try {
-                $pStmt = $pdo->prepare("SELECT id, seller_id, name, price, image_url FROM `products` WHERE id IN ($inPlaceholders)");
+                $pStmt = $pdo->prepare("SELECT id, seller_id, name, price, image_url, images FROM `products` WHERE id IN ($inPlaceholders)");
                 $pStmt->execute($productIds);
                 $pMap = [];
                 while ($row = $pStmt->fetch(PDO::FETCH_ASSOC)) {
@@ -1141,10 +1173,21 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
                         if (empty($pi['price']) || $pi['price'] <= 0) {
                             $pi['price'] = (float)$prod['price'];
                         }
+                        if (empty($pi['product_image'])) {
+                            if (!empty($prod['image_url'])) {
+                                $pi['product_image'] = $prod['image_url'];
+                            } elseif (!empty($prod['images'])) {
+                                $decImgs = json_decode($prod['images'], true);
+                                if (is_array($decImgs) && !empty($decImgs[0])) {
+                                    $pi['product_image'] = $decImgs[0];
+                                }
+                            }
+                        }
                     }
                     if (empty($pi['seller_id'])) {
                         $pi['seller_id'] = !empty($existing['seller_id']) ? (int)$existing['seller_id'] : 1;
                     }
+                    $pi['image_url'] = $pi['product_image'];
                     $pi['subtotal'] = round($pi['price'] * $pi['quantity'], 2);
                     $subtotal += $pi['subtotal'];
                 }

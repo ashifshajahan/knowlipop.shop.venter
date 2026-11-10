@@ -1908,10 +1908,10 @@
     // Fetch Products Catalog from /api/products
     async function fetchProductsCatalog() {
       try {
-        const res = await fetch('/api/products');
+        const res = await fetch('/api/products?limit=100');
         if (res.ok) {
           const data = await res.json();
-          const items = data.products?.data || [];
+          const items = data.data || data.products?.data || [];
           if (items.length > 0) {
             allProducts = items;
           }
@@ -1956,8 +1956,10 @@
           imgList = p.images;
         } else if (p.image_url) {
           imgList = [p.image_url];
+        } else if (p.image) {
+          imgList = [p.image];
         }
-        const primaryImg = imgList[0] || 'https://via.placeholder.com/300?text=Product';
+        const primaryImg = imgList[0] || '/uploads/products/placeholder.jpg';
 
         // Clean pricing and presentation according to Amazon / Flipkart standards
         const cleanPrice = parseFloat(p.price || p.seller_price || 0);
@@ -1974,17 +1976,17 @@
         const galleryThumbsHtml = imgList.length > 1 ? `
           <div class="product-gallery-thumbs" style="display: flex; gap: 6px; padding: 6px 12px; background: rgba(15, 23, 42, 0.6); overflow-x: auto; border-bottom: 1px solid var(--border);">
             ${imgList.map((img, idx) => `
-              <img src="${img}" class="gallery-thumb-item" alt="Thumbnail ${idx + 1}"
+              <img src="${escapeHtml(img)}" data-src="${escapeHtml(img)}" class="gallery-thumb-item" alt="Thumbnail ${idx + 1}"
                    style="width: 36px; height: 36px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 2px solid ${idx === 0 ? 'var(--primary)' : 'rgba(255,255,255,0.15)'}; transition: all 0.2s;"
-                   onclick="switchMainImage(${p.id}, '${img}', this)"
-                   onerror="this.src='https://via.placeholder.com/36?text=Thumb'">
+                   onclick="switchMainImage(${Number(p.id)}, this.dataset.src, this)"
+                   onerror="this.onerror=null;this.src='/uploads/products/placeholder.jpg'">
             `).join('')}
           </div>
         ` : '';
 
         card.innerHTML = `
           <div class="product-badge-qty" id="card-badge-${p.id}">In List: ×${currentQty}</div>
-          <img id="main-img-${p.id}" src="${primaryImg}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.src='https://via.placeholder.com/300?text=Product'">
+          <img id="main-img-${p.id}" src="${escapeHtml(primaryImg)}" class="product-thumb" alt="${escapeHtml(p.name)}" onerror="this.onerror=null;this.src='/uploads/products/placeholder.jpg'">
           ${galleryThumbsHtml}
           <div class="product-body">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
@@ -2164,7 +2166,7 @@
         const row = document.createElement('div');
         row.className = 'cart-item';
         row.innerHTML = `
-          <img src="${product.image_url || 'https://via.placeholder.com/60'}" class="cart-item-img" alt="${escapeHtml(product.name)}">
+          <img src="${escapeHtml(product.image_url || product.image || '/uploads/products/placeholder.jpg')}" class="cart-item-img" alt="${escapeHtml(product.name)}" onerror="this.onerror=null;this.src='/uploads/products/placeholder.jpg'">
           <div class="cart-item-details">
             <div class="cart-item-name">${escapeHtml(product.name)}</div>
             <div style="font-size: 11px; color: var(--accent); margin-top: 2px;">🏪 Seller #${product.seller_id || 1}: ${escapeHtml(product.seller_name || 'Verified Provider')}</div>
@@ -2224,7 +2226,7 @@
         product_id: product.id,
         seller_id: product.seller_id || 1,
         product_name: product.name,
-        product_image: product.image_url,
+        product_image: product.image_url || product.image || null,
         price: parseFloat(product.price),
         unit_price: parseFloat(product.price),
         product_price: parseFloat(product.price),
@@ -2484,7 +2486,7 @@
                   <tr>
                     <td>
                       <div class="item-cell-product">
-                        <img src="${i.product_image || i.image_url || 'https://via.placeholder.com/40'}" class="item-cell-thumb" onerror="this.src='https://via.placeholder.com/40'">
+                        <img src="${escapeHtml(i.product_image || i.image_url || '/uploads/products/placeholder.jpg')}" class="item-cell-thumb" alt="${escapeHtml(i.product_name || 'Product')}" onerror="this.onerror=null;this.src='/uploads/products/placeholder.jpg'">
                         <div>
                           <div style="font-weight: 700; color: #fff;">${escapeHtml(i.product_name || 'Product')}</div>
                           <div style="font-size: 11px; color: var(--accent); margin-top: 2px;">🏪 Seller #${i.seller_id || order.seller_id || 1}</div>
@@ -2602,7 +2604,7 @@
           row.className = 'edit-item-row';
           row.innerHTML = `
             <div class="edit-item-details">
-              <img src="${item.product_image || 'https://via.placeholder.com/44'}" class="edit-item-thumb" alt="${escapeHtml(item.product_name)}">
+              <img src="${escapeHtml(item.product_image || item.image_url || '/uploads/products/placeholder.jpg')}" class="edit-item-thumb" alt="${escapeHtml(item.product_name)}" onerror="this.onerror=null;this.src='/uploads/products/placeholder.jpg'">
               <div>
                 <div style="font-weight: 700; color: #fff; font-size: 14px;">${escapeHtml(item.product_name)}</div>
                 <div style="font-family: var(--font-mono); font-size: 12px; color: var(--accent);">₹${item.price.toFixed(2)} each</div>
