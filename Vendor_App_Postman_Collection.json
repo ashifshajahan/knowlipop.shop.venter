@@ -207,7 +207,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"password\": \"Password123!\"\n}"
+              "raw": "{\n  \"email\": \"seller@example.com\",\n  \"phone\": \"+919876543210\",\n  \"password\": \"Password123!\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/login",
@@ -219,7 +219,7 @@
                 "login"
               ]
             },
-            "description": "Authenticates a seller with phone and password, returning a JWT token."
+            "description": "Authenticates a seller with required email, phone, and password, returning a JWT token."
           },
           "event": [
             {

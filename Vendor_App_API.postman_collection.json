@@ -22,6 +22,11 @@
       "type": "string"
     },
     {
+      "key": "seller_email",
+      "value": "seller@example.com",
+      "type": "string"
+    },
+    {
       "key": "seller_password",
       "value": "SecretPass123!",
       "type": "string"
@@ -253,7 +258,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"password\": \"{{seller_password}}\"\n}"
+              "raw": "{\n  \"email\": \"{{seller_email}}\",\n  \"phone\": \"{{seller_phone}}\",\n  \"password\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/login",
@@ -265,7 +270,7 @@
                 "login"
               ]
             },
-            "description": "Logs in the seller and saves JWT Bearer token into {{token}}."
+            "description": "Logs in the seller with required email, phone, and password and saves JWT Bearer token into {{token}}."
           },
           "response": []
         },

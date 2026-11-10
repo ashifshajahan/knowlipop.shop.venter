@@ -69,11 +69,13 @@ async function testAll() {
 
   // 2. Register or Login
   console.log('\n2. Testing Authentication...');
+  const testEmail = 'seller_live@knowlipop.shop';
   const testPhone = '+919633426254';
   const testPassword = 'Password123!';
 
   // Attempt login first
   let loginRes = await request('POST', '/api/login', {
+    email: testEmail,
     phone: testPhone,
     password: testPassword
   });

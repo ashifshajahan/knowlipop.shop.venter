@@ -126,6 +126,7 @@ async function runLiveTests() {
   // Step 2: Login or register seller
   let token = null;
   const loginRes = await request('POST', '/api/login', {}, {
+    email: 'seller@vendor.app',
     phone: '9876543210',
     password: 'Password123!'
   });

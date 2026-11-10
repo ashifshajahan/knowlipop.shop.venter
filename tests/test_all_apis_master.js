@@ -138,7 +138,7 @@ async function runMasterTestSuite() {
   });
   assert(regRes.status === 201 && regRes.body.token && regRes.body.user.email === testEmail, 'POST /api/register (Seller registration returns 201 with required email & JWT token)');
 
-  const loginRes = await dispatch(app, {
+  const loginMissingEmailRes = await dispatch(app, {
     method: 'POST',
     url: '/api/login',
     body: {
@@ -146,7 +146,28 @@ async function runMasterTestSuite() {
       password: 'Password123!'
     }
   });
-  assert(loginRes.status === 200 && loginRes.body.token, 'POST /api/login (Seller login returns 200 with JWT token)');
+  assert(loginMissingEmailRes.status === 422 && loginMissingEmailRes.body.errors && loginMissingEmailRes.body.errors.email, 'POST /api/login rejects missing email with 422');
+
+  const loginMissingPhoneRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      email: testEmail,
+      password: 'Password123!'
+    }
+  });
+  assert(loginMissingPhoneRes.status === 422 && loginMissingPhoneRes.body.errors && loginMissingPhoneRes.body.errors.phone, 'POST /api/login rejects missing phone with 422');
+
+  const loginRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: {
+      email: testEmail,
+      phone: testPhone,
+      password: 'Password123!'
+    }
+  });
+  assert(loginRes.status === 200 && loginRes.body.token, 'POST /api/login (Seller login with email + phone returns 200 with JWT token)');
   const dynamicToken = loginRes.body.token;
 
   const meRes = await dispatch(app, {

@@ -237,34 +237,67 @@ function apiRegister(PDO $pdo): void
 function apiLogin(PDO $pdo): void
 {
     if ($_SERVER['REQUEST_METHOD'] === 'GET' || $_SERVER['REQUEST_METHOD'] === 'HEAD') {
-        errorResponse('The login endpoint only accepts POST requests with credentials (phone, password).', [], 405);
+        errorResponse('The login endpoint only accepts POST requests with credentials (email, phone, password).', [], 405);
     }
 
     $input = getJsonInput();
-    $rawPhone = extractPhonePhp($input) ?: extractFieldPhp($input, ['email', 'username', 'user', 'login']);
+    $rawEmail = extractFieldPhp($input, [
+        'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
+        'user_email', 'seller_email', 'business_email', 'mail'
+    ]);
+    $email = !empty($rawEmail) ? strtolower(trim($rawEmail)) : '';
+    $rawPhone = extractPhonePhp($input);
     $phone = normalizePhonePhp($rawPhone);
     $password = extractPasswordPhp($input);
     $errors = [];
 
-    if (empty($rawPhone)) {
-        $errors['phone'] = ['The phone field is required.'];
+    if (empty($email)) {
+        $errors['email'] = ['The email field is required.'];
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors['email'] = ['The email address format is invalid.'];
     }
     if (empty($password)) {
         $errors['password'] = ['The password field is required.'];
     }
 
     if (!empty($errors)) {
+        if (empty($rawPhone)) {
+            $errors['phone'] = ['The phone field is required.'];
+        }
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
+    // Allow admin REST API authentication via email + password when admin has no phone in payload
+    if (empty($rawPhone)) {
+        $adminStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(:email) AND role = 'admin' LIMIT 1");
+        $adminStmt->execute([':email' => $email]);
+        $adminUser = $adminStmt->fetch();
+        if ($adminUser && verifyPassword($password, $adminUser['password'])) {
+            $token = createToken($pdo, (int) $adminUser['id'], $adminUser['phone'] ?? '');
+            jsonResponse([
+                'message' => 'Login successful.',
+                'user' => safeSeller($adminUser),
+                'token' => $token,
+                'token_type' => 'Bearer',
+            ]);
+        }
+        errorResponse('Validation error occurred.', ['phone' => ['The phone field is required.']], 422);
+    }
+
     $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix OR LOWER(email) = LOWER(:rawEmail) LIMIT 1");
-    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':rawEmail' => $rawPhone]);
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = LOWER(:email) LIMIT 1");
+    $stmt->execute([
+        ':phone' => $phone,
+        ':rawPhone' => $rawPhone,
+        ':rawNoPrefix' => $rawNoPrefix,
+        ':email' => $email,
+    ]);
     $user = $stmt->fetch();
 
     if (!$user || !verifyPassword($password, $user['password'])) {
-        errorResponse('The supplied phone number or password is incorrect.', [
-            'phone' => ['The supplied phone number or password is incorrect.']
+        errorResponse('The supplied email, phone number, or password is incorrect.', [
+            'email' => ['The supplied email, phone number, or password is incorrect.'],
+            'phone' => ['The supplied email, phone number, or password is incorrect.'],
         ], 422);
     }
 

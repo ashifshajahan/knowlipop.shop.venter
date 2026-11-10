@@ -65,7 +65,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"seller_demo@knowlipop.shop\",\n  \"password\": \"Password123!\"\n}"
+              "raw": "{\n  \"email\": \"seller_demo@knowlipop.shop\",\n  \"phone\": \"+919876543210\",\n  \"password\": \"Password123!\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/login",
