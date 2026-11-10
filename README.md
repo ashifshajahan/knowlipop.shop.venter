@@ -70,8 +70,8 @@ The platform features built-in multi-vendor marketplace routing and privacy isol
 ### Products Catalog & CRUD
 * `GET /api/products` — Public catalog with pagination, rich details, and seller information
 * `GET /api/seller/products` or `GET /api/sellers/{seller_id}/products` — Dedicated authenticated seller catalog (filters to only the authenticated seller's products)
-* `POST /api/products` — Create product (`Authorization: Bearer <token>`) — supports `multipart/form-data` image file upload (`image`), Base64 image data, or image URL
-* `POST /api/upload` — Dedicated image file upload endpoint (`Authorization: Bearer <token>`)
+* `POST /api/products` — Create product (`Authorization: Bearer <token>`) — supports `multipart/form-data` image file upload (`image`), Base64 image data, or image URL (uploaded & Base64 product images of any format — JPG, PNG, GIF, BMP, TIFF, AVIF, HEIC/HEIF, SVG, ICO, WEBP — are automatically converted and stored in `.webp` format)
+* `POST /api/upload` — Dedicated product image upload endpoint (`Authorization: Bearer <token>`, converts uploaded & Base64 images to `.webp`)
 * `GET /api/products/{id}` — Single product details including seller details
 * `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`) — protected by seller ownership check (403 if unauthorized)
 * `DELETE /api/products/{id}` — Delete product (`Authorization: Bearer <token>`) — protected by seller ownership check (403 if unauthorized)

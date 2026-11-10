@@ -724,7 +724,7 @@ function calculatePricingBreakdown(array $input): array
 function getImageBasename(?string $url): string {
     if (!$url) return '';
     $clean = explode('#', explode('?', trim($url))[0])[0];
-    if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $clean, $matches)) {
+    if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i', $clean, $matches)) {
         return strtolower($matches[1]);
     }
     return strtolower(basename($clean));
@@ -792,7 +792,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
 
         // Check if string contains a product image filename anywhere (e.g. mangled/double URLs)
         $fnMatch = [];
-        if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $t, $fnMatch)) {
+        if (preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i', $t, $fnMatch)) {
             return $baseUrl . '/uploads/products/' . $fnMatch[1];
         }
 
@@ -808,7 +808,7 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
             $clean = ltrim(preg_replace('/^\/?(storage\/|public\/uploads\/)/', 'uploads/', $t), '/');
             return $baseUrl . '/' . $clean;
         }
-        if (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $t) || preg_match('/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $t)) {
+        if (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i', $t) || preg_match('/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i', $t)) {
             return $baseUrl . '/uploads/products/' . basename(explode('?', $t)[0]);
         }
         return $t;
@@ -1160,6 +1160,307 @@ function apiGetProduct(PDO $pdo, int $id): void
     ]);
 }
 
+function isWebpBytesPhp(string $bytes): bool
+{
+    return strlen($bytes) >= 12 && substr($bytes, 0, 4) === 'RIFF' && substr($bytes, 8, 4) === 'WEBP';
+}
+
+function isSvgBytesPhp(string $bytes): bool
+{
+    if (strlen($bytes) < 10) return false;
+    $headSlice = substr($bytes, 0, 512);
+    if (str_contains($headSlice, "\0")) return false;
+    $head = strtolower(ltrim(preg_replace('/^\xEF\xBB\xBF/', '', $headSlice)));
+    return str_starts_with($head, '<svg') || (str_starts_with($head, '<?xml') && str_contains($head, '<svg'));
+}
+
+function isSafeSvgBytesPhp(string $bytes): bool
+{
+    return !preg_match('/<script[\s>]|<!entity|javascript:|vbscript:|<foreignobject|\son[a-z]+\s*=/i', $bytes);
+}
+
+function getIsobmffBrandPhp(string $bytes): ?string
+{
+    if (strlen($bytes) < 16 || substr($bytes, 4, 4) !== 'ftyp') return null;
+    return strtolower(substr($bytes, 8, 4));
+}
+
+function isAnimatedGifOrWebpPhp(string $bytes): bool
+{
+    if (strlen($bytes) >= 6 && (str_starts_with($bytes, 'GIF87a') || str_starts_with($bytes, 'GIF89a'))) {
+        $count = @preg_match_all('/\x00\x21\xF9\x04/', substr($bytes, 0, 524288));
+        return $count !== false && $count > 1;
+    }
+    if (isWebpBytesPhp($bytes)) {
+        return str_contains(substr($bytes, 0, 64), 'ANIM');
+    }
+    return false;
+}
+
+function bufferLooksLikeSupportedImagePhp(string $bytes): bool
+{
+    $len = strlen($bytes);
+    if ($len < 10) return false;
+    if (substr($bytes, 0, 3) === "\xFF\xD8\xFF") return true;
+    if (substr($bytes, 0, 8) === "\x89PNG\r\n\x1A\n") return true;
+    $head6 = substr($bytes, 0, 6);
+    if ($head6 === 'GIF87a' || $head6 === 'GIF89a') return true;
+    if (isWebpBytesPhp($bytes)) return true;
+    if (substr($bytes, 0, 2) === 'BM') return true;
+    $head4 = substr($bytes, 0, 4);
+    if ($head4 === "II*\x00" || $head4 === "MM\x00*") return true;
+    if ($len >= 22 && substr($bytes, 0, 4) === "\x00\x00\x01\x00") return true;
+    $brand = getIsobmffBrandPhp($bytes);
+    if ($brand !== null && in_array($brand, ['avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'], true)) return true;
+    if (isSvgBytesPhp($bytes)) return true;
+    return false;
+}
+
+function convertImageViaNodePhp(string $rawBytes): ?string
+{
+    if (!function_exists('proc_open')) return null;
+
+    $js = <<<'NODEJS'
+const sharp = require('sharp');
+const bmpJs = require('bmp-js');
+const heicDecode = require('heic-decode');
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', async () => {
+  try {
+    const buf = Buffer.concat(chunks);
+    if (buf.length < 10 || buf.length > 15 * 1024 * 1024) process.exit(1);
+    const isSvg = !buf.subarray(0, 512).includes(0) && (() => {
+      const h = buf.subarray(0, 512).toString('utf8').trimStart().replace(/^\uFEFF/, '').toLowerCase();
+      return h.startsWith('<svg') || (h.startsWith('<?xml') && h.includes('<svg'));
+    })();
+    const brand = (buf.length >= 16 && buf.toString('ascii', 4, 8) === 'ftyp') ? buf.toString('ascii', 8, 12).toLowerCase() : null;
+    const decodeBmp = async (b) => {
+      const w = b.readInt32LE(18), h = Math.abs(b.readInt32LE(22));
+      if (w <= 0 || h <= 0 || w > 25000 || h > 25000 || w * h > 100000000) throw new Error('bmp bounds');
+      const d = bmpJs.decode(b);
+      const abgr = d.data, rgba = Buffer.allocUnsafe(abgr.length);
+      let hasA = false;
+      if (d.bitPP === 32) { for (let i = 0; i < abgr.length; i += 4) { if (abgr[i] !== 0) { hasA = true; break; } } }
+      for (let i = 0; i < abgr.length; i += 4) {
+        rgba[i] = abgr[i + 3]; rgba[i + 1] = abgr[i + 2]; rgba[i + 2] = abgr[i + 1];
+        rgba[i + 3] = (d.bitPP === 32 && hasA) ? abgr[i] : 255;
+      }
+      return sharp(rgba, { raw: { width: d.width, height: d.height, channels: 4 } }).webp({ quality: 85, effort: 4 }).toBuffer();
+    };
+    let out;
+    if (isSvg) {
+      out = await sharp(buf, { failOn: 'none', density: 150, limitInputPixels: 100000000 }).webp({ quality: 85, effort: 4 }).toBuffer();
+    } else if (buf[0] === 0x42 && buf[1] === 0x4D) {
+      out = await decodeBmp(buf);
+    } else if (buf.length >= 22 && buf.readUInt16LE(0) === 0 && buf.readUInt16LE(2) === 1) {
+      const cnt = buf.readUInt16LE(4);
+      let best = null, score = -1;
+      for (let i = 0; i < cnt && i < 64 && 6 + i * 16 + 16 <= buf.length; i++) {
+        const o = 6 + i * 16, w = buf[o] || 256, h = buf[o + 1] || 256, bpp = buf.readUInt16LE(o + 6);
+        const sz = buf.readUInt32LE(o + 8), off = buf.readUInt32LE(o + 12);
+        if (sz >= 8 && off + sz <= buf.length && (w * h * 64 + bpp) > score) { score = w * h * 64 + bpp; best = buf.subarray(off, off + sz); }
+      }
+      if (!best) throw new Error('ico');
+      if (best.length >= 8 && best.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
+        out = await sharp(best, { failOn: 'none', limitInputPixels: 100000000 }).webp({ quality: 85, effort: 4 }).toBuffer();
+      } else if (best.length >= 40 && best.readUInt32LE(0) === 40) {
+        const w = best.readInt32LE(4), dh = best.readInt32LE(8), hh = Math.floor(Math.abs(dh) / 2), bpp = best.readUInt16LE(14), cu = best.readUInt32LE(32);
+        const pc = bpp <= 8 ? (cu > 0 ? cu : (1 << bpp)) : 0;
+        const hdr = Buffer.alloc(14); hdr.write('BM', 0, 2, 'ascii'); hdr.writeUInt32LE(14 + best.length, 2); hdr.writeUInt32LE(14 + 40 + pc * 4, 10);
+        const dib = Buffer.from(best); dib.writeInt32LE(dh < 0 ? -hh : hh, 8);
+        out = await decodeBmp(Buffer.concat([hdr, dib]));
+      } else throw new Error('ico payload');
+    } else if (brand && ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) {
+      const dec = await heicDecode({ buffer: buf });
+      const raw = Buffer.from(dec.data.buffer, dec.data.byteOffset, dec.data.byteLength);
+      out = await sharp(raw, { raw: { width: dec.width, height: dec.height, channels: 4 } }).webp({ quality: 85, effort: 4 }).toBuffer();
+    } else {
+      out = await sharp(buf, { failOn: 'none', animated: true, limitInputPixels: 100000000 }).rotate().webp({ quality: 85, effort: 4 }).toBuffer();
+    }
+    if (!out || out.length < 12 || out.toString('ascii', 0, 4) !== 'RIFF' || out.toString('ascii', 8, 12) !== 'WEBP') process.exit(1);
+    process.stdout.write(out);
+  } catch (e) { process.stderr.write(String(e && e.message || e)); process.exit(1); }
+});
+NODEJS;
+
+    $candidates = [];
+    $envNode = getenv('NODE_BINARY');
+    if (is_string($envNode) && trim($envNode) !== '') {
+        $candidates[] = trim($envNode);
+    }
+    $candidates[] = 'node';
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $candidates[] = 'C:\\Program Files\\nodejs\\node.exe';
+    } else {
+        $candidates[] = '/usr/local/bin/node';
+        $candidates[] = '/usr/bin/node';
+    }
+
+    $rootDir = dirname(__DIR__);
+    foreach (array_unique($candidates) as $bin) {
+        $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $proc = @proc_open([$bin, '-e', $js], $descriptors, $pipes, $rootDir);
+        if (!is_resource($proc)) continue;
+
+        $written = 0;
+        $totalLen = strlen($rawBytes);
+        while ($written < $totalLen) {
+            $chunk = @fwrite($pipes[0], substr($rawBytes, $written, 65536));
+            if ($chunk === false || $chunk === 0) break;
+            $written += $chunk;
+        }
+        @fclose($pipes[0]);
+        $out = @stream_get_contents($pipes[1]);
+        @stream_get_contents($pipes[2]);
+        @fclose($pipes[1]);
+        @fclose($pipes[2]);
+        $code = @proc_close($proc);
+
+        if ($code === 0 && is_string($out) && isWebpBytesPhp($out)) {
+            return $out;
+        }
+    }
+
+    return null;
+}
+
+function convertImageBytesToWebpPhp(string $rawBytes, string $declaredMime = ''): ?string
+{
+    $len = strlen($rawBytes);
+    if ($len < 10 || $len > 15 * 1024 * 1024) {
+        return null;
+    }
+
+    // 1. SVG vector image: sanitize active scripts first
+    if (isSvgBytesPhp($rawBytes) || str_contains(strtolower($declaredMime), 'svg')) {
+        if (!isSvgBytesPhp($rawBytes) || !isSafeSvgBytesPhp($rawBytes)) {
+            return null;
+        }
+        if (class_exists('Imagick')) {
+            try {
+                $im = new \Imagick();
+                $im->readImageBlob($rawBytes);
+                $im->setImageFormat('webp');
+                $im->setImageCompressionQuality(85);
+                $out = $im->getImagesBlob();
+                $im->clear();
+                $im->destroy();
+                if (is_string($out) && isWebpBytesPhp($out)) {
+                    return $out;
+                }
+            } catch (\Throwable $e) {}
+        }
+        return convertImageViaNodePhp($rawBytes);
+    }
+
+    // 2. Imagick (supports TIFF, HEIC, AVIF, BMP, GIF animation, PNG, JPEG, WEBP)
+    if (class_exists('Imagick')) {
+        try {
+            $im = new \Imagick();
+            $im->readImageBlob($rawBytes);
+            $im = $im->coalesceImages();
+            foreach ($im as $frame) {
+                if (method_exists($frame, 'autoOrient')) {
+                    @$frame->autoOrient();
+                }
+                $frame->setImageFormat('webp');
+                $frame->setImageCompressionQuality(85);
+            }
+            $im->setFirstIterator();
+            $out = $im->getImagesBlob();
+            $im->clear();
+            $im->destroy();
+            if (is_string($out) && isWebpBytesPhp($out)) {
+                return $out;
+            }
+        } catch (\Throwable $e) {}
+    }
+
+    // 3. Formats that GD cannot decode cleanly (TIFF, ICO, HEIC/HEIF, animated GIF/WEBP): try Node sharp pipeline
+    $head4 = substr($rawBytes, 0, 4);
+    $brand = getIsobmffBrandPhp($rawBytes);
+    $isTiff = ($head4 === "II*\x00" || $head4 === "MM\x00*");
+    $isIco = ($len >= 22 && $head4 === "\x00\x00\x01\x00");
+    $isHeic = ($brand !== null && in_array($brand, ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'], true));
+    $isAnimated = isAnimatedGifOrWebpPhp($rawBytes);
+
+    if ($isTiff || $isIco || $isHeic || $isAnimated) {
+        $viaNode = convertImageViaNodePhp($rawBytes);
+        if ($viaNode !== null) {
+            return $viaNode;
+        }
+        if ($isTiff || $isIco || $isHeic) {
+            return null;
+        }
+    }
+
+    // 4. Native PHP GD conversion (JPEG with EXIF orientation, PNG w/ alpha, BMP, AVIF, static GIF/WEBP)
+    if (function_exists('imagewebp')) {
+        $gdImg = false;
+        if (substr($rawBytes, 0, 2) === 'BM' && function_exists('imagecreatefrombmp')) {
+            $tmpFile = @tempnam(sys_get_temp_dir(), 'bmp_');
+            if ($tmpFile) {
+                @file_put_contents($tmpFile, $rawBytes);
+                $gdImg = @imagecreatefrombmp($tmpFile);
+                @unlink($tmpFile);
+            }
+        } elseif ($brand !== null && in_array($brand, ['avif', 'avis'], true) && function_exists('imagecreatefromavif')) {
+            $tmpFile = @tempnam(sys_get_temp_dir(), 'avif_');
+            if ($tmpFile) {
+                @file_put_contents($tmpFile, $rawBytes);
+                $gdImg = @imagecreatefromavif($tmpFile);
+                @unlink($tmpFile);
+            }
+        } else {
+            $gdImg = @imagecreatefromstring($rawBytes);
+        }
+
+        if ($gdImg !== false) {
+            if (substr($rawBytes, 0, 3) === "\xFF\xD8\xFF" && function_exists('exif_read_data')) {
+                $tmpMem = @fopen('php://temp', 'r+b');
+                if ($tmpMem) {
+                    fwrite($tmpMem, $rawBytes);
+                    rewind($tmpMem);
+                    $exif = @exif_read_data($tmpMem);
+                    fclose($tmpMem);
+                    if (is_array($exif) && !empty($exif['Orientation'])) {
+                        switch ((int) $exif['Orientation']) {
+                            case 3:
+                                $rot = @imagerotate($gdImg, 180, 0);
+                                if ($rot) $gdImg = $rot;
+                                break;
+                            case 6:
+                                $rot = @imagerotate($gdImg, -90, 0);
+                                if ($rot) $gdImg = $rot;
+                                break;
+                            case 8:
+                                $rot = @imagerotate($gdImg, 90, 0);
+                                if ($rot) $gdImg = $rot;
+                                break;
+                        }
+                    }
+                }
+            }
+            if (function_exists('imageistruecolor') && !imageistruecolor($gdImg) && function_exists('imagepalettetotruecolor')) {
+                @imagepalettetotruecolor($gdImg);
+            }
+            @imagealphablending($gdImg, false);
+            @imagesavealpha($gdImg, true);
+            ob_start();
+            $ok = @imagewebp($gdImg, null, 85);
+            $out = ob_get_clean();
+            @imagedestroy($gdImg);
+            if ($ok && is_string($out) && isWebpBytesPhp($out)) {
+                return $out;
+            }
+        }
+    }
+
+    // 5. Fallback to Node sharp (works even when GD is disabled in PHP)
+    return convertImageViaNodePhp($rawBytes);
+}
+
 function saveUploadedProductImages(array $input = [], ?string $fallback = null): array
 {
     $uploadDir = getPersistentMediaDirPhp('products');
@@ -1173,20 +1474,35 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
     }
     $collected = [];
     $filesInfo = [];
-    $allowedExts = ['jpg', 'jpeg', 'png', 'webp'];
-    $allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
-    $dangerousExts = ['php', 'phtml', 'php5', 'exe', 'sh', 'bat', 'cmd', 'js', 'vbs', 'html', 'htm', 'cgi', 'pl'];
+    $uploadErrors = [];
+    $allowedExts = ['jpg', 'jpeg', 'jfif', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'avif', 'heic', 'heif', 'svg', 'ico'];
+    $allowedMimes = [
+        'image/jpeg', 'image/jpg', 'image/pjpeg', 'image/jfif',
+        'image/png', 'image/x-png',
+        'image/webp',
+        'image/gif',
+        'image/bmp', 'image/x-ms-bmp', 'image/x-bmp',
+        'image/tiff', 'image/x-tiff',
+        'image/avif',
+        'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence',
+        'image/svg+xml',
+        'image/x-icon', 'image/vnd.microsoft.icon',
+    ];
+    $dangerousExts = ['php', 'phtml', 'php5', 'exe', 'sh', 'bat', 'cmd', 'js', 'mjs', 'cjs', 'vbs', 'html', 'htm', 'cgi', 'pl'];
 
-    // Helper to process uploaded file with strict validation and SHA-256 deduplication
+    // Helper to process uploaded file with strict validation, SHA-256 deduplication, and WebP conversion
     $seenHashes = [];
-    $processUploadedFile = function($tmp, $origName) use ($uploadDir, $baseUrl, $allowedExts, $allowedMimes, $dangerousExts, &$collected, &$filesInfo, &$seenHashes) {
+    $processUploadedFile = function($tmp, $origName, $clientMime = '') use ($uploadDir, $baseUrl, $allowedExts, $allowedMimes, $dangerousExts, &$collected, &$filesInfo, &$seenHashes, &$uploadErrors) {
         if (!empty($tmp) && is_uploaded_file($tmp)) {
             $ext = strtolower(pathinfo($origName ?: 'product.jpg', PATHINFO_EXTENSION));
             if (in_array($ext, $dangerousExts, true)) {
-                return; // Strictly reject dangerous files
+                $uploadErrors[] = 'Security violation: Executable or script files are strictly prohibited.';
+                return;
             }
-            if (filesize($tmp) > 15 * 1024 * 1024) {
-                return; // Exceeds 15MB
+            $fSize = @filesize($tmp);
+            if ($fSize === false || $fSize < 10 || $fSize > 15 * 1024 * 1024) {
+                $uploadErrors[] = 'Image file size must be between 10 bytes and 15MB.';
+                return;
             }
 
             $fileHash = @hash_file('sha256', $tmp);
@@ -1195,61 +1511,87 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
             if ($fileHash) $seenHashes[] = $fileHash;
 
-            // Verify MIME type
-            $mime = 'image/jpeg';
+            // Detect MIME type
+            $mime = strtolower((string) $clientMime);
             if (function_exists('finfo_open')) {
-                $finfo = finfo_open(FILEINFO_MIME_TYPE);
-                $detected = finfo_file($finfo, $tmp);
-                finfo_close($finfo);
-                if ($detected) $mime = strtolower($detected);
+                $finfo = @finfo_open(FILEINFO_MIME_TYPE);
+                if ($finfo) {
+                    $detected = @finfo_file($finfo, $tmp);
+                    @finfo_close($finfo);
+                    if ($detected) $mime = strtolower((string) $detected);
+                }
             } elseif (function_exists('mime_content_type')) {
-                $detected = mime_content_type($tmp);
-                if ($detected) $mime = strtolower($detected);
+                $detected = @mime_content_type($tmp);
+                if ($detected) $mime = strtolower((string) $detected);
             }
+            if ($mime === '' || $mime === 'text/plain' || $mime === 'application/octet-stream') {
+                // Allow XML/SVG or extension-less binary uploads if magic bytes check passes inside convertImageBytesToWebpPhp
+                $mimeCheckOk = ($mime === 'text/plain' && $ext === 'svg') ||
+                    ($mime === 'application/octet-stream' && ($ext === '' || in_array($ext, $allowedExts, true))) ||
+                    ($mime === '' && ($ext === '' || in_array($ext, $allowedExts, true)));
+            } else {
+                $mimeCheckOk = in_array($mime, $allowedMimes, true) || str_starts_with($mime, 'image/') || ($mime === 'text/xml' && $ext === 'svg');
+            }
+            $extCheckOk = ($ext === '') || in_array($ext, $allowedExts, true);
 
-            if (!in_array($ext, $allowedExts, true) && !in_array($mime, $allowedMimes, true)) {
+            if (!$mimeCheckOk || !$extCheckOk) {
+                $uploadErrors[] = 'Invalid image format. Please upload an image file (automatically converted and stored as .webp).';
                 return;
             }
-            if (!in_array($ext, $allowedExts, true)) {
-                $ext = ($mime === 'image/png') ? 'png' : (($mime === 'image/webp') ? 'webp' : 'jpg');
+
+            $rawBytes = @file_get_contents($tmp);
+            if (!is_string($rawBytes)) {
+                $uploadErrors[] = 'Failed to read uploaded image.';
+                return;
             }
 
-            $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
-            if (move_uploaded_file($tmp, $uploadDir . $filename)) {
+            $webpBytes = convertImageBytesToWebpPhp($rawBytes, $mime);
+            if ($webpBytes === null) {
+                $uploadErrors[] = 'Invalid or unsupported image file (could not convert to .webp).';
+                return;
+            }
+
+            $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.webp';
+            if (@file_put_contents($uploadDir . $filename, $webpBytes) !== false) {
                 @chmod($uploadDir . $filename, 0644);
+                @unlink($tmp);
                 $fullUrl = $baseUrl . '/uploads/products/' . $filename;
                 $collected[] = $fullUrl;
                 $filesInfo[] = [
                     'file_name' => $filename,
                     'relative_path' => 'uploads/products/' . $filename,
                     'image_url' => $fullUrl,
-                    'file_size' => @filesize($uploadDir . $filename) ?: 0,
-                    'mime_type' => $mime
+                    'file_size' => strlen($webpBytes),
+                    'mime_type' => 'image/webp'
                 ];
+            } else {
+                $uploadErrors[] = 'Failed to save converted .webp image to storage.';
             }
         }
     };
 
     // 1. Process $_FILES (both single fields and multiple file array uploads, recursive for nested structures)
-    $extractFiles = function($tmpName, $name) use (&$extractFiles, $processUploadedFile) {
+    $extractFiles = function($tmpName, $name, $type) use (&$extractFiles, $processUploadedFile) {
         if (is_array($tmpName)) {
             foreach ($tmpName as $k => $v) {
                 $subName = is_array($name) ? ($name[$k] ?? 'product.jpg') : 'product.jpg';
-                $extractFiles($v, $subName);
+                $subType = is_array($type) ? ($type[$k] ?? '') : '';
+                $extractFiles($v, $subName, $subType);
             }
         } elseif (!empty($tmpName)) {
-            $processUploadedFile($tmpName, is_string($name) ? $name : 'product.jpg');
+            $processUploadedFile($tmpName, is_string($name) ? $name : 'product.jpg', is_string($type) ? $type : '');
         }
     };
     foreach ($_FILES as $field => $fileData) {
         if (isset($fileData['tmp_name'])) {
-            $extractFiles($fileData['tmp_name'], $fileData['name'] ?? 'product.jpg');
+            $extractFiles($fileData['tmp_name'], $fileData['name'] ?? 'product.jpg', $fileData['type'] ?? '');
         }
     }
 
     // Helper to process candidate items (string URLs, comma-separated URLs, JSON arrays, objects, base64)
+    $seenBase64 = [];
     $processCandidate = null;
-    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$filesInfo, &$processCandidate) {
+    $processCandidate = function($candidate) use ($uploadDir, $baseUrl, &$collected, &$filesInfo, &$seenBase64, &$processCandidate) {
         if (empty($candidate)) return;
         if (is_array($candidate)) {
             if (isset($candidate['url']) || isset($candidate['image_url']) || isset($candidate['src']) || isset($candidate['path']) || isset($candidate['link']) || isset($candidate['image'])) {
@@ -1302,7 +1644,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         }
 
         // Multi-URL strings separated by comma, newline, semicolon, pipe, or space
-        if (!str_starts_with($trimmed, 'data:image/')) {
+        if (!str_starts_with(strtolower($trimmed), 'data:image/')) {
             if (preg_match('/[,;\n\r|]/', $trimmed)) {
                 $parts = preg_split('/[,;\n\r|]+/', $trimmed);
                 if (count($parts) > 1) {
@@ -1323,38 +1665,56 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
         }
 
-        // Base64 data URI or raw base64 string
-        $isB64 = str_starts_with($trimmed, 'data:image/') || (strlen($trimmed) > 50 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/', $trimmed) && preg_match('/^[A-Za-z0-9+\/=\s\r\n]+$/', $trimmed));
-        if ($isB64) {
-            $rawB64 = '';
-            $ext = 'jpg';
-            if (preg_match('/^data:image\/(\w+);base64,(.+)$/is', $trimmed, $matches)) {
-                $ext = strtolower($matches[1]);
-                if ($ext === 'jpeg') $ext = 'jpg';
-                if (!in_array($ext, ['jpg', 'png', 'webp'])) $ext = 'jpg';
-                $rawB64 = preg_replace('/\s+/', '', $matches[2]);
-            } else {
-                $rawB64 = preg_replace('/\s+/', '', $trimmed);
-                if (str_starts_with($rawB64, '/9j/')) $ext = 'jpg';
-                elseif (str_starts_with($rawB64, 'iVBORw0KGgo')) $ext = 'png';
-                elseif (str_starts_with($rawB64, 'UklGR')) $ext = 'webp';
+        // Base64 data URI or raw base64 string -> decode, convert & save permanently as .webp
+        $compact = preg_replace('/\s+/', '', $trimmed);
+        $isDataUriImg = preg_match('/^data:image\/([a-z0-9.+-]+)(?:;[^,]*)?;base64,(.+)$/is', $trimmed, $uriMatches) === 1;
+        $isRawB64 = false;
+        if (!$isDataUriImg && strlen($compact) > 32 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR|Qk|SUkq|TU0A|PHN2Zy|PD94bWw|AAAA)/', $compact) && preg_match('/^[A-Za-z0-9+\/=]+$/', $compact)) {
+            $sample = base64_decode($compact, true);
+            if ($sample !== false && bufferLooksLikeSupportedImagePhp($sample)) {
+                $isRawB64 = true;
             }
-            $data = base64_decode($rawB64);
-            if ($data !== false && strlen($data) > 10 && strlen($data) <= 15 * 1024 * 1024) {
-                $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
-                if (file_put_contents($uploadDir . $filename, $data)) {
-                    @chmod($uploadDir . $filename, 0644);
-                    $fullUrl = $baseUrl . '/uploads/products/' . $filename;
-                    $collected[] = $fullUrl;
-                    $filesInfo[] = [
-                        'file_name' => $filename,
-                        'relative_path' => 'uploads/products/' . $filename,
-                        'image_url' => $fullUrl,
-                        'file_size' => strlen($data),
-                        'mime_type' => ($ext === 'png') ? 'image/png' : (($ext === 'webp') ? 'image/webp' : 'image/jpeg')
-                    ];
+        }
+
+        if ($isDataUriImg || $isRawB64) {
+            $declaredMime = $isDataUriImg ? ('image/' . strtolower($uriMatches[1])) : '';
+            $rawB64 = $isDataUriImg ? preg_replace('/\s+/', '', $uriMatches[2]) : $compact;
+            $b64Hash = hash('sha256', $rawB64);
+
+            if (array_key_exists($b64Hash, $seenBase64)) {
+                return;
+            }
+
+            $data = base64_decode($rawB64, true);
+            if ($data === false) {
+                $data = base64_decode($rawB64);
+            }
+            $savedInfo = null;
+            if (is_string($data) && strlen($data) >= 10 && strlen($data) <= 15 * 1024 * 1024) {
+                $webpBytes = convertImageBytesToWebpPhp($data, $declaredMime);
+                if ($webpBytes !== null) {
+                    $filename = 'prod_' . time() . '_' . bin2hex(random_bytes(8)) . '.webp';
+                    if (@file_put_contents($uploadDir . $filename, $webpBytes) !== false) {
+                        @chmod($uploadDir . $filename, 0644);
+                        $fullUrl = $baseUrl . '/uploads/products/' . $filename;
+                        $savedInfo = [
+                            'file_name' => $filename,
+                            'relative_path' => 'uploads/products/' . $filename,
+                            'image_url' => $fullUrl,
+                            'file_size' => strlen($webpBytes),
+                            'mime_type' => 'image/webp'
+                        ];
+                        $collected[] = $fullUrl;
+                        $filesInfo[] = $savedInfo;
+                    }
                 }
             }
+            $seenBase64[$b64Hash] = $savedInfo;
+            return;
+        }
+
+        // Ignore non-image data: URIs (e.g. data:text/plain;base64,...)
+        if (str_starts_with(strtolower($trimmed), 'data:')) {
             return;
         }
 
@@ -1369,7 +1729,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         } elseif (str_starts_with($trimmed, '/uploads/') || str_starts_with($trimmed, 'uploads/') || str_starts_with($trimmed, '/storage/') || str_starts_with($trimmed, 'storage/') || str_starts_with($trimmed, '/public/uploads/') || str_starts_with($trimmed, 'public/uploads/')) {
             $clean = ltrim(preg_replace('/^\/?(storage\/|public\/uploads\/)/', 'uploads/', $trimmed), '/');
             $collected[] = $baseUrl . '/' . $clean;
-        } elseif (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $trimmed) || preg_match('/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp|gif|svg)$/i', $trimmed)) {
+        } elseif (preg_match('/^prod_\d+_[a-f0-9]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i', $trimmed) || preg_match('/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i', $trimmed)) {
             $collected[] = $baseUrl . '/uploads/products/' . $trimmed;
         }
     };
@@ -1403,7 +1763,7 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             preg_match('/^file\d+$/i', $k)
         ) {
             $processCandidate($v);
-        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with($v, 'data:image/') || (strlen(trim($v)) > 50 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/', trim($v))))) {
+        } elseif (is_string($v) && (str_starts_with($v, 'http://') || str_starts_with($v, 'https://') || str_starts_with(strtolower(trim($v)), 'data:image/') || (strlen(trim($v)) > 32 && preg_match('/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR|Qk|SUkq|TU0A|PHN2Zy|PD94bWw|AAAA)/', trim($v))))) {
             $processCandidate($v);
         }
     }
@@ -1419,6 +1779,15 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
     // Strictly enforce seller multiple URL limit of 4 images
     $uniqueImages = array_slice($uniqueImages, 0, 4);
     $primaryImageUrl = !empty($uniqueImages) ? $uniqueImages[0] : null;
+    $filteredFilesInfo = [];
+    $seenInfoNames = [];
+    foreach ($filesInfo as $fi) {
+        $fn = $fi['file_name'] ?? '';
+        if ($fn !== '' && in_array($fi['image_url'] ?? '', $uniqueImages, true) && !in_array($fn, $seenInfoNames, true)) {
+            $seenInfoNames[] = $fn;
+            $filteredFilesInfo[] = $fi;
+        }
+    }
 
     return [
         'hasImages' => $hasImages,
@@ -1430,7 +1799,8 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
         'gallery' => $uniqueImages,
         'photos' => $uniqueImages,
         'imagesJson' => !empty($uniqueImages) ? json_encode($uniqueImages) : null,
-        'filesInfo' => $filesInfo,
+        'filesInfo' => $filteredFilesInfo,
+        'uploadErrors' => $uploadErrors,
         'limit' => 4,
         'total' => count($uniqueImages),
     ];
@@ -1467,8 +1837,14 @@ function syncProductImagesRecordPHP(PDO $pdo, int $sellerId, ?int $productId, ar
         if (!$fileSize && file_exists($localPath)) {
             $fileSize = @filesize($localPath);
             $ext = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
-            $mimes = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'webp' => 'image/webp'];
-            $mimeType = $mimes[$ext] ?? 'image/jpeg';
+            $mimes = [
+                'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'jfif' => 'image/jpeg',
+                'png' => 'image/png', 'webp' => 'image/webp', 'gif' => 'image/gif',
+                'bmp' => 'image/bmp', 'tif' => 'image/tiff', 'tiff' => 'image/tiff',
+                'avif' => 'image/avif', 'heic' => 'image/heic', 'heif' => 'image/heif',
+                'ico' => 'image/x-icon', 'svg' => 'image/svg+xml'
+            ];
+            $mimeType = $mimes[$ext] ?? 'image/webp';
         }
 
         try {
@@ -1503,7 +1879,7 @@ function syncProductImagesRecordPHP(PDO $pdo, int $sellerId, ?int $productId, ar
 function safeDeleteLocalImageFilePHP(PDO $pdo, string $fileName, ?int $excludeProductId = null): bool
 {
     $safeName = basename(explode('?', $fileName)[0]);
-    if (!str_starts_with($safeName, 'prod_') || !preg_match('/\.(jpg|jpeg|png|webp)$/i', $safeName)) {
+    if (!str_starts_with($safeName, 'prod_') || !preg_match('/\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i', $safeName)) {
         return false;
     }
 
@@ -1555,9 +1931,14 @@ function apiUploadImage(PDO $pdo): void
     ensureProductPriceColumns($pdo);
     $input = array_merge($_POST, getJsonInput());
     $res = saveUploadedProductImages($input);
+    if (!empty($res['uploadErrors'])) {
+        errorResponse($res['uploadErrors'][0], [
+            'image' => $res['uploadErrors']
+        ], 422);
+    }
     if (empty($res['images'])) {
         errorResponse('No image uploaded or invalid format.', [
-            'image' => ['Please upload an image file (jpg, jpeg, png, webp) or provide image data/URLs.']
+            'image' => ['Please upload an image file (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or provide image data/URLs.']
         ], 422);
     }
 
@@ -1620,6 +2001,8 @@ function apiUploadImage(PDO $pdo): void
     }
 
     $primaryOut = $res['primaryImageUrl'];
+    $primaryInfo = $res['filesInfo'][0] ?? null;
+    $primaryFn = $primaryInfo['file_name'] ?? ($primaryOut ? basename(explode('?', $primaryOut)[0]) : null);
     jsonResponse([
         'success' => true,
         'status' => true,
@@ -1627,12 +2010,19 @@ function apiUploadImage(PDO $pdo): void
         'image_url' => $primaryOut,
         'image' => $primaryOut,
         'images' => $res['images'],
+        'file_name' => $primaryFn,
+        'relative_path' => $primaryInfo['relative_path'] ?? ($primaryFn ? ('uploads/products/' . $primaryFn) : null),
+        'file_size' => $primaryInfo['file_size'] ?? null,
+        'mime_type' => $primaryInfo['mime_type'] ?? 'image/webp',
+        'files' => $res['filesInfo'] ?? [],
         'product_id' => $targetProductId,
         'product' => $attachedProduct,
         'data' => [
             'image_url' => $primaryOut,
             'image' => $primaryOut,
-            'images' => $res['images']
+            'images' => $res['images'],
+            'file_name' => $primaryFn,
+            'mime_type' => $primaryInfo['mime_type'] ?? 'image/webp',
         ],
         'limit' => 4,
         'count' => count($res['images']),
@@ -1754,9 +2144,14 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
 
     $input = array_merge($_POST, getJsonInput());
     $res = saveUploadedProductImages($input);
+    if (!empty($res['uploadErrors'])) {
+        errorResponse($res['uploadErrors'][0], [
+            'image' => $res['uploadErrors']
+        ], 422);
+    }
     if (empty($res['images'])) {
         errorResponse('No replacement image provided.', [
-            'image' => ['Please upload an image file (jpg, jpeg, png, webp) or image URL.']
+            'image' => ['Please upload an image file (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or image URL.']
         ], 422);
     }
 
@@ -2110,6 +2505,11 @@ function apiCreateProduct(PDO $pdo): void
 
     // Process image file uploads, base64, or multiple images (up to 4 max). Never inject demo images or placeholders.
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
+    if (!empty($imgResult['uploadErrors'])) {
+        errorResponse($imgResult['uploadErrors'][0], [
+            'image' => $imgResult['uploadErrors']
+        ], 422);
+    }
     $finalImages = $imgResult['hasImages'] ? dedupeImagesByFilename(array_values(array_filter($imgResult['images'], function($u) {
         return !str_contains(strtolower($u), 'placeholder') && !str_contains(strtolower($u), 'unsplash.com');
     }))) : [];
@@ -2422,6 +2822,11 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 
     // Process uploaded file(s), base64, or image URLs if provided (up to 4 max)
     $imgResult = saveUploadedProductImages($input, $input['image_url'] ?? $input['image'] ?? null);
+    if (!empty($imgResult['uploadErrors'])) {
+        errorResponse($imgResult['uploadErrors'][0], [
+            'image' => $imgResult['uploadErrors']
+        ], 422);
+    }
     if (!empty($imgResult['hasImages']) && !empty($imgResult['images'])) {
         $currentImgs = [];
         if (!empty($product['images'])) {

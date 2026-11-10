@@ -8,6 +8,9 @@ const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const multer = require('multer');
+const sharp = require('sharp');
+const bmpJs = require('bmp-js');
+const heicDecode = require('heic-decode');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -238,8 +241,24 @@ try {
   console.warn('[Media Storage] Startup migration warning:', migrateErr.message);
 }
 
-const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
-const ALLOWED_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
+const ALLOWED_IMAGE_MIMES = [
+  'image/jpeg', 'image/jpg', 'image/pjpeg', 'image/jfif',
+  'image/png', 'image/x-png',
+  'image/webp',
+  'image/gif',
+  'image/bmp', 'image/x-ms-bmp', 'image/x-bmp',
+  'image/tiff', 'image/x-tiff',
+  'image/avif',
+  'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence',
+  'image/svg+xml',
+  'image/x-icon', 'image/vnd.microsoft.icon'
+];
+const ALLOWED_IMAGE_EXTS = [
+  '.jpg', '.jpeg', '.jfif', '.png', '.webp', '.gif',
+  '.bmp', '.tif', '.tiff', '.avif', '.heic', '.heif', '.svg', '.ico'
+];
+const AVATAR_ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+const AVATAR_ALLOWED_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.webp'];
 
 // Universal Static Image Serving & Double/Mangled URL Resolver
 // Matches any image file request regardless of whether frontend prepends /api, /storage, /images, double URLs, or port/host
@@ -247,7 +266,7 @@ app.use((req, res, next) => {
   const urlPath = req.path || req.url;
 
   // Match any product image filename or avatar filename anywhere in the URL
-  const imgMatch = urlPath.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
+  const imgMatch = urlPath.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
   const isImageRoute = (
     imgMatch ||
     urlPath.startsWith('/uploads/') ||
@@ -292,12 +311,20 @@ app.use((req, res, next) => {
     const mimeMap = {
       '.jpg': 'image/jpeg',
       '.jpeg': 'image/jpeg',
+      '.jfif': 'image/jpeg',
       '.png': 'image/png',
       '.webp': 'image/webp',
       '.gif': 'image/gif',
+      '.bmp': 'image/bmp',
+      '.tif': 'image/tiff',
+      '.tiff': 'image/tiff',
+      '.avif': 'image/avif',
+      '.heic': 'image/heic',
+      '.heif': 'image/heif',
+      '.ico': 'image/x-icon',
       '.svg': 'image/svg+xml'
     };
-    res.setHeader('Content-Type', mimeMap[ext] || 'image/jpeg');
+    res.setHeader('Content-Type', mimeMap[ext] || 'image/webp');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     return res.sendFile(targetPath);
   }
@@ -340,6 +367,205 @@ app.use(
   express.static(path.resolve(__dirname, 'uploads'), mediaStaticOpts)
 );
 
+function isWebpBuffer(buf) {
+  return Buffer.isBuffer(buf) && buf.length >= 12 &&
+    buf.toString('ascii', 0, 4) === 'RIFF' &&
+    buf.toString('ascii', 8, 12) === 'WEBP';
+}
+
+function isSvgBuffer(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 10) return false;
+  const headSlice = buf.subarray(0, Math.min(buf.length, 512));
+  if (headSlice.includes(0)) return false;
+  const head = headSlice.toString('utf8').trimStart().replace(/^\uFEFF/, '').toLowerCase();
+  return head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'));
+}
+
+function isSafeSvgBuffer(buf) {
+  const fullText = buf.toString('utf8');
+  return !/<script[\s>]|<!entity|javascript:|vbscript:|<foreignobject|\son[a-z]+\s*=/i.test(fullText);
+}
+
+function getIsobmffBrand(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 16) return null;
+  if (buf.toString('ascii', 4, 8) !== 'ftyp') return null;
+  return buf.toString('ascii', 8, 12).toLowerCase();
+}
+
+function extractIcoPayload(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 22) return null;
+  if (buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1) return null;
+  const count = buf.readUInt16LE(4);
+  if (count < 1 || count > 64 || 6 + count * 16 > buf.length) return null;
+  let best = null;
+  let bestScore = -1;
+  for (let i = 0; i < count; i++) {
+    const entryOffset = 6 + i * 16;
+    const w = buf[entryOffset] === 0 ? 256 : buf[entryOffset];
+    const h = buf[entryOffset + 1] === 0 ? 256 : buf[entryOffset + 1];
+    const bpp = buf.readUInt16LE(entryOffset + 6);
+    const bytesInRes = buf.readUInt32LE(entryOffset + 8);
+    const imageOffset = buf.readUInt32LE(entryOffset + 12);
+    if (bytesInRes < 8 || imageOffset + bytesInRes > buf.length) continue;
+    const score = (w * h * 64) + bpp;
+    if (score > bestScore) {
+      bestScore = score;
+      best = buf.subarray(imageOffset, imageOffset + bytesInRes);
+    }
+  }
+  if (!best) return null;
+  if (best.length >= 8 && best.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
+    return best;
+  }
+  // Convert BITMAPINFOHEADER DIB inside ICO into a standard BM file buffer
+  if (best.length >= 40 && best.readUInt32LE(0) === 40) {
+    const width = best.readInt32LE(4);
+    const doubleHeight = best.readInt32LE(8);
+    const height = Math.floor(Math.abs(doubleHeight) / 2);
+    const bpp = best.readUInt16LE(14);
+    const colorsUsed = best.readUInt32LE(32);
+    if (width > 0 && height > 0) {
+      const paletteCount = bpp <= 8 ? (colorsUsed > 0 ? colorsUsed : (1 << bpp)) : 0;
+      const header = Buffer.alloc(14);
+      header.write('BM', 0, 2, 'ascii');
+      header.writeUInt32LE(14 + best.length, 2);
+      header.writeUInt32LE(14 + 40 + paletteCount * 4, 10);
+      const patchedDib = Buffer.from(best);
+      patchedDib.writeInt32LE(doubleHeight < 0 ? -height : height, 8);
+      return Buffer.concat([header, patchedDib]);
+    }
+  }
+  return null;
+}
+
+async function decodeBmpToWebp(bmpBuffer) {
+  if (!Buffer.isBuffer(bmpBuffer) || bmpBuffer.length < 26 || bmpBuffer[0] !== 0x42 || bmpBuffer[1] !== 0x4D) {
+    throw new Error('Invalid BMP image.');
+  }
+  const bmpWidth = bmpBuffer.readInt32LE(18);
+  const bmpHeight = Math.abs(bmpBuffer.readInt32LE(22));
+  if (bmpWidth <= 0 || bmpHeight <= 0 || bmpWidth > 25000 || bmpHeight > 25000 || (bmpWidth * bmpHeight) > 100000000) {
+    throw new Error('BMP dimensions out of allowed range.');
+  }
+  const decoded = bmpJs.decode(bmpBuffer);
+  if (!decoded || !decoded.data || decoded.width <= 0 || decoded.height <= 0) {
+    throw new Error('Failed to decode BMP pixels.');
+  }
+  const abgr = decoded.data;
+  const rgba = Buffer.allocUnsafe(abgr.length);
+  let hasAlpha = false;
+  if (decoded.bitPP === 32) {
+    for (let i = 0; i < abgr.length; i += 4) {
+      if (abgr[i] !== 0) {
+        hasAlpha = true;
+        break;
+      }
+    }
+  }
+  for (let i = 0; i < abgr.length; i += 4) {
+    rgba[i] = abgr[i + 3];
+    rgba[i + 1] = abgr[i + 2];
+    rgba[i + 2] = abgr[i + 1];
+    rgba[i + 3] = (decoded.bitPP === 32 && hasAlpha) ? abgr[i] : 255;
+  }
+  return sharp(rgba, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
+    .webp({ quality: 85, effort: 4 })
+    .toBuffer();
+}
+
+async function convertImageBufferToWebp(inputBuffer, meta = {}) {
+  if (!Buffer.isBuffer(inputBuffer) || inputBuffer.length < 10) {
+    throw new Error('Image buffer is empty or too small.');
+  }
+  if (inputBuffer.length > 15 * 1024 * 1024) {
+    throw new Error('Image exceeds maximum 15MB size limit.');
+  }
+
+  let webpBuffer = null;
+
+  // 1. SVG vector image
+  if (isSvgBuffer(inputBuffer) || (meta.mimeType && meta.mimeType.toLowerCase().includes('svg'))) {
+    if (!isSvgBuffer(inputBuffer)) {
+      throw new Error('Invalid SVG image content.');
+    }
+    if (!isSafeSvgBuffer(inputBuffer)) {
+      throw new Error('SVG contains prohibited active content.');
+    }
+    webpBuffer = await sharp(inputBuffer, { failOn: 'none', density: 150, limitInputPixels: 100000000 })
+      .webp({ quality: 85, effort: 4 })
+      .toBuffer();
+  }
+  // 2. BMP bitmap image
+  else if (inputBuffer[0] === 0x42 && inputBuffer[1] === 0x4D) {
+    webpBuffer = await decodeBmpToWebp(inputBuffer);
+  }
+  // 3. ICO icon container
+  else if (inputBuffer.length >= 22 && inputBuffer.readUInt16LE(0) === 0 && inputBuffer.readUInt16LE(2) === 1) {
+    const icoInner = extractIcoPayload(inputBuffer);
+    if (!icoInner) {
+      throw new Error('Unsupported or invalid ICO image.');
+    }
+    if (icoInner[0] === 0x42 && icoInner[1] === 0x4D) {
+      webpBuffer = await decodeBmpToWebp(icoInner);
+    } else {
+      webpBuffer = await sharp(icoInner, { failOn: 'none', limitInputPixels: 100000000 })
+        .webp({ quality: 85, effort: 4 })
+        .toBuffer();
+    }
+  }
+  // 4. HEIC / HEIF (iOS camera photos) vs AVIF
+  else {
+    const brand = getIsobmffBrand(inputBuffer);
+    if (brand && ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) {
+      const decoded = await heicDecode({ buffer: inputBuffer });
+      if (!decoded || !decoded.data || !decoded.width || !decoded.height) {
+        throw new Error('Failed to decode HEIC/HEIF image.');
+      }
+      const rawBuf = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
+      webpBuffer = await sharp(rawBuf, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
+        .webp({ quality: 85, effort: 4 })
+        .toBuffer();
+    } else {
+      // 5. JPEG, PNG, WEBP, GIF, TIFF, AVIF (auto-rotates EXIF & preserves alpha/animation)
+      webpBuffer = await sharp(inputBuffer, { failOn: 'none', animated: true, limitInputPixels: 100000000 })
+        .rotate()
+        .webp({ quality: 85, effort: 4 })
+        .toBuffer();
+    }
+  }
+
+  if (!isWebpBuffer(webpBuffer)) {
+    throw new Error('Image conversion did not produce valid WEBP output.');
+  }
+  return webpBuffer;
+}
+
+function bufferLooksLikeSupportedImage(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 10) return false;
+  // JPEG
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true;
+  // PNG
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return true;
+  // GIF
+  const head6 = buf.toString('ascii', 0, 6);
+  if (head6 === 'GIF87a' || head6 === 'GIF89a') return true;
+  // WEBP
+  if (isWebpBuffer(buf)) return true;
+  // BMP
+  if (buf[0] === 0x42 && buf[1] === 0x4D) return true;
+  // TIFF (II* or MM*)
+  if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2A && buf[3] === 0x00) ||
+      (buf[0] === 0x4D && buf[1] === 0x4D && buf[2] === 0x00 && buf[3] === 0x2A)) return true;
+  // ICO
+  if (buf.readUInt16LE(0) === 0 && buf.readUInt16LE(2) === 1 && buf.length >= 22) return true;
+  // AVIF / HEIC / HEIF
+  const brand = getIsobmffBrand(buf);
+  if (brand && ['avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) return true;
+  // SVG
+  if (isSvgBuffer(buf)) return true;
+  return false;
+}
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     if (!fs.existsSync(uploadDir)) {
@@ -348,14 +574,9 @@ const storage = multer.diskStorage({
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    let ext = path.extname(file.originalname || '').toLowerCase();
-    if (!ALLOWED_IMAGE_EXTS.includes(ext)) {
-      if (file.mimetype === 'image/png') ext = '.png';
-      else if (file.mimetype === 'image/webp') ext = '.webp';
-      else ext = '.jpg';
-    }
-    const safeBase = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
-    cb(null, safeBase);
+    const ext = path.extname(file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '') || '.tmp';
+    const tempName = `tmp_upload_${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
+    cb(null, tempName);
   }
 });
 
@@ -364,18 +585,19 @@ const imageFileFilter = (req, file, cb) => {
   const mime = (file.mimetype || '').toLowerCase();
 
   // Block executable or script files
-  const dangerousExts = ['.php', '.phtml', '.php5', '.exe', '.sh', '.bat', '.cmd', '.js', '.vbs', '.html', '.htm', '.cgi', '.pl'];
+  const dangerousExts = ['.php', '.phtml', '.php5', '.exe', '.sh', '.bat', '.cmd', '.js', '.mjs', '.cjs', '.vbs', '.html', '.htm', '.cgi', '.pl'];
   if (dangerousExts.includes(ext)) {
     return cb(new Error('Security violation: Executable or script files are strictly prohibited.'), false);
   }
 
-  const isValidMime = ALLOWED_IMAGE_MIMES.includes(mime) || mime.startsWith('image/');
+  const isOctetWithImageExt = mime === 'application/octet-stream' && (ALLOWED_IMAGE_EXTS.includes(ext) || ext === '');
+  const isValidMime = ALLOWED_IMAGE_MIMES.includes(mime) || mime.startsWith('image/') || isOctetWithImageExt;
   const isValidExt = ALLOWED_IMAGE_EXTS.includes(ext) || ext === '';
 
   if (isValidMime && isValidExt) {
     cb(null, true);
   } else {
-    cb(new Error('Invalid image format. Allowed formats: JPG, JPEG, PNG, and WEBP.'), false);
+    cb(new Error('Invalid image format. Please upload an image file (automatically converted and stored as .webp).'), false);
   }
 };
 
@@ -389,7 +611,7 @@ const rawUpload = multer({
 });
 
 function handleMulterUpload(req, res, next) {
-  rawUpload.any()(req, res, (err) => {
+  rawUpload.any()(req, res, async (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(422).json({
@@ -403,35 +625,74 @@ function handleMulterUpload(req, res, next) {
       });
     }
 
-    // Ensure permissions 0644 on all saved files and deduplicate identical file uploads (e.g. Flutter sending image + images[])
     if (req.files) {
       const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
       const seenHashes = new Set();
       const uniqueFiles = [];
-      for (const f of fileList) {
-        if (!f || !f.path) continue;
-        try {
-          fs.chmodSync(f.path, 0o644);
-          const buf = fs.readFileSync(f.path);
-          const hash = crypto.createHash('sha256').update(buf).digest('hex');
-          if (seenHashes.has(hash)) {
-            // Duplicate file in same request: delete physical copy and omit from req.files
-            try { fs.unlinkSync(f.path); } catch (e) {}
-            continue;
+      const createdWebpPaths = [];
+
+      const cleanupRemainingTempFiles = (fromIndex) => {
+        for (let i = fromIndex; i < fileList.length; i++) {
+          const rem = fileList[i];
+          if (rem && rem.path && fs.existsSync(rem.path)) {
+            try { fs.unlinkSync(rem.path); } catch (e) {}
           }
-          seenHashes.add(hash);
+        }
+        for (const wp of createdWebpPaths) {
+          if (wp && fs.existsSync(wp)) {
+            try { fs.unlinkSync(wp); } catch (e) {}
+          }
+        }
+      };
+
+      for (let i = 0; i < fileList.length; i++) {
+        const f = fileList[i];
+        if (!f || !f.path) continue;
+        const tempPath = f.path;
+        let rawBuf = null;
+        try {
+          rawBuf = fs.readFileSync(tempPath);
+        } finally {
+          try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+        }
+
+        const hash = crypto.createHash('sha256').update(rawBuf).digest('hex');
+        if (seenHashes.has(hash)) {
+          // Duplicate file in same request: skip duplicate
+          continue;
+        }
+        seenHashes.add(hash);
+
+        try {
+          const webpBuf = await convertImageBufferToWebp(rawBuf, {
+            originalName: f.originalname,
+            mimeType: f.mimetype
+          });
+          const webpFilename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.webp`;
+          const webpPath = path.join(uploadDir, webpFilename);
+          fs.writeFileSync(webpPath, webpBuf);
+          try { fs.chmodSync(webpPath, 0o644); } catch (e) {}
+          createdWebpPaths.push(webpPath);
+
+          f.filename = webpFilename;
+          f.path = webpPath;
+          f.mimetype = 'image/webp';
+          f.size = webpBuf.length;
           uniqueFiles.push(f);
-        } catch (e) {
-          uniqueFiles.push(f);
+        } catch (convErr) {
+          cleanupRemainingTempFiles(i + 1);
+          return res.status(422).json({
+            message: 'Invalid or unsupported image file.',
+            errors: { image: [convErr.message || 'Could not process uploaded image into WebP format.'] }
+          });
         }
       }
+
       req.files = uniqueFiles;
       if (req.file) {
         const found = uniqueFiles.find(f => f.path === req.file.path);
         req.file = found || (uniqueFiles.length > 0 ? uniqueFiles[0] : null);
       }
-    } else if (req.file && req.file.path) {
-      try { fs.chmodSync(req.file.path, 0o644); } catch (e) {}
     }
     next();
   });
@@ -444,57 +705,63 @@ const upload = {
   fields: () => handleMulterUpload
 };
 
-
-
 function isBase64Image(str) {
   if (typeof str !== 'string') return false;
   const t = str.trim();
-  if (t.startsWith('data:image/')) return true;
-  // Raw base64 check: must start with standard magic bytes for jpeg, png, gif, or webp
-  if (/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR)/.test(t) && t.length > 50 && /^[A-Za-z0-9+/=\r\n]+$/.test(t.replace(/\s+/g, ''))) {
-    return true;
+  if (/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?;base64,.+/is.test(t)) return true;
+  // Raw base64 check: starts with known image base64 prefixes and decodes to valid image bytes
+  const compact = t.replace(/\s+/g, '');
+  if (/^(\/9j\/|iVBORw0KGgo|R0lGOD|UklGR|Qk|SUkq|TU0A|PHN2Zy|PD94bWw|AAAA)/.test(compact) &&
+      compact.length > 32 &&
+      /^[A-Za-z0-9+/=]+$/.test(compact)) {
+    try {
+      const sampleBuf = Buffer.from(compact, 'base64');
+      return bufferLooksLikeSupportedImage(sampleBuf);
+    } catch (e) {
+      return false;
+    }
   }
   return false;
 }
 
-function saveBase64Image(dataString, req = null) {
+async function saveBase64Image(dataString, req = null) {
   if (typeof dataString !== 'string') return null;
   const trimmed = dataString.trim();
   if (!isBase64Image(trimmed)) return null;
 
-  let ext = 'jpg';
+  let declaredMime = null;
   let rawB64 = '';
 
-  const matches = trimmed.match(/^data:image\/(\w+);base64,(.+)$/is);
+  const matches = trimmed.match(/^data:image\/([a-z0-9.+-]+)(?:;[^,]*)?;base64,(.+)$/is);
   if (matches) {
-    ext = matches[1].toLowerCase();
-    if (ext === 'jpeg') ext = 'jpg';
-    if (!['jpg', 'png', 'webp'].includes(ext)) ext = 'jpg';
+    declaredMime = `image/${matches[1].toLowerCase()}`;
     rawB64 = matches[2].replace(/\s+/g, '');
   } else {
     rawB64 = trimmed.replace(/\s+/g, '');
-    if (rawB64.startsWith('/9j/')) ext = 'jpg';
-    else if (rawB64.startsWith('iVBORw0KGgo')) ext = 'png';
-    else if (rawB64.startsWith('UklGR')) ext = 'webp';
-    else ext = 'jpg';
   }
 
   try {
     const buffer = Buffer.from(rawB64, 'base64');
-    if (buffer.length < 10) return null;
-    if (buffer.length > 15 * 1024 * 1024) return null; // 15MB size limit
+    if (buffer.length < 10 || buffer.length > 15 * 1024 * 1024) return null;
 
-    const filename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${ext}`;
+    const webpBuffer = await convertImageBufferToWebp(buffer, { mimeType: declaredMime });
+    const filename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.webp`;
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
     }
     const fullPath = path.join(uploadDir, filename);
-    fs.writeFileSync(fullPath, buffer);
+    fs.writeFileSync(fullPath, webpBuffer);
     try { fs.chmodSync(fullPath, 0o644); } catch (e) {}
-    const baseUrl = getAppBaseUrl(req);
-    return `${baseUrl.replace(/\/$/, '')}/uploads/products/${filename}`;
+    const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
+    return {
+      url: `${baseUrl}/uploads/products/${filename}`,
+      file_name: filename,
+      relative_path: `uploads/products/${filename}`,
+      file_size: webpBuffer.length,
+      mime_type: 'image/webp'
+    };
   } catch (err) {
-    console.error('Failed to save base64 image:', err);
+    console.error('Failed to convert & save base64 image as .webp:', err.message);
     return null;
   }
 }
@@ -502,7 +769,7 @@ function saveBase64Image(dataString, req = null) {
 function getImageBasename(url) {
   if (!url || typeof url !== 'string') return '';
   const clean = url.split('?')[0].split('#')[0].trim();
-  const fnMatch = clean.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
+  const fnMatch = clean.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i);
   if (fnMatch) return fnMatch[1].toLowerCase();
   return path.basename(clean).toLowerCase();
 }
@@ -521,11 +788,12 @@ function dedupeImagesByFilename(list) {
   return result;
 }
 
-function resolveProductImages(req) {
+async function resolveProductImages(req) {
   const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
   const collected = [];
   const filesInfo = [];
   const seenKeys = new Set();
+  const seenBase64Payloads = new Map();
 
   function addCollected(url, info = null) {
     if (!url || typeof url !== 'string') return;
@@ -547,7 +815,7 @@ function resolveProductImages(req) {
           relative_path: `uploads/products/${f.filename}`,
           image_url: fullUrl,
           file_size: f.size || 0,
-          mime_type: f.mimetype || 'image/jpeg'
+          mime_type: f.mimetype || 'image/webp'
         });
       }
     }
@@ -558,19 +826,19 @@ function resolveProductImages(req) {
       relative_path: `uploads/products/${req.file.filename}`,
       image_url: fullUrl,
       file_size: req.file.size || 0,
-      mime_type: req.file.mimetype || 'image/jpeg'
+      mime_type: req.file.mimetype || 'image/webp'
     });
   }
 
   // 2. Process candidate items from request body
   const body = req.body || {};
 
-  function processCandidate(item) {
+  async function processCandidate(item) {
     if (!item) return;
 
     // Handle array of items
     if (Array.isArray(item)) {
-      for (const el of item) processCandidate(el);
+      for (const el of item) await processCandidate(el);
       return;
     }
 
@@ -578,11 +846,11 @@ function resolveProductImages(req) {
     if (typeof item === 'object') {
       const cand = item.url || item.image_url || item.src || item.path || item.link || item.image || item.relative_path || item.image_path || item['image.path'] || item.imagePath;
       if (cand) {
-        processCandidate(cand);
+        await processCandidate(cand);
         return;
       }
       for (const val of Object.values(item)) {
-        processCandidate(val);
+        await processCandidate(val);
       }
       return;
     }
@@ -608,14 +876,14 @@ function resolveProductImages(req) {
         try {
           const parsed = JSON.parse(trimmed);
           if (Array.isArray(parsed)) {
-            for (const el of parsed) processCandidate(el);
+            for (const el of parsed) await processCandidate(el);
             return;
           }
         } catch (e) {
           try {
             const fixed = JSON.parse(trimmed.replace(/'/g, '"'));
             if (Array.isArray(fixed)) {
-              for (const el of fixed) processCandidate(el);
+              for (const el of fixed) await processCandidate(el);
               return;
             }
           } catch (e2) {}
@@ -623,7 +891,7 @@ function resolveProductImages(req) {
         // Fallback for non-JSON bracketed string e.g. Dart's list.toString() [url1, url2]
         const parts = inner.split(/[,;\n\r|]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
         if (parts.length > 0) {
-          for (const p of parts) processCandidate(p);
+          for (const p of parts) await processCandidate(p);
           return;
         }
       }
@@ -633,32 +901,53 @@ function resolveProductImages(req) {
         if (/[,;\n\r|]/.test(trimmed)) {
           const parts = trimmed.split(/[,;\n\r|]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
           if (parts.length > 1) {
-            for (const p of parts) processCandidate(p);
+            for (const p of parts) await processCandidate(p);
             return;
           }
         }
         if (/https?:\/\/[^\s]+\s+https?:\/\//.test(trimmed)) {
           const spaceParts = trimmed.split(/\s+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
           if (spaceParts.length > 1) {
-            for (const p of spaceParts) processCandidate(p);
+            for (const p of spaceParts) await processCandidate(p);
             return;
           }
         }
       }
 
-      // Base64 data URI or raw base64 string
+      // Base64 data URI or raw base64 string -> convert & save permanently as .webp
       if (isBase64Image(trimmed)) {
-        const saved = saveBase64Image(trimmed, req);
-        if (saved) {
-          addCollected(saved, {
-            file_name: path.basename(saved),
-            relative_path: `uploads/products/${path.basename(saved)}`,
-            image_url: saved,
-            file_size: null,
-            mime_type: 'image/jpeg'
-          });
+        const strippedB64 = trimmed.replace(/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?;base64,/is, '').replace(/\s+/g, '');
+        const b64Key = crypto.createHash('sha256').update(strippedB64).digest('hex');
+        if (seenBase64Payloads.has(b64Key)) {
+          const cached = seenBase64Payloads.get(b64Key);
+          if (cached && cached.url) {
+            addCollected(cached.url, {
+              file_name: cached.file_name,
+              relative_path: cached.relative_path,
+              image_url: cached.url,
+              file_size: cached.file_size,
+              mime_type: cached.mime_type || 'image/webp'
+            });
+          }
           return;
         }
+        const saved = await saveBase64Image(trimmed, req);
+        seenBase64Payloads.set(b64Key, saved);
+        if (saved && saved.url) {
+          addCollected(saved.url, {
+            file_name: saved.file_name,
+            relative_path: saved.relative_path,
+            image_url: saved.url,
+            file_size: saved.file_size,
+            mime_type: saved.mime_type || 'image/webp'
+          });
+        }
+        return;
+      }
+
+      // Reject non-image data: URIs (e.g. data:text/plain;base64,...)
+      if (/^data:/i.test(trimmed)) {
+        return;
       }
 
       // Reject external demo/sample images (e.g. Unsplash) and placeholder images
@@ -667,7 +956,7 @@ function resolveProductImages(req) {
       }
 
       // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or device path)
-      const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
+      const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i);
       if (fnMatch) {
         addCollected(`${baseUrl}/uploads/products/${fnMatch[1]}`);
         return;
@@ -680,7 +969,7 @@ function resolveProductImages(req) {
       } else if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') || trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') || trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')) {
         const cleanPath = trimmed.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
         addCollected(`${baseUrl}/${cleanPath}`);
-      } else if (/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png|webp|gif|svg)$/i.test(trimmed)) {
+      } else if (/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i.test(trimmed)) {
         addCollected(`${baseUrl}/uploads/products/${trimmed}`);
       }
     }
@@ -690,7 +979,7 @@ function resolveProductImages(req) {
   const explicitGalleryKeys = ['images', 'image_urls', 'product_images', 'gallery', 'photos'];
   for (const key of explicitGalleryKeys) {
     if (body[key]) {
-      processCandidate(body[key]);
+      await processCandidate(body[key]);
     }
   }
 
@@ -714,9 +1003,9 @@ function resolveProductImages(req) {
       /^img\d+$/i.test(k) ||
       /^file\d+$/i.test(k)
     ) {
-      processCandidate(v);
+      await processCandidate(v);
     } else if (typeof v === 'string' && (v.startsWith('http://') || v.startsWith('https://') || isBase64Image(v))) {
-      processCandidate(v);
+      await processCandidate(v);
     }
   }
 
@@ -727,6 +1016,7 @@ function resolveProductImages(req) {
   // Strictly enforce seller multiple URL limit of 4 images
   uniqueImages = uniqueImages.slice(0, 4);
   const primaryImageUrl = uniqueImages.length > 0 ? uniqueImages[0] : null;
+  const filteredFilesInfo = filesInfo.filter(fi => fi && uniqueImages.includes(fi.image_url));
 
   return {
     hasImages,
@@ -735,7 +1025,7 @@ function resolveProductImages(req) {
     images: uniqueImages,
     image_urls: uniqueImages,
     imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null,
-    filesInfo,
+    filesInfo: filteredFilesInfo,
     limit: 4,
     count: uniqueImages.length
   };
@@ -796,8 +1086,14 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
             const stat = fs.statSync(localPath);
             fileSize = stat.size;
             const ext = path.extname(fileName).toLowerCase();
-            const mimes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
-            mimeType = mimes[ext] || 'image/jpeg';
+            const mimes = {
+              '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.jfif': 'image/jpeg',
+              '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif',
+              '.bmp': 'image/bmp', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+              '.avif': 'image/avif', '.heic': 'image/heic', '.heif': 'image/heif',
+              '.ico': 'image/x-icon', '.svg': 'image/svg+xml'
+            };
+            mimeType = mimes[ext] || 'image/webp';
           } catch (e) {}
         }
       }
@@ -837,7 +1133,7 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
 async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null) {
   if (!fileName || typeof fileName !== 'string') return false;
   const safeName = path.basename(fileName.split('?')[0]);
-  if (!safeName.startsWith('prod_') || !/\.(jpg|jpeg|png|webp)$/i.test(safeName)) {
+  if (!safeName.startsWith('prod_') || !/\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i.test(safeName)) {
     return false; // Never delete placeholders or sample images!
   }
 
@@ -887,12 +1183,28 @@ async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null
   return false;
 }
 
-function resolveProductImage(req) {
-  const result = resolveProductImages(req);
+async function resolveProductImage(req) {
+  const result = await resolveProductImages(req);
   return result.primaryImageUrl;
 }
 
 // Avatar Storage Configuration
+
+const avatarImageFileFilter = (req, file, cb) => {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  const mime = (file.mimetype || '').toLowerCase();
+  const dangerousExts = ['.php', '.phtml', '.php5', '.exe', '.sh', '.bat', '.cmd', '.js', '.vbs', '.html', '.htm', '.cgi', '.pl'];
+  if (dangerousExts.includes(ext)) {
+    return cb(new Error('Security violation: Executable or script files are strictly prohibited.'), false);
+  }
+  const isValidMime = AVATAR_ALLOWED_IMAGE_MIMES.includes(mime) || mime.startsWith('image/') || mime === 'application/octet-stream';
+  const isValidExt = AVATAR_ALLOWED_IMAGE_EXTS.includes(ext) || ext === '';
+  if (isValidMime && isValidExt) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid avatar format. Allowed formats: jpg, jpeg, png, webp.'), false);
+  }
+};
 
 const avatarStorage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -903,7 +1215,7 @@ const avatarStorage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     let ext = path.extname(file.originalname || '').toLowerCase();
-    if (!ALLOWED_IMAGE_EXTS.includes(ext)) {
+    if (!AVATAR_ALLOWED_IMAGE_EXTS.includes(ext)) {
       if (file.mimetype === 'image/png') ext = '.png';
       else if (file.mimetype === 'image/webp') ext = '.webp';
       else ext = '.jpg';
@@ -913,7 +1225,7 @@ const avatarStorage = multer.diskStorage({
 });
 const rawAvatarUpload = multer({
   storage: avatarStorage,
-  fileFilter: imageFileFilter,
+  fileFilter: avatarImageFileFilter,
   limits: { fileSize: 10 * 1024 * 1024, files: 2 }
 });
 
@@ -2613,7 +2925,7 @@ function formatProductRecord(p, options = {}) {
     }
 
     // Check if string contains a product image filename anywhere (e.g. mangled/double URLs)
-    const fnMatch = t.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i);
+    const fnMatch = t.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i);
     if (fnMatch) {
       return `${baseUrl}/uploads/products/${fnMatch[1]}`;
     }
@@ -2630,7 +2942,7 @@ function formatProductRecord(p, options = {}) {
       const clean = t.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
       return `${baseUrl}/${clean}`;
     }
-    if (/\.(jpg|jpeg|png|webp|gif|svg)(\?.*)?$/i.test(t)) {
+    if (/\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)(\?.*)?$/i.test(t)) {
       const fn = path.basename(t.split('?')[0]);
       return `${baseUrl}/uploads/products/${fn}`;
     }
@@ -3608,11 +3920,11 @@ app.get([
 
 // Dedicated Image Upload Endpoint (Supports single or multiple images, base64, multipart)
 app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), async (req, res) => {
-  const imgResult = resolveProductImages(req);
+  const imgResult = await resolveProductImages(req);
   if (!imgResult.hasImages || imgResult.images.length === 0) {
     return res.status(422).json({
       message: 'No image uploaded or invalid format.',
-      errors: { image: ['Please upload image file(s) (jpg, jpeg, png, webp) or provide image data/URLs.'] }
+      errors: { image: ['Please upload image file(s) (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or provide image data/URLs.'] }
     });
   }
 
@@ -3684,6 +3996,9 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
     return u.includes('/uploads/products/') ? `uploads/products/${fn}` : u;
   });
 
+  const primaryInfo = (imgResult.filesInfo && imgResult.filesInfo[0]) ? imgResult.filesInfo[0] : null;
+  const primaryFn = primaryInfo ? primaryInfo.file_name : (imgResult.primaryImageUrl ? path.basename(imgResult.primaryImageUrl.split('?')[0]) : null);
+
   res.status(201).json({
     success: true,
     status: true,
@@ -3691,12 +4006,19 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
     image_url: imgResult.primaryImageUrl,
     image: imgResult.primaryImageUrl,
     images: imgResult.images,
+    file_name: primaryFn,
+    relative_path: relativePaths[0] || null,
+    file_size: primaryInfo ? primaryInfo.file_size : null,
+    mime_type: primaryInfo ? primaryInfo.mime_type : 'image/webp',
+    files: imgResult.filesInfo,
     product_id: targetProductId || null,
     product: attachedProduct,
     data: {
       image_url: imgResult.primaryImageUrl,
       image: imgResult.primaryImageUrl,
-      images: imgResult.images
+      images: imgResult.images,
+      file_name: primaryFn,
+      mime_type: primaryInfo ? primaryInfo.mime_type : 'image/webp'
     },
     limit: 4,
     count: imgResult.images.length
@@ -3828,11 +4150,11 @@ const handleProductImageReplacement = async (req, res) => {
     return res.status(403).json({ message: 'Access denied. You do not own this product.' });
   }
 
-  const imgResult = resolveProductImages(req);
+  const imgResult = await resolveProductImages(req);
   if (!imgResult.hasImages) {
     return res.status(422).json({
       message: 'No replacement image provided.',
-      errors: { image: ['Please upload an image file (jpg, jpeg, png, webp) or image URL.'] }
+      errors: { image: ['Please upload an image file (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or image URL.'] }
     });
   }
 
@@ -3975,6 +4297,22 @@ const handleProductImageReplacement = async (req, res) => {
       data: formatted
     });
   } catch (err) {
+    const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+    if (fbIdx !== -1) {
+      fallbackProducts[fbIdx].images = newImages;
+      fallbackProducts[fbIdx].image_url = primaryUrl;
+      const formattedFb = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
+      return res.json({
+        success: true,
+        status: true,
+        message: 'Product image updated successfully.',
+        image_url: primaryUrl,
+        image: primaryUrl,
+        images: newImages,
+        product: formattedFb,
+        data: formattedFb
+      });
+    }
     res.status(500).json({ message: 'Failed to update product image.' });
   }
 };
@@ -4108,7 +4446,7 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const description = body.description || null;
   const rawPrice = body.seller_price !== undefined ? body.seller_price : body.price;
   const stock = body.stock;
-  const imgResult = resolveProductImages(req);
+  const imgResult = await resolveProductImages(req);
 
   if (!name || rawPrice === undefined || stock === undefined) {
     return res.status(422).json({ message: 'Name, price and stock are required.' });
@@ -4483,7 +4821,7 @@ async function handleProductUpdateRoute(req, res) {
   }
 
   // Resolve newly uploaded image files, base64, or image URLs if provided (limit 4)
-  const imgResult = resolveProductImages(req);
+  const imgResult = await resolveProductImages(req);
   if (imgResult.hasImages && imgResult.images.length > 0) {
     const isReplaceAll = body.replace_all === true || body.replace_all === 'true' || body.replace_images === true || body.replace_images === 'true' || body.mode === 'replace';
     let currentImgs = [];
