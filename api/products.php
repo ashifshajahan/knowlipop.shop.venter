@@ -6,7 +6,661 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
-require_once __DIR__ . '/categories.php';
+
+function getDefaultStarterCategoriesPhp(): array
+{
+    return [
+        [
+            'id' => 1,
+            'name' => 'Electronics',
+            'slug' => 'electronics',
+            'description' => 'Smartphones, headphones, gadgets & tech accessories',
+            'icon' => '📱',
+            'image_url' => null,
+            'sort_order' => 1,
+            'is_active' => 1,
+        ],
+        [
+            'id' => 2,
+            'name' => 'Fashion',
+            'slug' => 'fashion',
+            'description' => 'Apparel, footwear, bags, sunglasses & style essentials',
+            'icon' => '👕',
+            'image_url' => null,
+            'sort_order' => 2,
+            'is_active' => 1,
+        ],
+        [
+            'id' => 3,
+            'name' => 'Home & Kitchen',
+            'slug' => 'home-kitchen',
+            'description' => 'Appliances, cookware, home decor & living essentials',
+            'icon' => '🏠',
+            'image_url' => null,
+            'sort_order' => 3,
+            'is_active' => 1,
+        ],
+        [
+            'id' => 4,
+            'name' => 'Beauty & Personal Care',
+            'slug' => 'beauty-personal-care',
+            'description' => 'Skincare, grooming, wellness & cosmetics',
+            'icon' => '✨',
+            'image_url' => null,
+            'sort_order' => 4,
+            'is_active' => 1,
+        ],
+        [
+            'id' => 5,
+            'name' => 'Grocery',
+            'slug' => 'grocery',
+            'description' => 'Daily staples, snacks, beverages & household essentials',
+            'icon' => '🛒',
+            'image_url' => null,
+            'sort_order' => 5,
+            'is_active' => 1,
+        ],
+    ];
+}
+
+function toCategorySlugPhp(string $name): string
+{
+    $slug = strtolower(trim($name));
+    $slug = str_replace('&', ' ', $slug);
+    $slug = preg_replace('/[^a-z0-9]+/', '-', $slug);
+    $slug = trim((string) $slug, '-');
+    return $slug !== '' ? $slug : 'category';
+}
+
+function ensureUniqueCategorySlugPhp(PDO $pdo, string $baseSlug, ?int $excludeId = null): string
+{
+    $candidate = $baseSlug !== '' ? $baseSlug : 'category';
+    $suffix = 2;
+    while (true) {
+        if ($excludeId !== null) {
+            $stmt = $pdo->prepare("SELECT id FROM categories WHERE slug = :slug AND id != :id LIMIT 1");
+            $stmt->execute([':slug' => $candidate, ':id' => $excludeId]);
+        } else {
+            $stmt = $pdo->prepare("SELECT id FROM categories WHERE slug = :slug LIMIT 1");
+            $stmt->execute([':slug' => $candidate]);
+        }
+        if (!$stmt->fetch()) {
+            return $candidate;
+        }
+        $candidate = $baseSlug . '-' . $suffix;
+        $suffix++;
+        if ($suffix > 200) {
+            return $baseSlug . '-' . time();
+        }
+    }
+}
+
+function ensureProductCategoriesTable(PDO $pdo): void
+{
+    static $initializedPdos = [];
+    $pdoKey = spl_object_id($pdo);
+    if (isset($initializedPdos[$pdoKey])) {
+        return;
+    }
+
+    try {
+        if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+            $initializedPdos[$pdoKey] = true;
+            return;
+        }
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS `categories` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `name` VARCHAR(100) NOT NULL,
+                `slug` VARCHAR(120) NOT NULL UNIQUE,
+                `description` VARCHAR(255) NULL DEFAULT NULL,
+                `icon` VARCHAR(60) NULL DEFAULT NULL,
+                `image_url` LONGTEXT NULL DEFAULT NULL,
+                `sort_order` INT NOT NULL DEFAULT 0,
+                `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`id`),
+                INDEX `idx_categories_active` (`is_active`),
+                INDEX `idx_categories_sort` (`sort_order`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        ");
+
+        // Ensure products.category_id column exists
+        try {
+            $cols = $pdo->query("SHOW COLUMNS FROM `products` LIKE 'category_id'")->fetchAll();
+            if (empty($cols)) {
+                $pdo->exec("ALTER TABLE `products` ADD COLUMN `category_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `category`");
+                try {
+                    $pdo->exec("ALTER TABLE `products` ADD INDEX `idx_products_category` (`category_id`)");
+                } catch (\Throwable $e) {}
+            }
+        } catch (\Throwable $e) {}
+
+        // Seed 5 default categories ONLY if the table is completely empty (never overwrite edits!)
+        $cnt = (int) $pdo->query("SELECT COUNT(*) FROM `categories`")->fetchColumn();
+        if ($cnt === 0) {
+            $ins = $pdo->prepare("
+                INSERT INTO `categories` (`id`, `name`, `slug`, `description`, `icon`, `sort_order`, `is_active`, `created_at`, `updated_at`)
+                VALUES (:id, :name, :slug, :description, :icon, :sort_order, :is_active, NOW(), NOW())
+            ");
+            foreach (getDefaultStarterCategoriesPhp() as $cat) {
+                $ins->execute([
+                    ':id' => $cat['id'],
+                    ':name' => $cat['name'],
+                    ':slug' => $cat['slug'],
+                    ':description' => $cat['description'],
+                    ':icon' => $cat['icon'],
+                    ':sort_order' => $cat['sort_order'],
+                    ':is_active' => $cat['is_active'],
+                ]);
+            }
+        }
+
+        // Non-destructive backfill of category_id for existing products matching category name/slug
+        try {
+            $pdo->exec("
+                UPDATE `products` p
+                JOIN `categories` c ON (LOWER(TRIM(p.category)) = LOWER(TRIM(c.name)) OR LOWER(TRIM(p.category)) = LOWER(TRIM(c.slug)))
+                SET p.category_id = c.id, p.category = c.name
+                WHERE p.category_id IS NULL AND p.category IS NOT NULL AND TRIM(p.category) != ''
+            ");
+        } catch (\Throwable $e) {}
+
+        $initializedPdos[$pdoKey] = true;
+    } catch (\Throwable $e) {
+        // ignore if table inspection failed transiently
+    }
+}
+
+function formatCategoryRecord(array $row, ?int $overrideCount = null): array
+{
+    $productsCount = $overrideCount !== null ? $overrideCount : (int) ($row['products_count'] ?? 0);
+    return [
+        'id' => (int) $row['id'],
+        'name' => (string) ($row['name'] ?? ''),
+        'slug' => (string) ($row['slug'] ?? ''),
+        'description' => $row['description'] ?? null,
+        'icon' => $row['icon'] ?? null,
+        'image_url' => $row['image_url'] ?? null,
+        'sort_order' => (int) ($row['sort_order'] ?? 0),
+        'is_active' => isset($row['is_active']) ? (bool) $row['is_active'] : true,
+        'products_count' => $productsCount,
+        'created_at' => $row['created_at'] ?? null,
+        'updated_at' => $row['updated_at'] ?? null,
+    ];
+}
+
+function findCategoryByIdOrSlugPhp(PDO $pdo, string $idOrSlug): ?array
+{
+    $trimmed = trim($idOrSlug);
+    if ($trimmed === '') return null;
+
+    if (ctype_digit($trimmed)) {
+        $stmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => (int) $trimmed]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row) return $row;
+    }
+
+    $stmt = $pdo->prepare("SELECT * FROM categories WHERE LOWER(slug) = LOWER(:s1) OR LOWER(name) = LOWER(:s2) LIMIT 1");
+    $stmt->execute([':s1' => $trimmed, ':s2' => $trimmed]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+function getCategoryProductCountPhp(PDO $pdo, array $cat): int
+{
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) FROM products
+            WHERE is_active = 1 AND (category_id = :cid OR LOWER(category) = LOWER(:cname))
+        ");
+        $stmt->execute([':cid' => (int) $cat['id'], ':cname' => $cat['name']]);
+        return (int) $stmt->fetchColumn();
+    } catch (\Throwable $e) {
+        return 0;
+    }
+}
+
+function getCategoriesListPhp(PDO $pdo, bool $includeInactive = false, string $search = ''): array
+{
+    ensureProductCategoriesTable($pdo);
+
+    $where = "WHERE 1=1";
+    $params = [];
+    if (!$includeInactive) {
+        $where .= " AND c.is_active = 1";
+    }
+    if ($search !== '') {
+        $where .= " AND (c.name LIKE :s1 OR c.description LIKE :s2 OR c.slug LIKE :s3)";
+        $sLike = '%' . $search . '%';
+        $params[':s1'] = $sLike;
+        $params[':s2'] = $sLike;
+        $params[':s3'] = $sLike;
+    }
+
+    try {
+        $stmt = $pdo->prepare("
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+            FROM categories c
+            {$where}
+            ORDER BY c.sort_order ASC, c.id ASC
+        ");
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return array_map(fn($r) => formatCategoryRecord($r), $rows);
+    } catch (\Throwable $e) {
+        try {
+            $stmt = $pdo->prepare("SELECT c.* FROM categories c {$where} ORDER BY c.sort_order ASC, c.id ASC");
+            $stmt->execute($params);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            return array_map(fn($r) => formatCategoryRecord($r, 0), $rows);
+        } catch (\Throwable $e2) {
+            return array_map(fn($r) => formatCategoryRecord($r, 0), getDefaultStarterCategoriesPhp());
+        }
+    }
+}
+
+function resolveProductCategoryPhp(PDO $pdo, array $input, bool $isCreate = false): array
+{
+    ensureProductCategoriesTable($pdo);
+
+    $hasCategoryId = array_key_exists('category_id', $input) && $input['category_id'] !== '' && $input['category_id'] !== null;
+    $hasCategoryName = array_key_exists('category', $input) || array_key_exists('category_name', $input) || array_key_exists('category_slug', $input);
+
+    if ($hasCategoryId) {
+        $rawId = $input['category_id'];
+        if (!is_numeric($rawId) || (int) $rawId <= 0) {
+            return ['provided' => true, 'error' => ['category_id' => ['Category ID must be a positive integer.']]];
+        }
+        $stmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => (int) $rawId]);
+        $cat = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$cat) {
+            return ['provided' => true, 'error' => ['category_id' => ['Selected category was not found.']]];
+        }
+        return [
+            'provided' => true,
+            'category' => (string) $cat['name'],
+            'category_id' => (int) $cat['id'],
+            'error' => null,
+        ];
+    }
+
+    if ($hasCategoryName) {
+        $rawCat = trim((string) ($input['category'] ?? ($input['category_name'] ?? ($input['category_slug'] ?? ''))));
+        if ($rawCat === '') {
+            return [
+                'provided' => true,
+                'category' => 'General',
+                'category_id' => null,
+                'error' => null,
+            ];
+        }
+
+        if (ctype_digit($rawCat)) {
+            $stmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id LIMIT 1");
+            $stmt->execute([':id' => (int) $rawCat]);
+            $cat = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($cat) {
+                return [
+                    'provided' => true,
+                    'category' => (string) $cat['name'],
+                    'category_id' => (int) $cat['id'],
+                    'error' => null,
+                ];
+            }
+        }
+
+        $stmt = $pdo->prepare("SELECT * FROM categories WHERE LOWER(name) = LOWER(:q1) OR LOWER(slug) = LOWER(:q2) LIMIT 1");
+        $stmt->execute([':q1' => $rawCat, ':q2' => $rawCat]);
+        $cat = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($cat) {
+            return [
+                'provided' => true,
+                'category' => (string) $cat['name'],
+                'category_id' => (int) $cat['id'],
+                'error' => null,
+            ];
+        }
+
+        // Preserve backward compatibility for custom or legacy category labels (e.g. 'General')
+        return [
+            'provided' => true,
+            'category' => $rawCat,
+            'category_id' => null,
+            'error' => null,
+        ];
+    }
+
+    if ($isCreate) {
+        return [
+            'provided' => true,
+            'category' => 'General',
+            'category_id' => null,
+            'error' => null,
+        ];
+    }
+
+    return ['provided' => false, 'category' => null, 'category_id' => null, 'error' => null];
+}
+
+function performCategoryMutationPhp(PDO $pdo, string $action, array $input, bool $allowUnprefixedFields = true, ?int $fallbackCatId = null): array
+{
+    ensureProductCategoriesTable($pdo);
+    $normAction = strtolower(trim($action));
+    $includeInactive = isset($input['include_inactive_categories']) && in_array(strtolower((string) $input['include_inactive_categories']), ['1', 'true', 'yes'], true);
+    if (!$includeInactive && isset($input['include_inactive']) && in_array(strtolower((string) $input['include_inactive']), ['1', 'true', 'yes'], true)) {
+        $includeInactive = true;
+    }
+
+    if (in_array($normAction, ['create', 'create_category', 'add_category', 'add'], true)) {
+        $catData = is_array($input['create_category'] ?? null) ? $input['create_category'] : (is_array($input['category_data'] ?? null) ? $input['category_data'] : []);
+        $name = trim((string) (
+            $catData['name']
+            ?? $input['category_name']
+            ?? $input['new_category_name']
+            ?? $input['new_category']
+            ?? ($allowUnprefixedFields ? ($input['name'] ?? '') : '')
+        ));
+
+        if ($name === '') {
+            errorResponse('Validation error occurred.', ['name' => ['The category name field is required.']], 422);
+        }
+        if (mb_strlen($name) > 100) {
+            errorResponse('Validation error occurred.', ['name' => ['The category name may not exceed 100 characters.']], 422);
+        }
+
+        $dupStmt = $pdo->prepare("SELECT id FROM categories WHERE LOWER(name) = LOWER(:name) LIMIT 1");
+        $dupStmt->execute([':name' => $name]);
+        if ($dupStmt->fetch()) {
+            errorResponse('A category with this name already exists.', ['name' => ['A category with this name already exists.']], 422);
+        }
+
+        $rawSlug = trim((string) ($catData['slug'] ?? ($input['category_slug'] ?? ($allowUnprefixedFields ? ($input['slug'] ?? '') : ''))));
+        $baseSlug = $rawSlug !== '' ? toCategorySlugPhp($rawSlug) : toCategorySlugPhp($name);
+        $slug = ensureUniqueCategorySlugPhp($pdo, $baseSlug);
+
+        $description = trim((string) ($catData['description'] ?? ($input['category_description'] ?? ($allowUnprefixedFields ? ($input['description'] ?? '') : ''))));
+        $icon = trim((string) ($catData['icon'] ?? ($input['category_icon'] ?? ($input['icon'] ?? ''))));
+        $imageUrl = trim((string) ($catData['image_url'] ?? ($input['category_image_url'] ?? ($allowUnprefixedFields ? ($input['image_url'] ?? '') : ''))));
+        $rawSort = $catData['sort_order'] ?? ($input['category_sort_order'] ?? ($allowUnprefixedFields ? ($input['sort_order'] ?? null) : null));
+        if ($rawSort !== null && is_numeric($rawSort)) {
+            $sortOrder = (int) $rawSort;
+        } else {
+            $maxSort = (int) $pdo->query("SELECT COALESCE(MAX(sort_order), 0) FROM categories")->fetchColumn();
+            $sortOrder = $maxSort + 1;
+        }
+        $rawActive = $catData['is_active'] ?? ($input['category_is_active'] ?? ($allowUnprefixedFields ? ($input['is_active'] ?? null) : null));
+        $isActive = $rawActive === null ? true : (is_bool($rawActive) ? $rawActive : !in_array(strtolower((string) $rawActive), ['0', 'false', 'no', 'off'], true));
+
+        $stmt = $pdo->prepare("
+            INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
+            VALUES (:name, :slug, :description, :icon, :image_url, :sort_order, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ");
+        $stmt->execute([
+            ':name' => $name,
+            ':slug' => $slug,
+            ':description' => $description !== '' ? $description : null,
+            ':icon' => $icon !== '' ? $icon : null,
+            ':image_url' => $imageUrl !== '' ? $imageUrl : null,
+            ':sort_order' => $sortOrder,
+            ':is_active' => $isActive ? 1 : 0,
+        ]);
+
+        $id = (int) $pdo->lastInsertId();
+        $cat = findCategoryByIdOrSlugPhp($pdo, (string) $id);
+        $formatted = formatCategoryRecord($cat, getCategoryProductCountPhp($pdo, $cat));
+        $categories = getCategoriesListPhp($pdo, $includeInactive);
+
+        return [
+            'statusCode' => 201,
+            'message' => 'Category created.',
+            'category' => $formatted,
+            'categories' => $categories,
+        ];
+    }
+
+    if (in_array($normAction, ['update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category'], true)) {
+        $catData = is_array($input['edit_category'] ?? null) ? $input['edit_category'] : (is_array($input['category_data'] ?? null) ? $input['category_data'] : []);
+        $target = $catData['id']
+            ?? $catData['slug']
+            ?? $input['target_category_id']
+            ?? $input['old_category_id']
+            ?? $input['target_category']
+            ?? $input['old_category']
+            ?? $input['category_id']
+            ?? $input['category_slug']
+            ?? $input['category']
+            ?? ($allowUnprefixedFields ? ($input['id'] ?? '') : '');
+        if (($target === '' || $target === null) && $fallbackCatId !== null) {
+            $target = (string) $fallbackCatId;
+        }
+
+        $existing = findCategoryByIdOrSlugPhp($pdo, (string) $target);
+        if (!$existing) {
+            errorResponse('Category not found.', [], 404);
+        }
+
+        $catId = (int) $existing['id'];
+        $oldName = (string) $existing['name'];
+        $updates = [];
+        $params = [':id' => $catId];
+        $newName = $oldName;
+        $nameChanged = false;
+
+        $hasIncomingName = false;
+        $incomingName = null;
+        if (array_key_exists('name', $catData)) {
+            $hasIncomingName = true;
+            $incomingName = $catData['name'];
+        } elseif (array_key_exists('new_category_name', $input)) {
+            $hasIncomingName = true;
+            $incomingName = $input['new_category_name'];
+        } elseif (array_key_exists('rename_category', $input) && is_string($input['rename_category'])) {
+            $hasIncomingName = true;
+            $incomingName = $input['rename_category'];
+        } elseif (array_key_exists('category_name', $input)) {
+            $hasIncomingName = true;
+            $incomingName = $input['category_name'];
+        } elseif (array_key_exists('new_name', $input)) {
+            $hasIncomingName = true;
+            $incomingName = $input['new_name'];
+        } elseif ($allowUnprefixedFields && array_key_exists('name', $input)) {
+            $hasIncomingName = true;
+            $incomingName = $input['name'];
+        }
+
+        if ($hasIncomingName) {
+            $trimmedName = trim((string) $incomingName);
+            if ($trimmedName === '') {
+                errorResponse('Validation error occurred.', ['name' => ['Category name cannot be empty.']], 422);
+            }
+            if (mb_strlen($trimmedName) > 100) {
+                errorResponse('Validation error occurred.', ['name' => ['Category name may not exceed 100 characters.']], 422);
+            }
+            $dupStmt = $pdo->prepare("SELECT id FROM categories WHERE LOWER(name) = LOWER(:name) AND id != :id LIMIT 1");
+            $dupStmt->execute([':name' => $trimmedName, ':id' => $catId]);
+            if ($dupStmt->fetch()) {
+                errorResponse('A category with this name already exists.', ['name' => ['A category with this name already exists.']], 422);
+            }
+            $updates[] = "name = :name";
+            $params[':name'] = $trimmedName;
+            $newName = $trimmedName;
+            $nameChanged = ($oldName !== $newName);
+        }
+
+        $rawSlug = $catData['slug'] ?? ($input['category_slug'] ?? ($allowUnprefixedFields && array_key_exists('slug', $input) ? $input['slug'] : null));
+        if ($rawSlug !== null && trim((string) $rawSlug) !== '') {
+            $updates[] = "slug = :slug";
+            $params[':slug'] = ensureUniqueCategorySlugPhp($pdo, toCategorySlugPhp((string) $rawSlug), $catId);
+        } elseif ($nameChanged) {
+            $updates[] = "slug = :slug";
+            $params[':slug'] = ensureUniqueCategorySlugPhp($pdo, toCategorySlugPhp($newName), $catId);
+        }
+
+        if (array_key_exists('description', $catData) || array_key_exists('category_description', $input) || ($allowUnprefixedFields && array_key_exists('description', $input))) {
+            $desc = trim((string) ($catData['description'] ?? $input['category_description'] ?? $input['description'] ?? ''));
+            $updates[] = "description = :description";
+            $params[':description'] = $desc !== '' ? $desc : null;
+        }
+        if (array_key_exists('icon', $catData) || array_key_exists('category_icon', $input) || array_key_exists('icon', $input)) {
+            $icon = trim((string) ($catData['icon'] ?? $input['category_icon'] ?? $input['icon'] ?? ''));
+            $updates[] = "icon = :icon";
+            $params[':icon'] = $icon !== '' ? $icon : null;
+        }
+        if (array_key_exists('image_url', $catData) || array_key_exists('category_image_url', $input) || ($allowUnprefixedFields && array_key_exists('image_url', $input))) {
+            $img = trim((string) ($catData['image_url'] ?? $input['category_image_url'] ?? $input['image_url'] ?? ''));
+            $updates[] = "image_url = :image_url";
+            $params[':image_url'] = $img !== '' ? $img : null;
+        }
+        $sortVal = $catData['sort_order'] ?? ($input['category_sort_order'] ?? ($allowUnprefixedFields ? ($input['sort_order'] ?? null) : null));
+        if ($sortVal !== null && is_numeric($sortVal)) {
+            $updates[] = "sort_order = :sort_order";
+            $params[':sort_order'] = (int) $sortVal;
+        }
+        if (array_key_exists('is_active', $catData) || array_key_exists('category_is_active', $input) || ($allowUnprefixedFields && array_key_exists('is_active', $input))) {
+            $rawActive = $catData['is_active'] ?? ($input['category_is_active'] ?? $input['is_active']);
+            $activeBool = is_bool($rawActive)
+                ? $rawActive
+                : !in_array(strtolower((string) $rawActive), ['0', 'false', 'no', 'off'], true);
+            $updates[] = "is_active = :is_active";
+            $params[':is_active'] = $activeBool ? 1 : 0;
+        }
+
+        if (!empty($updates)) {
+            $updates[] = "updated_at = CURRENT_TIMESTAMP";
+            $sql = "UPDATE categories SET " . implode(', ', $updates) . " WHERE id = :id";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+        }
+
+        $updatedProductsCount = 0;
+        if ($nameChanged) {
+            try {
+                $syncStmt = $pdo->prepare("
+                    UPDATE products
+                    SET category = :new_name, category_id = :cat_id, updated_at = CURRENT_TIMESTAMP
+                    WHERE category_id = :match_cid OR LOWER(category) = LOWER(:old_name)
+                ");
+                $syncStmt->execute([
+                    ':new_name' => $newName,
+                    ':cat_id' => $catId,
+                    ':match_cid' => $catId,
+                    ':old_name' => $oldName,
+                ]);
+                $updatedProductsCount = $syncStmt->rowCount();
+            } catch (\Throwable $e) {}
+        }
+
+        $fresh = findCategoryByIdOrSlugPhp($pdo, (string) $catId);
+        $formatted = formatCategoryRecord($fresh, getCategoryProductCountPhp($pdo, $fresh));
+        $categories = getCategoriesListPhp($pdo, $includeInactive);
+
+        return [
+            'statusCode' => 200,
+            'message' => 'Category updated.',
+            'updated_products_count' => $updatedProductsCount,
+            'category' => $formatted,
+            'categories' => $categories,
+        ];
+    }
+
+    if (in_array($normAction, ['delete', 'delete_category', 'remove', 'remove_category'], true)) {
+        $target = $input['target_category_id']
+            ?? $input['category_id']
+            ?? $input['category_slug']
+            ?? $input['category']
+            ?? ($allowUnprefixedFields ? ($input['id'] ?? '') : '');
+        if (($target === '' || $target === null) && $fallbackCatId !== null) {
+            $target = (string) $fallbackCatId;
+        }
+
+        $existing = findCategoryByIdOrSlugPhp($pdo, (string) $target);
+        if (!$existing) {
+            errorResponse('Category not found.', [], 404);
+        }
+
+        $catId = (int) $existing['id'];
+        $oldName = (string) $existing['name'];
+
+        try {
+            $detachStmt = $pdo->prepare("
+                UPDATE products
+                SET category = 'General', category_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE category_id = :cid OR LOWER(category) = LOWER(:old_name)
+            ");
+            $detachStmt->execute([':cid' => $catId, ':old_name' => $oldName]);
+        } catch (\Throwable $e) {}
+
+        $delStmt = $pdo->prepare("DELETE FROM categories WHERE id = :id");
+        $delStmt->execute([':id' => $catId]);
+
+        $categories = getCategoriesListPhp($pdo, $includeInactive);
+
+        return [
+            'statusCode' => 200,
+            'message' => 'Category deleted.',
+            'deleted_category_id' => $catId,
+            'categories' => $categories,
+        ];
+    }
+
+    errorResponse('Unsupported category_action. Use create, update, or delete.', [], 422);
+    return [];
+}
+
+function apiManageProductCategoriesViaProducts(PDO $pdo): void
+{
+    $user = authenticateUser($pdo);
+    ensureProductPriceColumns($pdo);
+
+    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'PUT');
+    if ($method === 'DELETE') {
+        $input = array_merge($_GET, $_POST, getJsonInput());
+        $target = $input['target_category_id'] ?? $input['category_id'] ?? $input['category_slug'] ?? $input['category'] ?? $input['id'] ?? '';
+        if (trim((string) $target) === '') {
+            errorResponse('Validation error occurred.', ['category_id' => ['Please provide category_id or category to delete.']], 422);
+        }
+        $res = performCategoryMutationPhp($pdo, 'delete', $input, true, null);
+        jsonResponse([
+            'success' => true,
+            'status' => true,
+            'message' => $res['message'],
+            'deleted_category_id' => $res['deleted_category_id'],
+            'categories' => $res['categories'],
+        ], $res['statusCode']);
+    }
+
+    $input = array_merge($_POST, getJsonInput());
+    $action = (string) ($input['category_action'] ?? ($input['action'] ?? ''));
+    if ($action === '') {
+        $hasTarget = !empty($input['category_id']) || !empty($input['target_category_id']) || !empty($input['old_category']) || !empty($input['target_category']) || !empty($input['id']);
+        $action = $hasTarget ? 'update' : 'create';
+    }
+
+    $res = performCategoryMutationPhp($pdo, $action, $input, true, null);
+    $payload = [
+        'success' => true,
+        'status' => true,
+        'message' => $res['message'],
+        'categories' => $res['categories'],
+    ];
+    if (isset($res['updated_products_count'])) {
+        $payload['updated_products_count'] = $res['updated_products_count'];
+    }
+    if (isset($res['category'])) {
+        $payload['category'] = $res['category'];
+        $payload['data'] = $res['category'];
+    }
+    if (isset($res['deleted_category_id'])) {
+        $payload['deleted_category_id'] = $res['deleted_category_id'];
+    }
+
+    jsonResponse($payload, $res['statusCode']);
+}
 
 function resolveProductPricing(array $input, ?array $existingRow = null): array
 {
@@ -451,11 +1105,15 @@ function apiGetProducts(PDO $pdo): void
         return formatProductRecord($p, false);
     }, $rawProducts);
 
+    $includeInactiveCats = isset($_GET['include_inactive_categories']) && in_array(strtolower((string) $_GET['include_inactive_categories']), ['1', 'true', 'yes'], true);
+    $categoriesList = getCategoriesListPhp($pdo, $includeInactiveCats);
+
     $lastPage = (int)ceil($total / $limit) ?: 1;
     jsonResponse([
         'success' => true,
         'status' => true,
         'data' => $products,
+        'categories' => $categoriesList,
         'total' => $total,
         'current_page' => $page,
         'per_page' => $limit,
@@ -491,11 +1149,14 @@ function apiGetProduct(PDO $pdo, int $id): void
 
     $isSellerView = (isset($_GET['seller_view']) && ($_GET['seller_view'] === '1' || $_GET['seller_view'] === 'true'));
     $formatted = formatProductRecord($product, $isSellerView);
+    $includeInactiveCats = isset($_GET['include_inactive_categories']) && in_array(strtolower((string) $_GET['include_inactive_categories']), ['1', 'true', 'yes'], true);
+    $categoriesList = getCategoriesListPhp($pdo, $includeInactiveCats);
     jsonResponse([
         'success' => true,
         'status' => true,
         'product' => $formatted,
         'data' => $formatted,
+        'categories' => $categoriesList,
     ]);
 }
 
@@ -1381,6 +2042,30 @@ function apiCreateProduct(PDO $pdo): void
     $user = authenticateUser($pdo);
     ensureProductPriceColumns($pdo);
     $input = array_merge($_POST, getJsonInput());
+
+    // Handle standalone category management actions routed via POST /api/products
+    $catAction = strtolower(trim((string) ($input['category_action'] ?? ($input['action'] ?? ''))));
+    if (in_array($catAction, ['create', 'create_category', 'add_category', 'add', 'update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category', 'delete', 'delete_category', 'remove', 'remove_category'], true)) {
+        $res = performCategoryMutationPhp($pdo, $catAction, $input, true, null);
+        $payload = [
+            'success' => true,
+            'status' => true,
+            'message' => $res['message'],
+            'categories' => $res['categories'],
+        ];
+        if (isset($res['updated_products_count'])) {
+            $payload['updated_products_count'] = $res['updated_products_count'];
+        }
+        if (isset($res['category'])) {
+            $payload['category'] = $res['category'];
+            $payload['data'] = $res['category'];
+        }
+        if (isset($res['deleted_category_id'])) {
+            $payload['deleted_category_id'] = $res['deleted_category_id'];
+        }
+        jsonResponse($payload, $res['statusCode']);
+    }
+
     $errors = [];
 
     $name = trim($input['name'] ?? '');
@@ -1399,6 +2084,28 @@ function apiCreateProduct(PDO $pdo): void
 
     if (!empty($errors)) {
         errorResponse('Validation error occurred.', $errors, 422);
+    }
+
+    // Inline create-and-assign new category during product creation if requested
+    $inlineNewCatName = trim((string) (
+        is_array($input['create_category'] ?? null)
+            ? ($input['create_category']['name'] ?? '')
+            : ($input['new_category_name'] ?? '')
+    ));
+    $createdCategoryObj = null;
+    if ($inlineNewCatName !== '' || $catAction === 'create_and_assign') {
+        $existingInline = $inlineNewCatName !== '' ? findCategoryByIdOrSlugPhp($pdo, $inlineNewCatName) : null;
+        if ($existingInline) {
+            $input['category_id'] = (int) $existingInline['id'];
+            $input['category'] = (string) $existingInline['name'];
+        } else {
+            $mutRes = performCategoryMutationPhp($pdo, 'create_category', $input, false, null);
+            $createdCategoryObj = $mutRes['category'] ?? null;
+            if ($createdCategoryObj) {
+                $input['category_id'] = (int) $createdCategoryObj['id'];
+                $input['category'] = (string) $createdCategoryObj['name'];
+            }
+        }
     }
 
     // Process image file uploads, base64, or multiple images (up to 4 max). Never inject demo images or placeholders.
@@ -1483,13 +2190,19 @@ function apiCreateProduct(PDO $pdo): void
 
     // Seller created product: Seller view has NO commission feature!
     $formatted = formatProductRecord($product, true);
-    jsonResponse([
+    $categoriesList = getCategoriesListPhp($pdo, false);
+    $resp = [
         'success' => true,
         'status' => true,
         'message' => 'Product created.',
         'product' => $formatted,
         'data' => $formatted,
-    ], 201);
+        'categories' => $categoriesList,
+    ];
+    if ($createdCategoryObj) {
+        $resp['category'] = $createdCategoryObj;
+    }
+    jsonResponse($resp, 201);
 }
 
 function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
@@ -1572,12 +2285,16 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
         return formatProductRecord($p, true);
     }, $rawProducts);
 
+    $includeInactiveCats = isset($_GET['include_inactive_categories']) && in_array(strtolower((string) $_GET['include_inactive_categories']), ['1', 'true', 'yes'], true);
+    $categoriesList = getCategoriesListPhp($pdo, $includeInactiveCats);
+
     $lastPage = (int)ceil($total / $limit) ?: 1;
     jsonResponse([
         'success' => true,
         'status' => true,
         'seller_id' => $targetSellerId,
         'data' => $products,
+        'categories' => $categoriesList,
         'total' => $total,
         'current_page' => $page,
         'per_page' => $limit,
@@ -1610,6 +2327,17 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     $input = array_merge($_POST, getJsonInput());
     $updates = [];
     $params = [':id' => $id];
+
+    // Support editing/renaming a category directly through PUT/PATCH/POST /api/products/:id
+    $catMutationRes = null;
+    $catAction = strtolower(trim((string) ($input['category_action'] ?? ($input['action'] ?? ''))));
+    $hasEditCatAction = in_array($catAction, ['update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category', 'create', 'create_category', 'add_category', 'add', 'delete', 'delete_category', 'remove', 'remove_category'], true);
+    $hasInlineEditCat = is_array($input['edit_category'] ?? null) || isset($input['rename_category']);
+    if ($hasEditCatAction || $hasInlineEditCat) {
+        $actionToRun = $hasEditCatAction ? $catAction : 'edit_category';
+        $fallbackCatId = !empty($product['category_id']) ? (int) $product['category_id'] : null;
+        $catMutationRes = performCategoryMutationPhp($pdo, $actionToRun, $input, false, $fallbackCatId);
+    }
 
     if (isset($input['name']) && trim($input['name']) !== '') {
         $updates[] = "name = :name";
@@ -1644,16 +2372,44 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $updates[] = "sku = :sku";
         $params[':sku'] = trim((string)$input['sku']);
     }
-    $catRes = resolveProductCategoryPhp($pdo, $input, false);
-    if (!empty($catRes['error'])) {
-        errorResponse('Validation error occurred.', $catRes['error'], 422);
+
+    $isCreateCatAction = in_array($catAction, ['create', 'create_category', 'add_category', 'add'], true);
+    $hasDedicatedCatTarget = is_array($input['edit_category'] ?? null) || isset($input['target_category_id']) || isset($input['target_category']) || isset($input['old_category']) || isset($input['old_category_id']);
+    $hasExplicitProductCatFields = array_key_exists('category_id', $input) || array_key_exists('category', $input);
+    $shouldAssignCategory = ($catMutationRes === null)
+        ? true
+        : ($isCreateCatAction || ($hasDedicatedCatTarget && $hasExplicitProductCatFields));
+
+    if ($shouldAssignCategory) {
+        $assignInput = $input;
+        if ($catMutationRes !== null) {
+            if ($isCreateCatAction && isset($catMutationRes['category'])) {
+                $assignInput = [
+                    'category_id' => (int) $catMutationRes['category']['id'],
+                    'category' => (string) $catMutationRes['category']['name'],
+                ];
+            } else {
+                $assignInput = [];
+                if (array_key_exists('category_id', $input)) {
+                    $assignInput['category_id'] = $input['category_id'];
+                }
+                if (array_key_exists('category', $input)) {
+                    $assignInput['category'] = $input['category'];
+                }
+            }
+        }
+        $catRes = resolveProductCategoryPhp($pdo, $assignInput, false);
+        if (!empty($catRes['error'])) {
+            errorResponse('Validation error occurred.', $catRes['error'], 422);
+        }
+        if (!empty($catRes['provided'])) {
+            $updates[] = "category = :category";
+            $params[':category'] = $catRes['category'];
+            $updates[] = "category_id = :category_id";
+            $params[':category_id'] = $catRes['category_id'];
+        }
     }
-    if (!empty($catRes['provided'])) {
-        $updates[] = "category = :category";
-        $params[':category'] = $catRes['category'];
-        $updates[] = "category_id = :category_id";
-        $params[':category_id'] = $catRes['category_id'];
-    }
+
     if (isset($input['brand'])) {
         $updates[] = "brand = :brand";
         $params[':brand'] = trim((string)$input['brand']);
@@ -1747,13 +2503,22 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 
     // Seller updated product: Seller view has NO commission feature!
     $formatted = formatProductRecord($updated, true);
-    jsonResponse([
+    $categoriesList = getCategoriesListPhp($pdo, false);
+    $resp = [
         'success' => true,
         'status' => true,
-        'message' => 'Product updated.',
+        'message' => $catMutationRes && empty($updates) ? $catMutationRes['message'] : 'Product updated.',
         'product' => $formatted,
         'data' => $formatted,
-    ]);
+        'categories' => $categoriesList,
+    ];
+    if ($catMutationRes !== null && isset($catMutationRes['category'])) {
+        $resp['category'] = $catMutationRes['category'];
+    }
+    if ($catMutationRes !== null && isset($catMutationRes['updated_products_count'])) {
+        $resp['updated_products_count'] = $catMutationRes['updated_products_count'];
+    }
+    jsonResponse($resp);
 }
 
 function apiDeleteProduct(PDO $pdo, int $id): void

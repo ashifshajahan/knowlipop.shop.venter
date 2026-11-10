@@ -1231,8 +1231,7 @@ app.get('/', (req, res) => {
           • GET /api/health<br>
           • POST /api/register<br>
           • POST /api/login<br>
-          • GET /api/products<br>
-          • GET /api/categories<br>
+          • GET /api/products (Catalog + 5 Editable Categories)<br>
           • GET /admin/login
         </div>
       </div>
@@ -2928,6 +2927,365 @@ async function resolveProductCategoryInput(p, body, isCreate = false) {
   return { provided: false, category: null, category_id: null, error: null };
 }
 
+async function getCategoriesListWithCounts(p, includeInactive = false, search = '') {
+  try {
+    await ensureProductCategoriesTable(p);
+    let where = 'WHERE 1=1';
+    const params = [];
+    if (!includeInactive) {
+      where += ' AND c.is_active = 1';
+    }
+    if (search) {
+      where += ' AND (c.name LIKE ? OR c.description LIKE ? OR c.slug LIKE ?)';
+      const s = `%${search}%`;
+      params.push(s, s, s);
+    }
+    const [rows] = await p.query(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM products pr WHERE pr.is_active = 1 AND (pr.category_id = c.id OR LOWER(pr.category) = LOWER(c.name))) AS products_count
+       FROM categories c
+       ${where}
+       ORDER BY c.sort_order ASC, c.id ASC`,
+      params
+    );
+    return rows.map(r => formatCategoryRecord(r));
+  } catch (err) {
+    const searchLower = String(search || '').toLowerCase();
+    return fallbackCategories
+      .filter(c => {
+        if (!includeInactive && c.is_active === false) return false;
+        if (searchLower && !c.name.toLowerCase().includes(searchLower) && !String(c.description || '').toLowerCase().includes(searchLower)) return false;
+        return true;
+      })
+      .sort((a, b) => (Number(a.sort_order || 0) - Number(b.sort_order || 0)) || (Number(a.id) - Number(b.id)))
+      .map(c => formatCategoryRecord(c, fallbackProducts.filter(pr => Number(pr.is_active ?? 1) === 1 && (Number(pr.category_id) === Number(c.id) || String(pr.category || '').toLowerCase() === c.name.toLowerCase())).length));
+  }
+}
+
+async function performCategoryMutationNode(p, action, body = {}, allowUnprefixedFields = true, fallbackCatId = null) {
+  const normAction = String(action || '').trim().toLowerCase();
+  const includeInactive = ['1', 'true', 'yes'].includes(String(body.include_inactive_categories || body.include_inactive || '').toLowerCase());
+
+  if (['create', 'create_category', 'add_category', 'add'].includes(normAction)) {
+    const catData = (body.create_category && typeof body.create_category === 'object')
+      ? body.create_category
+      : ((body.category_data && typeof body.category_data === 'object') ? body.category_data : {});
+    const name = String(
+      catData.name !== undefined ? catData.name
+        : (body.category_name !== undefined ? body.category_name
+          : (body.new_category_name !== undefined ? body.new_category_name
+            : (body.new_category !== undefined ? body.new_category
+              : (allowUnprefixedFields && body.name !== undefined ? body.name : ''))))
+    ).trim();
+
+    if (!name) {
+      return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['The category name field is required.'] } } };
+    }
+    if (name.length > 100) {
+      return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['The category name may not exceed 100 characters.'] } } };
+    }
+
+    try {
+      await ensureProductCategoriesTable(p);
+      const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [name]);
+      if (dup.length > 0) {
+        return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+      }
+      const rawSlug = String(catData.slug ?? body.category_slug ?? (allowUnprefixedFields ? (body.slug ?? '') : '')).trim();
+      const slug = await ensureUniqueCategorySlug(p, rawSlug ? toCategorySlug(rawSlug) : toCategorySlug(name));
+      const description = String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null;
+      const icon = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || null;
+      const imageUrl = String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null;
+      const rawSort = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+      let sortOrder = 0;
+      if (rawSort !== undefined && !isNaN(parseInt(rawSort, 10))) {
+        sortOrder = parseInt(rawSort, 10);
+      } else {
+        const [[{ maxSort }]] = await p.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
+        sortOrder = Number(maxSort || 0) + 1;
+      }
+      const rawActive = catData.is_active !== undefined ? catData.is_active
+        : (body.category_is_active !== undefined ? body.category_is_active : (allowUnprefixedFields ? body.is_active : undefined));
+      const isActive = rawActive === undefined ? 1 : (['0', 'false', 'no', 'off'].includes(String(rawActive).toLowerCase()) ? 0 : 1);
+
+      const [ins] = await p.query(
+        `INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [name, slug, description, icon, imageUrl, sortOrder, isActive]
+      );
+      const cat = await findCategoryByIdOrSlug(p, String(ins.insertId));
+      const formatted = formatCategoryRecord(cat, 0);
+      const categories = await getCategoriesListWithCounts(p, includeInactive);
+      return {
+        ok: true,
+        statusCode: 201,
+        payload: { success: true, status: true, message: 'Category created.', category: formatted, data: formatted, categories }
+      };
+    } catch (dbErr) {
+      if (fallbackCategories.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+        return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+      }
+      const newId = fallbackCategories.length ? Math.max(...fallbackCategories.map(c => Number(c.id))) + 1 : 6;
+      const created = formatCategoryRecord({
+        id: newId,
+        name,
+        slug: toCategorySlug(name),
+        description: String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null,
+        icon: String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || '🏷️',
+        image_url: String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null,
+        sort_order: fallbackCategories.length + 1,
+        is_active: true
+      }, 0);
+      fallbackCategories.push(created);
+      const categories = await getCategoriesListWithCounts(null, includeInactive);
+      return {
+        ok: true,
+        statusCode: 201,
+        payload: { success: true, status: true, message: 'Category created.', category: created, data: created, categories }
+      };
+    }
+  }
+
+  if (['update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category'].includes(normAction)) {
+    const catData = (body.edit_category && typeof body.edit_category === 'object')
+      ? body.edit_category
+      : ((body.category_data && typeof body.category_data === 'object') ? body.category_data : {});
+    let target = catData.id
+      ?? catData.slug
+      ?? body.target_category_id
+      ?? body.old_category_id
+      ?? body.target_category
+      ?? body.old_category
+      ?? body.category_id
+      ?? body.category_slug
+      ?? body.category
+      ?? (allowUnprefixedFields ? body.id : '');
+    if ((target === undefined || target === null || String(target).trim() === '') && fallbackCatId !== null) {
+      target = String(fallbackCatId);
+    }
+
+    let hasIncomingName = false;
+    let incomingName = null;
+    if (catData.name !== undefined) { hasIncomingName = true; incomingName = catData.name; }
+    else if (body.new_category_name !== undefined) { hasIncomingName = true; incomingName = body.new_category_name; }
+    else if (typeof body.rename_category === 'string') { hasIncomingName = true; incomingName = body.rename_category; }
+    else if (body.category_name !== undefined) { hasIncomingName = true; incomingName = body.category_name; }
+    else if (body.new_name !== undefined) { hasIncomingName = true; incomingName = body.new_name; }
+    else if (allowUnprefixedFields && body.name !== undefined) { hasIncomingName = true; incomingName = body.name; }
+
+    try {
+      await ensureProductCategoriesTable(p);
+      const existing = await findCategoryByIdOrSlug(p, String(target || ''));
+      if (!existing) {
+        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+      }
+
+      const catId = Number(existing.id);
+      const oldName = String(existing.name);
+      const updates = [];
+      const params = [];
+      let newName = oldName;
+      let nameChanged = false;
+
+      if (hasIncomingName) {
+        const trimmed = String(incomingName || '').trim();
+        if (!trimmed) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
+        }
+        if (trimmed.length > 100) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } } };
+        }
+        const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [trimmed, catId]);
+        if (dup.length > 0) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+        }
+        updates.push('name = ?');
+        params.push(trimmed);
+        newName = trimmed;
+        nameChanged = (oldName !== newName);
+      }
+
+      const rawSlug = catData.slug !== undefined ? catData.slug : (body.category_slug !== undefined ? body.category_slug : (allowUnprefixedFields ? body.slug : undefined));
+      if (rawSlug !== undefined && String(rawSlug).trim() !== '') {
+        const slug = await ensureUniqueCategorySlug(p, toCategorySlug(rawSlug), catId);
+        updates.push('slug = ?');
+        params.push(slug);
+      } else if (nameChanged) {
+        const slug = await ensureUniqueCategorySlug(p, toCategorySlug(newName), catId);
+        updates.push('slug = ?');
+        params.push(slug);
+      }
+
+      if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
+        const d = String(catData.description ?? body.category_description ?? body.description ?? '').trim();
+        updates.push('description = ?');
+        params.push(d || null);
+      }
+      if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
+        const ic = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim();
+        updates.push('icon = ?');
+        params.push(ic || null);
+      }
+      if (catData.image_url !== undefined || body.category_image_url !== undefined || (allowUnprefixedFields && body.image_url !== undefined)) {
+        const im = String(catData.image_url ?? body.category_image_url ?? body.image_url ?? '').trim();
+        updates.push('image_url = ?');
+        params.push(im || null);
+      }
+      const sortVal = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+      if (sortVal !== undefined && !isNaN(parseInt(sortVal, 10))) {
+        updates.push('sort_order = ?');
+        params.push(parseInt(sortVal, 10));
+      }
+      if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
+        const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
+        const activeBit = ['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase()) ? 0 : 1;
+        updates.push('is_active = ?');
+        params.push(activeBit);
+      }
+
+      if (updates.length > 0) {
+        updates.push('updated_at = NOW()');
+        params.push(catId);
+        await p.query(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`, params);
+      }
+
+      let updatedProductsCount = 0;
+      if (nameChanged) {
+        try {
+          const [syncRes] = await p.query(
+            'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
+            [newName, catId, catId, oldName]
+          );
+          updatedProductsCount = Number(syncRes.affectedRows || 0);
+        } catch (e) {}
+      }
+
+      const fresh = await findCategoryByIdOrSlug(p, String(catId));
+      const [[{ cnt }]] = await p.query(
+        'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
+        [catId, fresh.name]
+      );
+      const formatted = formatCategoryRecord(fresh, cnt);
+      const categories = await getCategoriesListWithCounts(p, includeInactive);
+      return {
+        ok: true,
+        statusCode: 200,
+        payload: {
+          success: true,
+          status: true,
+          message: 'Category updated.',
+          updated_products_count: updatedProductsCount,
+          category: formatted,
+          data: formatted,
+          categories
+        }
+      };
+    } catch (dbErr) {
+      const targetStr = String(target || '').trim().toLowerCase();
+      const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
+      if (idx === -1) {
+        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+      }
+      const oldName = fallbackCategories[idx].name;
+      let updatedProductsCount = 0;
+      if (hasIncomingName) {
+        const trimmed = String(incomingName || '').trim();
+        if (!trimmed) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
+        }
+        if (fallbackCategories.some((c, i) => i !== idx && c.name.toLowerCase() === trimmed.toLowerCase())) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+        }
+        fallbackCategories[idx].name = trimmed;
+        fallbackCategories[idx].slug = toCategorySlug(trimmed);
+        for (const pr of fallbackProducts) {
+          if (String(pr.category || '').toLowerCase() === oldName.toLowerCase() || Number(pr.category_id) === fallbackCategories[idx].id) {
+            pr.category = trimmed;
+            pr.category_id = fallbackCategories[idx].id;
+            updatedProductsCount++;
+          }
+        }
+      }
+      if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
+        fallbackCategories[idx].description = catData.description ?? body.category_description ?? body.description;
+      }
+      if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
+        fallbackCategories[idx].icon = catData.icon ?? body.category_icon ?? body.icon;
+      }
+      if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
+        const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
+        fallbackCategories[idx].is_active = !['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase());
+      }
+      const formatted = formatCategoryRecord(fallbackCategories[idx]);
+      const categories = await getCategoriesListWithCounts(null, includeInactive);
+      return {
+        ok: true,
+        statusCode: 200,
+        payload: {
+          success: true,
+          status: true,
+          message: 'Category updated.',
+          updated_products_count: updatedProductsCount,
+          category: formatted,
+          data: formatted,
+          categories
+        }
+      };
+    }
+  }
+
+  if (['delete', 'delete_category', 'remove', 'remove_category'].includes(normAction)) {
+    let target = body.target_category_id ?? body.category_id ?? body.category_slug ?? body.category ?? (allowUnprefixedFields ? body.id : '');
+    if ((target === undefined || target === null || String(target).trim() === '') && fallbackCatId !== null) {
+      target = String(fallbackCatId);
+    }
+
+    try {
+      await ensureProductCategoriesTable(p);
+      const existing = await findCategoryByIdOrSlug(p, String(target || ''));
+      if (!existing) {
+        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+      }
+      const catId = Number(existing.id);
+      try {
+        await p.query(
+          "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
+          [catId, existing.name]
+        );
+      } catch (e) {}
+      await p.query('DELETE FROM categories WHERE id = ?', [catId]);
+      const categories = await getCategoriesListWithCounts(p, includeInactive);
+      return {
+        ok: true,
+        statusCode: 200,
+        payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: catId, categories }
+      };
+    } catch (dbErr) {
+      const targetStr = String(target || '').trim().toLowerCase();
+      const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
+      if (idx === -1) {
+        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+      }
+      const removed = fallbackCategories[idx];
+      fallbackCategories.splice(idx, 1);
+      for (const pr of fallbackProducts) {
+        if (Number(pr.category_id) === Number(removed.id) || String(pr.category || '').toLowerCase() === removed.name.toLowerCase()) {
+          pr.category = 'General';
+          pr.category_id = null;
+        }
+      }
+      const categories = await getCategoriesListWithCounts(null, includeInactive);
+      return {
+        ok: true,
+        statusCode: 200,
+        payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: Number(removed.id), categories }
+      };
+    }
+  }
+
+  return { ok: false, statusCode: 422, errorBody: { message: 'Unsupported category_action. Use create, update, or delete.' } };
+}
+
 let fallbackProducts = [
   { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, images: [], is_active: true },
   { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, images: [], is_active: true },
@@ -2940,468 +3298,37 @@ let fallbackProducts = [
 ];
 
 // ==========================================
-// 3A. Product Categories CRUD & Assignment
+// 3. Product Catalog, Embedded 5 Categories & CRUD
+// (All category listing, filtering & editing live inside the Product API)
 // ==========================================
 
-app.get(['/api/categories', '/api/product-categories', '/api/products/categories', '/api/seller/categories'], async (req, res) => {
-  const includeInactive = ['1', 'true', 'yes'].includes(String(req.query.include_inactive || req.query.all || '').toLowerCase());
-  const search = String(req.query.search || req.query.q || '').trim();
-
-  try {
-    await ensureProductCategoriesTable(pool);
-    let where = 'WHERE 1=1';
-    const params = [];
-    if (!includeInactive) {
-      where += ' AND c.is_active = 1';
-    }
-    if (search) {
-      where += ' AND (c.name LIKE ? OR c.description LIKE ? OR c.slug LIKE ?)';
-      const s = `%${search}%`;
-      params.push(s, s, s);
-    }
-
-    const [rows] = await pool.query(
-      `SELECT c.*,
-              (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
-       FROM categories c
-       ${where}
-       ORDER BY c.sort_order ASC, c.id ASC`,
-      params
-    );
-
-    const formatted = rows.map(r => formatCategoryRecord(r));
-    res.json({
-      success: true,
-      status: true,
-      data: formatted,
-      categories: formatted,
-      total: formatted.length
-    });
-  } catch (err) {
-    const searchLower = search.toLowerCase();
-    const list = fallbackCategories.filter(c => {
-      if (!includeInactive && !c.is_active) return false;
-      if (searchLower && !c.name.toLowerCase().includes(searchLower) && !String(c.description || '').toLowerCase().includes(searchLower)) return false;
-      return true;
-    }).map(c => formatCategoryRecord(c, fallbackProducts.filter(p => String(p.category || '').toLowerCase() === c.name.toLowerCase() || Number(p.category_id) === c.id).length));
-    res.json({
-      success: true,
-      status: true,
-      data: list,
-      categories: list,
-      total: list.length
-    });
-  }
-});
-
-app.get('/api/admin/categories', authenticateToken, requireAdminRole, async (req, res) => {
-  const includeInactive = req.query.include_inactive === undefined ? true : ['1', 'true', 'yes'].includes(String(req.query.include_inactive).toLowerCase());
-  try {
-    await ensureProductCategoriesTable(pool);
-    const where = includeInactive ? '' : 'WHERE c.is_active = 1';
-    const [rows] = await pool.query(
-      `SELECT c.*,
-              (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
-       FROM categories c
-       ${where}
-       ORDER BY c.sort_order ASC, c.id ASC`
-    );
-    const formatted = rows.map(r => formatCategoryRecord(r));
-    res.json({ success: true, status: true, data: formatted, categories: formatted, total: formatted.length });
-  } catch (err) {
-    const formatted = fallbackCategories.map(c => formatCategoryRecord(c));
-    res.json({ success: true, status: true, data: formatted, categories: formatted, total: formatted.length });
-  }
-});
-
-app.get(['/api/categories/:id/products', '/api/product-categories/:id/products', '/api/products/categories/:id/products'], async (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page || '1', 10));
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
-  const offset = (page - 1) * limit;
-  const search = String(req.query.search || req.query.q || '').trim();
-
-  try {
-    await ensureProductPriceColumns(pool);
-    const cat = await findCategoryByIdOrSlug(pool, req.params.id);
-    if (!cat) return res.status(404).json({ message: 'Category not found.' });
-
-    let where = 'WHERE p.is_active = 1 AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
-    const params = [cat.id, cat.name];
-    if (search) {
-      where += ' AND (p.name LIKE ? OR p.description LIKE ?)';
-      const s = `%${search}%`;
-      params.push(s, s);
-    }
-
-    const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
-    const [rows] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       ${where}
-       ORDER BY p.id DESC
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
-
-    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: false, req }));
-    const catFormatted = formatCategoryRecord(cat, total);
-    res.json({
-      success: true,
-      status: true,
-      category: catFormatted,
-      data: formatted,
-      total,
-      current_page: page,
-      per_page: limit,
-      last_page: Math.ceil(total / limit) || 1,
-      pagination: { current_page: page, per_page: limit, total, last_page: Math.ceil(total / limit) || 1 }
-    });
-  } catch (err) {
-    const foundCat = fallbackCategories.find(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase() || c.name.toLowerCase() === String(req.params.id).toLowerCase());
-    if (!foundCat) return res.status(404).json({ message: 'Category not found.' });
-    const searchLower = search.toLowerCase();
-    const matched = fallbackProducts.filter(p => {
-      const catMatch = Number(p.category_id) === Number(foundCat.id) || String(p.category || '').toLowerCase() === foundCat.name.toLowerCase();
-      if (!catMatch) return false;
-      if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
-      return true;
-    }).map(p => formatProductRecord(p, { isSellerView: false, req }));
-    res.json({
-      success: true,
-      status: true,
-      category: formatCategoryRecord(foundCat, matched.length),
-      data: matched,
-      total: matched.length,
-      current_page: 1,
-      per_page: limit,
-      last_page: 1,
-      pagination: { current_page: 1, per_page: limit, total: matched.length, last_page: 1 }
-    });
-  }
-});
-
-app.get(['/api/categories/:id', '/api/product-categories/:id', '/api/products/categories/:id'], async (req, res) => {
-  try {
-    await ensureProductCategoriesTable(pool);
-    const cat = await findCategoryByIdOrSlug(pool, req.params.id);
-    if (!cat) return res.status(404).json({ message: 'Category not found.' });
-    const [[{ cnt }]] = await pool.query(
-      'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
-      [cat.id, cat.name]
-    );
-    const formatted = formatCategoryRecord(cat, cnt);
-    res.json({ success: true, status: true, data: formatted, category: formatted });
-  } catch (err) {
-    const found = fallbackCategories.find(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase());
-    if (!found) return res.status(404).json({ message: 'Category not found.' });
-    const formatted = formatCategoryRecord(found);
-    res.json({ success: true, status: true, data: formatted, category: formatted });
-  }
-});
-
-async function handleCreateCategoryRequest(req, res) {
-  const body = req.body || {};
-  const name = String(body.name !== undefined ? body.name : (body.category_name || '')).trim();
-  if (!name) {
-    return res.status(422).json({
-      message: 'Validation error occurred.',
-      errors: { name: ['The category name field is required.'] }
-    });
-  }
-  if (name.length > 100) {
-    return res.status(422).json({
-      message: 'Validation error occurred.',
-      errors: { name: ['The category name may not exceed 100 characters.'] }
-    });
-  }
-
-  try {
-    await ensureProductCategoriesTable(pool);
-    const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [name]);
-    if (dup.length > 0) {
+async function handleProductsCollectionCategoryMutation(req, res) {
+  if (req.method === 'DELETE') {
+    const merged = { ...(req.query || {}), ...(req.body || {}) };
+    const target = String(merged.target_category_id ?? merged.category_id ?? merged.category_slug ?? merged.category ?? merged.id ?? '').trim();
+    if (!target) {
       return res.status(422).json({
-        message: 'A category with this name already exists.',
-        errors: { name: ['A category with this name already exists.'] }
+        message: 'Validation error occurred.',
+        errors: { category_id: ['Please provide category_id or category to delete.'] }
       });
     }
-
-    const baseSlug = body.slug ? toCategorySlug(body.slug) : toCategorySlug(name);
-    const slug = await ensureUniqueCategorySlug(pool, baseSlug);
-    const description = body.description !== undefined && String(body.description).trim() !== '' ? String(body.description).trim() : null;
-    const icon = body.icon !== undefined && String(body.icon).trim() !== '' ? String(body.icon).trim() : null;
-    const imageUrl = body.image_url !== undefined && String(body.image_url).trim() !== '' ? String(body.image_url).trim() : null;
-    let sortOrder = 0;
-    if (body.sort_order !== undefined && !isNaN(parseInt(body.sort_order, 10))) {
-      sortOrder = parseInt(body.sort_order, 10);
-    } else {
-      const [[{ maxSort }]] = await pool.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
-      sortOrder = Number(maxSort || 0) + 1;
-    }
-    const isActive = body.is_active === undefined ? 1 : (['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase()) ? 0 : 1);
-
-    const [ins] = await pool.query(
-      `INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-      [name, slug, description, icon, imageUrl, sortOrder, isActive]
-    );
-    const cat = await findCategoryByIdOrSlug(pool, String(ins.insertId));
-    const formatted = formatCategoryRecord(cat, 0);
-    res.status(201).json({
-      success: true,
-      status: true,
-      message: 'Category created.',
-      data: formatted,
-      category: formatted
-    });
-  } catch (err) {
-    const newId = fallbackCategories.length ? Math.max(...fallbackCategories.map(c => c.id)) + 1 : 6;
-    const created = formatCategoryRecord({
-      id: newId,
-      name,
-      slug: toCategorySlug(name),
-      description: body.description || null,
-      icon: body.icon || '🏷️',
-      image_url: body.image_url || null,
-      sort_order: fallbackCategories.length + 1,
-      is_active: true
-    }, 0);
-    fallbackCategories.push(created);
-    res.status(201).json({ success: true, status: true, message: 'Category created.', data: created, category: created });
+    const delRes = await performCategoryMutationNode(pool, 'delete', merged, true, null);
+    return res.status(delRes.statusCode).json(delRes.ok ? delRes.payload : delRes.errorBody);
   }
-}
 
-async function handleUpdateCategoryRequest(req, res) {
   const body = req.body || {};
-  try {
-    await ensureProductCategoriesTable(pool);
-    const existing = await findCategoryByIdOrSlug(pool, req.params.id);
-    if (!existing) return res.status(404).json({ message: 'Category not found.' });
-
-    const catId = Number(existing.id);
-    const oldName = String(existing.name);
-    const updates = [];
-    const params = [];
-    let newName = oldName;
-    let nameChanged = false;
-
-    const incomingName = body.name !== undefined ? body.name : body.category_name;
-    if (incomingName !== undefined) {
-      const trimmed = String(incomingName).trim();
-      if (!trimmed) {
-        return res.status(422).json({ message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } });
-      }
-      if (trimmed.length > 100) {
-        return res.status(422).json({ message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } });
-      }
-      const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [trimmed, catId]);
-      if (dup.length > 0) {
-        return res.status(422).json({ message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } });
-      }
-      updates.push('name = ?');
-      params.push(trimmed);
-      newName = trimmed;
-      nameChanged = (oldName !== newName);
-    }
-
-    if (body.slug !== undefined && String(body.slug).trim() !== '') {
-      const slug = await ensureUniqueCategorySlug(pool, toCategorySlug(body.slug), catId);
-      updates.push('slug = ?');
-      params.push(slug);
-    } else if (nameChanged) {
-      const slug = await ensureUniqueCategorySlug(pool, toCategorySlug(newName), catId);
-      updates.push('slug = ?');
-      params.push(slug);
-    }
-
-    if (body.description !== undefined) {
-      const d = String(body.description || '').trim();
-      updates.push('description = ?');
-      params.push(d || null);
-    }
-    if (body.icon !== undefined) {
-      const ic = String(body.icon || '').trim();
-      updates.push('icon = ?');
-      params.push(ic || null);
-    }
-    if (body.image_url !== undefined) {
-      const im = String(body.image_url || '').trim();
-      updates.push('image_url = ?');
-      params.push(im || null);
-    }
-    if (body.sort_order !== undefined && !isNaN(parseInt(body.sort_order, 10))) {
-      updates.push('sort_order = ?');
-      params.push(parseInt(body.sort_order, 10));
-    }
-    if (body.is_active !== undefined) {
-      const activeBit = ['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase()) ? 0 : 1;
-      updates.push('is_active = ?');
-      params.push(activeBit);
-    }
-
-    if (updates.length > 0) {
-      updates.push('updated_at = NOW()');
-      params.push(catId);
-      await pool.query(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`, params);
-    }
-
-    let updatedProductsCount = 0;
-    if (nameChanged) {
-      try {
-        const [syncRes] = await pool.query(
-          'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
-          [newName, catId, catId, oldName]
-        );
-        updatedProductsCount = Number(syncRes.affectedRows || 0);
-      } catch (e) {}
-    }
-
-    const fresh = await findCategoryByIdOrSlug(pool, String(catId));
-    const [[{ cnt }]] = await pool.query(
-      'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
-      [catId, fresh.name]
-    );
-    const formatted = formatCategoryRecord(fresh, cnt);
-    res.json({
-      success: true,
-      status: true,
-      message: 'Category updated.',
-      updated_products_count: updatedProductsCount,
-      data: formatted,
-      category: formatted
-    });
-  } catch (err) {
-    const idx = fallbackCategories.findIndex(c => String(c.id) === String(req.params.id) || c.slug.toLowerCase() === String(req.params.id).toLowerCase());
-    if (idx === -1) return res.status(404).json({ message: 'Category not found.' });
-    const oldName = fallbackCategories[idx].name;
-    if (body.name) {
-      fallbackCategories[idx].name = String(body.name).trim();
-      fallbackCategories[idx].slug = toCategorySlug(fallbackCategories[idx].name);
-      for (const p of fallbackProducts) {
-        if (String(p.category || '').toLowerCase() === oldName.toLowerCase() || Number(p.category_id) === fallbackCategories[idx].id) {
-          p.category = fallbackCategories[idx].name;
-          p.category_id = fallbackCategories[idx].id;
-        }
-      }
-    }
-    if (body.description !== undefined) fallbackCategories[idx].description = body.description;
-    if (body.icon !== undefined) fallbackCategories[idx].icon = body.icon;
-    if (body.is_active !== undefined) fallbackCategories[idx].is_active = !['0', 'false', 'no', 'off'].includes(String(body.is_active).toLowerCase());
-    const formatted = formatCategoryRecord(fallbackCategories[idx]);
-    res.json({ success: true, status: true, message: 'Category updated.', data: formatted, category: formatted });
+  let action = String(body.category_action || body.action || '').trim();
+  if (!action) {
+    const hasTarget = body.category_id || body.target_category_id || body.old_category || body.target_category || body.id;
+    action = hasTarget ? 'update' : 'create';
   }
+  const mutRes = await performCategoryMutationNode(pool, action, body, true, null);
+  return res.status(mutRes.statusCode).json(mutRes.ok ? mutRes.payload : mutRes.errorBody);
 }
 
-async function handleDeleteCategoryRequest(req, res) {
-  try {
-    await ensureProductCategoriesTable(pool);
-    const existing = await findCategoryByIdOrSlug(pool, req.params.id);
-    if (!existing) return res.status(404).json({ message: 'Category not found.' });
-    const catId = Number(existing.id);
-
-    try {
-      await pool.query(
-        "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
-        [catId, existing.name]
-      );
-    } catch (e) {}
-
-    await pool.query('DELETE FROM categories WHERE id = ?', [catId]);
-    res.json({ success: true, status: true, message: 'Category deleted.' });
-  } catch (err) {
-    const before = fallbackCategories.length;
-    fallbackCategories = fallbackCategories.filter(c => String(c.id) !== String(req.params.id));
-    if (fallbackCategories.length === before) return res.status(404).json({ message: 'Category not found.' });
-    res.json({ success: true, status: true, message: 'Category deleted.' });
-  }
-}
-
-app.post(['/api/categories', '/api/product-categories', '/api/products/categories'], authenticateToken, handleCreateCategoryRequest);
-app.post('/api/admin/categories', authenticateToken, requireAdminRole, handleCreateCategoryRequest);
-
-app.all([
-  '/api/categories/:id',
-  '/api/categories/:id/update',
-  '/api/product-categories/:id',
-  '/api/product-categories/:id/update',
-  '/api/products/categories/:id',
-  '/api/products/categories/:id/update'
-], authenticateToken, (req, res, next) => {
-  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
-  return handleUpdateCategoryRequest(req, res);
-});
-
-app.all(['/api/admin/categories/:id', '/api/admin/categories/:id/update'], authenticateToken, requireAdminRole, (req, res, next) => {
-  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
-  return handleUpdateCategoryRequest(req, res);
-});
-
-app.delete(['/api/categories/:id', '/api/product-categories/:id', '/api/products/categories/:id'], authenticateToken, handleDeleteCategoryRequest);
-app.delete('/api/admin/categories/:id', authenticateToken, requireAdminRole, handleDeleteCategoryRequest);
-
-app.all([
-  '/api/products/:id/category',
-  '/api/product/:id/category',
-  '/api/seller/products/:id/category',
-  '/api/seller/product/:id/category'
-], authenticateToken, async (req, res, next) => {
-  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [req.params.id]);
-    if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
-    if (req.user.role !== 'admin' && Number(rows[0].seller_id) !== Number(req.user.id)) {
-      return res.status(403).json({ message: 'Access denied. You do not own this product.' });
-    }
-    const catRes = await resolveProductCategoryInput(pool, req.body || {}, false);
-    if (!catRes.provided) {
-      return res.status(422).json({ message: 'Please provide category or category_id.', errors: { category: ['Please provide category or category_id.'] } });
-    }
-    if (catRes.error) {
-      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
-    }
-    await pool.query('UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE id = ?', [catRes.category, catRes.category_id, req.params.id]);
-    const [updated] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ?`,
-      [req.params.id]
-    );
-    const product = formatProductRecord(updated[0], { isSellerView: true, req });
-    res.json({ success: true, status: true, message: 'Product category updated.', product, data: product });
-  } catch (err) {
-    const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
-    if (idx === -1) return res.status(404).json({ message: 'Product not found.' });
-    if (req.user.role !== 'admin' && Number(fallbackProducts[idx].seller_id) !== Number(req.user.id)) {
-      return res.status(403).json({ message: 'Access denied. You do not own this product.' });
-    }
-    const body = req.body || {};
-    if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '') {
-      const matched = fallbackCategories.find(c => String(c.id) === String(body.category_id).trim());
-      if (!matched) {
-        return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
-      }
-      fallbackProducts[idx].category_id = matched.id;
-      fallbackProducts[idx].category = matched.name;
-    } else if (body.category !== undefined || body.category_name !== undefined || body.category_slug !== undefined) {
-      const raw = String(body.category ?? body.category_name ?? body.category_slug ?? '').trim();
-      const matched = fallbackCategories.find(c => String(c.id) === raw || c.name.toLowerCase() === raw.toLowerCase() || c.slug.toLowerCase() === raw.toLowerCase());
-      fallbackProducts[idx].category = matched ? matched.name : (raw || 'General');
-      fallbackProducts[idx].category_id = matched ? matched.id : null;
-    } else {
-      return res.status(422).json({ message: 'Please provide category or category_id.', errors: { category: ['Please provide category or category_id.'] } });
-    }
-    const product = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
-    res.json({ success: true, status: true, message: 'Product category updated.', product, data: product });
-  }
-});
+app.put('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
+app.patch('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
+app.delete('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
 
 app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
@@ -3411,6 +3338,7 @@ app.get('/api/products', async (req, res) => {
   const search = (req.query.search || req.query.q || '').toString().trim();
   const category = (req.query.category || '').toString().trim();
   const categoryIdParam = (req.query.category_id || '').toString().trim();
+  const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
 
   try {
     await ensureProductPriceColumns(pool);
@@ -3458,6 +3386,7 @@ app.get('/api/products', async (req, res) => {
 
     const [[{ total }]] = await pool.query(countSql, whereParams);
     const [products] = await pool.query(querySql, [...whereParams, limit, offset]);
+    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
 
     // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
     const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
@@ -3466,6 +3395,7 @@ app.get('/api/products', async (req, res) => {
       success: true,
       status: true,
       data: formatted,
+      categories: categoriesList,
       total,
       current_page: page,
       per_page: limit,
@@ -3496,10 +3426,12 @@ app.get('/api/products', async (req, res) => {
       if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
       return true;
     }).map(p => formatProductRecord(p, { isSellerView: false, req }));
+    const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
     res.json({
       success: true,
       status: true,
       data: filtered,
+      categories: categoriesList,
       total: filtered.length,
       current_page: 1,
       per_page: limit,
@@ -3521,6 +3453,7 @@ app.get([
   '/api/seller/product/:id',
   '/api/sellers/:seller_id/products/:id'
 ], async (req, res) => {
+  const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
   try {
     await ensureProductPriceColumns(pool);
     const [rows] = await pool.query(
@@ -3539,22 +3472,26 @@ app.get([
     }
     const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
     const product = formatProductRecord(rows[0], { isSellerView, req });
+    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
     res.json({
       success: true,
       status: true,
       data: product,
-      product
+      product,
+      categories: categoriesList
     });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
     if (found) {
       const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
       const product = formatProductRecord(found, { isSellerView, req });
+      const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
       return res.json({
         success: true,
         status: true,
         data: product,
-        product
+        product,
+        categories: categoriesList
       });
     }
     res.status(404).json({ message: 'Product not found.' });
@@ -4051,6 +3988,14 @@ app.delete('/api/images/:filename', authenticateToken, async (req, res) => {
 
 app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   const body = req.body || {};
+
+  // Handle category create / update / delete actions directly inside Product API
+  const catAction = String(body.category_action || body.action || '').trim().toLowerCase();
+  if (['create', 'create_category', 'add_category', 'add', 'update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category', 'delete', 'delete_category', 'remove', 'remove_category'].includes(catAction)) {
+    const mutRes = await performCategoryMutationNode(pool, catAction, body, true, null);
+    return res.status(mutRes.statusCode).json(mutRes.ok ? mutRes.payload : mutRes.errorBody);
+  }
+
   const name = (body.name || '').toString().trim();
   const description = body.description || null;
   const rawPrice = body.seller_price !== undefined ? body.seller_price : body.price;
@@ -4067,6 +4012,40 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
   let categoryId = null;
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
+
+  // Inline create-and-assign category during product creation
+  let createdCategoryObj = null;
+  const inlineNewCatName = String(
+    (body.create_category && typeof body.create_category === 'object')
+      ? (body.create_category.name || '')
+      : (body.new_category_name || '')
+  ).trim();
+  if (inlineNewCatName || catAction === 'create_and_assign') {
+    let existingInline = null;
+    try {
+      if (inlineNewCatName) {
+        await ensureProductCategoriesTable(pool);
+        existingInline = await findCategoryByIdOrSlug(pool, inlineNewCatName);
+      }
+    } catch (e) {}
+    if (!existingInline && inlineNewCatName) {
+      existingInline = fallbackCategories.find(c => c.name.toLowerCase() === inlineNewCatName.toLowerCase() || c.slug.toLowerCase() === inlineNewCatName.toLowerCase()) || null;
+    }
+    if (existingInline) {
+      body.category_id = Number(existingInline.id);
+      body.category = String(existingInline.name);
+    } else {
+      const mutRes = await performCategoryMutationNode(pool, 'create_category', body, false, null);
+      if (!mutRes.ok) {
+        return res.status(mutRes.statusCode).json(mutRes.errorBody);
+      }
+      createdCategoryObj = mutRes.payload.category;
+      if (createdCategoryObj) {
+        body.category_id = Number(createdCategoryObj.id);
+        body.category = String(createdCategoryObj.name);
+      }
+    }
+  }
 
   // Use seller's uploaded/provided images (up to 4 max). Never inject demo, sample, or placeholder images.
   let finalImages = imgResult.hasImages ? dedupeImagesByFilename(imgResult.images.filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'))).slice(0, 4) : [];
@@ -4135,13 +4114,17 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
     );
     // Seller created product: Seller view has NO commission feature!
     const product = formatProductRecord(rows[0], { isSellerView: true, req });
-    res.status(201).json({
+    const categoriesList = await getCategoriesListWithCounts(pool, false);
+    const resp = {
       success: true,
       status: true,
       message: 'Product created.',
       product,
-      data: product
-    });
+      data: product,
+      categories: categoriesList
+    };
+    if (createdCategoryObj) resp.category = createdCategoryObj;
+    res.status(201).json(resp);
   } catch (err) {
     const fbCatMatch = (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '')
       ? fallbackCategories.find(c => String(c.id) === String(body.category_id).trim())
@@ -4168,13 +4151,17 @@ app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
       is_active: true
     }, { isSellerView: true, req });
     fallbackProducts.unshift(newProduct);
-    return res.status(201).json({
+    const categoriesList = await getCategoriesListWithCounts(null, false);
+    const resp = {
       success: true,
       status: true,
       message: 'Product created.',
       product: newProduct,
-      data: newProduct
-    });
+      data: newProduct,
+      categories: categoriesList
+    };
+    if (createdCategoryObj) resp.category = createdCategoryObj;
+    return res.status(201).json(resp);
   }
 });
 
@@ -4188,6 +4175,7 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
   const offset = (page - 1) * limit;
+  const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
 
   try {
     await ensureProductPriceColumns(pool);
@@ -4243,12 +4231,14 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
 
     // Seller view: Commission feature is deleted from seller field!
     const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true, req }));
+    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
 
     res.json({
       success: true,
       status: true,
       seller_id: targetSellerId,
       data: formatted,
+      categories: categoriesList,
       total,
       current_page: page,
       per_page: limit,
@@ -4277,11 +4267,13 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       }
       return true;
     }).map(p => formatProductRecord(p, { isSellerView: true, req }));
+    const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
     res.json({
       success: true,
       status: true,
       seller_id: targetSellerId,
       data: filtered,
+      categories: categoriesList,
       total: filtered.length,
       current_page: 1,
       per_page: limit,
@@ -4296,14 +4288,14 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
   }
 });
 
-app.all([
+const productUpdatePaths = [
   '/api/products/:id',
   '/api/product/:id',
   '/api/products/update/:id',
   '/api/seller/products/:id',
   '/api/seller/product/:id'
-], authenticateToken, upload.any(), async (req, res, next) => {
-  if (!['PUT', 'PATCH', 'POST'].includes(req.method)) return next();
+];
+async function handleProductUpdateRoute(req, res) {
   let existing = [];
   try {
     await ensureProductPriceColumns(pool);
@@ -4322,6 +4314,20 @@ app.all([
   const body = req.body || {};
   const updates = [];
   const params = [];
+
+  // Optional inline category edit / rename / create directly via /api/products/:id
+  let catMutationRes = null;
+  const catAction = String(body.category_action || body.action || '').trim().toLowerCase();
+  const hasEditCatAction = ['update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category', 'create', 'create_category', 'add_category', 'add', 'delete', 'delete_category', 'remove', 'remove_category'].includes(catAction);
+  const hasInlineEditCat = (body.edit_category && typeof body.edit_category === 'object') || body.rename_category !== undefined;
+  if (hasEditCatAction || hasInlineEditCat) {
+    const actionToRun = hasEditCatAction ? catAction : 'edit_category';
+    const fallbackCatId = existing[0].category_id ? Number(existing[0].category_id) : null;
+    catMutationRes = await performCategoryMutationNode(pool, actionToRun, body, false, fallbackCatId);
+    if (!catMutationRes.ok) {
+      return res.status(catMutationRes.statusCode).json(catMutationRes.errorBody);
+    }
+  }
 
   if (body.name !== undefined && body.name.toString().trim() !== '') {
     updates.push('name = ?');
@@ -4430,14 +4436,37 @@ app.all([
     params.push(body.is_active ? 1 : 0);
   }
 
-  try {
-    const catRes = await resolveProductCategoryInput(pool, body, false);
-    if (catRes.error) {
-      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+  const isCreateCatAction = ['create', 'create_category', 'add_category', 'add'].includes(catAction);
+  const hasDedicatedCatTarget = (body.edit_category && typeof body.edit_category === 'object') || body.target_category_id !== undefined || body.target_category !== undefined || body.old_category !== undefined || body.old_category_id !== undefined;
+  const hasExplicitProductCatFields = body.category_id !== undefined || body.category !== undefined;
+  const shouldAssignCategory = catMutationRes === null
+    ? true
+    : (isCreateCatAction || (hasDedicatedCatTarget && hasExplicitProductCatFields));
+
+  const buildAssignBody = () => {
+    if (catMutationRes === null) return body;
+    if (isCreateCatAction && catMutationRes.payload && catMutationRes.payload.category) {
+      return {
+        category_id: Number(catMutationRes.payload.category.id),
+        category: String(catMutationRes.payload.category.name)
+      };
     }
-    if (catRes.provided) {
-      updates.push('category = ?', 'category_id = ?');
-      params.push(catRes.category, catRes.category_id);
+    const filtered = {};
+    if (body.category_id !== undefined) filtered.category_id = body.category_id;
+    if (body.category !== undefined) filtered.category = body.category;
+    return filtered;
+  };
+
+  try {
+    if (shouldAssignCategory) {
+      const catRes = await resolveProductCategoryInput(pool, buildAssignBody(), false);
+      if (catRes.error) {
+        return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+      }
+      if (catRes.provided) {
+        updates.push('category = ?', 'category_id = ?');
+        params.push(catRes.category, catRes.category_id);
+      }
     }
 
     if (updates.length > 0) {
@@ -4464,14 +4493,22 @@ app.all([
     );
     // Seller updated product: Seller view has NO commission feature!
     const product = formatProductRecord(updated[0], { isSellerView: true, req });
-
-    res.json({
+    const categoriesList = await getCategoriesListWithCounts(pool, false);
+    const resp = {
       success: true,
       status: true,
-      message: 'Product updated.',
+      message: (catMutationRes && updates.length === 0) ? catMutationRes.payload.message : 'Product updated.',
       product,
-      data: product
-    });
+      data: product,
+      categories: categoriesList
+    };
+    if (catMutationRes && catMutationRes.payload && catMutationRes.payload.category) {
+      resp.category = catMutationRes.payload.category;
+    }
+    if (catMutationRes && catMutationRes.payload && catMutationRes.payload.updated_products_count !== undefined) {
+      resp.updated_products_count = catMutationRes.payload.updated_products_count;
+    }
+    res.json(resp);
   } catch (err) {
     const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
     if (idx !== -1) {
@@ -4487,18 +4524,21 @@ app.all([
         fallbackProducts[idx].mrp = parseFloat(body.mrp).toFixed(2);
       }
       if (body.sku !== undefined) fallbackProducts[idx].sku = body.sku.toString().trim();
-      if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '') {
-        const matchedCat = fallbackCategories.find(c => String(c.id) === String(body.category_id).trim());
-        if (!matchedCat) {
-          return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+      if (shouldAssignCategory) {
+        const assignSrc = buildAssignBody();
+        if (assignSrc.category_id !== undefined && assignSrc.category_id !== null && String(assignSrc.category_id).trim() !== '') {
+          const matchedCat = fallbackCategories.find(c => String(c.id) === String(assignSrc.category_id).trim());
+          if (!matchedCat) {
+            return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+          }
+          fallbackProducts[idx].category_id = matchedCat.id;
+          fallbackProducts[idx].category = matchedCat.name;
+        } else if (assignSrc.category !== undefined) {
+          const rawC = assignSrc.category.toString().trim();
+          const matchedCat = fallbackCategories.find(c => String(c.id) === rawC || c.name.toLowerCase() === rawC.toLowerCase() || c.slug.toLowerCase() === rawC.toLowerCase());
+          fallbackProducts[idx].category = matchedCat ? matchedCat.name : (rawC || 'General');
+          fallbackProducts[idx].category_id = matchedCat ? matchedCat.id : null;
         }
-        fallbackProducts[idx].category_id = matchedCat.id;
-        fallbackProducts[idx].category = matchedCat.name;
-      } else if (body.category !== undefined) {
-        const rawC = body.category.toString().trim();
-        const matchedCat = fallbackCategories.find(c => String(c.id) === rawC || c.name.toLowerCase() === rawC.toLowerCase() || c.slug.toLowerCase() === rawC.toLowerCase());
-        fallbackProducts[idx].category = matchedCat ? matchedCat.name : (rawC || 'General');
-        fallbackProducts[idx].category_id = matchedCat ? matchedCat.id : null;
       }
       if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
       if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
@@ -4506,17 +4546,27 @@ app.all([
         fallbackProducts[idx].images = imgResult.images;
       }
       const updatedFallback = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
-      return res.json({
+      const categoriesList = await getCategoriesListWithCounts(null, false);
+      const resp = {
         success: true,
         status: true,
-        message: 'Product updated.',
+        message: (catMutationRes && updates.length === 0) ? catMutationRes.payload.message : 'Product updated.',
         product: updatedFallback,
-        data: updatedFallback
-      });
+        data: updatedFallback,
+        categories: categoriesList
+      };
+      if (catMutationRes && catMutationRes.payload && catMutationRes.payload.category) {
+        resp.category = catMutationRes.payload.category;
+      }
+      return res.json(resp);
     }
     res.status(500).json({ message: 'Update failed.' });
   }
-});
+}
+
+app.put(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
+app.patch(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
+app.post(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
 
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   let existing = [];

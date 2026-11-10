@@ -148,8 +148,7 @@ if ($requestUri === '/' || $requestUri === '') {
                 • GET /api/orders/{id}<br>
                 • PUT /api/orders/{id}<br>
                 • DELETE /api/orders/{id}<br>
-                • GET /api/products<br>
-                • GET /api/categories<br>
+                • GET /api/products (Catalog + 5 Editable Categories)<br>
                 • GET /admin/login
             </div>
         </div>
@@ -184,7 +183,6 @@ if ($requestUri === '/admin/logout') {
 // ==========================================
 
 require_once __DIR__ . '/api/auth.php';
-require_once __DIR__ . '/api/categories.php';
 require_once __DIR__ . '/api/products.php';
 require_once __DIR__ . '/api/payment.php';
 require_once __DIR__ . '/api/seller.php';
@@ -264,84 +262,14 @@ if ($requestUri === '/api/reset-password') {
     apiResetPassword($pdo);
 }
 
-// Product Categories CRUD & Assignment
-if (in_array($requestUri, ['/api/categories', '/api/product-categories', '/api/products/categories', '/api/seller/categories'], true)) {
-    if ($method === 'GET') {
-        apiGetCategories($pdo);
-    } elseif ($method === 'POST') {
-        apiCreateCategory($pdo, false);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if ($requestUri === '/api/admin/categories') {
-    if ($method === 'GET') {
-        apiGetCategories($pdo);
-    } elseif ($method === 'POST') {
-        apiCreateCategory($pdo, true);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if (preg_match('#^/api/(?:categories|product-categories|products/categories)/([^/]+)/products$#', $requestUri, $matches)) {
-    if ($method === 'GET') {
-        apiGetCategoryProducts($pdo, $matches[1]);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if (preg_match('#^/api/(?:categories|product-categories|products/categories)/([^/]+)/update$#', $requestUri, $matches)) {
-    if ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
-        apiUpdateCategory($pdo, $matches[1], false);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if (preg_match('#^/api/(?:categories|product-categories|products/categories)/([^/]+)$#', $requestUri, $matches)) {
-    $idOrSlug = $matches[1];
-    if ($method === 'GET') {
-        apiGetCategoryDetail($pdo, $idOrSlug);
-    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
-        apiUpdateCategory($pdo, $idOrSlug, false);
-    } elseif ($method === 'DELETE') {
-        apiDeleteCategory($pdo, $idOrSlug, false);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if (preg_match('#^/api/admin/categories/([^/]+)(?:/update)?$#', $requestUri, $matches)) {
-    $idOrSlug = $matches[1];
-    if ($method === 'GET') {
-        apiGetCategoryDetail($pdo, $idOrSlug);
-    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
-        apiUpdateCategory($pdo, $idOrSlug, true);
-    } elseif ($method === 'DELETE') {
-        apiDeleteCategory($pdo, $idOrSlug, true);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-if (preg_match('#^/api/(?:seller/)?products?/(\d+)/category$#', $requestUri, $matches)) {
-    $productId = (int) $matches[1];
-    if ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
-        apiUpdateProductCategory($pdo, $productId);
-    } else {
-        errorResponse('Method Not Allowed', [], 405);
-    }
-}
-
-// Products Catalog & CRUD
+// Products Catalog, Categories & CRUD (All category listing, filtering & editing included inside Product API)
 if ($requestUri === '/api/products') {
     if ($method === 'GET') {
         apiGetProducts($pdo);
     } elseif ($method === 'POST') {
         apiCreateProduct($pdo);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'DELETE') {
+        apiManageProductCategoriesViaProducts($pdo);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }

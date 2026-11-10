@@ -20,7 +20,7 @@ if (empty($_SESSION['admin_logged_in'])) {
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../helpers/auth.php';
 require_once __DIR__ . '/../helpers/gst.php';
-require_once __DIR__ . '/../api/categories.php';
+require_once __DIR__ . '/../api/products.php';
 
 $pdo = getDatabaseConnection();
 ensureGstTables($pdo);

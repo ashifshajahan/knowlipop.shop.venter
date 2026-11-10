@@ -1465,7 +1465,7 @@
                 placeholder="Search products by name, category, or description..." oninput="handleCatalogSearch(this.value)">
             </div>
             <div class="category-pills-bar" id="category-pills-bar">
-              <!-- Populated dynamically from GET /api/categories -->
+              <!-- Populated dynamically from GET /api/products (embedded categories) -->
             </div>
           </div>
 
@@ -1943,27 +1943,11 @@
     // 2. Lifecycle Boot
     document.addEventListener('DOMContentLoaded', async () => {
       await checkBackendHealth();
-      await fetchCategoriesList();
       await fetchProductsCatalog();
+      renderCategoryPills();
       await refreshOrdersList();
       renderCartDraft();
     });
-
-    async function fetchCategoriesList() {
-      try {
-        const res = await fetch('/api/categories');
-        if (res.ok) {
-          const data = await res.json();
-          const list = data.data || data.categories || [];
-          if (Array.isArray(list) && list.length > 0) {
-            allCategories = list;
-          }
-        }
-      } catch (e) {
-        console.warn('Using starter categories list.');
-      }
-      renderCategoryPills();
-    }
 
     function renderCategoryPills() {
       const bar = document.getElementById('category-pills-bar');
@@ -2008,7 +1992,7 @@
       }
     }
 
-    // Fetch Products Catalog from /api/products
+    // Fetch Products Catalog & Embedded Categories from /api/products
     async function fetchProductsCatalog() {
       try {
         const res = await fetch('/api/products?limit=100');
@@ -2018,10 +2002,14 @@
           if (items.length > 0) {
             allProducts = items;
           }
+          if (Array.isArray(data.categories) && data.categories.length > 0) {
+            allCategories = data.categories;
+          }
         }
       } catch (e) {
         console.warn('Could not fetch products from API, using default starter products.');
       }
+      renderCategoryPills();
       applyCatalogFilters();
       populateCatalogPickerSelect();
     }
