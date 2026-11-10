@@ -6551,8 +6551,8 @@ function detectDocumentMimeType(doc, realPath) {
   return 'application/pdf';
 }
 
-// GET /admin/gst_storage_info - Check active GST persistent storage status
-app.get('/admin/gst_storage_info', async (req, res) => {
+// GET /admin/gst_storage_info - Admin-only check of active GST persistent storage status
+app.get('/admin/gst_storage_info', authenticateToken, requireAdminRole, async (req, res) => {
   const dirs = [
     gstUploadDir,
     '/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst',
@@ -6589,20 +6589,7 @@ app.get('/admin/view_gst_doc', async (req, res) => {
     const doc = rows[0];
     const realPath = resolveGstDocumentPath(doc);
     if (!realPath) {
-      if (req.query.debug === '1') {
-        let dirFiles = [];
-        try { dirFiles = fs.readdirSync(gstUploadDir); } catch(e) { dirFiles = [e.message]; }
-        return res.status(404).json({
-          error: 'Document file not found on disk.',
-          doc_id: doc.id,
-          db_file_path: doc.file_path,
-          db_file_name: doc.file_name,
-          gstUploadDir,
-          __dirname,
-          cwd: process.cwd(),
-          files_in_gstUploadDir: dirFiles
-        });
-      }
+      const safeName = String(doc.original_name || 'Document.pdf').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
       return res.status(404).send(`
         <!doctype html><html><head><meta charset="utf-8"><title>Document Unavailable</title>
         <style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#1e293b;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
@@ -6611,7 +6598,7 @@ app.get('/admin/view_gst_doc', async (req, res) => {
         .btn{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700;margin-top:12px;}</style></head>
         <body><div class="box">
           <h2>📄 Document File Not Available</h2>
-          <p>The file <strong>${doc.original_name || 'Document.pdf'}</strong> (Document #${doc.id}) was uploaded to a temporary server build directory before persistent storage was configured, and that old build folder was removed during deployment.</p>
+          <p>The file <strong>${safeName}</strong> (Document #${doc.id}) was uploaded to a temporary server build directory before persistent storage was configured, and that old build folder was removed during deployment.</p>
           <p>Please ask the seller to upload the PDF again (you can reject this request with a note requesting re-upload). All newly uploaded PDFs are stored persistently.</p>
           <a href="/admin" class="btn">← Back to Admin Dashboard</a>
         </div></body></html>
@@ -8060,8 +8047,9 @@ app.delete('/api/seller/gst/documents/:id', authenticateToken, async (req, res) 
     }
 
     const doc = docRows[0];
-    if (doc.file_path && fs.existsSync(doc.file_path)) {
-      try { fs.unlinkSync(doc.file_path); } catch (e) {}
+    const resolvedPath = resolveGstDocumentPath(doc);
+    if (resolvedPath && fs.existsSync(resolvedPath)) {
+      try { fs.unlinkSync(resolvedPath); } catch (e) {}
     }
 
     await pool.query('DELETE FROM seller_gst_documents WHERE id = ?', [docId]);
