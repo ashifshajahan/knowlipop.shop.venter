@@ -107,11 +107,26 @@ async function runMasterTestSuite() {
   console.log('\n--- Category 2: Authentication & Session ---');
 
   const testPhone = `+9198765${Math.floor(10000 + Math.random() * 90000)}`;
+  const testEmail = `superelec_${Date.now()}_${Math.floor(Math.random() * 1000)}@example.com`;
+  const missingEmailRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/register',
+    body: {
+      seller_name: 'Missing Email Shop',
+      phone: testPhone,
+      address: 'Shop 102, Electronic City',
+      password: 'Password123!',
+      password_confirmation: 'Password123!'
+    }
+  });
+  assert(missingEmailRes.status === 422 && missingEmailRes.body.errors && missingEmailRes.body.errors.email, 'POST /api/register rejects missing email with 422');
+
   const regRes = await dispatch(app, {
     method: 'POST',
     url: '/api/register',
     body: {
       seller_name: 'Super Electronics',
+      email: testEmail,
       phone: testPhone,
       address: 'Shop 102, Electronic City',
       landmark: 'Near Metro',
@@ -121,7 +136,7 @@ async function runMasterTestSuite() {
       password_confirmation: 'Password123!'
     }
   });
-  assert(regRes.status === 201 && regRes.body.token, 'POST /api/register (Seller registration returns 201 with JWT token)');
+  assert(regRes.status === 201 && regRes.body.token && regRes.body.user.email === testEmail, 'POST /api/register (Seller registration returns 201 with required email & JWT token)');
 
   const loginRes = await dispatch(app, {
     method: 'POST',

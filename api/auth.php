@@ -114,7 +114,8 @@ function apiRegister(PDO $pdo): void
         'fullname', 'full_name', 'user_name', 'userName'
     ]);
     $rawEmail = extractFieldPhp($input, [
-        'email', 'email_address', 'user_email', 'seller_email', 'mail'
+        'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
+        'user_email', 'seller_email', 'business_email', 'mail'
     ]);
     $email = !empty($rawEmail) ? strtolower(trim($rawEmail)) : '';
     $rawPhone = extractPhonePhp($input);
@@ -131,7 +132,9 @@ function apiRegister(PDO $pdo): void
     if (empty($sellerName)) {
         $errors['seller_name'] = ['The seller name field is required.'];
     }
-    if (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+    if (empty($email)) {
+        $errors['email'] = ['The email field is required.'];
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors['email'] = ['The email address format is invalid.'];
     }
     if (empty($rawPhone)) {
@@ -155,59 +158,58 @@ function apiRegister(PDO $pdo): void
     }
 
     $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
-    $checkSql = "SELECT id, password, phone, email FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix)";
-    $checkParams = [':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix];
-    if (!empty($email)) {
-        $checkSql .= " OR (LOWER(email) = :email AND email NOT LIKE '%@phone.vendor.local')";
-        $checkParams[':email'] = $email;
-    }
-    $checkSql .= " LIMIT 1";
+    $phoneStmt = $pdo->prepare("SELECT id, password, phone, email FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
+    $phoneStmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
+    $phoneMatch = $phoneStmt->fetch(PDO::FETCH_ASSOC);
 
-    $checkStmt = $pdo->prepare($checkSql);
-    $checkStmt->execute($checkParams);
-    $existing = $checkStmt->fetch();
-    if ($existing) {
-        $emailMatches = !empty($email) && !empty($existing['email']) && strtolower($existing['email']) === $email;
-        $phoneMatches = ($existing['phone'] === $phone || $existing['phone'] === $rawPhone || $existing['phone'] === $rawNoPrefix);
+    $emailStmt = $pdo->prepare("SELECT id, password, phone, email FROM users WHERE LOWER(email) = :email LIMIT 1");
+    $emailStmt->execute([':email' => $email]);
+    $emailMatch = $emailStmt->fetch(PDO::FETCH_ASSOC);
 
-        if ($phoneMatches) {
-            if (verifyPassword($password, $existing['password'])) {
-                $token = createToken($pdo, (int)$existing['id'], $phone);
-                jsonResponse([
-                    'message' => 'Seller account already exists. Successfully signed in.',
-                    'user' => safeSeller([
-                        'id' => $existing['id'],
-                        'seller_name' => $sellerName,
-                        'email' => $existing['email'] ?? ($email ?: null),
-                        'phone' => $phone,
-                        'address' => $address,
-                        'landmark' => $landmark,
-                        'state' => $state,
-                        'country' => $country
-                    ]),
-                    'token' => $token,
-                    'token_type' => 'Bearer'
-                ], 200);
+    if ($phoneMatch) {
+        if (verifyPassword($password, $phoneMatch['password'])) {
+            if ($emailMatch && (int) $emailMatch['id'] !== (int) $phoneMatch['id']) {
+                errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
             }
-            errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
+            $resolvedEmail = $phoneMatch['email'] ?? '';
+            if (empty($resolvedEmail) || str_ends_with((string) $resolvedEmail, '@phone.vendor.local')) {
+                $updEmail = $pdo->prepare("UPDATE users SET email = :email, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
+                $updEmail->execute([':email' => $email, ':id' => (int) $phoneMatch['id']]);
+                $resolvedEmail = $email;
+            }
+            $token = createToken($pdo, (int) $phoneMatch['id'], $phone);
+            jsonResponse([
+                'message' => 'Seller account already exists. Successfully signed in.',
+                'user' => safeSeller([
+                    'id' => $phoneMatch['id'],
+                    'seller_name' => $sellerName,
+                    'email' => $resolvedEmail,
+                    'phone' => $phone,
+                    'address' => $address,
+                    'landmark' => $landmark,
+                    'state' => $state,
+                    'country' => $country
+                ]),
+                'token' => $token,
+                'token_type' => 'Bearer'
+            ], 200);
         }
-
-        if ($emailMatches) {
-            errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
-        }
+        errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
     }
 
-    $phoneDigits = preg_replace('/\D+/', '', $phone);
-    $finalEmail = !empty($email) ? $email : ('seller_' . $phoneDigits . '@phone.vendor.local');
+    if ($emailMatch) {
+        errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
+    }
+
     $hashedPassword = hashPassword($password);
 
     $stmt = $pdo->prepare("
         INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-        VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
+        VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ");
     $stmt->execute([
         ':name' => $sellerName,
-        ':email' => $finalEmail,
+        ':email' => $email,
         ':seller_name' => $sellerName,
         ':phone' => $phone,
         ':address' => $address,

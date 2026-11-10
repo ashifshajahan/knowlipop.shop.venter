@@ -140,14 +140,17 @@
               "listen": "prerequest",
               "script": {
                 "exec": [
-                  "// Generate fresh unique phone number for registration",
+                  "// Generate fresh unique phone number & email for registration",
                   "var randomSuffix = Math.floor(1000000 + Math.random() * 9000000);",
                   "var phone = '+91987' + randomSuffix;",
+                  "var email = 'seller_' + randomSuffix + '_' + Date.now() + '@example.com';",
                   "var password = 'SecretPass123!';",
                   "pm.collectionVariables.set('seller_phone', phone);",
+                  "pm.collectionVariables.set('seller_email', email);",
                   "pm.collectionVariables.set('seller_password', password);",
                   "if (pm.environment) {",
                   "    pm.environment.set('seller_phone', phone);",
+                  "    pm.environment.set('seller_email', email);",
                   "    pm.environment.set('seller_password', password);",
                   "}"
                 ],
@@ -193,7 +196,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"seller_name\": \"Apex Store\",\n  \"phone\": \"{{seller_phone}}\",\n  \"address\": \"452 MG Road, Suite 300\",\n  \"landmark\": \"Opposite Tech Park\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\",\n  \"password\": \"{{seller_password}}\",\n  \"password_confirmation\": \"{{seller_password}}\"\n}"
+              "raw": "{\n  \"seller_name\": \"Apex Store\",\n  \"email\": \"{{seller_email}}\",\n  \"phone\": \"{{seller_phone}}\",\n  \"address\": \"452 MG Road, Suite 300\",\n  \"landmark\": \"Opposite Tech Park\",\n  \"state\": \"Kerala\",\n  \"country\": \"India\",\n  \"password\": \"{{seller_password}}\",\n  \"password_confirmation\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/register",
@@ -205,7 +208,7 @@
                 "register"
               ]
             },
-            "description": "Registers a new seller with dynamically generated phone. Automatically saves returned Bearer token into {{token}}."
+            "description": "Registers a new seller with required email and dynamically generated phone. Automatically saves returned Bearer token into {{token}}."
           },
           "response": []
         },

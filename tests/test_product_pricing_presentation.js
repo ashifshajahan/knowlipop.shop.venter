@@ -138,6 +138,7 @@ async function runLiveTests() {
     const regRes = await request('POST', '/api/register', {}, {
       name: 'Clean Pricing Seller',
       seller_name: 'Flipkart Style Store',
+      email: `pricing_${Date.now()}@example.com`,
       phone: regPhone,
       address: '77 Bannerghatta Road',
       state: 'Karnataka',

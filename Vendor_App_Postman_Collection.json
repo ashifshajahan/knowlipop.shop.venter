@@ -154,7 +154,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions\",\n  \"phone\": \"+919876543210\",\n  \"address\": \"402 Cyber Heights, MG Road\",\n  \"landmark\": \"Near Trinity Metro\",\n  \"state\": \"Karnataka\",\n  \"country\": \"India\",\n  \"password\": \"Password123!\",\n  \"password_confirmation\": \"Password123!\"\n}"
+              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions\",\n  \"email\": \"seller@apextech.example.com\",\n  \"phone\": \"+919876543210\",\n  \"address\": \"402 Cyber Heights, MG Road\",\n  \"landmark\": \"Near Trinity Metro\",\n  \"state\": \"Karnataka\",\n  \"country\": \"India\",\n  \"password\": \"Password123!\",\n  \"password_confirmation\": \"Password123!\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/register",

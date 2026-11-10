@@ -1430,7 +1430,8 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     'fullname', 'full_name', 'user_name', 'userName'
   ]);
   const rawEmail = extractField(body, [
-    'email', 'email_address', 'user_email', 'seller_email', 'mail'
+    'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
+    'user_email', 'seller_email', 'business_email', 'mail'
   ]);
   const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
   const rawPhone = extractPhone(body);
@@ -1454,7 +1455,9 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
   const errors = {};
 
   if (!seller_name) errors.seller_name = ['The seller name field is required.'];
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (!email) {
+    errors.email = ['The email field is required.'];
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     errors.email = ['The email address format is invalid.'];
   }
   if (!rawPhone) errors.phone = ['The phone field is required.'];
@@ -1470,60 +1473,68 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
   try {
     const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const checkSql = 'SELECT id, password, phone, email FROM users WHERE (phone = ? OR phone = ? OR phone = ?)' +
-      (email ? ' OR (LOWER(email) = ? AND email NOT LIKE \'%@phone.vendor.local\')' : '') +
-      ' LIMIT 1';
-    const checkParams = email ? [phone, rawPhone, rawNoPrefix, email] : [phone, rawPhone, rawNoPrefix];
-    const [existing] = await pool.query(checkSql, checkParams);
+    const [phoneRows] = await pool.query(
+      'SELECT id, password, phone, email FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix]
+    );
+    const [emailRows] = await pool.query(
+      'SELECT id, password, phone, email FROM users WHERE LOWER(email) = ? LIMIT 1',
+      [email]
+    );
 
-    if (existing.length > 0) {
-      const match = existing[0];
-      const phoneMatches = match.phone === phone || match.phone === rawPhone || match.phone === rawNoPrefix;
-      const emailMatches = email && match.email && match.email.toLowerCase() === email;
+    const phoneMatch = phoneRows[0] || null;
+    const emailMatch = emailRows[0] || null;
 
-      if (phoneMatches) {
-        // If same seller is re-submitting with matching password, return successful auth
-        const isSamePassword = await bcrypt.compare(password, match.password);
-        if (isSamePassword) {
-          const token = jwt.sign({ id: match.id, phone }, JWT_SECRET, { expiresIn: '30d' });
-          return res.status(200).json({
-            message: 'Seller account already exists. Successfully signed in.',
-            user: safeSeller({
-              id: match.id,
-              seller_name,
-              email: match.email || (email || null),
-              phone,
-              address,
-              landmark,
-              state,
-              country
-            }),
-            token,
-            token_type: 'Bearer'
+    if (phoneMatch) {
+      const isSamePassword = await bcrypt.compare(password, phoneMatch.password);
+      if (isSamePassword) {
+        if (emailMatch && Number(emailMatch.id) !== Number(phoneMatch.id)) {
+          return res.status(422).json({
+            message: 'The email has already been taken.',
+            errors: { email: ['The email has already been taken.'] }
           });
         }
-        return res.status(422).json({
-          message: 'The phone has already been taken.',
-          errors: { phone: ['The phone has already been taken.'] }
+        let resolvedEmail = phoneMatch.email;
+        if (!resolvedEmail || String(resolvedEmail).endsWith('@phone.vendor.local')) {
+          await pool.query('UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?', [email, phoneMatch.id]);
+          resolvedEmail = email;
+        }
+        const token = jwt.sign({ id: phoneMatch.id, phone }, JWT_SECRET, { expiresIn: '30d' });
+        return res.status(200).json({
+          message: 'Seller account already exists. Successfully signed in.',
+          user: safeSeller({
+            id: phoneMatch.id,
+            seller_name,
+            email: resolvedEmail,
+            phone,
+            address,
+            landmark,
+            state,
+            country
+          }),
+          token,
+          token_type: 'Bearer'
         });
       }
+      return res.status(422).json({
+        message: 'The phone has already been taken.',
+        errors: { phone: ['The phone has already been taken.'] }
+      });
+    }
 
-      if (emailMatches) {
-        return res.status(422).json({
-          message: 'The email has already been taken.',
-          errors: { email: ['The email has already been taken.'] }
-        });
-      }
+    if (emailMatch) {
+      return res.status(422).json({
+        message: 'The email has already been taken.',
+        errors: { email: ['The email has already been taken.'] }
+      });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const phoneDigits = phone.replace(/\D/g, '');
-    const finalEmail = email || `seller_${phoneDigits}@phone.vendor.local`;
 
     const [result] = await pool.query(
       `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-      [seller_name, finalEmail, seller_name, phone, address, landmark, state, country || 'India', hashedPassword]
+      [seller_name, email, seller_name, phone, address, landmark, state, country || 'India', hashedPassword]
     );
 
     const userId = result.insertId;
@@ -1531,15 +1542,25 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
     res.status(201).json({
       message: 'Seller registration successful.',
-      user: safeSeller({ id: userId, seller_name, email: finalEmail, phone, address, landmark, state, country }),
+      user: safeSeller({ id: userId, seller_name, email, phone, address, landmark, state, country }),
       token,
       token_type: 'Bearer'
     });
   } catch (err) {
+    if (fallbackSellers.some(s => String(s.phone || '') === phone)) {
+      return res.status(422).json({
+        message: 'The phone has already been taken.',
+        errors: { phone: ['The phone has already been taken.'] }
+      });
+    }
+    if (fallbackSellers.some(s => String(s.email || '').toLowerCase() === email)) {
+      return res.status(422).json({
+        message: 'The email has already been taken.',
+        errors: { email: ['The email has already been taken.'] }
+      });
+    }
     const newId = fallbackSellers.length ? Math.max(...fallbackSellers.map(s => s.id)) + 1 : 99;
-    const phoneDigits = phone.replace(/\D/g, '');
-    const finalEmail = email || `seller_${phoneDigits}@phone.vendor.local`;
-    const newSeller = { id: newId, seller_name, email: finalEmail, phone, address, landmark, state, country: country || 'India', role: 'seller' };
+    const newSeller = { id: newId, seller_name, email, phone, address, landmark, state, country: country || 'India', role: 'seller' };
     fallbackSellers.push(newSeller);
     const token = jwt.sign({ id: newId, phone, role: 'seller' }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({
@@ -7538,31 +7559,46 @@ app.post('/admin', async (req, res) => {
     } else if (action === 'create_seller') {
       const name = (body.seller_name || '').trim();
       const phone = (body.phone || '').trim();
+      const email = (body.email || '').trim().toLowerCase();
       const address = (body.address || '').trim();
       const landmark = (body.landmark || '').trim();
       const state = (body.state || '').trim();
       const country = (body.country || 'India').trim();
       const password = body.password || '';
       const confirmPassword = body.password_confirmation || '';
-      let email = (body.email || '').trim().toLowerCase();
 
-      if (name && phone && address && password && password.length >= 8 && password === confirmPassword) {
-        if (!email) {
-          const digits = phone.replace(/\D+/g, '');
-          email = `seller_${digits}@phone.vendor.local`;
+      if (!name || !phone || !email || !address || !landmark || !state || !password) {
+        feedbackErr = 'All seller fields including Email Address are required.';
+      } else if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+        feedbackErr = 'Phone must be in international format with country code (e.g. +919876543210).';
+      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        feedbackErr = 'Please enter a valid email address.';
+      } else if (password.length < 8) {
+        feedbackErr = 'Password must be at least 8 characters.';
+      } else if (password !== confirmPassword) {
+        feedbackErr = 'Password confirmation does not match.';
+      } else {
+        const [dupPhone] = await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
+        const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+        if (dupPhone.length > 0) {
+          feedbackErr = 'A seller with this phone number already exists.';
+        } else if (dupEmail.length > 0) {
+          feedbackErr = 'A seller with this email address already exists.';
+        } else {
+          const hashedPassword = await bcrypt.hash(password, 10);
+          await pool.query(
+            `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
+            [name, email, name, phone, address, landmark, state, country, hashedPassword]
+          );
+          feedbackMsg = `Seller "${name}" created.`;
         }
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await pool.query(
-          `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-          [name, email, name, phone, address, landmark, state, country, hashedPassword]
-        );
-        feedbackMsg = `Seller "${name}" created.`;
       }
     } else if (action === 'edit_seller') {
       const sellerId = parseInt(body.seller_id, 10);
       const name = (body.seller_name || '').trim();
       const phone = (body.phone || '').trim();
+      const email = (body.email || '').trim().toLowerCase();
       const address = (body.address || '').trim();
       const landmark = (body.landmark || '').trim();
       const state = (body.state || '').trim();
@@ -7571,29 +7607,45 @@ app.post('/admin', async (req, res) => {
       const newPassword = body.new_password || body.password || '';
       const confirmPassword = body.confirm_password || '';
 
-      if (sellerId && name && phone && address && state) {
-        let passwordToUpdate = null;
-        if (newPassword && newPassword.length >= 8 && newPassword === confirmPassword) {
-          if (currentPassword) {
-            const [rows] = await pool.query('SELECT password FROM users WHERE id = ? LIMIT 1', [sellerId]);
-            if (rows.length > 0 && (await bcrypt.compare(currentPassword, rows[0].password))) {
-              passwordToUpdate = await bcrypt.hash(newPassword, 10);
-            }
-          } else {
-            passwordToUpdate = await bcrypt.hash(newPassword, 10);
+      if (!sellerId || !name || !phone || !address || !state) {
+        feedbackErr = 'Seller ID, name, phone, address, and state are required.';
+      } else if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        feedbackErr = 'Please enter a valid email address.';
+      } else {
+        if (email) {
+          const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email, sellerId]);
+          if (dupEmail.length > 0) {
+            feedbackErr = 'This email address is already used by another account.';
           }
         }
+        if (!feedbackErr) {
+          let passwordToUpdate = null;
+          if (newPassword && newPassword.length >= 8 && newPassword === confirmPassword) {
+            if (currentPassword) {
+              const [rows] = await pool.query('SELECT password FROM users WHERE id = ? LIMIT 1', [sellerId]);
+              if (rows.length > 0 && (await bcrypt.compare(currentPassword, rows[0].password))) {
+                passwordToUpdate = await bcrypt.hash(newPassword, 10);
+              }
+            } else {
+              passwordToUpdate = await bcrypt.hash(newPassword, 10);
+            }
+          }
 
-        const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
-        const params = [name, name, phone, address, landmark, state, country];
-        if (passwordToUpdate) {
-          updates.push('password = ?');
-          params.push(passwordToUpdate);
+          const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
+          const params = [name, name, phone, address, landmark, state, country];
+          if (email) {
+            updates.push('email = ?');
+            params.push(email);
+          }
+          if (passwordToUpdate) {
+            updates.push('password = ?');
+            params.push(passwordToUpdate);
+          }
+          updates.push('updated_at = NOW()');
+          params.push(sellerId);
+          await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+          feedbackMsg = `Seller #${sellerId} updated.`;
         }
-        updates.push('updated_at = NOW()');
-        params.push(sellerId);
-        await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
-        feedbackMsg = `Seller #${sellerId} updated.`;
       }
     }
   } catch (err) {
@@ -8438,8 +8490,8 @@ app.get('/admin', async (req, res) => {
                 <input name="phone" required placeholder="+919876543210">
               </div>
               <div>
-                <label>Email Address</label>
-                <input type="email" name="email" placeholder="seller@example.com">
+                <label>Email Address *</label>
+                <input type="email" name="email" required placeholder="seller@example.com">
               </div>
               <div>
                 <label>State</label>
@@ -8619,6 +8671,10 @@ app.get('/admin', async (req, res) => {
                   <label>Phone (+country code)</label>
                   <input name="phone" id="formPhone" required placeholder="+919876543210">
                 </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Email Address</label>
+                  <input type="email" name="email" id="formEmail" placeholder="seller@example.com">
+                </div>
                 <div>
                   <label>State</label>
                   <input name="state" id="formState" required>
@@ -8695,6 +8751,7 @@ app.get('/admin', async (req, res) => {
           document.getElementById('formSellerId').value = seller.id;
           document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
           document.getElementById('formPhone').value = seller.phone || '';
+          document.getElementById('formEmail').value = (seller.email && !seller.email.endsWith('@phone.vendor.local')) ? seller.email : '';
           document.getElementById('formAddress').value = seller.address || '';
           document.getElementById('formLandmark').value = seller.landmark || '';
           document.getElementById('formState').value = seller.state || '';

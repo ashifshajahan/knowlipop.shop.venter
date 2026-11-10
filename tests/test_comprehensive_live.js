@@ -78,6 +78,7 @@ async function testComprehensiveLive() {
   const regA = await request('POST', '/api/register', {
     store_name: 'Studio Audio Boutique',
     owner_name: 'Alok Nath',
+    email: `studio_${Date.now()}@example.com`,
     phone: phoneA,
     password: 'Password123!',
     address: '42 MG Road',
@@ -95,6 +96,7 @@ async function testComprehensiveLive() {
   const regB = await request('POST', '/api/register', {
     store_name: 'Prime Gadgets Corp',
     owner_name: 'Bina Roy',
+    email: `prime_${Date.now()}_${Math.floor(Math.random() * 100)}@example.com`,
     phone: phoneB,
     password: 'Password123!',
     address: '88 Park Street',

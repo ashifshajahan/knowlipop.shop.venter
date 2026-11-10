@@ -93,6 +93,7 @@ async function testAll() {
     const regRes = await request('POST', '/api/register', {
       store_name: 'Test Store Hostinger',
       owner_name: 'Hostinger Tester',
+      email: `hostinger_${Date.now()}@example.com`,
       phone: uniquePhone,
       password: testPassword,
       address: '123 Cloud St',

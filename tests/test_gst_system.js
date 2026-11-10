@@ -255,6 +255,7 @@ async function runGstTests() {
     'Content-Type': 'application/json'
   }, Buffer.from(JSON.stringify({
     seller_name: 'Intruder Shop',
+    email: `intruder_${ts}@example.com`,
     phone: sellerBPhone,
     address: 'Anywhere',
     password: sellerPassword,

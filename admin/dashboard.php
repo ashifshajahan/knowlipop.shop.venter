@@ -137,6 +137,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_seller') {
     $name = trim($_POST['seller_name'] ?? '');
     $phone = trim($_POST['phone'] ?? '');
+    $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '');
     $state = trim($_POST['state'] ?? '');
@@ -144,8 +145,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $password = $_POST['password'] ?? '';
     $confirmPassword = $_POST['password_confirmation'] ?? '';
 
-    if (empty($name) || empty($phone) || empty($address) || empty($landmark) || empty($state) || empty($password)) {
-        $error = 'All fields are required.';
+    if (empty($name) || empty($email) || empty($phone) || empty($address) || empty($landmark) || empty($state) || empty($password)) {
+        $error = 'All seller fields including Email Address are required.';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'The email address format is invalid.';
     } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
         $error = 'Phone must be in international format with country code (e.g. +919876543210).';
     } elseif (strlen($password) < 8) {
@@ -155,50 +158,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     } else {
         $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
         $chk->execute([':phone' => $phone]);
+        $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
+        $chkEmail->execute([':email' => $email]);
         if ($chk->fetch()) {
             $error = 'A seller with this phone number already exists.';
+        } elseif ($chkEmail->fetch()) {
+            $error = 'A seller with this email address already exists.';
         } else {
-            $rawInputEmail = trim($_POST['email'] ?? '');
-            $email = '';
-            if (!empty($rawInputEmail)) {
-                if (!filter_var($rawInputEmail, FILTER_VALIDATE_EMAIL)) {
-                    $error = 'The email address format is invalid.';
-                } else {
-                    $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
-                    $chkEmail->execute([':email' => $rawInputEmail]);
-                    if ($chkEmail->fetch()) {
-                        $error = 'A seller with this email address already exists.';
-                    } else {
-                        $email = strtolower($rawInputEmail);
-                    }
-                }
-            }
+            $hashed = hashPassword($password);
 
-            if (empty($error)) {
-                if (empty($email)) {
-                    $phoneDigits = preg_replace('/\D+/', '', $phone);
-                    $email = 'seller_' . $phoneDigits . '@phone.vendor.local';
-                }
-                $hashed = hashPassword($password);
+            $ins = $pdo->prepare("
+                INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+                VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
+            ");
+            $ins->execute([
+                ':name' => $name,
+                ':email' => $email,
+                ':seller_name' => $name,
+                ':phone' => $phone,
+                ':address' => $address,
+                ':landmark' => $landmark,
+                ':state' => $state,
+                ':country' => $country,
+                ':password' => $hashed,
+            ]);
 
-                $ins = $pdo->prepare("
-                    INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-                    VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
-                ");
-                $ins->execute([
-                    ':name' => $name,
-                    ':email' => $email,
-                    ':seller_name' => $name,
-                    ':phone' => $phone,
-                    ':address' => $address,
-                    ':landmark' => $landmark,
-                    ':state' => $state,
-                    ':country' => $country,
-                    ':password' => $hashed,
-                ]);
-
-                $success = 'Seller account created successfully!';
-            }
+            $success = 'Seller account created successfully!';
         }
     }
 }
@@ -208,6 +193,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $name = trim($_POST['seller_name'] ?? '');
     $phone = trim($_POST['phone'] ?? '');
+    $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '');
     $state = trim($_POST['state'] ?? '');
@@ -218,6 +204,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
     if (empty($sellerId) || empty($name) || empty($phone) || empty($address) || empty($state)) {
         $error = 'Seller ID, name, phone, address, and state are required.';
+    } elseif (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'The email address format is invalid.';
     } elseif (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
         $error = 'Phone must be in international format with country code (e.g. +919876543210).';
     } else {
@@ -226,8 +214,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if ($chk->fetch()) {
             $error = 'This phone number is already registered to another account.';
         } else {
+            if (!empty($email)) {
+                $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) AND id != :id LIMIT 1");
+                $chkEmail->execute([':email' => $email, ':id' => $sellerId]);
+                if ($chkEmail->fetch()) {
+                    $error = 'This email address is already registered to another account.';
+                }
+            }
             $passwordToUpdate = null;
-            if (!empty($newPassword)) {
+            if (empty($error) && !empty($newPassword)) {
                 if (strlen($newPassword) < 8) {
                     $error = 'The new password must be at least 8 characters.';
                 } elseif ($newPassword !== $confirmPassword) {
@@ -259,6 +254,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     ':state' => $state,
                     ':country' => $country,
                 ];
+                if (!empty($email)) {
+                    $sql .= ", email = :email";
+                    $params[':email'] = $email;
+                }
                 if ($passwordToUpdate !== null) {
                     $sql .= ", password = :password";
                     $params[':password'] = $passwordToUpdate;
@@ -969,8 +968,8 @@ function formatBytesPhp($bytes): string {
                         <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" required placeholder="+919876543210">
                     </div>
                     <div>
-                        <label>Email Address</label>
-                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" placeholder="seller@example.com">
+                        <label>Email Address *</label>
+                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" required placeholder="seller@example.com">
                     </div>
                     <div>
                         <label>State</label>
@@ -1153,6 +1152,10 @@ function formatBytesPhp($bytes): string {
                             <label>Phone (+country code)</label>
                             <input name="phone" id="formPhone" required placeholder="+919876543210">
                         </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Email Address</label>
+                            <input type="email" name="email" id="formEmail" placeholder="seller@example.com">
+                        </div>
                         <div>
                             <label>State</label>
                             <input name="state" id="formState" required>
@@ -1228,6 +1231,7 @@ function formatBytesPhp($bytes): string {
             document.getElementById('formSellerId').value = seller.id;
             document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
             document.getElementById('formPhone').value = seller.phone || '';
+            document.getElementById('formEmail').value = (seller.email && !seller.email.endsWith('@phone.vendor.local')) ? seller.email : '';
             document.getElementById('formAddress').value = seller.address || '';
             document.getElementById('formLandmark').value = seller.landmark || '';
             document.getElementById('formState').value = seller.state || '';
