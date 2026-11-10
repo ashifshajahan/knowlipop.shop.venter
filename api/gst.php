@@ -25,12 +25,13 @@ function requireAdminUser(array $user): void
  */
 function streamSecureDocument(array $doc, string $mode = 'preview'): void
 {
-    $filePath = $doc['file_path'];
-    if (!file_exists($filePath)) {
+    $filePath = resolveGstFilePathPhp($doc);
+    if (!$filePath || !file_exists($filePath)) {
         errorResponse('Document file not found on server.', [], 404);
     }
 
-    $mimeType = $doc['mime_type'] ?: 'application/octet-stream';
+    $ext = strtolower(pathinfo($doc['original_name'] ?: $filePath, PATHINFO_EXTENSION));
+    $mimeType = ($ext === 'pdf') ? 'application/pdf' : ($doc['mime_type'] ?: 'application/octet-stream');
     $fileName = $doc['original_name'] ?: basename($filePath);
     $disposition = ($mode === 'download') ? 'attachment' : 'inline';
 
@@ -201,6 +202,7 @@ function apiSellerSubmitGst(PDO $pdo): void
                     ->execute([':seller_id' => $sellerId]);
             }
 
+            $storedMime = ($ext === 'pdf') ? 'application/pdf' : (($ext === 'png') ? 'image/png' : (($ext === 'jpg' || $ext === 'jpeg') ? 'image/jpeg' : $f['type']));
             $docStmt = $pdo->prepare("
                 INSERT INTO seller_gst_documents
                 (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
@@ -214,7 +216,7 @@ function apiSellerSubmitGst(PDO $pdo): void
                 ':file_name' => $uniqueName,
                 ':file_path' => $destPath,
                 ':file_size' => $f['size'],
-                ':mime_type' => $f['type'],
+                ':mime_type' => $storedMime,
                 ':is_primary' => $isPrimary
             ]);
             $docId = (int) $pdo->lastInsertId();
@@ -227,7 +229,7 @@ function apiSellerSubmitGst(PDO $pdo): void
                 'original_name' => $f['name'],
                 'file_name' => $uniqueName,
                 'file_size' => $f['size'],
-                'mime_type' => $f['type'],
+                'mime_type' => $storedMime,
                 'is_primary' => $isPrimary,
                 'created_at' => date('Y-m-d H:i:s')
             ]);
@@ -413,6 +415,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
             ->execute([':seller_id' => $sellerId]);
     }
 
+    $storedMime = ($ext === 'pdf') ? 'application/pdf' : (($ext === 'png') ? 'image/png' : (($ext === 'jpg' || $ext === 'jpeg') ? 'image/jpeg' : $fileField['type']));
     $insDoc = $pdo->prepare("
         INSERT INTO seller_gst_documents
         (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
@@ -426,7 +429,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
         ':file_name' => $uniqueName,
         ':file_path' => $destPath,
         ':file_size' => $fileField['size'],
-        ':mime_type' => $fileField['type'],
+        ':mime_type' => $storedMime,
         ':is_primary' => $isPrimary
     ]);
     $docId = (int) $pdo->lastInsertId();
@@ -451,7 +454,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
             'original_name' => $fileField['name'],
             'file_name' => $uniqueName,
             'file_size' => $fileField['size'],
-            'mime_type' => $fileField['type'],
+            'mime_type' => $storedMime,
             'is_primary' => $isPrimary,
             'created_at' => date('Y-m-d H:i:s')
         ], false)
@@ -477,8 +480,9 @@ function apiSellerDeleteGstDocument(PDO $pdo, int $docId): void
     }
 
     // Delete physical file
-    if (!empty($doc['file_path']) && file_exists($doc['file_path'])) {
-        @unlink($doc['file_path']);
+    $resolvedPath = resolveGstFilePathPhp($doc);
+    if ($resolvedPath && file_exists($resolvedPath)) {
+        @unlink($resolvedPath);
     }
 
     // Delete database record

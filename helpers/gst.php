@@ -93,16 +93,46 @@ function ensureGstTables(PDO $pdo): void
 
 function getGstStorageDir(): string
 {
-    $dir = dirname(__DIR__) . '/uploads/secure_documents/gst';
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
+    $candidates = [
+        '/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst',
+        '/home/u999617803/venter_secure_storage/gst',
+        dirname(__DIR__) . '/uploads/secure_documents/gst'
+    ];
+    foreach ($candidates as $dir) {
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        if (is_dir($dir) && is_writable($dir)) {
+            $htaccess = dirname($dir) . '/.htaccess';
+            if (!file_exists($htaccess)) {
+                @file_put_contents($htaccess, "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n");
+            }
+            return $dir;
+        }
     }
-    // Ensure .htaccess prevents direct HTTP access to parent secure_documents folder
-    $htaccess = dirname(__DIR__) . '/uploads/secure_documents/.htaccess';
-    if (!file_exists($htaccess)) {
-        @file_put_contents($htaccess, "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n");
+    $fallback = dirname(__DIR__) . '/uploads/secure_documents/gst';
+    if (!is_dir($fallback)) {
+        @mkdir($fallback, 0755, true);
     }
-    return $dir;
+    return $fallback;
+}
+
+function resolveGstFilePathPhp(array $doc): ?string
+{
+    $fileName = $doc['file_name'] ?? (!empty($doc['file_path']) ? basename($doc['file_path']) : null);
+    $candidates = array_filter([
+        $doc['file_path'] ?? null,
+        $fileName ? getGstStorageDir() . '/' . $fileName : null,
+        $fileName ? '/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst/' . $fileName : null,
+        $fileName ? '/home/u999617803/venter_secure_storage/gst/' . $fileName : null,
+        $fileName ? dirname(__DIR__) . '/uploads/secure_documents/gst/' . $fileName : null
+    ]);
+    foreach ($candidates as $p) {
+        if (is_file($p)) {
+            return $p;
+        }
+    }
+    return null;
 }
 
 /**

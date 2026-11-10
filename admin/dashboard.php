@@ -33,20 +33,22 @@ if (isset($_GET['action']) && $_GET['action'] === 'view_gst_doc' && !empty($_GET
     $docStmt = $pdo->prepare("SELECT * FROM seller_gst_documents WHERE id = :id LIMIT 1");
     $docStmt->execute([':id' => $docId]);
     $doc = $docStmt->fetch();
-    if (!$doc || !file_exists($doc['file_path'])) {
+    $filePath = $doc ? resolveGstFilePathPhp($doc) : null;
+    if (!$doc || !$filePath) {
         http_response_code(404);
         echo 'Document file not found on server.';
         exit;
     }
-    $mimeType = $doc['mime_type'] ?: 'application/octet-stream';
-    $fileName = $doc['original_name'] ?: basename($doc['file_path']);
+    $ext = strtolower(pathinfo($doc['original_name'] ?: $filePath, PATHINFO_EXTENSION));
+    $mimeType = ($ext === 'pdf') ? 'application/pdf' : ($doc['mime_type'] ?: 'application/octet-stream');
+    $fileName = $doc['original_name'] ?: basename($filePath);
     $disposition = ($mode === 'download') ? 'attachment' : 'inline';
     if (ob_get_level()) ob_end_clean();
     header('Content-Type: ' . $mimeType);
-    header('Content-Length: ' . filesize($doc['file_path']));
+    header('Content-Length: ' . filesize($filePath));
     header('Content-Disposition: ' . $disposition . '; filename="' . rawurlencode($fileName) . '"');
     header('X-Content-Type-Options: nosniff');
-    readfile($doc['file_path']);
+    readfile($filePath);
     exit;
 }
 

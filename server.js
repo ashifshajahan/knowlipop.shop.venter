@@ -6419,14 +6419,59 @@ app.post('/admin', async (req, res) => {
   res.redirect('/admin');
 });
 
+function getPersistentGstUploadDir() {
+  const candidates = [];
+  if (process.env.GST_STORAGE_DIR) {
+    candidates.push(path.resolve(process.env.GST_STORAGE_DIR));
+  }
+  if (isHostinger) {
+    candidates.push('/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst');
+    candidates.push('/home/u999617803/venter_secure_storage/gst');
+    candidates.push(path.resolve(__dirname, '..', '..', '..', '..', 'venter_secure_storage', 'gst'));
+    candidates.push(path.resolve(__dirname, '..', '..', '..', 'venter_secure_storage', 'gst'));
+  }
+  candidates.push(path.resolve(__dirname, 'uploads', 'secure_documents', 'gst'));
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      }
+      const probe = path.join(dir, '.write_probe');
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      // Protect parent folder against direct Apache HTTP access if applicable
+      try {
+        const htaccess = path.join(path.dirname(dir), '.htaccess');
+        if (!fs.existsSync(htaccess)) {
+          fs.writeFileSync(htaccess, "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n");
+        }
+      } catch (ignoreHt) {}
+      return dir;
+    } catch (err) {
+      console.warn(`[GST Storage] Candidate dir unavailable (${dir}):`, err.message);
+    }
+  }
+  const fallback = path.resolve(__dirname, 'uploads', 'secure_documents', 'gst');
+  if (!fs.existsSync(fallback)) fs.mkdirSync(fallback, { recursive: true });
+  return fallback;
+}
+
+const gstUploadDir = getPersistentGstUploadDir();
+console.log('[GST Storage] Active directory:', gstUploadDir);
+
 function resolveGstDocumentPath(doc) {
   if (!doc) return null;
   const fileName = doc.file_name || (doc.file_path ? path.basename(doc.file_path) : null);
+  const localDir = path.resolve(__dirname, 'uploads', 'secure_documents', 'gst');
   const candidates = [
     doc.file_path,
     fileName ? path.join(gstUploadDir, fileName) : null,
-    fileName ? path.resolve(__dirname, 'uploads', 'secure_documents', 'gst', fileName) : null,
+    fileName ? path.join(localDir, fileName) : null,
     fileName ? path.resolve(process.cwd(), 'uploads', 'secure_documents', 'gst', fileName) : null,
+    fileName ? path.resolve('/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst', fileName) : null,
+    fileName ? path.resolve('/home/u999617803/venter_secure_storage/gst', fileName) : null,
+    fileName ? path.resolve('/home/u999617803/domains/knowlipop.shop/public_html/uploads/secure_documents/gst', fileName) : null,
     fileName ? path.resolve(__dirname, 'uploads', fileName) : null,
     doc.file_path ? path.resolve(process.cwd(), doc.file_path) : null,
     doc.file_path ? path.resolve(__dirname, doc.file_path) : null
@@ -6434,7 +6479,32 @@ function resolveGstDocumentPath(doc) {
 
   for (const p of candidates) {
     try {
-      if (fs.existsSync(p)) return p;
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+    } catch (e) {}
+  }
+
+  // Scan sibling Hostinger build versions if accessible to recover files uploaded before redeploy
+  if (fileName) {
+    const versionsRoot = '/home/u999617803/domains/knowlipop.shop/hbuilds/versions';
+    try {
+      if (fs.existsSync(versionsRoot)) {
+        const versions = fs.readdirSync(versionsRoot);
+        for (const ver of versions) {
+          const oldCandidate = path.join(versionsRoot, ver, 'nodejs', 'uploads', 'secure_documents', 'gst', fileName);
+          if (fs.existsSync(oldCandidate) && fs.statSync(oldCandidate).isFile()) {
+            // Migrate into persistent gstUploadDir automatically
+            try {
+              const destPath = path.join(gstUploadDir, fileName);
+              if (!fs.existsSync(destPath)) {
+                fs.copyFileSync(oldCandidate, destPath);
+              }
+              return destPath;
+            } catch (copyErr) {
+              return oldCandidate;
+            }
+          }
+        }
+      }
     } catch (e) {}
   }
 
@@ -6444,16 +6514,66 @@ function resolveGstDocumentPath(doc) {
       if (fileName && files.includes(fileName)) {
         return path.join(gstUploadDir, fileName);
       }
-      if (doc.seller_id) {
-        const prefix = `gst_${doc.seller_id}_`;
-        const match = files.find(f => f.startsWith(prefix));
-        if (match) return path.join(gstUploadDir, match);
-      }
     }
   } catch (e) {}
 
   return null;
 }
+
+function detectDocumentMimeType(doc, realPath) {
+  // 1. Inspect actual file header magic bytes first (handles mobile clients sending application/octet-stream)
+  try {
+    const fd = fs.openSync(realPath, 'r');
+    const buf = Buffer.alloc(8);
+    const bytesRead = fs.readSync(fd, buf, 0, 8, 0);
+    fs.closeSync(fd);
+    if (bytesRead >= 5 && buf.slice(0, 5).toString('ascii') === '%PDF-') {
+      return 'application/pdf';
+    }
+    if (bytesRead >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+      return 'image/png';
+    }
+    if (bytesRead >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+      return 'image/jpeg';
+    }
+  } catch (e) {}
+
+  // 2. Inspect filename extension
+  const ext = path.extname(doc.original_name || doc.file_name || realPath || '').toLowerCase();
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+
+  // 3. Fallback to DB mime_type if it's meaningful
+  if (doc.mime_type && doc.mime_type !== 'application/octet-stream') {
+    return doc.mime_type;
+  }
+  return 'application/pdf';
+}
+
+// GET /admin/gst_storage_info - Check active GST persistent storage status
+app.get('/admin/gst_storage_info', async (req, res) => {
+  const dirs = [
+    gstUploadDir,
+    '/home/u999617803/domains/knowlipop.shop/venter_secure_storage/gst',
+    '/home/u999617803/venter_secure_storage/gst',
+    '/home/u999617803/domains/knowlipop.shop/hbuilds/versions',
+    path.resolve(__dirname, 'uploads', 'secure_documents', 'gst')
+  ];
+  const info = dirs.map(d => {
+    let exists = false, writable = false, files = [];
+    try {
+      exists = fs.existsSync(d);
+      if (exists) {
+        files = fs.readdirSync(d).slice(0, 20);
+        fs.accessSync(d, fs.constants.W_OK);
+        writable = true;
+      }
+    } catch (e) {}
+    return { dir: d, exists, writable, sample_files: files };
+  });
+  res.json({ isHostinger, activeGstUploadDir: gstUploadDir, __dirname, cwd: process.cwd(), check: info });
+});
 
 // GET /admin/view_gst_doc - Preview or download document for admin
 app.get('/admin/view_gst_doc', async (req, res) => {
@@ -6469,29 +6589,53 @@ app.get('/admin/view_gst_doc', async (req, res) => {
     const doc = rows[0];
     const realPath = resolveGstDocumentPath(doc);
     if (!realPath) {
-      let dirFiles = [];
-      try { dirFiles = fs.readdirSync(gstUploadDir); } catch(e) { dirFiles = [e.message]; }
-      return res.status(404).json({
-        error: 'Document file not found on disk.',
-        doc_id: doc.id,
-        db_file_path: doc.file_path,
-        db_file_name: doc.file_name,
-        gstUploadDir,
-        __dirname,
-        cwd: process.cwd(),
-        files_in_gstUploadDir: dirFiles
-      });
+      if (req.query.debug === '1') {
+        let dirFiles = [];
+        try { dirFiles = fs.readdirSync(gstUploadDir); } catch(e) { dirFiles = [e.message]; }
+        return res.status(404).json({
+          error: 'Document file not found on disk.',
+          doc_id: doc.id,
+          db_file_path: doc.file_path,
+          db_file_name: doc.file_name,
+          gstUploadDir,
+          __dirname,
+          cwd: process.cwd(),
+          files_in_gstUploadDir: dirFiles
+        });
+      }
+      return res.status(404).send(`
+        <!doctype html><html><head><meta charset="utf-8"><title>Document Unavailable</title>
+        <style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#1e293b;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+        .box{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;max-width:520px;box-shadow:0 10px 25px rgba(0,0,0,0.06);}
+        h2{margin-top:0;color:#b91c1c;}p{color:#475569;line-height:1.6;}
+        .btn{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700;margin-top:12px;}</style></head>
+        <body><div class="box">
+          <h2>📄 Document File Not Available</h2>
+          <p>The file <strong>${doc.original_name || 'Document.pdf'}</strong> (Document #${doc.id}) was uploaded to a temporary server build directory before persistent storage was configured, and that old build folder was removed during deployment.</p>
+          <p>Please ask the seller to upload the PDF again (you can reject this request with a note requesting re-upload). All newly uploaded PDFs are stored persistently.</p>
+          <a href="/admin" class="btn">← Back to Admin Dashboard</a>
+        </div></body></html>
+      `);
     }
 
-    const mimeType = doc.mime_type || (doc.file_name && doc.file_name.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream');
-    const fileName = doc.original_name || path.basename(realPath);
+    const mimeType = detectDocumentMimeType(doc, realPath);
+    const rawName = doc.original_name || path.basename(realPath) || 'document.pdf';
+    const safeAsciiName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
     const disposition = mode === 'download' ? 'attachment' : 'inline';
+    const stat = fs.statSync(realPath);
+
     res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Length', fs.statSync(realPath).size);
-    res.setHeader('Content-Disposition', `${disposition}; filename="${encodeURIComponent(fileName)}"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', `${disposition}; filename="${safeAsciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
-    fs.createReadStream(realPath).pipe(res);
+
+    const stream = fs.createReadStream(realPath);
+    stream.on('error', (streamErr) => {
+      console.error('[GST View Stream Error]:', streamErr);
+      if (!res.headersSent) res.status(500).send('Error reading document file.');
+    });
+    stream.pipe(res);
   } catch (err) {
     res.status(500).send('Error streaming document: ' + err.message);
   }
@@ -6510,7 +6654,12 @@ app.get('/admin/get_gst_details', async (req, res) => {
     res.json({
       status: 'success',
       gst: gstRows[0] || null,
-      documents: docs.map(d => formatGstDocumentRecord(d, true)),
+      documents: docs.map(d => ({
+        ...formatGstDocumentRecord(d, true),
+        admin_preview_url: `/admin/view_gst_doc?id=${d.id}&mode=preview`,
+        admin_download_url: `/admin/view_gst_doc?id=${d.id}&mode=download`,
+        file_exists: Boolean(resolveGstDocumentPath(d))
+      })),
       logs
     });
   } catch (err) {
@@ -6541,10 +6690,11 @@ app.get('/admin', async (req, res) => {
       const [[m]] = await pool.query(`
         SELECT
           COUNT(*) as total_gst,
-          SUM(CASE WHEN status = 'Pending' OR status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
-          SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
-          SUM(CASE WHEN status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
-        FROM seller_gst_details
+          SUM(CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
+          SUM(CASE WHEN g.status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
+          SUM(CASE WHEN g.status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
+        FROM seller_gst_details g
+        JOIN users u ON g.seller_id = u.id
       `);
       metrics = m || metrics;
     } catch (e) {}
@@ -6557,13 +6707,23 @@ app.get('/admin', async (req, res) => {
                (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
                (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
                (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
+               (SELECT d.file_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_name,
+               (SELECT d.file_path FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_path,
                (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
         FROM seller_gst_details g
         JOIN users u ON g.seller_id = u.id
         ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
         LIMIT 100
       `);
-      gstSellers = rows;
+      gstSellers = rows.map(g => ({
+        ...g,
+        latest_doc_exists: g.latest_doc_id ? Boolean(resolveGstDocumentPath({
+          id: g.latest_doc_id,
+          seller_id: g.seller_id,
+          file_name: g.latest_doc_file_name,
+          file_path: g.latest_doc_file_path
+        })) : false
+      }));
     } catch (e) {}
 
     let sellers = [];
@@ -6585,6 +6745,21 @@ app.get('/admin', async (req, res) => {
       if (!bytes) return '0 KB';
       if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
       return (bytes / 1024).toFixed(1) + ' KB';
+    }
+
+    function formatDateStr(dt) {
+      if (!dt) return { date: '—', time: '' };
+      try {
+        const d = (dt instanceof Date) ? dt : new Date(dt);
+        if (isNaN(d.getTime())) {
+          const s = String(dt);
+          return { date: s.slice(0, 10), time: s.slice(11, 16) };
+        }
+        const iso = d.toISOString();
+        return { date: iso.slice(0, 10), time: iso.slice(11, 16) + ' UTC' };
+      } catch (e) {
+        return { date: String(dt).slice(0, 10), time: '' };
+      }
     }
 
     function escapeHtml(str) {
@@ -6749,6 +6924,7 @@ app.get('/admin', async (req, res) => {
                 const sellerLabel = g.seller_name || g.user_name || 'Seller #' + g.seller_id;
                 const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (g.email || '')).toLowerCase();
                 const latestDocId = g.latest_doc_id;
+                const subDate = formatDateStr(g.submitted_at || g.updated_at);
 
                 return `
                   <tr class="gst-row" data-status="${st}" data-search="${escapeHtml(searchString)}">
@@ -6766,10 +6942,14 @@ app.get('/admin', async (req, res) => {
                           <span class="badge-pdf">PDF</span>
                           <strong style="color:#334155; font-size:13px;">${escapeHtml(g.latest_doc_name || 'Certificate.pdf')}</strong>
                           <span style="color:#94a3b8; font-size:11px;">(${formatBytes(g.latest_doc_size)})</span>
+                          ${!g.latest_doc_exists ? `<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>` : ''}
                         </div>
-                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center;">
-                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn-view">
-                            📄 1-Click Preview PDF
+                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                          <button type="button" class="btn-view" style="border:none; cursor:pointer;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">
+                            📄 Preview PDF
+                          </button>
+                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn-view" style="background:#475569;" title="Open PDF in New Tab">
+                            ↗ New Tab
                           </a>
                           <a href="/admin/view_gst_doc?id=${latestDocId}&mode=download" class="btn-dl" title="Download PDF">
                             ⬇
@@ -6792,8 +6972,8 @@ app.get('/admin', async (req, res) => {
                       ` : ''}
                     </td>
                     <td>
-                      <div style="font-size:13px; color:#334155;">${String(g.submitted_at || g.updated_at || '').slice(0, 10)}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${String(g.submitted_at || g.updated_at || '').slice(11, 16)}</div>
+                      <div style="font-size:13px; color:#334155;">${subDate.date}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${subDate.time}</div>
                     </td>
                     <td>
                       <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
@@ -6807,10 +6987,10 @@ app.get('/admin', async (req, res) => {
                         ` : ''}
 
                         ${st !== 'rejected' ? `
-                          <button type="button" class="btn-reject-sm" onclick="openGstModalWithReject(${g.seller_id}, '${escapeHtml(sellerLabel).replace(/'/g, "\\'")}')" title="Reject with Reason">✕ Reject</button>
+                          <button type="button" class="btn-reject-sm" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModalWithReject(${g.seller_id}, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
                         ` : ''}
 
-                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" onclick="openGstModal(${g.seller_id}, '${escapeHtml(sellerLabel).replace(/'/g, "\\'")}')">Details & Logs</button>
+                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">Details & Logs</button>
                       </div>
                     </td>
                   </tr>
@@ -6955,7 +7135,19 @@ app.get('/admin', async (req, res) => {
               </div>
 
               <h4 style="margin: 18px 0 10px; color:#1e1b4b;">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
-              <div id="modalDocumentsList" style="margin-bottom: 24px;"></div>
+              <div id="modalDocumentsList" style="margin-bottom: 16px;"></div>
+
+              <!-- Embedded Live PDF / Document Viewer -->
+              <div id="modalInlinePreviewBox" style="display:none; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; margin-bottom:20px; background:#f8fafc;">
+                <div style="background:#f1f5f9; padding:8px 14px; border-bottom:1px solid #cbd5e1; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                  <strong style="font-size:13px; color:#334155;" id="modalPreviewLabel">Live Document Preview</strong>
+                  <div style="display:flex; gap:8px; align-items:center;">
+                    <a id="modalPreviewNewTab" href="#" target="_blank" style="font-size:12px; font-weight:700; color:#0284c7; text-decoration:none;">↗ Open Full Screen</a>
+                    <a id="modalPreviewDownload" href="#" style="font-size:12px; font-weight:700; color:#475569; text-decoration:none;">⬇ Download</a>
+                  </div>
+                </div>
+                <div id="modalPreviewFrameWrap" style="width:100%; height:440px; background:#e2e8f0; display:flex; align-items:center; justify-content:center;"></div>
+              </div>
 
               <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
                 <h4 style="margin: 0 0 12px; color:#1e1b4b;">Admin Verification Actions</h4>
@@ -7123,22 +7315,51 @@ app.get('/admin', async (req, res) => {
           });
         }
 
+        window._modalGstDocs = {};
+
         function openGstModalWithReject(sellerId, sellerName) {
-          openGstModal(sellerId, sellerName);
-          setTimeout(() => {
-            const b = document.getElementById('rejectBox');
-            if (b) {
-              b.style.display = 'block';
-              b.scrollIntoView({ behavior: 'smooth' });
-            }
-          }, 300);
+          openGstModal(sellerId, sellerName, true);
         }
 
-        function openGstModal(sellerId, sellerName) {
+        function showInlineDocPreview(docId) {
+          const d = (window._modalGstDocs && window._modalGstDocs[docId]) || {};
+          const docName = d.original_name || ('Document #' + docId);
+          const isPdf = Boolean(d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf') || (docName.toLowerCase().endsWith('.pdf')));
+          const fileExists = (d.file_exists !== false);
+
+          const previewBox = document.getElementById('modalInlinePreviewBox');
+          const frameWrap = document.getElementById('modalPreviewFrameWrap');
+          const labelEl = document.getElementById('modalPreviewLabel');
+          const newTabEl = document.getElementById('modalPreviewNewTab');
+          const dlEl = document.getElementById('modalPreviewDownload');
+          if (!previewBox || !frameWrap) return;
+
+          const previewUrl = '/admin/view_gst_doc?id=' + docId + '&mode=preview';
+          const dlUrl = '/admin/view_gst_doc?id=' + docId + '&mode=download';
+          labelEl.innerText = 'Preview: ' + docName;
+          newTabEl.href = previewUrl;
+          dlEl.href = dlUrl;
+          previewBox.style.display = 'block';
+
+          if (!fileExists) {
+            frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><strong>⚠ File Not Found on Server Disk</strong><p style="font-size:13px;max-width:420px;margin:8px 0 0;">This document was uploaded before persistent storage was active. Ask the seller to re-upload the PDF.</p></div>';
+            return;
+          }
+
+          if (isPdf) {
+            frameWrap.innerHTML = '<iframe src="' + previewUrl + '#toolbar=1&navpanes=0" style="width:100%;height:100%;border:none;background:#fff;"></iframe>';
+          } else {
+            frameWrap.innerHTML = '<img src="' + previewUrl + '" alt="Document Preview" style="max-width:100%;max-height:100%;object-fit:contain;">';
+          }
+        }
+
+        function openGstModal(sellerId, sellerName, autoShowReject) {
           document.getElementById('gstModalTitle').innerText = 'Verification Review — ' + (sellerName || 'Seller #' + sellerId);
           document.getElementById('approveSellerId').value = sellerId;
           document.getElementById('rejectSellerId').value = sellerId;
           document.getElementById('rejectBox').style.display = 'none';
+          document.getElementById('modalInlinePreviewBox').style.display = 'none';
+          document.getElementById('modalPreviewFrameWrap').innerHTML = '';
 
           document.getElementById('gstModalLoading').style.display = 'block';
           document.getElementById('gstModalContent').style.display = 'none';
@@ -7154,9 +7375,12 @@ app.get('/admin', async (req, res) => {
               const docs = data.documents || [];
               const logs = data.logs || [];
 
+              window._modalGstDocs = {};
+              docs.forEach(d => { window._modalGstDocs[d.id] = d; });
+
               document.getElementById('modalSellerName').innerText = sellerName + ' (#' + sellerId + ')';
-              document.getElementById('modalSubmittedAt').innerText = (g.submitted_at || g.created_at || '—').slice(0, 16);
-              document.getElementById('modalVerifiedAt').innerText = (g.verified_at || '—').slice(0, 16);
+              document.getElementById('modalSubmittedAt').innerText = (g.submitted_at || g.created_at || '—').slice(0, 16).replace('T', ' ');
+              document.getElementById('modalVerifiedAt').innerText = (g.verified_at || '—').slice(0, 16).replace('T', ' ');
 
               const st = (g.status || 'Pending').toLowerCase();
               let badgeHtml = '<span class="badge-pending">' + (g.status || 'Pending') + '</span>';
@@ -7179,28 +7403,36 @@ app.get('/admin', async (req, res) => {
               } else {
                 let docsHtml = '';
                 docs.forEach(d => {
-                  const isPdf = d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf');
+                  const isPdf = d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf') || (d.original_name && d.original_name.toLowerCase().endsWith('.pdf'));
                   const typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
                   const primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
+                  const missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Old Build)</span>' : '';
 
                   docsHtml += \`
                     <div class="doc-card">
                       <div>
-                        <div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px;">
-                          \${typeBadge} \${escapeHtml(d.original_name)} \${primaryTag}
+                        <div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                          \${typeBadge} \${escapeHtml(d.original_name)} \${primaryTag} \${missingTag}
                         </div>
                         <div style="font-size:12px; color:#64748b; margin-top:4px;">
                           \${d.file_size_formatted || ''} &bull; Uploaded \${d.created_at ? d.created_at.slice(0, 10) : ''}
                         </div>
                       </div>
-                      <div style="display:flex; gap:8px;">
-                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=preview" target="_blank" class="btn-view">📄 Preview PDF</a>
+                      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(\${d.id})">👁 View Here</button>
+                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=preview" target="_blank" class="btn-view" style="background:#475569;">↗ New Tab</a>
                         <a href="/admin/view_gst_doc?id=\${d.id}&mode=download" class="btn-dl">⬇ Download</a>
                       </div>
                     </div>
                   \`;
                 });
                 docsContainer.innerHTML = docsHtml;
+
+                // Automatically display the primary document in the inline preview viewer
+                const firstDoc = docs[0];
+                if (firstDoc) {
+                  showInlineDocPreview(firstDoc.id);
+                }
               }
 
               const logsContainer = document.getElementById('modalLogsList');
@@ -7211,7 +7443,7 @@ app.get('/admin', async (req, res) => {
                 logs.forEach(l => {
                   logsHtml += \`
                     <div class="log-row">
-                      <div style="color:#64748b; font-size:12px; min-width:130px;">\${escapeHtml((l.created_at || '').slice(0, 16))}</div>
+                      <div style="color:#64748b; font-size:12px; min-width:130px;">\${escapeHtml((l.created_at || '').slice(0, 16).replace('T', ' '))}</div>
                       <div style="flex:1;">
                         <strong>\${escapeHtml(l.action.toUpperCase())}</strong>
                         <span style="color:#64748b;">(\${escapeHtml(l.performer_role || 'seller')}):</span>
@@ -7223,6 +7455,14 @@ app.get('/admin', async (req, res) => {
                 });
                 logsContainer.innerHTML = logsHtml;
               }
+
+              if (autoShowReject) {
+                const b = document.getElementById('rejectBox');
+                if (b) {
+                  b.style.display = 'block';
+                  b.scrollIntoView({ behavior: 'smooth' });
+                }
+              }
             })
             .catch(err => {
               document.getElementById('gstModalLoading').innerText = 'Failed to load details: ' + err.message;
@@ -7231,6 +7471,7 @@ app.get('/admin', async (req, res) => {
 
         function closeGstModal() {
           document.getElementById('gstReviewModal').classList.remove('active');
+          document.getElementById('modalPreviewFrameWrap').innerHTML = '';
         }
 
         function toggleRejectBox() {
@@ -7376,17 +7617,20 @@ async function ensureGstTables(p) {
   }
 }
 
-// Secure directory for GST documents (not publicly accessible via web)
-const gstUploadDir = path.resolve(__dirname, 'uploads', 'secure_documents', 'gst');
-if (!fs.existsSync(gstUploadDir)) {
-  fs.mkdirSync(gstUploadDir, { recursive: true });
-}
-
-// Multer storage for GST documents
+// Multer storage for GST documents (uses persistent gstUploadDir configured above)
 const gstStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, gstUploadDir),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(gstUploadDir)) fs.mkdirSync(gstUploadDir, { recursive: true });
+    cb(null, gstUploadDir);
+  },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
+    let ext = path.extname(file.originalname || '').toLowerCase();
+    if (!ext) {
+      const mt = (file.mimetype || '').toLowerCase();
+      if (mt.includes('png')) ext = '.png';
+      else if (mt.includes('jpeg') || mt.includes('jpg')) ext = '.jpg';
+      else ext = '.pdf';
+    }
     const sellerId = req.user ? req.user.id : 'anon';
     const rand = crypto.randomBytes(4).toString('hex');
     cb(null, `gst_${sellerId}_${Date.now()}_${rand}${ext}`);
@@ -7452,7 +7696,8 @@ function formatGstDocumentRecord(doc, isAdmin = false) {
     : `/api/seller/gst/documents/${docId}/download`;
 
   const isPdf = (doc.mime_type && doc.mime_type.toLowerCase() === 'application/pdf') ||
-    (doc.original_name && doc.original_name.toLowerCase().endsWith('.pdf'));
+    (doc.original_name && doc.original_name.toLowerCase().endsWith('.pdf')) ||
+    (doc.file_name && doc.file_name.toLowerCase().endsWith('.pdf'));
 
   return {
     id: docId,
@@ -7493,16 +7738,23 @@ function streamGstDocumentFile(res, doc, mode = 'preview') {
     return res.status(404).json({ message: 'Document file not found on server.' });
   }
 
-  const mimeType = doc.mime_type || ((doc.file_name && doc.file_name.endsWith('.pdf')) ? 'application/pdf' : 'application/octet-stream');
-  const filename = doc.original_name || path.basename(filePath);
+  const mimeType = detectDocumentMimeType(doc, filePath);
+  const rawName = doc.original_name || path.basename(filePath) || 'document.pdf';
+  const safeAsciiName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
   const disposition = mode === 'download' ? 'attachment' : 'inline';
+  const stat = fs.statSync(filePath);
 
   res.setHeader('Content-Type', mimeType);
-  res.setHeader('Content-Disposition', `${disposition}; filename="${encodeURIComponent(filename)}"`);
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Content-Disposition', `${disposition}; filename="${safeAsciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
 
   const stream = fs.createReadStream(filePath);
+  stream.on('error', (err) => {
+    console.error('[GST Stream Error]:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to stream document file.' });
+  });
   stream.pipe(res);
 }
 
@@ -7526,7 +7778,44 @@ app.post(
     await ensureGstTables(pool);
     const sellerId = req.user.id;
     const body = req.body || {};
-    const files = req.files || [];
+    const files = Array.isArray(req.files) ? [...req.files] : [];
+
+    // Support base64 PDF / image uploads if sent via JSON instead of multipart/form-data
+    if (files.length === 0) {
+      const b64Raw = extractField(body, ['document_base64', 'pdf_base64', 'file_base64', 'document', 'certificate', 'gst_certificate', 'pdf', 'file']);
+      if (b64Raw && typeof b64Raw === 'string' && (b64Raw.startsWith('data:') || b64Raw.startsWith('JVBERi0') || b64Raw.length > 120)) {
+        try {
+          let mimeType = 'application/pdf';
+          let ext = '.pdf';
+          let cleanB64 = b64Raw.trim();
+          const dataUriMatch = cleanB64.match(/^data:([^;]+);base64,(.+)$/i);
+          if (dataUriMatch) {
+            mimeType = dataUriMatch[1].toLowerCase();
+            cleanB64 = dataUriMatch[2];
+            if (mimeType.includes('png')) ext = '.png';
+            else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = '.jpg';
+            else { mimeType = 'application/pdf'; ext = '.pdf'; }
+          }
+          const buf = Buffer.from(cleanB64, 'base64');
+          if (buf.length > 10 && buf.length <= 5 * 1024 * 1024) {
+            if (!fs.existsSync(gstUploadDir)) fs.mkdirSync(gstUploadDir, { recursive: true });
+            const origName = (extractField(body, ['original_name', 'filename', 'file_name']) || `GST_Document${ext}`).trim();
+            const storedName = `gst_${sellerId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+            const fullPath = path.join(gstUploadDir, storedName);
+            fs.writeFileSync(fullPath, buf);
+            files.push({
+              originalname: origName,
+              filename: storedName,
+              path: fullPath,
+              size: buf.length,
+              mimetype: mimeType
+            });
+          }
+        } catch (b64Err) {
+          console.warn('[GST Upload] Base64 parse ignored:', b64Err.message);
+        }
+      }
+    }
 
     // Optional fields (none are strictly required)
     const gstin = (extractField(body, ['gstin', 'gst_number', 'gstNumber', 'gst_registration_number']) || '').toUpperCase().trim();
@@ -7580,6 +7869,11 @@ app.post(
           if (isPrimary === 1) {
             await pool.query('UPDATE seller_gst_documents SET is_primary = 0 WHERE seller_id = ?', [sellerId]);
           }
+          const detectedMime = detectDocumentMimeType({
+            original_name: f.originalname,
+            file_name: f.filename,
+            mime_type: f.mimetype
+          }, f.path);
           const [docRes] = await pool.query(
             `INSERT INTO seller_gst_documents (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
@@ -7591,7 +7885,7 @@ app.post(
               f.filename,
               f.path,
               f.size,
-              f.mimetype,
+              detectedMime,
               isPrimary
             ]
           );
@@ -7605,7 +7899,7 @@ app.post(
               file_name: f.filename,
               file_path: f.path,
               file_size: f.size,
-              mime_type: f.mimetype,
+              mime_type: detectedMime,
               is_primary: 1
             };
           }
