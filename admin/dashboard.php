@@ -8,23 +8,44 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../helpers/gst.php';
+require_once __DIR__ . '/../api/products.php';
+require_once __DIR__ . '/../helpers/seller_deletion.php';
+
+$rawJwtToken = getBearerToken();
+$adminJwtPayload = !empty($rawJwtToken) ? verifyJwtToken((string) $rawJwtToken, getJwtSecret()) : null;
+$hasValidAdminJwt = is_array($adminJwtPayload) && strtolower((string) ($adminJwtPayload['role'] ?? '')) === 'admin';
+
 if (empty($_SESSION['admin_logged_in'])) {
-    if (!empty($_COOKIE['admin_logged_in'])) {
+    if ($hasValidAdminJwt) {
         $_SESSION['admin_logged_in'] = true;
+        $_SESSION['admin_id'] = (int) ($adminJwtPayload['id'] ?? 1);
+        $_SESSION['admin_email'] = $adminJwtPayload['email'] ?? ($_COOKIE['admin_email'] ?? 'admin@vendor.app');
     } else {
         header('Location: /admin/login');
         exit;
     }
 }
 
-require_once __DIR__ . '/../config/database.php';
-require_once __DIR__ . '/../helpers/auth.php';
-require_once __DIR__ . '/../helpers/gst.php';
-require_once __DIR__ . '/../api/products.php';
-
 $pdo = getDatabaseConnection();
 ensureGstTables($pdo);
 ensureProductCategoriesTable($pdo);
+ensureSellerDeletionSchemaPhp($pdo);
+
+if (!$hasValidAdminJwt && empty($_SERVER['HTTP_AUTHORIZATION']) && !headers_sent()) {
+    $mintedAdminJwt = createToken(
+        $pdo,
+        (int) ($_SESSION['admin_id'] ?? 1),
+        null,
+        'admin-dashboard',
+        $_SESSION['admin_email'] ?? 'admin@vendor.app',
+        'admin',
+        1
+    );
+    setcookie('admin_token', $mintedAdminJwt, time() + 86400 * 7, '/');
+}
 $success = null;
 $error = null;
 
@@ -93,7 +114,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $prevStatus = $gst['status'];
         $up = $pdo->prepare("
             UPDATE seller_gst_details
-            SET status = 'Approved', rejection_reason = NULL, verified_by = :admin, verified_at = NOW(), updated_at = NOW()
+            SET status = 'Approved', rejection_reason = NULL, verified_by = :admin, verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
             WHERE id = :id
         ");
         $up->execute([':admin' => $adminId, ':id' => $gst['id']]);
@@ -121,7 +142,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $prevStatus = $gst['status'];
             $up = $pdo->prepare("
                 UPDATE seller_gst_details
-                SET status = 'Rejected', rejection_reason = :reason, verified_by = :admin, verified_at = NOW(), updated_at = NOW()
+                SET status = 'Rejected', rejection_reason = :reason, verified_by = :admin, verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE id = :id
             ");
             $up->execute([':reason' => $reason, ':admin' => $adminId, ':id' => $gst['id']]);
@@ -193,7 +214,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
             $ins = $pdo->prepare("
                 INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-                VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', NOW(), NOW())
+                VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ");
             $ins->execute([
                 ':name' => $name,
@@ -303,7 +324,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $sql .= ", password = :password";
                     $params[':password'] = $passwordToUpdate;
                 }
-                $sql .= ", updated_at = NOW() WHERE id = :id";
+                $sql .= ", updated_at = CURRENT_TIMESTAMP WHERE id = :id";
                 $upd = $pdo->prepare($sql);
                 $upd->execute($params);
 
@@ -330,7 +351,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $error = 'A category with this name already exists.';
         } else {
             $slug = ensureUniqueCategorySlugPhp($pdo, toCategorySlugPhp($catName));
-            $insCat = $pdo->prepare("INSERT INTO categories (name, slug, description, icon, sort_order, is_active, created_at, updated_at) VALUES (:name, :slug, :desc, :icon, :sort, :active, NOW(), NOW())");
+            $insCat = $pdo->prepare("INSERT INTO categories (name, slug, description, icon, sort_order, is_active, created_at, updated_at) VALUES (:name, :slug, :desc, :icon, :sort, :active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
             $insCat->execute([
                 ':name' => $catName,
                 ':slug' => $slug,
@@ -374,7 +395,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
                 $updCat = $pdo->prepare("
                     UPDATE categories
-                    SET name = :name, slug = :slug, description = :desc, icon = :icon, sort_order = :sort, is_active = :active, updated_at = NOW()
+                    SET name = :name, slug = :slug, description = :desc, icon = :icon, sort_order = :sort, is_active = :active, updated_at = CURRENT_TIMESTAMP
                     WHERE id = :id
                 ");
                 $updCat->execute([
@@ -388,7 +409,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 ]);
 
                 if ($oldName !== $catName) {
-                    $syncProd = $pdo->prepare("UPDATE products SET category = :new_name, category_id = :cid, updated_at = NOW() WHERE category_id = :match_cid OR LOWER(category) = LOWER(:old_name)");
+                    $syncProd = $pdo->prepare("UPDATE products SET category = :new_name, category_id = :cid, updated_at = CURRENT_TIMESTAMP WHERE category_id = :match_cid OR LOWER(category) = LOWER(:old_name)");
                     $syncProd->execute([':new_name' => $catName, ':cid' => $catId, ':match_cid' => $catId, ':old_name' => $oldName]);
                 }
                 $success = "Category #{$catId} (\"{$catName}\") updated successfully!";
@@ -404,7 +425,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $currStmt->execute([':id' => $catId]);
     $existingCat = $currStmt->fetch(PDO::FETCH_ASSOC);
     if ($existingCat) {
-        $pdo->prepare("UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = :cid OR LOWER(category) = LOWER(:cname)")
+        $pdo->prepare("UPDATE products SET category = 'General', category_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE category_id = :cid OR LOWER(category) = LOWER(:cname)")
             ->execute([':cid' => $catId, ':cname' => $existingCat['name']]);
         $pdo->prepare("DELETE FROM categories WHERE id = :id")->execute([':id' => $catId]);
         $success = "Category \"{$existingCat['name']}\" deleted.";
@@ -422,7 +443,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $cStmt->execute([':id' => $targetCatId]);
         $catRow = $cStmt->fetch(PDO::FETCH_ASSOC);
         if ($catRow) {
-            $pdo->prepare("UPDATE products SET category = :cat, category_id = :cid, updated_at = NOW() WHERE id = :pid")
+            $pdo->prepare("UPDATE products SET category = :cat, category_id = :cid, updated_at = CURRENT_TIMESTAMP WHERE id = :pid")
                 ->execute([':cat' => $catRow['name'], ':cid' => (int) $catRow['id'], ':pid' => $prodId]);
             $success = "Product #{$prodId} category updated to \"{$catRow['name']}\"!";
         } else {
@@ -506,23 +527,40 @@ $gstSellersStmt = $pdo->query("
 ");
 $gstSellers = $gstSellersStmt ? $gstSellersStmt->fetchAll() : [];
 
-// Sellers list with product counts and document status
+// Sellers list with product counts, document status, account status & deletion request link
 $sellersStmt = $pdo->query("
     SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
+           COALESCE(u.account_status, 'ACTIVE') AS account_status,
+           u.deletion_requested_at, u.deleted_at,
            (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count,
            (SELECT g.status FROM seller_gst_details g WHERE g.seller_id = u.id LIMIT 1) AS doc_status,
-           (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id
+           (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id,
+           (SELECT sdr.id FROM seller_deletion_requests sdr WHERE sdr.seller_id = u.id AND sdr.status NOT IN ('DELETED', 'DELETION_REJECTED') ORDER BY sdr.id DESC LIMIT 1) AS active_deletion_request_id
     FROM users u
     WHERE u.role = 'seller'
     ORDER BY u.id DESC
-    LIMIT 50
+    LIMIT 100
 ");
 $sellers = $sellersStmt ? $sellersStmt->fetchAll() : [];
+
+$deletionData = deletionListRequestsPhp($pdo, []);
+$delRequests = $deletionData['requests'] ?? [];
+$delKpis = $deletionData['kpis'] ?? ['total' => 0, 'pending' => 0, 'processing' => 0, 'failed' => 0, 'on_hold' => 0, 'approved' => 0, 'deleted' => 0, 'rejected' => 0];
+$focusDeletionTab = str_contains($_SERVER['REQUEST_URI'] ?? '', 'seller-deletions') || (($_GET['tab'] ?? '') === 'seller-deletions');
 
 function formatBytesPhp($bytes): string {
     if (!$bytes) return '0 KB';
     if ($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
     return round($bytes / 1024, 1) . ' KB';
+}
+
+function delBadgeClassPhp(?string $statusOrColor): string {
+    $s = strtoupper(trim((string) $statusOrColor));
+    if ($s === 'GREEN' || in_array($s, ['SUCCESS', 'REFUND_SUCCESS', 'APPROVED_FOR_DELETION', 'DELETED', 'SETTLED', 'ACTIVE', 'RESOLVED'], true)) return 'del-badge del-green';
+    if ($s === 'BLUE' || str_contains($s, 'PROCESSING') || str_contains($s, 'VERIFICATION') || str_contains($s, 'REVIEW') || $s === 'LOCKED') return 'del-badge del-blue';
+    if ($s === 'RED' || str_contains($s, 'FAILED') || str_contains($s, 'REJECTED')) return 'del-badge del-red';
+    if ($s === 'ORANGE' || str_contains($s, 'HOLD') || $s === 'OPEN' || str_contains($s, 'REQUIRES_REVIEW')) return 'del-badge del-orange';
+    return 'del-badge del-yellow';
 }
 ?>
 <!doctype html>
@@ -534,21 +572,25 @@ function formatBytesPhp($bytes): string {
     <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
-        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; }
+        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
         .brand { font-size: 21px; font-weight: 800; }
-        .wrap { max-width: 1050px; margin: 32px auto; padding: 0 18px; }
+        .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; }
+        .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
+        .wrap { max-width: 1180px; margin: 28px auto; padding: 0 18px; }
         .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
         .stat { font-size: 32px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
         p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
         label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
-        input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
-        input:focus { border-color: #6366f1; }
+        input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
+        input:focus, textarea:focus, select:focus { border-color: #6366f1; }
         button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 12px 20px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
         button:hover, .btn:hover { background: #4a3cb8; }
+        button:disabled { opacity: 0.45; cursor: not-allowed; }
         table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
         th { color: #64748b; font-weight: 600; }
         .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
         .success { background: #ecfdf5; color: #047857; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
@@ -556,16 +598,33 @@ function formatBytesPhp($bytes): string {
         .logout-btn:hover { background: rgba(255,255,255,0.25); }
         .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .btn-sm:hover { background: #4f46e5; }
+        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; }
+        .btn-hold-sm:hover { background: #c2410c; }
+        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-del-req:hover { background: #fee2e2; }
         .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        .del-badge { font-weight: 700; font-size: 11px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+        .del-yellow { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
+        .del-blue { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
+        .del-green { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+        .del-red { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+        .del-orange { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
         /* Modal Styles */
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
         .modal-overlay.active { display: flex; }
         .modal-box { background: #fff; width: 92%; max-width: 650px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
-        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
+        .modal-box.wide { max-width: 1040px; }
+        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
         .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
         .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
         .modal-close:hover { color: #0f172a; }
         .modal-body { padding: 24px; }
+        .metric-mini { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+        .metric-mini .k { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
+        .metric-mini .v { font-size: 17px; font-weight: 800; color: #1e1b4b; margin-top: 3px; }
+        .ws-section { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #fff; }
+        .ws-section h4 { margin: 0 0 10px; color: #1e1b4b; font-size: 15px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .status-legend { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 6px; }
         .info-pill { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
         .info-pill-item { font-size: 12px; color: #64748b; }
         .info-pill-item strong { display: block; font-size: 14px; color: #1e293b; margin-top: 2px; }
@@ -604,14 +663,31 @@ function formatBytesPhp($bytes): string {
 <body>
     <header class="top">
         <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
+        <nav class="top-nav">
+            <a href="/admin#sellersSection" class="nav-pill <?= !$focusDeletionTab ? 'active' : '' ?>">Seller Management</a>
+            <a href="/admin/seller-deletions" class="nav-pill <?= $focusDeletionTab ? 'active' : '' ?>">Seller Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
+            <a href="/admin#gstSection" class="nav-pill">PDF Verifications</a>
+            <a href="/admin#categoriesSection" class="nav-pill">Categories</a>
+        </nav>
         <div>
             <span style="margin-right:15px; font-size:14px; opacity:.9;">Welcome, <?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?></span>
             <a href="/admin/logout" class="logout-btn">Sign out</a>
         </div>
     </header>
     <main class="wrap">
-        <h1>Dashboard</h1>
-        <p class="muted">Manage your marketplace sellers, GST verifications, and compliance.</p>
+        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+            <div>
+                <h1 style="margin-bottom:6px;"><?= $focusDeletionTab ? 'Seller Management → Seller Deletion Requests' : 'Dashboard' ?></h1>
+                <p class="muted" style="margin:0;">Manage marketplace sellers, Seller Account Deletion & Refund workflows, categories, and PDF verifications.</p>
+            </div>
+            <div class="status-legend">
+                <span class="del-badge del-yellow">PENDING</span>
+                <span class="del-badge del-blue">PROCESSING</span>
+                <span class="del-badge del-green">SUCCESS</span>
+                <span class="del-badge del-red">FAILED</span>
+                <span class="del-badge del-orange">ON HOLD</span>
+            </div>
+        </div>
 
         <?php if ($success): ?><div class="success"><?= htmlspecialchars($success) ?></div><?php endif; ?>
         <?php if ($error): ?><div class="error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
@@ -770,12 +846,12 @@ function formatBytesPhp($bytes): string {
             </table>
         </section>
 
-        <!-- Section 2: Seller Accounts Overview with Verification Status -->
-        <section class="card" style="margin-top:24px;">
+        <!-- Section 2: Seller Accounts Overview with Account Status & Deletion Controls -->
+        <section class="card" id="sellersSection" style="margin-top:24px;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
                 <div>
                     <h2>Seller Accounts</h2>
-                    <p class="muted">All registered sellers on Venter App with inventory counts and verification status.</p>
+                    <p class="muted">All registered sellers on Venter App with inventory counts, verification status, and deletion controls.</p>
                 </div>
             </div>
             <table>
@@ -787,19 +863,22 @@ function formatBytesPhp($bytes): string {
                         <th>Location</th>
                         <th>Products</th>
                         <th>Document Status</th>
+                        <th>Account Status</th>
                         <th>Created</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if (empty($sellers)): ?>
-                        <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
+                        <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
                     <?php else: ?>
                         <?php foreach ($sellers as $s): ?>
                             <?php
                                 $dSt = strtolower($s['doc_status'] ?? '');
                                 if ($dSt === 'resubmitted') $dSt = 'pending';
                                 $docBadgeClass = ($dSt === 'approved') ? 'badge-approved' : (($dSt === 'rejected') ? 'badge-rejected' : (($dSt === 'pending') ? 'badge-pending' : ''));
+                                $accStatus = strtoupper((string) ($s['account_status'] ?? 'ACTIVE'));
+                                $accBadgeCls = $accStatus === 'ACTIVE' ? 'del-badge del-green' : ($accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : ($accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
                             ?>
                             <tr>
                                 <td>#<?= $s['id'] ?></td>
@@ -822,9 +901,104 @@ function formatBytesPhp($bytes): string {
                                         <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
                                     <?php endif; ?>
                                 </td>
+                                <td><span class="<?= $accBadgeCls ?>"><?= htmlspecialchars($accStatus) ?></span></td>
                                 <td><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
                                 <td>
-                                    <button type="button" class="btn-sm" onclick='openSellerModal(<?= htmlspecialchars(json_encode($s, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>View / Edit</button>
+                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                                        <button type="button" class="btn-sm" onclick='openSellerModal(<?= htmlspecialchars(json_encode($s, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>View / Edit</button>
+                                        <?php if (!empty($s['active_deletion_request_id'])): ?>
+                                            <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(<?= (int) $s['active_deletion_request_id'] ?>)">Manage Deletion #<?= (int) $s['active_deletion_request_id'] ?></button>
+                                        <?php elseif ($accStatus !== 'DELETED'): ?>
+                                            <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(<?= (int) $s['id'] ?>)">Request Seller Deletion</button>
+                                        <?php endif; ?>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- Section 2B: Seller Management → Seller Deletion Requests -->
+        <section class="card" id="deletionRequestsSection" style="margin-top:24px; border-top: 4px solid #dc2626;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
+                <div>
+                    <h2>Seller Management → Seller Deletion Requests</h2>
+                    <p class="muted">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <div class="search-box" style="max-width:260px;">
+                        <input type="text" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
+                    </div>
+                    <button type="button" class="btn-sm" onclick="reloadDeletionRequestsList()">↻ Refresh</button>
+                </div>
+            </div>
+
+            <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap:10px; margin-bottom:14px;">
+                <div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal"><?= (int) ($delKpis['total'] ?? 0) ?></div></div>
+                <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Pending (Yellow)</div><div class="v" style="color:#b45309;" id="delKpiPending"><?= (int) ($delKpis['pending'] ?? 0) ?></div></div>
+                <div class="metric-mini" style="background:#eff6ff;"><div class="k" style="color:#1d4ed8;">Processing (Blue)</div><div class="v" style="color:#1d4ed8;" id="delKpiProcessing"><?= (int) ($delKpis['processing'] ?? 0) ?></div></div>
+                <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Failed (Red)</div><div class="v" style="color:#b91c1c;" id="delKpiFailed"><?= (int) ($delKpis['failed'] ?? 0) ?></div></div>
+                <div class="metric-mini" style="background:#fff7ed;"><div class="k" style="color:#c2410c;">On Hold (Orange)</div><div class="v" style="color:#c2410c;" id="delKpiHold"><?= (int) ($delKpis['on_hold'] ?? 0) ?></div></div>
+                <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Approved / Deleted</div><div class="v" style="color:#15803d;" id="delKpiApprovedDeleted"><?= (int) ($delKpis['approved'] ?? 0) + (int) ($delKpis['deleted'] ?? 0) ?></div></div>
+            </div>
+
+            <div class="tabs-bar" id="delFilterTabs">
+                <button type="button" class="tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
+                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Req ID</th>
+                        <th>Seller &amp; ID</th>
+                        <th>Requested Date</th>
+                        <th>Deletion Stage</th>
+                        <th>Status</th>
+                        <th>Metrics / Balance Snapshot</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="deletionRequestsTbody">
+                    <?php if (empty($delRequests)): ?>
+                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($delRequests as $dr): ?>
+                            <?php
+                                $snapMetrics = is_array($dr['metrics'] ?? null) ? $dr['metrics'] : [];
+                                $finSum = is_array($dr['financial_summary'] ?? null) ? $dr['financial_summary'] : [];
+                                $badgeCls = delBadgeClassPhp($dr['badge_color'] ?? $dr['status'] ?? 'PENDING');
+                                $searchTxt = strtolower(($dr['seller_name'] ?? '') . ' ' . ($dr['seller_email'] ?? '') . ' ' . ($dr['seller_phone'] ?? '') . ' ' . $dr['seller_id'] . ' ' . $dr['status'] . ' ' . $dr['stage']);
+                            ?>
+                            <tr class="del-req-row" data-status="<?= htmlspecialchars($dr['status']) ?>" data-search="<?= htmlspecialchars($searchTxt) ?>">
+                                <td><strong>#<?= (int) $dr['id'] ?></strong></td>
+                                <td>
+                                    <strong style="color:#1e1b4b;"><?= htmlspecialchars($dr['seller_name']) ?></strong>
+                                    <div style="font-size:12px; color:#64748b;">Seller ID #<?= (int) $dr['seller_id'] ?><?= !empty($dr['seller_phone']) ? ' &bull; ' . htmlspecialchars($dr['seller_phone']) : '' ?></div>
+                                    <?php if (!empty($dr['seller_email'])): ?>
+                                        <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($dr['seller_email']) ?></div>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <div style="font-size:13px;"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 0, 10)) ?></div>
+                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 11, 8)) ?></div>
+                                </td>
+                                <td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;"><?= htmlspecialchars($dr['stage']) ?></code></td>
+                                <td><span class="<?= $badgeCls ?>"><?= htmlspecialchars($dr['status']) ?></span></td>
+                                <td style="font-size:12px; color:#475569;">
+                                    Orders: <strong><?= (int) ($snapMetrics['total_orders'] ?? 0) ?></strong> &bull;
+                                    Balance: <strong>₹<?= number_format((float) ($finSum['available_seller_balance'] ?? $snapMetrics['seller_wallet_balance'] ?? 0), 2) ?></strong>
+                                </td>
+                                <td>
+                                    <button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(<?= (int) $dr['id'] ?>)">Manage Deletion</button>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
@@ -1241,6 +1415,34 @@ function formatBytesPhp($bytes): string {
         </div>
     </div>
 
+    <!-- Seller Deletion Preflight Modal -->
+    <div id="deletionPreflightModal" class="modal-overlay" onclick="if(event.target.id==='deletionPreflightModal') closeDeletionPreflightModal();">
+        <div class="modal-box wide">
+            <div class="modal-header">
+                <h3 id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
+                <button type="button" class="modal-close" onclick="closeDeletionPreflightModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="delPreflightLoading" style="text-align:center; padding:32px; color:#64748b;">Computing orders, refunds, payouts &amp; settlement snapshot...</div>
+                <div id="delPreflightBody" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Seller Deletion Review Workspace Modal -->
+    <div id="deletionWorkspaceModal" class="modal-overlay" onclick="if(event.target.id==='deletionWorkspaceModal') closeDeletionWorkspaceModal();">
+        <div class="modal-box wide">
+            <div class="modal-header">
+                <h3 id="delWsTitle">Seller Deletion Review Workspace</h3>
+                <button type="button" class="modal-close" onclick="closeDeletionWorkspaceModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="delWsLoading" style="text-align:center; padding:32px; color:#64748b;">Loading seller deletion workspace...</div>
+                <div id="delWsBody" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
     <script>
         function openCategoryModal(cat) {
             document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' — ' + (cat.name || '');
@@ -1298,7 +1500,7 @@ function formatBytesPhp($bytes): string {
 
         // GST Verification Table Filter by Status
         function filterGstRows(status, btn) {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('#gstSection .tab-btn').forEach(b => b.classList.remove('active'));
             if (btn) btn.classList.add('active');
 
             const rows = document.querySelectorAll('.gst-row');
@@ -1464,6 +1666,433 @@ function formatBytesPhp($bytes): string {
                 "'": '&#39;',
                 '"': '&quot;'
             }[tag] || tag));
+        }
+
+        // === Seller Deletion & Refund Management UI Controller ===
+        window._activeDelStatusFilter = 'all';
+        window._currentWsData = null;
+
+        function delStatusBadgeHtml(statusOrColor, textOverride) {
+            var s = String(statusOrColor || '').toUpperCase();
+            var cls = 'del-yellow';
+            if (s === 'GREEN' || s === 'SUCCESS' || s === 'REFUND_SUCCESS' || s === 'APPROVED_FOR_DELETION' || s === 'DELETED' || s === 'SETTLED' || s === 'ACTIVE' || s === 'RESOLVED') cls = 'del-green';
+            else if (s === 'BLUE' || s.indexOf('PROCESSING') !== -1 || s.indexOf('VERIFICATION') !== -1 || s.indexOf('REVIEW') !== -1 || s === 'LOCKED') cls = 'del-blue';
+            else if (s === 'RED' || s.indexOf('FAILED') !== -1 || s.indexOf('REJECTED') !== -1) cls = 'del-red';
+            else if (s === 'ORANGE' || s.indexOf('HOLD') !== -1 || s === 'OPEN' || s.indexOf('REQUIRES_REVIEW') !== -1) cls = 'del-orange';
+            return '<span class="del-badge ' + cls + '">' + escapeHtml(textOverride || statusOrColor || 'PENDING') + '</span>';
+        }
+
+        function fmtCur(v) {
+            return '₹' + Number(v || 0).toFixed(2);
+        }
+
+        function filterDeletionStatus(status, btn) {
+            window._activeDelStatusFilter = status || 'all';
+            document.querySelectorAll('#delFilterTabs .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            if (btn) btn.classList.add('active');
+            applyDeletionTableFilters();
+        }
+
+        function filterDeletionTableSearch(q) {
+            window._activeDelSearch = (q || '').toLowerCase().trim();
+            applyDeletionTableFilters();
+        }
+
+        function applyDeletionTableFilters() {
+            var st = window._activeDelStatusFilter || 'all';
+            var q = window._activeDelSearch || '';
+            document.querySelectorAll('.del-req-row').forEach(function(r) {
+                var rSt = r.getAttribute('data-status') || '';
+                var rTxt = r.getAttribute('data-search') || '';
+                var matchSt = (st === 'all' || rSt === st);
+                var matchQ = (!q || rTxt.indexOf(q) !== -1);
+                r.style.display = (matchSt && matchQ) ? '' : 'none';
+            });
+        }
+
+        function reloadDeletionRequestsList() {
+            fetch('/api/admin/seller-deletions', { credentials: 'same-origin' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data || !data.requests) return;
+                    var k = data.kpis || {};
+                    var el;
+                    if ((el = document.getElementById('delKpiTotal'))) el.innerText = Number(k.total || 0);
+                    if ((el = document.getElementById('delKpiPending'))) el.innerText = Number(k.pending || 0);
+                    if ((el = document.getElementById('delKpiProcessing'))) el.innerText = Number(k.processing || 0);
+                    if ((el = document.getElementById('delKpiFailed'))) el.innerText = Number(k.failed || 0);
+                    if ((el = document.getElementById('delKpiHold'))) el.innerText = Number(k.on_hold || 0);
+                    if ((el = document.getElementById('delKpiApprovedDeleted'))) el.innerText = Number(k.approved || 0) + Number(k.deleted || 0);
+
+                    var tbody = document.getElementById('deletionRequestsTbody');
+                    if (!tbody) return;
+                    if (data.requests.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                        return;
+                    }
+                    var html = '';
+                    data.requests.forEach(function(dr) {
+                        var snapM = dr.metrics || {};
+                        var finS = dr.financial_summary || {};
+                        var searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
+                        html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
+                            '<td><strong>#' + Number(dr.id) + '</strong></td>' +
+                            '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
+                            '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
+                            (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
+                            '</td>' +
+                            '<td><div style="font-size:13px;">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div style="font-size:11px; color:#94a3b8;">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
+                            '<td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">' + escapeHtml(dr.stage) + '</code></td>' +
+                            '<td>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</td>' +
+                            '<td style="font-size:12px; color:#475569;">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
+                            '<td><button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
+                            '</tr>';
+                    });
+                    tbody.innerHTML = html;
+                    applyDeletionTableFilters();
+                })
+                .catch(function() {});
+        }
+
+        function closeDeletionPreflightModal() {
+            document.getElementById('deletionPreflightModal').classList.remove('active');
+        }
+
+        function openDeletionPreflightModal(sellerId) {
+            document.getElementById('delPreflightTitle').innerText = 'Request Seller Deletion — Seller #' + sellerId;
+            document.getElementById('delPreflightLoading').style.display = 'block';
+            document.getElementById('delPreflightBody').style.display = 'none';
+            document.getElementById('deletionPreflightModal').classList.add('active');
+
+            fetch('/api/admin/seller-deletions/preflight/' + Number(sellerId), { credentials: 'same-origin' })
+                .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+                .then(function(resObj) {
+                    document.getElementById('delPreflightLoading').style.display = 'none';
+                    var bodyEl = document.getElementById('delPreflightBody');
+                    bodyEl.style.display = 'block';
+                    if (!resObj.ok || !resObj.d || !resObj.d.seller) {
+                        bodyEl.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:14px;border-radius:8px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
+                        return;
+                    }
+                    var s = resObj.d.seller;
+                    var m = resObj.d.metrics || {};
+                    var cards = [
+                        ['Total Products (Active / Total)', Number(m.active_products || 0) + ' / ' + Number(m.total_products || 0)],
+                        ['Total Orders', Number(m.total_orders || 0)],
+                        ['Pending Orders (Rule A)', Number(m.pending_orders || 0)],
+                        ['Confirmed / Accepted Orders (Rule B)', Number(m.confirmed_orders || 0)],
+                        ['Shipped Orders (Rule C)', Number(m.shipped_orders || 0)],
+                        ['Delivered Orders (Rule D)', Number(m.delivered_orders || 0)],
+                        ['Cancelled Orders (Rule E)', Number(m.cancelled_orders || 0)],
+                        ['Total Successful Payments', fmtCur(m.total_successful_payments || 0)],
+                        ['Pending Refunds', Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')'],
+                        ['Seller Wallet Balance', fmtCur(m.seller_wallet_balance || 0)],
+                        ['Pending Payouts', Number(m.pending_payouts_count || 0) + ' (' + fmtCur(m.pending_payouts_amount || 0) + ')'],
+                        ['Outstanding Commissions', fmtCur(m.outstanding_commissions || 0)],
+                        ['Open Disputes', Number(m.open_disputes_count || 0)]
+                    ];
+                    var html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
+                        '<div><strong style="font-size:16px;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
+                        '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '—') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
+                        '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div>' +
+                        '<div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(175px, 1fr));gap:10px;margin-bottom:16px;">';
+                    cards.forEach(function(c) {
+                        html += '<div class="metric-mini"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div>';
+                    });
+                    html += '</div>' +
+                        '<div style="background:#fffbeb;border:1px solid #fcd34d;padding:12px;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:14px;">' +
+                        'Submitting this request sets the seller account immediately to <strong>DELETION_PENDING</strong>, notifies the seller, and blocks new buyer orders without deleting any historical data.' +
+                        '</div>' +
+                        '<label>Deletion Request Reason *</label>' +
+                        '<input type="text" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255">' +
+                        '<label>Admin Remarks</label>' +
+                        '<textarea id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea>' +
+                        '<div id="preflightErrBox" style="color:#b91c1c;font-size:13px;margin-top:8px;"></div>' +
+                        '<div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end;">' +
+                        '<button type="button" onclick="closeDeletionPreflightModal()" style="background:#e2e8f0;color:#334155;">Cancel</button>' +
+                        '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" style="background:#dc2626;">Confirm Deletion Request (DELETION_PENDING)</button>' +
+                        '</div>';
+                    bodyEl.innerHTML = html;
+                })
+                .catch(function(err) {
+                    document.getElementById('delPreflightLoading').style.display = 'none';
+                    document.getElementById('delPreflightBody').style.display = 'block';
+                    document.getElementById('delPreflightBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+                });
+        }
+
+        function submitCreateDeletionRequest(sellerId) {
+            var reason = (document.getElementById('preflightReason') || {}).value || '';
+            var remarks = (document.getElementById('preflightRemarks') || {}).value || '';
+            var errBox = document.getElementById('preflightErrBox');
+            if (errBox) errBox.innerText = '';
+            fetch('/api/admin/seller-deletions', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ seller_id: sellerId, reason: reason, remarks: remarks })
+            })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(resObj) {
+                if (!resObj.ok) {
+                    if (errBox) errBox.innerText = (resObj.d && resObj.d.message) || 'Failed to create deletion request.';
+                    return;
+                }
+                closeDeletionPreflightModal();
+                reloadDeletionRequestsList();
+                if (resObj.d && resObj.d.deletion_request) {
+                    openDeletionWorkspaceModal(resObj.d.deletion_request.id);
+                }
+            })
+            .catch(function(err) {
+                if (errBox) errBox.innerText = err.message;
+            });
+        }
+
+        function closeDeletionWorkspaceModal() {
+            document.getElementById('deletionWorkspaceModal').classList.remove('active');
+        }
+
+        function openDeletionWorkspaceModal(reqId) {
+            document.getElementById('delWsTitle').innerText = 'Seller Deletion Request #' + Number(reqId);
+            document.getElementById('delWsLoading').style.display = 'block';
+            document.getElementById('delWsBody').style.display = 'none';
+            document.getElementById('deletionWorkspaceModal').classList.add('active');
+
+            fetch('/api/admin/seller-deletions/' + Number(reqId), { credentials: 'same-origin' })
+                .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+                .then(function(resObj) {
+                    document.getElementById('delWsLoading').style.display = 'none';
+                    var bodyEl = document.getElementById('delWsBody');
+                    bodyEl.style.display = 'block';
+                    if (!resObj.ok || !resObj.d || !resObj.d.deletion_request) {
+                        bodyEl.innerHTML = '<div style="color:#b91c1c;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load deletion request.') + '</div>';
+                        return;
+                    }
+                    renderDeletionWorkspace(resObj.d);
+                })
+                .catch(function(err) {
+                    document.getElementById('delWsLoading').style.display = 'none';
+                    document.getElementById('delWsBody').style.display = 'block';
+                    document.getElementById('delWsBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+                });
+        }
+
+        function runDelAction(reqId, subPath, bodyObj) {
+            var remarksInput = document.getElementById('wsAdminRemarks');
+            var payload = Object.assign({}, bodyObj || {});
+            if (remarksInput && remarksInput.value.trim() && !payload.remarks) {
+                payload.remarks = remarksInput.value.trim();
+            }
+            var msgBox = document.getElementById('wsFeedbackBox');
+            if (msgBox) msgBox.innerHTML = '<span style="color:#1d4ed8;">Processing action...</span>';
+
+            fetch('/api/admin/seller-deletions/' + Number(reqId) + '/' + subPath, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(resObj) {
+                if (!resObj.ok) {
+                    if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
+                    return;
+                }
+                if (resObj.d && resObj.d.deletion_request) {
+                    renderDeletionWorkspace(resObj.d, (resObj.d.message || 'Action completed.'));
+                }
+                reloadDeletionRequestsList();
+            })
+            .catch(function(err) {
+                if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
+            });
+        }
+
+        function handleSettlePayoutClick(reqId) {
+            var chk = document.getElementById('wsConfirmGatewaySettled');
+            var ref = document.getElementById('wsPayoutRef');
+            runDelAction(reqId, 'settle-payout', {
+                confirm_gateway_settled: Boolean(chk && chk.checked),
+                payout_reference: (ref && ref.value.trim()) || ''
+            });
+        }
+
+        function handleHoldClick(reqId) {
+            var reason = prompt('Enter reason for putting this seller deletion request ON HOLD:', 'Awaiting manual verification / return period');
+            if (reason === null) return;
+            runDelAction(reqId, 'hold', { reason: reason });
+        }
+
+        function handleRejectClick(reqId) {
+            var reason = prompt('Enter MANDATORY reason to REJECT seller deletion and restore seller to ACTIVE:', '');
+            if (!reason || !reason.trim()) return;
+            runDelAction(reqId, 'reject', { reason: reason.trim() });
+        }
+
+        function toggleFinalDeleteConfirm() {
+            var b = document.getElementById('wsFinalConfirmBox');
+            if (b) b.style.display = (b.style.display === 'none' || !b.style.display) ? 'block' : 'none';
+        }
+
+        function submitFinalDelete(reqId) {
+            var dr = (window._currentWsData && window._currentWsData.deletion_request) || {};
+            var phraseInput = document.getElementById('wsConfirmPhraseInput');
+            var phrase = phraseInput ? phraseInput.value.trim() : '';
+            runDelAction(reqId, 'final-delete', {
+                confirmation_token: dr.confirmation_token || '',
+                confirmation_phrase: phrase
+            });
+        }
+
+        function renderDeletionWorkspace(data, successBanner) {
+            window._currentWsData = data;
+            var dr = data.deletion_request || {};
+            var s = data.seller || {};
+            var m = data.metrics || {};
+            var set = data.settlement || {};
+            var orders = data.orders || [];
+            var refunds = data.refunds || [];
+            var payouts = data.payouts || [];
+            var disputes = data.disputes || [];
+            var checks = data.checks || [];
+            var logs = data.audit_logs || [];
+            var isTerminal = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED');
+
+            var html = '<div id="wsFeedbackBox">' +
+                (successBanner ? '<div style="background:#dcfce7;color:#15803d;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;">' + escapeHtml(successBanner) + '</div>' : '') +
+                '</div>';
+
+            html += '<div class="ws-section" style="background:#f8fafc;">' +
+                '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">' +
+                '<div>' +
+                '<div style="font-size:17px;font-weight:800;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span style="font-size:13px;color:#64748b;">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
+                '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '—') + ' &bull; Email: ' + escapeHtml(s.email || '—') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
+                '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '—') + '</div>' +
+                '</div>' +
+                '<div style="text-align:right;">' +
+                '<div style="margin-bottom:6px;">Stage: <code style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-weight:700;">' + escapeHtml(dr.stage) + '</code></div>' +
+                '<div>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</div>' +
+                '</div></div></div>';
+
+            html += '<div class="ws-section"><h4><span>6-Gate Verification Checklist</span><span>' +
+                (data.all_checks_passed ? delStatusBadgeHtml('GREEN', 'ALL CHECKS PASSED') : delStatusBadgeHtml('YELLOW', 'VERIFICATION INCOMPLETE')) +
+                '</span></h4><table><thead><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
+            checks.forEach(function(ck) {
+                html += '<tr><td><strong>' + escapeHtml(ck.label) + '</strong></td><td>' + delStatusBadgeHtml(ck.status, ck.status) + '</td></tr>';
+            });
+            html += '</tbody></table></div>';
+
+            html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
+                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+                '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'lock\', {})">Lock Account</button>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-orders\', { approve_accepted_cancellations: Boolean(document.getElementById(\'wsApproveRuleB\') && document.getElementById(\'wsApproveRuleB\').checked) })">Verify Orders</button>' +
+                '</div></h4>' +
+                '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
+                '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div>' +
+                '</div>';
+            if (orders.length > 0) {
+                html += '<table><thead><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
+                orders.forEach(function(o) {
+                    html += '<tr><td>#' + Number(o.id) + ' (' + escapeHtml(o.order_number || '') + ')</td>' +
+                        '<td><strong>' + escapeHtml(o.effective_status) + '</strong></td>' +
+                        '<td>' + escapeHtml(o.payment_method || '') + ' / ' + escapeHtml(o.payment_status || '') + '</td>' +
+                        '<td>' + fmtCur(o.seller_gross || 0) + '</td>' +
+                        '<td style="font-size:12px;">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
+                });
+                html += '</tbody></table>';
+            }
+            html += '</div>';
+
+            html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'process-refunds\', {})">Process Eligible Refunds (Razorpay)</button></h4>' +
+                '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
+            if (refunds.length === 0) {
+                html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
+            } else {
+                html += '<table><thead><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
+                refunds.forEach(function(rf) {
+                    html += '<tr><td>#' + Number(rf.id) + '</td><td>#' + Number(rf.order_id) + '</td><td>' + fmtCur(rf.eligible_refund_amount) + ' / ' + fmtCur(rf.refunded_amount) + '</td>' +
+                        '<td><code>' + escapeHtml(rf.gateway_refund_id || '—') + '</code></td>' +
+                        '<td>' + delStatusBadgeHtml(rf.badge_color || rf.status, rf.status) + '</td>' +
+                        '<td style="font-size:11px;color:#b91c1c;">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
+                });
+                html += '</tbody></table>';
+            }
+            html += '</div>';
+
+            html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-settlement\', {})">Verify Settlement</button></h4>' +
+                '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
+                '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
+                '<div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v" style="font-size:14px;">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div>' +
+                '<div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div>' +
+                '</div>' +
+                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:10px;">' +
+                '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;"><input type="checkbox" id="wsConfirmGatewaySettled" style="width:auto;" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
+                '<input type="text" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;padding:6px 10px;font-size:12px;">' +
+                '<button type="button" class="btn-approve-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
+                '</div>';
+            if (disputes.length > 0) {
+                html += '<table><thead><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+                disputes.forEach(function(dp) {
+                    var isOpen = ['OPEN', 'UNDER_REVIEW', 'ESCALATED'].indexOf(String(dp.status || '').toUpperCase()) !== -1;
+                    html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
+                        '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
+                        '<td>' + (isOpen && !isTerminal
+                            ? '<button type="button" class="btn-sm" onclick="runDelAction(' + Number(dr.id) + ', \'resolve-dispute\', { dispute_id: ' + Number(dp.id) + ', resolution: \'RESOLVED\', mark_delivered: true, close_return_window: true })">Mark Delivered &amp; Resolve</button>'
+                            : 'Resolved') + '</td></tr>';
+                });
+                html += '</tbody></table>';
+            }
+            html += '</div>';
+
+            html += '<div class="ws-section"><h4>Admin Decision &amp; Final Confirmation</h4>' +
+                '<label style="margin-top:0;">Admin Remarks</label>' +
+                '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
+                '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
+                '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'approve\', {})">✓ Approve Deletion</button>' +
+                '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleHoldClick(' + Number(dr.id) + ')">⏸ Put On Hold</button>' +
+                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleRejectClick(' + Number(dr.id) + ')">✕ Reject Request</button>' +
+                '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
+                '</div>' +
+                (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
+                '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
+                '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
+                '<p style="font-size:13px;color:#7f1d1d;margin:6px 0;">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
+                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+                '<input type="text" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
+                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
+                '</div></div></div>';
+
+            html += '<div class="ws-section"><h4>Admin Activity History (' + logs.length + ')</h4>';
+            if (logs.length === 0) {
+                html += '<div style="font-size:12px;color:#94a3b8;">No admin activity recorded yet.</div>';
+            } else {
+                logs.forEach(function(lg) {
+                    html += '<div class="log-row"><div style="color:#64748b;font-size:12px;min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
+                        '<div style="flex:1;"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div style="color:#475569;font-size:12px;">' + escapeHtml(lg.remarks || '') + '</div></div>' +
+                        '<div>' + delStatusBadgeHtml(lg.new_status || lg.new_stage || 'INFO', lg.new_status || lg.new_stage || '') + '</div></div>';
+                });
+            }
+            html += '</div>';
+
+            document.getElementById('delWsBody').innerHTML = html;
+        }
+
+        if (window.location.pathname.indexOf('seller-deletions') !== -1 || window.location.search.indexOf('seller-deletions') !== -1) {
+            window.addEventListener('DOMContentLoaded', function() {
+                var sec = document.getElementById('deletionRequestsSection');
+                if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth' });
+            });
         }
     </script>
 </body>

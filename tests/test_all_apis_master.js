@@ -9,7 +9,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'vendor_jwt_secret_key_987654321';
 
 // Generate standard tokens
 const tokenSeller1 = jwt.sign({ id: 1, role: 'seller', phone: '+919876543210' }, JWT_SECRET, { expiresIn: '1d' });
-const tokenSeller2 = jwt.sign({ id: 2, role: 'seller', phone: '+919633426254' }, JWT_SECRET, { expiresIn: '1d' });
+let tokenSeller2 = jwt.sign({ id: 2, role: 'seller', phone: '+919633426254' }, JWT_SECRET, { expiresIn: '1d' });
 const tokenSeller3 = jwt.sign({ id: 3, role: 'seller', phone: '+919876543212' }, JWT_SECRET, { expiresIn: '1d' });
 const tokenAdmin = jwt.sign({ id: 1, role: 'admin', phone: '+919876543210' }, JWT_SECRET, { expiresIn: '1d' });
 
@@ -476,6 +476,21 @@ async function runMasterTestSuite() {
     }
   });
   assert(resetPassRes.status === 200, 'POST /api/reset-password (phone) with valid token returns 200');
+
+  const staleSeller2Check = await dispatch(app, {
+    method: 'GET',
+    url: '/api/me',
+    headers: { authorization: `Bearer ${tokenSeller2}` }
+  });
+  assert(staleSeller2Check.status === 401, 'Prior Seller 2 JWT revoked after password reset (401)');
+
+  const loginAfterPhoneReset = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: { phone: '+919633426254', password: 'NewSecurePassword123!' }
+  });
+  assert(loginAfterPhoneReset.status === 200 && loginAfterPhoneReset.body.token, 'POST /api/login succeeds with new password after phone password reset');
+  tokenSeller2 = loginAfterPhoneReset.body.token;
 
   const forgotEmailRes = await dispatch(app, {
     method: 'POST',

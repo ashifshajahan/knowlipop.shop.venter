@@ -168,6 +168,12 @@ if ($requestUri === '/admin/login') {
     exit;
 }
 
+if ($requestUri === '/admin/seller-deletions') {
+    $_GET['tab'] = $_GET['tab'] ?? 'seller-deletions';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
 if ($requestUri === '/admin' || $requestUri === '/admin/dashboard' || $requestUri === '/admin/sellers') {
     require __DIR__ . '/admin/dashboard.php';
     exit;
@@ -189,11 +195,13 @@ require_once __DIR__ . '/api/seller.php';
 require_once __DIR__ . '/api/orders.php';
 require_once __DIR__ . '/api/invoice.php';
 require_once __DIR__ . '/api/gst.php';
+require_once __DIR__ . '/api/seller_deletion.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
     $dbStatus = 'connected';
     $dbError = null;
+    $dbCfg = getDatabaseConfig();
     try {
         $checkPdo = getDatabaseConnection();
         $checkPdo->query('SELECT 1');
@@ -208,6 +216,8 @@ if ($requestUri === '/api/health') {
         'engine' => 'Pure PHP',
         'database' => [
             'status' => $dbStatus,
+            'host' => $dbCfg['host'] ?? '127.0.0.1',
+            'name' => $dbCfg['name'] ?? 'u999617803_knowlipop1',
             ...( $dbError ? ['error' => $dbError] : [] )
         ]
     ], $dbStatus === 'connected' ? 200 : 503);
@@ -657,6 +667,124 @@ if (preg_match('#^/api/admin/sellers/gst/documents/(\d+)/(preview|download)$#', 
     }
 }
 
+// ==========================================
+// Admin Seller Account Deletion & Refund Routes
+// ==========================================
+
+if ($requestUri === '/api/admin/seller-deletions') {
+    if ($method === 'GET') {
+        apiAdminListSellerDeletions($pdo);
+    } elseif ($method === 'POST') {
+        apiAdminCreateSellerDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/preflight/(\d+)$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiAdminSellerDeletionPreflight($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiAdminGetSellerDeletionDetail($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/lock$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminLockSellerAccount($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/verify-orders$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminVerifySellerDeletionOrders($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/refunds$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiAdminGetSellerDeletionRefunds($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/process-refunds$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminProcessSellerDeletionRefunds($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/verify-settlement$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminVerifySellerDeletionSettlement($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/settle-payout$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminSettleSellerDeletionPayout($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/resolve-dispute$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminResolveSellerDeletionDispute($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/approve$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminApproveSellerDeletion($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/reject$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminRejectSellerDeletion($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/hold$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminHoldSellerDeletion($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/final-delete$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminFinalDeleteSeller($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 // Buyer Orders & Order Items CRUD (supports /api/orders and /api/order)
 if ($requestUri === '/api/orders' || $requestUri === '/api/order') {
     if ($method === 'GET') {
@@ -673,6 +801,23 @@ if (preg_match('#^(?:/api/orders?/([^/]+)/invoice|/invoice/([^/]+))$#', $request
     $orderParam = trim(!empty($matches[1]) ? $matches[1] : $matches[2]);
     if ($method === 'GET') {
         apiGenerateOrderInvoice($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Payment capture verification & Customer Dispute creation on an order
+if (preg_match('#^/api/orders?/([^/]+)/payment-verify$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiOrderPaymentVerify($pdo, trim($matches[1]));
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/orders?/([^/]+)/disputes$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiOrderCreateDispute($pdo, trim($matches[1]));
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }

@@ -7,27 +7,25 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../helpers/seller_deletion.php';
 require_once __DIR__ . '/auth.php';
 
 function hasUserColumn(PDO $pdo, string $column): bool
 {
-    static $columns = null;
-    if ($columns === null) {
-        try {
-            $stmt = $pdo->query("SHOW COLUMNS FROM users");
-            $columns = $stmt->fetchAll(PDO::FETCH_COLUMN, 0);
-        } catch (Throwable $e) {
-            $columns = [];
-        }
-    }
-    return in_array($column, $columns, true);
+    return dbHasColumnPhp($pdo, 'users', $column);
 }
 
 function ensureUserColumns(PDO $pdo): void
 {
+    ensureSellerDeletionSchemaPhp($pdo);
     try {
         if (!hasUserColumn($pdo, 'avatar_url')) {
-            $pdo->exec("ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER country");
+            $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+            if ($driver === 'sqlite') {
+                $pdo->exec("ALTER TABLE users ADD COLUMN avatar_url TEXT NULL");
+            } else {
+                $pdo->exec("ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER country");
+            }
         }
     } catch (Throwable $e) {
         // Silently continue if permissions restrict ALTER
@@ -116,6 +114,11 @@ function apiGetSellerProfile(PDO $pdo): void
         if (!$user) {
             errorResponse('Seller not found.', [], 404);
         }
+        $caller = getAuthenticatedUserOptional($pdo);
+        $isAdminCaller = $caller && (($caller['role'] ?? '') === 'admin');
+        if (!$isAdminCaller && strtoupper((string) ($user['account_status'] ?? 'ACTIVE')) === 'DELETED') {
+            errorResponse('Seller not found.', [], 404);
+        }
     } else {
         $user = authenticateUser($pdo);
         $sellerId = (int) $user['id'];
@@ -146,6 +149,12 @@ function apiGetSellerById(PDO $pdo, int $sellerId): void
         errorResponse('Seller not found.', [], 404);
     }
 
+    $caller = getAuthenticatedUserOptional($pdo);
+    $isAdminCaller = $caller && (($caller['role'] ?? '') === 'admin');
+    if (!$isAdminCaller && strtoupper((string) ($user['account_status'] ?? 'ACTIVE')) === 'DELETED') {
+        errorResponse('Seller not found.', [], 404);
+    }
+
     $sellerData = safeSeller($user);
 
     jsonResponse([
@@ -167,7 +176,16 @@ function apiGetSellersList(PDO $pdo): void
     $offset = ($page - 1) * $limit;
     $search = trim($_GET['search'] ?? $_GET['q'] ?? '');
 
+    $caller = getAuthenticatedUserOptional($pdo);
+    $isAdminCaller = $caller && (($caller['role'] ?? '') === 'admin');
+    $includeDeleted = $isAdminCaller && !empty($_GET['include_deleted']);
+
     $where = "WHERE (role = 'seller' OR role = 'admin')";
+    if (!$includeDeleted) {
+        $where .= $isAdminCaller
+            ? " AND COALESCE(account_status, 'ACTIVE') != 'DELETED'"
+            : " AND COALESCE(account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
+    }
     $params = [];
 
     if ($search !== '') {
@@ -183,7 +201,7 @@ function apiGetSellersList(PDO $pdo): void
     $total = (int) $countStmt->fetchColumn();
 
     $sql = "
-        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, u.created_at, u.updated_at,
+        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, COALESCE(u.account_status, 'ACTIVE') AS account_status, u.created_at, u.updated_at,
                (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
         FROM users u
         {$where}
@@ -225,6 +243,7 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
 {
     ensureUserColumns($pdo);
     $currentUser = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($currentUser);
 
     // Authorization: seller can edit their own profile, or an admin can edit any profile
     if ($targetId !== null && (int)$currentUser['id'] !== $targetId && ($currentUser['role'] ?? '') !== 'admin') {
@@ -367,7 +386,7 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     }
 
     if (!empty($updates)) {
-        $updates[] = "updated_at = NOW()";
+        $updates[] = "updated_at = CURRENT_TIMESTAMP";
         $sql = "UPDATE users SET " . implode(', ', $updates) . " WHERE id = :id";
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
@@ -393,7 +412,9 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
  */
 function apiChangePassword(PDO $pdo): void
 {
+    ensureUserColumns($pdo);
     $currentUser = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($currentUser);
     $sellerId = (int) $currentUser['id'];
 
     $fetchStmt = $pdo->prepare("SELECT id, password FROM users WHERE id = :id LIMIT 1");
@@ -433,7 +454,7 @@ function apiChangePassword(PDO $pdo): void
     }
 
     $hashed = hashPassword($newPassword);
-    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = NOW() WHERE id = :id");
+    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
     $upd->execute([':password' => $hashed, ':id' => $sellerId]);
 
     jsonResponse([

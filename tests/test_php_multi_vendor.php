@@ -260,8 +260,8 @@ $res7 = runPhpSubprocess('get_seller_products', [
     'REQUEST_METHOD' => 'GET',
     'HTTP_AUTHORIZATION' => "Bearer {$token2}"
 ]);
-assertTest(isset($res7['json']['products']['data']), "Seller 2 catalog retrieved");
-$s2Prods = $res7['json']['products']['data'];
+$s2Prods = $res7['json']['data'] ?? ($res7['json']['products']['data'] ?? null);
+assertTest(is_array($s2Prods), "Seller 2 catalog retrieved", $res7);
 assertTest(count($s2Prods) === 1 && (int)$s2Prods[0]['seller_id'] === 2, "Seller 2 only sees their product (id 7)");
 
 // Seller 2 attempts to update Seller 1's product (id: 1)

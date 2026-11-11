@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "c1f7a83d-9472-4b36-a971-897db6743912",
     "name": "Vendor App API — Complete Postman Collection (2026)",
-    "description": "Comprehensive Postman Collection for the Vendor App Dual Engine (Pure PHP + Node.js) REST API on https://knowlipop.shop. Contains all endpoints for Authentication, Seller Profiles, Products Catalog, Banking/Payouts, Buyer Orders (without buyer email), and Provider Invoices (main production host https://knowlipop.shop).",
+    "description": "Comprehensive Postman Collection for the Vendor App Dual Engine (Pure PHP + Node.js) REST API on https://knowlipop.shop. Contains all endpoints for Authentication, Seller Profiles, Products Catalog & WebP Media, Banking/Payouts, Buyer Orders (without buyer email), Provider Invoices, and Admin Seller Deletion & Refund Management.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -19,10 +19,52 @@
       "description": "Bearer JWT Authentication Token auto-set on Login / Register"
     },
     {
+      "key": "seller_phone",
+      "value": "+919876543210",
+      "type": "string",
+      "description": "Registered seller phone number"
+    },
+    {
+      "key": "seller_email",
+      "value": "seller@apextech.example.com",
+      "type": "string",
+      "description": "Registered seller email address"
+    },
+    {
+      "key": "seller_password",
+      "value": "Password123!",
+      "type": "string",
+      "description": "Active seller password updated automatically across reset and change-password steps"
+    },
+    {
+      "key": "otp_code",
+      "value": "123456",
+      "type": "string",
+      "description": "OTP captured from /api/forgot-password dev_otp"
+    },
+    {
+      "key": "reset_token",
+      "value": "",
+      "type": "string",
+      "description": "Reset token captured from /api/verify-otp"
+    },
+    {
       "key": "product_id",
       "value": "1",
       "type": "string",
       "description": "Sample Product ID"
+    },
+    {
+      "key": "active_product_id",
+      "value": "1",
+      "type": "string",
+      "description": "Active Seller Product ID preserved across order placement"
+    },
+    {
+      "key": "temp_product_id",
+      "value": "1",
+      "type": "string",
+      "description": "Disposable Product ID used for DELETE verification"
     },
     {
       "key": "order_id",
@@ -35,6 +77,36 @@
       "value": "1",
       "type": "string",
       "description": "Sample Seller ID"
+    },
+    {
+      "key": "admin_token",
+      "value": "",
+      "type": "string",
+      "description": "Admin Bearer JWT auto-set on Admin Login"
+    },
+    {
+      "key": "deletion_request_id",
+      "value": "1",
+      "type": "string",
+      "description": "Active Seller Deletion Request ID"
+    },
+    {
+      "key": "confirmation_token",
+      "value": "",
+      "type": "string",
+      "description": "Single-use final delete confirmation token issued on Step-1 Approval"
+    },
+    {
+      "key": "dispute_id",
+      "value": "1",
+      "type": "string",
+      "description": "Order Dispute ID"
+    },
+    {
+      "key": "razorpay_payment_id",
+      "value": "pay_demo_capture_001",
+      "type": "string",
+      "description": "Captured Razorpay Payment ID"
     }
   ],
   "item": [
@@ -97,7 +169,23 @@
               ]
             },
             "description": "Returns the main web dashboard overview and server engine status badge."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Landing portal displays backend branding', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Vendor App Backend');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Buyer Module Hub (Interactive Order Studio)",
@@ -114,7 +202,23 @@
               ]
             },
             "description": "Interactive HTML5 Buyer test hub for browsing catalog, managing item quantities, placing test orders without email, and generating invoices."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Buyer Hub page loaded', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Buyer Hub');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Firebase OTP Tester Hub",
@@ -131,7 +235,23 @@
               ]
             },
             "description": "Live Firebase Phone OTP and Recaptcha testing interface."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Firebase Tester page loaded', function () {",
+                  "    pm.expect(pm.response.text()).to.include('Firebase');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },
@@ -154,7 +274,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions\",\n  \"email\": \"seller@apextech.example.com\",\n  \"phone\": \"+919876543210\",\n  \"address\": \"402 Cyber Heights, MG Road\",\n  \"landmark\": \"Near Trinity Metro\",\n  \"state\": \"Karnataka\",\n  \"country\": \"India\",\n  \"password\": \"Password123!\",\n  \"password_confirmation\": \"Password123!\"\n}"
+              "raw": "{\n  \"seller_name\": \"Apex Tech Solutions\",\n  \"email\": \"{{seller_email}}\",\n  \"phone\": \"{{seller_phone}}\",\n  \"address\": \"402 Cyber Heights, MG Road\",\n  \"landmark\": \"Near Trinity Metro\",\n  \"state\": \"Karnataka\",\n  \"country\": \"India\",\n  \"password\": \"{{seller_password}}\",\n  \"password_confirmation\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/register",
@@ -170,73 +290,44 @@
           },
           "event": [
             {
-              "listen": "test",
+              "listen": "prerequest",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 201 or 200\", function () {",
-                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                  "});",
-                  "var jsonData = pm.response.json();",
-                  "if (jsonData.token) {",
-                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
-                  "    if (pm.environment) pm.environment.set(\"token\", jsonData.token);",
-                  "}",
-                  "if (jsonData.user && jsonData.user.id) {",
-                  "    pm.collectionVariables.set(\"seller_id\", String(jsonData.user.id));",
-                  "    if (pm.environment) pm.environment.set(\"seller_id\", String(jsonData.user.id));",
+                  "var randomSuffix = Math.floor(10000000 + Math.random() * 89999999);",
+                  "var phone = '+9197' + randomSuffix;",
+                  "var email = 'apextech_' + randomSuffix + '_' + Date.now() + '@example.com';",
+                  "var password = 'Password123!';",
+                  "pm.collectionVariables.set('seller_phone', phone);",
+                  "pm.collectionVariables.set('seller_email', email);",
+                  "pm.collectionVariables.set('seller_password', password);",
+                  "if (pm.environment) {",
+                  "    pm.environment.set('seller_phone', phone);",
+                  "    pm.environment.set('seller_email', email);",
+                  "    pm.environment.set('seller_password', password);",
                   "}"
                 ],
                 "type": "text/javascript"
               }
-            }
-          ]
-        },
-        {
-          "name": "Seller Login",
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"email\": \"seller@example.com\",\n  \"phone\": \"+919876543210\",\n  \"password\": \"Password123!\"\n}"
             },
-            "url": {
-              "raw": "{{base_url}}/api/login",
-              "host": [
-                "{{base_url}}"
-              ],
-              "path": [
-                "api",
-                "login"
-              ]
-            },
-            "description": "Authenticates a seller with email or phone (email only, phone only, both matching, or a single identifier/login/email_or_phone field) and password, returning a JWT token."
-          },
-          "event": [
             {
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
-                  "    pm.response.to.have.status(200);",
+                  "pm.test('Status code is 201 or 200', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Returns Bearer token and user ID', function () {",
+                  "    pm.expect(jsonData.token).to.be.a('string');",
+                  "    pm.expect(jsonData.user.id).to.be.a('number');",
+                  "});",
                   "if (jsonData.token) {",
-                  "    pm.collectionVariables.set(\"token\", jsonData.token);",
-                  "    if (pm.environment) pm.environment.set(\"token\", jsonData.token);",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    if (pm.environment) pm.environment.set('token', jsonData.token);",
                   "}",
                   "if (jsonData.user && jsonData.user.id) {",
-                  "    pm.collectionVariables.set(\"seller_id\", String(jsonData.user.id));",
-                  "    if (pm.environment) pm.environment.set(\"seller_id\", String(jsonData.user.id));",
+                  "    pm.collectionVariables.set('seller_id', String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set('seller_id', String(jsonData.user.id));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -275,13 +366,16 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Returns email channel and OTP code', function () {",
+                  "    pm.expect(jsonData.channel).to.eql('email');",
+                  "});",
                   "if (jsonData.dev_otp) {",
-                  "    pm.collectionVariables.set(\"otp_code\", jsonData.dev_otp);",
-                  "    if (pm.environment) pm.environment.set(\"otp_code\", jsonData.dev_otp);",
+                  "    pm.collectionVariables.set('otp_code', String(jsonData.dev_otp));",
+                  "    if (pm.environment) pm.environment.set('otp_code', String(jsonData.dev_otp));",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -320,13 +414,16 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Reset token issued', function () {",
+                  "    pm.expect(jsonData.reset_token).to.be.a('string');",
+                  "});",
                   "if (jsonData.reset_token) {",
-                  "    pm.collectionVariables.set(\"reset_token\", jsonData.reset_token);",
-                  "    if (pm.environment) pm.environment.set(\"reset_token\", jsonData.reset_token);",
+                  "    pm.collectionVariables.set('reset_token', jsonData.reset_token);",
+                  "    if (pm.environment) pm.environment.set('reset_token', jsonData.reset_token);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -346,7 +443,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"new_password\": \"NewPassword2026!\",\n  \"confirm_password\": \"NewPassword2026!\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"new_password\": \"{{seller_password}}\",\n  \"confirm_password\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/reset-password",
@@ -358,30 +455,92 @@
                 "reset-password"
               ]
             },
-            "description": "Resets password for email or phone account using reset_token (or Firebase oob_code / id_token)."
-          }
+            "description": "Resets password for email or phone account using reset_token (or Firebase oob_code / id_token) and bumps token_version."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "pm.collectionVariables.set('seller_password', 'NewPassword2026!');",
+                  "if (pm.environment) pm.environment.set('seller_password', 'NewPassword2026!');"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Password reset confirmation returned', function () {",
+                  "    pm.expect(jsonData.message).to.include('successful');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
-          "name": "Logout",
+          "name": "Seller Login",
           "request": {
             "method": "POST",
             "header": [
               {
-                "key": "Authorization",
-                "value": "Bearer {{token}}"
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
               }
             ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{seller_email}}\",\n  \"phone\": \"{{seller_phone}}\",\n  \"password\": \"{{seller_password}}\"\n}"
+            },
             "url": {
-              "raw": "{{base_url}}/api/logout",
+              "raw": "{{base_url}}/api/login",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
                 "api",
-                "logout"
+                "login"
               ]
+            },
+            "description": "Authenticates a seller with email and/or phone after password reset and refreshes JWT token in {{token}}."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Fresh JWT token returned', function () {",
+                  "    pm.expect(jsonData.token).to.be.a('string');",
+                  "    pm.expect(jsonData.token_type).to.eql('Bearer');",
+                  "});",
+                  "if (jsonData.token) {",
+                  "    pm.collectionVariables.set('token', jsonData.token);",
+                  "    if (pm.environment) pm.environment.set('token', jsonData.token);",
+                  "}",
+                  "if (jsonData.user && jsonData.user.id) {",
+                  "    pm.collectionVariables.set('seller_id', String(jsonData.user.id));",
+                  "    if (pm.environment) pm.environment.set('seller_id', String(jsonData.user.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
             }
-          }
+          ]
         }
       ]
     },
@@ -412,7 +571,25 @@
                 "me"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Returns authenticated seller profile', function () {",
+                  "    pm.expect(jsonData.seller).to.be.an('object');",
+                  "    pm.expect(jsonData.seller.id).to.be.a('number');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Update Profile Details (/api/me)",
@@ -442,7 +619,25 @@
                 "me"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Seller profile updated accurately', function () {",
+                  "    pm.expect(jsonData.seller).to.be.an('object');",
+                  "    pm.expect(jsonData.seller.seller_name).to.eql('Apex Tech Solutions Pvt Ltd');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Change Password (Authenticated)",
@@ -460,7 +655,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"current_password\": \"Password123!\",\n  \"new_password\": \"UpdatedPass2026!\",\n  \"confirm_password\": \"UpdatedPass2026!\"\n}"
+              "raw": "{\n  \"current_password\": \"{{seller_password}}\",\n  \"new_password\": \"UpdatedPass2026!\",\n  \"confirm_password\": \"UpdatedPass2026!\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/seller/change-password",
@@ -473,7 +668,26 @@
                 "change-password"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Password changed confirmation returned', function () {",
+                  "    pm.expect(jsonData.message).to.include('successfully');",
+                  "});",
+                  "pm.collectionVariables.set('seller_password', 'UpdatedPass2026!');",
+                  "if (pm.environment) pm.environment.set('seller_password', 'UpdatedPass2026!');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Get Public Sellers Directory",
@@ -500,7 +714,24 @@
                 }
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Returns sellers directory array', function () {",
+                  "    pm.expect(jsonData.sellers.data).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Get Seller Details by ID",
@@ -518,7 +749,25 @@
                 "{{seller_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Returns matched seller record', function () {",
+                  "    pm.expect(jsonData.seller).to.be.an('object');",
+                  "    pm.expect(String(jsonData.seller.id)).to.eql(pm.collectionVariables.get('seller_id'));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },
@@ -560,6 +809,9 @@
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
+                  "pm.test('Products paginated array returned', function () {",
+                  "    pm.expect(jsonData.products.data).to.be.an('array');",
+                  "});",
                   "var items = jsonData.products && jsonData.products.data ? jsonData.products.data : [];",
                   "if (items.length > 0) {",
                   "    pm.collectionVariables.set('product_id', String(items[0].id));",
@@ -586,7 +838,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50,\n  \"image_url\": \"https://knowlipop.shop/uploads/products/placeholder.jpg\"\n}"
+              "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (2026 Edition)\",\n  \"description\": \"Active noise cancelling over-ear headphones with 40-hour battery life.\",\n  \"price\": 1000.00,\n  \"stock\": 50\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/products",
@@ -604,22 +856,29 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 201 or 200\", function () {",
+                  "pm.test('Status code is 201 or 200', function () {",
                   "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test(\"Product presentation price computed from base 1000\", function () {",
+                  "pm.test('Seller pricing and estimated marketplace fee calculated accurately', function () {",
                   "    var p = jsonData.product;",
                   "    pm.expect(p.seller_price).to.eql('1000.00');",
-                  "    pm.expect(p.commission).to.eql('50.00');",
-                  "    pm.expect(p.delivery_charge).to.eql('50.00');",
-                  "    pm.expect(p.gst).to.eql('18.00');",
-                  "    pm.expect(p.other_charges).to.eql('20.00');",
-                  "    pm.expect(p.price).to.eql('1138.00');",
+                  "    pm.expect(p.price).to.eql('1000.00');",
+                  "    pm.expect(p.selling_price).to.eql('1000.00');",
+                  "    pm.expect(p.mrp).to.eql('1300.00');",
+                  "    pm.expect(p.discount_percent).to.eql(23);",
+                  "    pm.expect(p.commission_rate).to.eql('5%');",
+                  "    pm.expect(p.estimated_fee).to.eql('50.00');",
+                  "    pm.expect(p.estimated_payout).to.eql('950.00');",
                   "});",
                   "if (jsonData.product && jsonData.product.id) {",
-                  "    pm.collectionVariables.set(\"product_id\", String(jsonData.product.id));",
-                  "    if (pm.environment) pm.environment.set(\"product_id\", String(jsonData.product.id));",
+                  "    var idStr = String(jsonData.product.id);",
+                  "    pm.collectionVariables.set('product_id', idStr);",
+                  "    pm.collectionVariables.set('active_product_id', idStr);",
+                  "    if (pm.environment) {",
+                  "        pm.environment.set('product_id', idStr);",
+                  "        pm.environment.set('active_product_id', idStr);",
+                  "    }",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -633,17 +892,34 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "raw": "{{base_url}}/api/products/{{active_product_id}}",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
                 "api",
                 "products",
-                "{{product_id}}"
+                "{{active_product_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Returns matching product details', function () {",
+                  "    pm.expect(String(jsonData.product.id)).to.eql(pm.collectionVariables.get('active_product_id'));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Update Product by ID",
@@ -664,14 +940,14 @@
               "raw": "{\n  \"name\": \"Smart Wireless Headset Pro (Special Edition)\",\n  \"price\": 1000.00,\n  \"stock\": 65\n}"
             },
             "url": {
-              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "raw": "{{base_url}}/api/products/{{active_product_id}}",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
                 "api",
                 "products",
-                "{{product_id}}"
+                "{{active_product_id}}"
               ]
             }
           },
@@ -680,14 +956,15 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200 OK\", function () {",
+                  "pm.test('Status code is 200 OK', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test(\"Updated product presentation price is 1138.00\", function () {",
+                  "pm.test('Updated product pricing matches seller payout model', function () {",
                   "    var p = jsonData.product;",
                   "    pm.expect(p.seller_price).to.eql('1000.00');",
-                  "    pm.expect(p.price).to.eql('1138.00');",
+                  "    pm.expect(p.price).to.eql('1000.00');",
+                  "    pm.expect(p.estimated_payout).to.eql('950.00');",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -723,7 +1000,78 @@
                 "upload"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 Created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Uploaded image converted and stored as .webp', function () {",
+                  "    pm.expect(jsonData.success).to.eql(true);",
+                  "    pm.expect(jsonData.mime_type).to.eql('image/webp');",
+                  "    pm.expect(jsonData.image_url).to.include('.webp');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Disposable Product for Deletion",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Disposable Test Cable\",\n  \"description\": \"Temporary product created to test DELETE without deleting active_product_id.\",\n  \"price\": 499.00,\n  \"stock\": 10\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/products",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 Created', function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Disposable product ID captured', function () {",
+                  "    pm.expect(jsonData.product.id).to.be.a('number');",
+                  "});",
+                  "if (jsonData.product && jsonData.product.id) {",
+                  "    var idStr = String(jsonData.product.id);",
+                  "    pm.collectionVariables.set('temp_product_id', idStr);",
+                  "    if (pm.environment) pm.environment.set('temp_product_id', idStr);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Delete Product by ID",
@@ -736,17 +1084,34 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/api/products/{{product_id}}",
+              "raw": "{{base_url}}/api/products/{{temp_product_id}}",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
                 "api",
                 "products",
-                "{{product_id}}"
+                "{{temp_product_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Disposable product deleted while active_product_id preserved', function () {",
+                  "    pm.expect(jsonData.message).to.include('deleted');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "List Seller's Own Products (/api/seller/products)",
@@ -789,12 +1154,13 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test(\"Response contains seller products list\", function () {",
-                  "    pm.expect(jsonData).to.have.property(\"products\");",
+                  "pm.test('Response contains seller products list', function () {",
+                  "    pm.expect(jsonData).to.have.property('products');",
+                  "    pm.expect(jsonData.products.data).to.be.an('array');",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -837,7 +1203,24 @@
                 "onboarding"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Bank account onboarded', function () {",
+                  "    pm.expect(jsonData.account.status).to.eql('created');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Get Bank Verification Status",
@@ -861,7 +1244,24 @@
                 "status"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Bank verification status returned', function () {",
+                  "    pm.expect(jsonData.status).to.be.a('string');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "List Seller Payouts",
@@ -884,7 +1284,24 @@
                 "payouts"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Seller payouts array returned', function () {",
+                  "    pm.expect(jsonData.payouts).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Calculate Commission Preview",
@@ -915,13 +1332,83 @@
                 "commission-preview"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Marketplace 5% commission preview calculated accurately', function () {",
+                  "    pm.expect(jsonData.commission_paise).to.eql(50000);",
+                  "    pm.expect(jsonData.seller_receives_paise).to.eql(950000);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         }
       ]
     },
     {
       "name": "6. Orders, Multi-Vendor Routing & Seller Isolation",
       "item": [
+        {
+          "name": "Place New Order (NO Buyer Email Required)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Rahul Sharma\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"landmark\": \"Near Metro Station Gate 2\",\n  \"city\": \"Bengaluru - 560001\",\n  \"payment_method\": \"cod\",\n  \"notes\": \"Please ring doorbell twice.\",\n  \"items\": [\n    {\n      \"product_id\": {{active_product_id}},\n      \"product_name\": \"Smart Wireless Headset Pro (Special Edition)\",\n      \"price\": 1000.00,\n      \"quantity\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            },
+            "description": "Places a new buyer order without buyer_email using {{active_product_id}} and captures {{order_id}}."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 or 200', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Order created with numeric ID', function () {",
+                  "    pm.expect(jsonData.order.id).to.be.a('number');",
+                  "});",
+                  "if (jsonData.order && jsonData.order.id) {",
+                  "    pm.collectionVariables.set('order_id', String(jsonData.order.id));",
+                  "    if (pm.environment) pm.environment.set('order_id', String(jsonData.order.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
         {
           "name": "List Buyer Orders",
           "request": {
@@ -962,59 +1449,10 @@
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "var orders = jsonData.orders && jsonData.orders.data ? jsonData.orders.data : (Array.isArray(jsonData.orders) ? jsonData.orders : []);",
-                  "if (orders.length > 0) {",
-                  "    pm.collectionVariables.set('order_id', String(orders[0].id));",
-                  "}"
-                ],
-                "type": "text/javascript"
-              }
-            }
-          ]
-        },
-        {
-          "name": "Place New Order (NO Buyer Email Required)",
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"buyer_name\": \"Rahul Sharma\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"landmark\": \"Near Metro Station Gate 2\",\n  \"city\": \"Bengaluru - 560001\",\n  \"payment_method\": \"cod\",\n  \"notes\": \"Please ring doorbell twice.\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999.00,\n      \"quantity\": 2\n    },\n    {\n      \"product_id\": 2,\n      \"product_name\": \"Ultra HD 4K Smart Watch\",\n      \"price\": 4499.00,\n      \"quantity\": 1\n    }\n  ]\n}"
-            },
-            "url": {
-              "raw": "{{base_url}}/api/orders",
-              "host": [
-                "{{base_url}}"
-              ],
-              "path": [
-                "api",
-                "orders"
-              ]
-            },
-            "description": "Places a new buyer order. Note: buyer_email is completely removed per client specifications."
-          },
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "exec": [
-                  "pm.test(\"Status code is 201 or 200\", function () {",
-                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                  "});",
-                  "var jsonData = pm.response.json();",
-                  "if (jsonData.order && jsonData.order.id) {",
-                  "    pm.collectionVariables.set(\"order_id\", String(jsonData.order.id));",
-                  "    if (pm.environment) pm.environment.set(\"order_id\", String(jsonData.order.id));",
-                  "}"
+                  "pm.test('Returns paginated orders list', function () {",
+                  "    var list = jsonData.orders && jsonData.orders.data ? jsonData.orders.data : jsonData.orders;",
+                  "    pm.expect(list).to.be.an('array');",
+                  "});"
                 ],
                 "type": "text/javascript"
               }
@@ -1037,7 +1475,24 @@
                 "{{order_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Order details match order_id', function () {",
+                  "    pm.expect(String(jsonData.order.id)).to.eql(pm.collectionVariables.get('order_id'));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Update Order (Status / Items / Quantities)",
@@ -1051,7 +1506,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"buyer_name\": \"Rahul Sharma (Updated)\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"order_status\": \"confirmed\",\n  \"payment_status\": \"paid\",\n  \"notes\": \"Address confirmed by customer.\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999.00,\n      \"quantity\": 3\n    }\n  ]\n}"
+              "raw": "{\n  \"buyer_name\": \"Rahul Sharma (Updated)\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 402, Lotus Residency, MG Road\",\n  \"order_status\": \"confirmed\",\n  \"payment_status\": \"unpaid\",\n  \"notes\": \"Address confirmed by customer.\",\n  \"items\": [\n    {\n      \"product_id\": {{active_product_id}},\n      \"product_name\": \"Smart Wireless Headset Pro (Special Edition)\",\n      \"price\": 1000.00,\n      \"quantity\": 3\n    }\n  ]\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/orders/{{order_id}}",
@@ -1064,7 +1519,24 @@
                 "{{order_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Order status updated cleanly', function () {",
+                  "    pm.expect(jsonData.order.order_status).to.eql('confirmed');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Generate Provider Tax Invoice (HTML / PDF)",
@@ -1117,7 +1589,23 @@
                 "{{order_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "pm.test('Direct invoice route rendered HTML', function () {",
+                  "    pm.expect(pm.response.text()).to.include('knowlipop.shop');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "Delete / Cancel Order",
@@ -1135,7 +1623,75 @@
                 "{{order_id}}"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Unpaid order deleted cleanly', function () {",
+                  "    pm.expect(jsonData.message).to.include('deleted');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Place Multi-Vendor Order (Auto-routed by product_id)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyer_name\": \"Multi-Vendor Shopper\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 303, Sunrise Towers, MG Road\",\n  \"landmark\": \"Opposite City Mall\",\n  \"city\": \"Bengaluru\",\n  \"state\": \"Karnataka\",\n  \"pincode\": \"560001\",\n  \"notes\": \"Multi-vendor split test order\",\n  \"items\": [\n    {\n      \"product_id\": {{active_product_id}},\n      \"product_name\": \"Smart Wireless Headset Pro (Special Edition)\",\n      \"price\": 1000,\n      \"quantity\": 1\n    },\n    {\n      \"product_id\": 7,\n      \"product_name\": \"Noise-Cancelling Studio Earbuds\",\n      \"price\": 1899,\n      \"quantity\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 201 or 200', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Multi-vendor order ID captured', function () {",
+                  "    pm.expect(jsonData.order.id).to.be.a('number');",
+                  "});",
+                  "if (jsonData.order && jsonData.order.id) {",
+                  "    pm.collectionVariables.set('order_id', String(jsonData.order.id));",
+                  "    if (pm.environment) pm.environment.set('order_id', String(jsonData.order.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
         },
         {
           "name": "List Authenticated Seller Orders (/api/seller/orders)",
@@ -1178,13 +1734,13 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test(\"Returns seller isolated orders\", function () {",
-                  "    pm.expect(jsonData).to.have.property(\"seller_id\");",
-                  "    pm.expect(jsonData).to.have.property(\"orders\");",
+                  "pm.test('Returns seller isolated orders', function () {",
+                  "    pm.expect(jsonData).to.have.property('seller_id');",
+                  "    pm.expect(jsonData).to.have.property('orders');",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -1234,7 +1790,7 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});"
                 ],
@@ -1275,62 +1831,14 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Status code is 200\", function () {",
+                  "pm.test('Status code is 200', function () {",
                   "    pm.response.to.have.status(200);",
                   "});",
                   "var jsonData = pm.response.json();",
-                  "pm.test(\"Seller sees only their products\", function () {",
-                  "    pm.expect(jsonData.order).to.have.property(\"items\");",
-                  "    pm.expect(jsonData.order).to.have.property(\"seller_subtotal\");",
+                  "pm.test('Seller sees only their products', function () {",
+                  "    pm.expect(jsonData.order).to.have.property('items');",
+                  "    pm.expect(jsonData.order).to.have.property('seller_subtotal');",
                   "});"
-                ],
-                "type": "text/javascript"
-              }
-            }
-          ]
-        },
-        {
-          "name": "Place Multi-Vendor Order (Auto-routed by product_id)",
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Accept",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"buyer_name\": \"Multi-Vendor Shopper\",\n  \"buyer_phone\": \"+919876543210\",\n  \"shipping_address\": \"Flat 303, Sunrise Towers, MG Road\",\n  \"landmark\": \"Opposite City Mall\",\n  \"city\": \"Bengaluru\",\n  \"state\": \"Karnataka\",\n  \"pincode\": \"560001\",\n  \"notes\": \"Multi-vendor split test order\",\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"product_name\": \"Smart Wireless Headset Pro\",\n      \"price\": 2999,\n      \"quantity\": 1\n    },\n    {\n      \"product_id\": 7,\n      \"product_name\": \"Noise-Cancelling Studio Earbuds\",\n      \"price\": 1899,\n      \"quantity\": 2\n    }\n  ]\n}"
-            },
-            "url": {
-              "raw": "{{base_url}}/api/orders",
-              "host": [
-                "{{base_url}}"
-              ],
-              "path": [
-                "api",
-                "orders"
-              ]
-            }
-          },
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "exec": [
-                  "pm.test(\"Status code is 201 or 200\", function () {",
-                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                  "});",
-                  "var jsonData = pm.response.json();",
-                  "if (jsonData.order && jsonData.order.id) {",
-                  "    pm.collectionVariables.set(\"order_id\", String(jsonData.order.id));",
-                  "    if (pm.environment) pm.environment.set(\"order_id\", String(jsonData.order.id));",
-                  "}"
                 ],
                 "type": "text/javascript"
               }
@@ -1369,7 +1877,7 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Cross-seller order access blocked with 403 Forbidden\", function () {",
+                  "pm.test('Cross-seller order access blocked with 403 Forbidden', function () {",
                   "    pm.response.to.have.status(403);",
                   "});"
                 ],
@@ -1413,7 +1921,7 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test(\"Cross-seller product edit blocked with 403 Forbidden\", function () {",
+                  "pm.test('Cross-seller product edit blocked with 403 Forbidden', function () {",
                   "    pm.response.to.have.status(403);",
                   "});"
                 ],
@@ -1421,6 +1929,722 @@
               }
             }
           ]
+        }
+      ]
+    },
+    {
+      "name": "7. Session Cleanup",
+      "item": [
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/logout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "logout"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "pm.test('Logout confirmed', function () {",
+                  "    pm.expect(jsonData.message).to.include('successful');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "8. Admin — Seller Deletion & Refund Management",
+      "description": "Complete multi-stage Seller Account Deletion, Order Verification (Rules A–E), Razorpay Refund Automation, Financial Settlement, Disputes, 2-Step Final Soft-Deletion, and Audit Trail.",
+      "item": [
+        {
+          "name": "Admin Sign In (POST /api/login)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Admin login 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var json = pm.response.json();",
+                  "pm.test('Admin token returned', function () { pm.expect(json.token).to.be.a('string'); });",
+                  "if (json.token) {",
+                  "    pm.collectionVariables.set('admin_token', json.token);",
+                  "    if (pm.environment) pm.environment.set('admin_token', json.token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@vendor.app\",\n  \"password\": \"Admin123!\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/login",
+              "host": ["{{base_url}}"],
+              "path": ["api", "login"]
+            }
+          }
+        },
+        {
+          "name": "Admin UI: Seller Deletion Requests Dashboard",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Dashboard page loaded 200 OK', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Contains Seller Deletion Requests view', function () { pm.expect(pm.response.text()).to.include('Seller Deletion'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/seller-deletions",
+              "host": ["{{base_url}}"],
+              "path": ["admin", "seller-deletions"]
+            }
+          }
+        },
+        {
+          "name": "Support: Verify Payment Capture (POST /api/orders/:order_id/payment-verify)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Payment capture recorded 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Payment marked paid', function () { pm.expect(j.success).to.eql(true); pm.expect(j.status).to.be.oneOf(['captured', 'settled']); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payment_gateway\": \"razorpay\",\n  \"gateway_order_id\": \"order_rzp_demo_001\",\n  \"gateway_payment_id\": \"{{razorpay_payment_id}}\",\n  \"settled\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}/payment-verify",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}", "payment-verify"]
+            }
+          }
+        },
+        {
+          "name": "Support: Create Order Dispute (POST /api/orders/:order_id/disputes)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Dispute created 201 Created', function () { pm.response.to.have.status(201); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Dispute ID returned', function () { pm.expect(j.dispute.id).to.be.a('number'); });",
+                  "if (j.dispute && j.dispute.id) {",
+                  "    pm.collectionVariables.set('dispute_id', String(j.dispute.id));",
+                  "    if (pm.environment) pm.environment.set('dispute_id', String(j.dispute.id));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_id\": {{seller_id}},\n  \"buyer_phone\": \"+919876543210\",\n  \"dispute_type\": \"complaint\",\n  \"description\": \"Damaged item reported by customer\",\n  \"claim_amount\": 199.00\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/orders/{{order_id}}/disputes",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "{{order_id}}", "disputes"]
+            }
+          }
+        },
+        {
+          "name": "1. Deletion Preflight Audit (GET /preflight/:seller_id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Preflight returned 200', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Contains all required seller metrics', function () {",
+                  "    pm.expect(j.metrics).to.have.all.keys(",
+                  "        'total_products', 'active_products', 'total_orders', 'pending_orders',",
+                  "        'confirmed_orders', 'shipped_orders', 'delivered_orders', 'cancelled_orders',",
+                  "        'total_successful_payments', 'pending_refunds_count', 'pending_refunds_amount',",
+                  "        'seller_wallet_balance', 'pending_payouts_count', 'pending_payouts_amount',",
+                  "        'outstanding_commissions', 'open_disputes_count'",
+                  "    );",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/preflight/{{seller_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "preflight", "{{seller_id}}"]
+            }
+          }
+        },
+        {
+          "name": "2. Create Seller Deletion Request (POST /api/admin/seller-deletions)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Created deletion request 201', function () { pm.response.to.have.status(201); });",
+                  "var j = pm.response.json();",
+                  "if (j.deletion_request && j.deletion_request.id) {",
+                  "    pm.collectionVariables.set('deletion_request_id', String(j.deletion_request.id));",
+                  "    if (pm.environment) pm.environment.set('deletion_request_id', String(j.deletion_request.id));",
+                  "}",
+                  "pm.test('Seller set to DELETION_PENDING', function () {",
+                  "    pm.expect(j.seller.account_status).to.eql('DELETION_PENDING');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_id\": {{seller_id}},\n  \"reason\": \"Admin compliance deletion request\",\n  \"remarks\": \"Seller enters DELETION_PENDING and new orders are blocked.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions"]
+            }
+          }
+        },
+        {
+          "name": "3. Put On Hold (POST /:id/hold)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Put on hold 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Status updated to DELETION_ON_HOLD', function () { pm.expect(j.deletion_request.status).to.eql('DELETION_ON_HOLD'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Pending return window verification\",\n  \"remarks\": \"Placed on hold pending verification.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/hold",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "hold"]
+            }
+          }
+        },
+        {
+          "name": "4. Reject Deletion & Restore ACTIVE (POST /:id/reject)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Rejected deletion request 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Deletion status is DELETION_REJECTED and seller restored to ACTIVE', function () {",
+                  "    pm.expect(j.deletion_request.status).to.eql('DELETION_REJECTED');",
+                  "    pm.expect(j.seller.account_status).to.eql('ACTIVE');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Deletion cancelled by administrator\",\n  \"remarks\": \"Restored seller to ACTIVE before re-initiating.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/reject",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "reject"]
+            }
+          }
+        },
+        {
+          "name": "5. Re-Create Seller Deletion Request (POST /api/admin/seller-deletions)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Re-created deletion request 201', function () { pm.response.to.have.status(201); });",
+                  "var j = pm.response.json();",
+                  "if (j.deletion_request && j.deletion_request.id) {",
+                  "    pm.collectionVariables.set('deletion_request_id', String(j.deletion_request.id));",
+                  "    if (pm.environment) pm.environment.set('deletion_request_id', String(j.deletion_request.id));",
+                  "}",
+                  "pm.test('Seller returned to DELETION_PENDING', function () {",
+                  "    pm.expect(j.seller.account_status).to.eql('DELETION_PENDING');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"seller_id\": {{seller_id}},\n  \"reason\": \"Final Admin-approved seller account deletion\",\n  \"remarks\": \"Proceeding through complete verification and settlement workflow.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions"]
+            }
+          }
+        },
+        {
+          "name": "6. List Deletion Requests (GET /api/admin/seller-deletions)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('List returned 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Contains deletion requests array', function () { pm.expect(j.requests).to.be.an('array'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions"]
+            }
+          }
+        },
+        {
+          "name": "7. Get Deletion Workspace Details (GET /api/admin/seller-deletions/:id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Workspace details 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Workspace includes checks and settlement', function () {",
+                  "    pm.expect(j.deletion_request).to.be.an('object');",
+                  "    pm.expect(j.checks).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}"]
+            }
+          }
+        },
+        {
+          "name": "8. Lock Seller Account (POST /:id/lock)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Seller account locked 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Seller account status is LOCKED', function () { pm.expect(j.seller.account_status).to.eql('LOCKED'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"remarks\": \"Seller account locked.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/lock",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "lock"]
+            }
+          }
+        },
+        {
+          "name": "9. Verify Orders Rules A–E (POST /:id/verify-orders)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Verify orders 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Orders and checks evaluated', function () {",
+                  "    pm.expect(j.orders).to.be.an('array');",
+                  "    pm.expect(j.checks).to.be.an('array');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"approve_accepted_cancellations\": true,\n  \"remarks\": \"Verified Rules A–E and queued eligible paid refunds.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/verify-orders",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "verify-orders"]
+            }
+          }
+        },
+        {
+          "name": "10. List Seller Refunds (GET /:id/refunds)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Refunds list 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Returns refunds array', function () { pm.expect(j.refunds).to.be.an('array'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/refunds",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "refunds"]
+            }
+          }
+        },
+        {
+          "name": "11. Process Eligible Refunds via Razorpay (POST /:id/process-refunds)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Process refunds 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('All queued refunds succeeded via Razorpay', function () {",
+                  "    pm.expect(j.refunds).to.be.an('array');",
+                  "    pm.expect(j.refund_stats.failed_count).to.eql(0);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"remarks\": \"Processing idempotent Razorpay refunds.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/process-refunds",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "process-refunds"]
+            }
+          }
+        },
+        {
+          "name": "12. Verify Financial Settlement (POST /:id/verify-settlement)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Verify settlement 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Returns settlement summary', function () { pm.expect(j.settlement).to.be.an('object'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"remarks\": \"Verified wallet balance, commissions, gateway settlement, and disputes.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/verify-settlement",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "verify-settlement"]
+            }
+          }
+        },
+        {
+          "name": "13. Resolve Order Dispute / Return Window (POST /:id/resolve-dispute)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Resolve dispute 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Disputes cleared', function () { pm.expect(j.settlement.pending_disputes_count).to.eql(0); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"dispute_id\": {{dispute_id}},\n  \"resolution\": \"RESOLVED\",\n  \"mark_delivered\": true,\n  \"close_return_window\": true,\n  \"remarks\": \"Resolved open dispute.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/resolve-dispute",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "resolve-dispute"]
+            }
+          }
+        },
+        {
+          "name": "14. Settle Pending Payout (POST /:id/settle-payout)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Settle payout 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('All 6 deletion checklist requirements passed', function () { pm.expect(j.all_checks_passed).to.eql(true); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirm_gateway_settled\": true,\n  \"payout_reference\": \"NEFT-SETTLE-2026-001\",\n  \"remarks\": \"Settled pending payout after gateway verification.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/settle-payout",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "settle-payout"]
+            }
+          }
+        },
+        {
+          "name": "15. Admin Approval Step 1 (POST /:id/approve)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Approval step 1 succeeded 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Status is APPROVED_FOR_DELETION with confirmation_token', function () {",
+                  "    pm.expect(j.deletion_request.status).to.eql('APPROVED_FOR_DELETION');",
+                  "    pm.expect(j.deletion_request.confirmation_token).to.be.a('string');",
+                  "});",
+                  "if (j.deletion_request && j.deletion_request.confirmation_token) {",
+                  "    pm.collectionVariables.set('confirmation_token', j.deletion_request.confirmation_token);",
+                  "    if (pm.environment) pm.environment.set('confirmation_token', j.deletion_request.confirmation_token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"remarks\": \"All checks passed; issuing single-use final delete confirmation token.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/approve",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "approve"]
+            }
+          }
+        },
+        {
+          "name": "16. Final Permanent Soft-Delete Step 2 (POST /:id/final-delete)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Final soft-delete succeeded 200 OK', function () { pm.response.to.have.status(200); });",
+                  "var j = pm.response.json();",
+                  "pm.test('Seller and deletion request marked DELETED', function () {",
+                  "    pm.expect(j.deletion_request.status).to.eql('DELETED');",
+                  "    pm.expect(j.seller.account_status).to.eql('DELETED');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmation_token\": \"{{confirmation_token}}\",\n  \"confirmation_phrase\": \"DELETE SELLER #{{seller_id}}\",\n  \"remarks\": \"Final deletion confirmed.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/admin/seller-deletions/{{deletion_request_id}}/final-delete",
+              "host": ["{{base_url}}"],
+              "path": ["api", "admin", "seller-deletions", "{{deletion_request_id}}", "final-delete"]
+            }
+          }
         }
       ]
     }

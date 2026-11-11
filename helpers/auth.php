@@ -92,13 +92,28 @@ function verifyJwtToken(string $token, string $secret): ?array
     return $payload;
 }
 
-function createToken(PDO $pdo, int $userId, ?string $phone = null, string $name = 'vendor-app', ?string $email = null, string $role = 'seller'): string
+function createToken(PDO $pdo, int $userId, ?string $phone = null, string $name = 'vendor-app', ?string $email = null, string $role = 'seller', ?int $tokenVersion = null): string
 {
     $secret = getJwtSecret();
     $cleanPhone = ($phone !== null && trim($phone) !== '') ? trim($phone) : null;
     $cleanEmail = ($email !== null && trim($email) !== '' && !str_ends_with(strtolower(trim($email)), '@phone.vendor.local'))
         ? strtolower(trim($email))
         : null;
+
+    $tv = $tokenVersion;
+    if ($tv === null) {
+        $tv = 1;
+        try {
+            $tvStmt = $pdo->prepare("SELECT token_version FROM users WHERE id = :id LIMIT 1");
+            $tvStmt->execute([':id' => $userId]);
+            $rowTv = $tvStmt->fetchColumn();
+            if ($rowTv !== false && $rowTv !== null) {
+                $tv = max(1, (int) $rowTv);
+            }
+        } catch (Throwable $e) {
+            $tv = 1;
+        }
+    }
 
     // Standard JWT token matching Node.js
     $header = rtrim(strtr(base64_encode(json_encode(['alg' => 'HS256', 'typ' => 'JWT'])), '+/', '-_'), '=');
@@ -107,6 +122,7 @@ function createToken(PDO $pdo, int $userId, ?string $phone = null, string $name 
         'email' => $cleanEmail,
         'phone' => $cleanPhone,
         'role' => $role ?: 'seller',
+        'tv' => $tv,
         'iat' => time(),
         'exp' => time() + (30 * 86400)
     ])), '+/', '-_'), '=');
@@ -147,9 +163,16 @@ function getAuthenticatedUserOptional(PDO $pdo): ?array
             $stmt->execute([':id' => $jwtPayload['id']]);
             $user = $stmt->fetch();
             if ($user) {
+                $dbTv = isset($user['token_version']) ? max(1, (int) $user['token_version']) : 1;
+                $tokTv = isset($jwtPayload['tv']) ? max(1, (int) $jwtPayload['tv']) : 1;
+                if ($tokTv !== $dbTv) {
+                    return null;
+                }
                 $user['token_id'] = 0;
                 return $user;
             }
+            // If user row does not exist in DB, reject token
+            return null;
         } catch (Throwable $e) {
             return [
                 'id' => (int)$jwtPayload['id'],
@@ -158,6 +181,8 @@ function getAuthenticatedUserOptional(PDO $pdo): ?array
                 'phone' => $jwtPayload['phone'] ?? null,
                 'name' => $jwtPayload['name'] ?? 'Verified Seller',
                 'seller_name' => $jwtPayload['seller_name'] ?? 'Verified Seller',
+                'token_version' => isset($jwtPayload['tv']) ? (int) $jwtPayload['tv'] : 1,
+                'account_status' => 'ACTIVE',
                 'token_id' => 0
             ];
         }
@@ -182,7 +207,7 @@ function getAuthenticatedUserOptional(PDO $pdo): ?array
 
             if ($user) {
                 try {
-                    $updateStmt = $pdo->prepare("UPDATE personal_access_tokens SET last_used_at = NOW() WHERE id = :id");
+                    $updateStmt = $pdo->prepare("UPDATE personal_access_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE id = :id");
                     $updateStmt->execute([':id' => $id]);
                 } catch (Throwable $e) {}
                 return $user;
@@ -199,7 +224,29 @@ function authenticateUser(PDO $pdo): array
     if (!$user) {
         errorResponse('Unauthenticated.', [], 401);
     }
+    $accStatus = strtoupper((string) ($user['account_status'] ?? 'ACTIVE'));
+    if (($user['role'] ?? 'seller') !== 'admin' && in_array($accStatus, ['LOCKED', 'DELETED'], true)) {
+        $msg = $accStatus === 'DELETED'
+            ? 'Seller account has been permanently deleted and access is revoked.'
+            : 'Seller account is locked due to an active deletion workflow.';
+        errorResponse($msg, ['account_status' => [$accStatus]], 403);
+    }
     return $user;
+}
+
+function requireActiveSellerForMutationPhp(array $user): void
+{
+    if (($user['role'] ?? 'seller') === 'admin') {
+        return;
+    }
+    $accStatus = strtoupper((string) ($user['account_status'] ?? 'ACTIVE'));
+    if (in_array($accStatus, ['DELETION_PENDING', 'LOCKED', 'DELETED'], true)) {
+        errorResponse(
+            "Action blocked: seller account status is {$accStatus}.",
+            ['account_status' => [$accStatus]],
+            403
+        );
+    }
 }
 
 function deleteCurrentToken(PDO $pdo, int $tokenId): void
@@ -237,6 +284,7 @@ function safeSeller(array $user): array
         'state' => $user['state'] ?? null,
         'country' => $user['country'] ?? null,
         'avatar_url' => $user['avatar_url'] ?? null,
+        'account_status' => $user['account_status'] ?? 'ACTIVE',
     ];
 
     if (!empty($user['role'])) {

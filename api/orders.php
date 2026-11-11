@@ -12,163 +12,256 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../helpers/seller_deletion.php';
 
 function ensureOrdersSchema(PDO $pdo): void
 {
     static $checked = false;
+    ensureSellerDeletionSchemaPhp($pdo);
     if ($checked) return;
 
-    try {
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `orders` (
-                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                `order_number` VARCHAR(60) NOT NULL UNIQUE,
-                `buyer_name` VARCHAR(150) NOT NULL,
-                `buyer_phone` VARCHAR(30) NOT NULL,
-                `shipping_address` TEXT NOT NULL,
-                `landmark` VARCHAR(200) NULL DEFAULT NULL,
-                `city` VARCHAR(100) NULL DEFAULT NULL,
-                `state` VARCHAR(100) NULL DEFAULT NULL,
-                `pincode` VARCHAR(20) NULL DEFAULT NULL,
-                `order_status` VARCHAR(40) NOT NULL DEFAULT 'pending',
-                `payment_method` VARCHAR(40) NOT NULL DEFAULT 'cod',
-                `payment_status` VARCHAR(40) NOT NULL DEFAULT 'unpaid',
-                `subtotal` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-                `delivery_fee` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-                `discount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-                `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-                `notes` TEXT NULL DEFAULT NULL,
-                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (`id`),
-                INDEX `idx_orders_seller` (`seller_id`),
-                INDEX `idx_orders_status` (`order_status`),
-                INDEX `idx_orders_phone` (`buyer_phone`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
-    } catch (Throwable $e) {}
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    $isSqlite = ($driver === 'sqlite');
 
     try {
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `order_items` (
-                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                `order_id` BIGINT UNSIGNED NOT NULL,
-                `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                `product_name` VARCHAR(150) NOT NULL,
-                `product_image` LONGTEXT NULL DEFAULT NULL,
-                `price` DECIMAL(10,2) NOT NULL,
-                `quantity` INT NOT NULL DEFAULT 1,
-                `subtotal` DECIMAL(10,2) NOT NULL,
-                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (`id`),
-                INDEX `idx_order_items_order` (`order_id`),
-                INDEX `idx_order_items_product` (`product_id`),
-                INDEX `idx_order_items_seller` (`seller_id`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
-    } catch (Throwable $e) {}
-
-    try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'seller_id'")->fetchAll();
-        if (empty($cols)) {
-            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `id`, ADD INDEX `idx_orders_seller` (`seller_id`)");
+        if ($isSqlite) {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    seller_id INTEGER NULL DEFAULT NULL,
+                    order_number TEXT NOT NULL UNIQUE,
+                    buyer_name TEXT NOT NULL,
+                    buyer_phone TEXT NOT NULL,
+                    shipping_address TEXT NOT NULL,
+                    landmark TEXT NULL DEFAULT NULL,
+                    city TEXT NULL DEFAULT NULL,
+                    state TEXT NULL DEFAULT NULL,
+                    pincode TEXT NULL DEFAULT NULL,
+                    order_status TEXT NOT NULL DEFAULT 'pending',
+                    payment_method TEXT NOT NULL DEFAULT 'cod',
+                    payment_status TEXT NOT NULL DEFAULT 'unpaid',
+                    subtotal REAL NOT NULL DEFAULT 0.00,
+                    delivery_fee REAL NOT NULL DEFAULT 0.00,
+                    discount REAL NOT NULL DEFAULT 0.00,
+                    total_amount REAL NOT NULL DEFAULT 0.00,
+                    notes TEXT NULL DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `orders` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `order_number` VARCHAR(60) NOT NULL UNIQUE,
+                    `buyer_name` VARCHAR(150) NOT NULL,
+                    `buyer_phone` VARCHAR(30) NOT NULL,
+                    `shipping_address` TEXT NOT NULL,
+                    `landmark` VARCHAR(200) NULL DEFAULT NULL,
+                    `city` VARCHAR(100) NULL DEFAULT NULL,
+                    `state` VARCHAR(100) NULL DEFAULT NULL,
+                    `pincode` VARCHAR(20) NULL DEFAULT NULL,
+                    `order_status` VARCHAR(40) NOT NULL DEFAULT 'pending',
+                    `payment_method` VARCHAR(40) NOT NULL DEFAULT 'cod',
+                    `payment_status` VARCHAR(40) NOT NULL DEFAULT 'unpaid',
+                    `subtotal` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    `delivery_fee` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    `discount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    `notes` TEXT NULL DEFAULT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    INDEX `idx_orders_seller` (`seller_id`),
+                    INDEX `idx_orders_status` (`order_status`),
+                    INDEX `idx_orders_phone` (`buyer_phone`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'rejection_reason'")->fetchAll();
-        if (empty($cols)) {
+        if ($isSqlite) {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS order_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    product_id INTEGER NULL DEFAULT NULL,
+                    seller_id INTEGER NULL DEFAULT NULL,
+                    product_name TEXT NOT NULL,
+                    product_image TEXT NULL DEFAULT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    subtotal REAL NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `order_items` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `order_id` BIGINT UNSIGNED NOT NULL,
+                    `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `product_name` VARCHAR(150) NOT NULL,
+                    `product_image` LONGTEXT NULL DEFAULT NULL,
+                    `price` DECIMAL(10,2) NOT NULL,
+                    `quantity` INT NOT NULL DEFAULT 1,
+                    `subtotal` DECIMAL(10,2) NOT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    INDEX `idx_order_items_order` (`order_id`),
+                    INDEX `idx_order_items_product` (`product_id`),
+                    INDEX `idx_order_items_seller` (`seller_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        if (!dbHasColumnPhp($pdo, 'orders', 'seller_id')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `orders` ADD COLUMN `seller_id` INTEGER NULL DEFAULT NULL"
+                : "ALTER TABLE `orders` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `id`, ADD INDEX `idx_orders_seller` (`seller_id`)");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        if (!dbHasColumnPhp($pdo, 'orders', 'rejection_reason')) {
             $pdo->exec("ALTER TABLE `orders` ADD COLUMN `rejection_reason` TEXT NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'cancellation_reason'")->fetchAll();
-        if (empty($cols)) {
+        if (!dbHasColumnPhp($pdo, 'orders', 'cancellation_reason')) {
             $pdo->exec("ALTER TABLE `orders` ADD COLUMN `cancellation_reason` TEXT NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'shipped_at'")->fetchAll();
-        if (empty($cols)) {
-            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `shipped_at` TIMESTAMP NULL DEFAULT NULL");
+        if (!dbHasColumnPhp($pdo, 'orders', 'shipped_at')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `orders` ADD COLUMN `shipped_at` DATETIME NULL DEFAULT NULL"
+                : "ALTER TABLE `orders` ADD COLUMN `shipped_at` TIMESTAMP NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `orders` LIKE 'delivered_at'")->fetchAll();
-        if (empty($cols)) {
-            $pdo->exec("ALTER TABLE `orders` ADD COLUMN `delivered_at` TIMESTAMP NULL DEFAULT NULL");
+        if (!dbHasColumnPhp($pdo, 'orders', 'delivered_at')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `orders` ADD COLUMN `delivered_at` DATETIME NULL DEFAULT NULL"
+                : "ALTER TABLE `orders` ADD COLUMN `delivered_at` TIMESTAMP NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'seller_id'")->fetchAll();
-        if (empty($cols)) {
-            $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `product_id`, ADD INDEX `idx_order_items_seller` (`seller_id`)");
+        if (!dbHasColumnPhp($pdo, 'order_items', 'seller_id')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `order_items` ADD COLUMN `seller_id` INTEGER NULL DEFAULT NULL"
+                : "ALTER TABLE `order_items` ADD COLUMN `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `product_id`, ADD INDEX `idx_order_items_seller` (`seller_id`)");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'item_status'")->fetchAll();
-        if (empty($cols)) {
-            $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `item_status` VARCHAR(40) NOT NULL DEFAULT 'pending'");
+        if (!dbHasColumnPhp($pdo, 'order_items', 'item_status')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `order_items` ADD COLUMN `item_status` TEXT NOT NULL DEFAULT 'pending'"
+                : "ALTER TABLE `order_items` ADD COLUMN `item_status` VARCHAR(40) NOT NULL DEFAULT 'pending'");
         }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `order_items` LIKE 'rejection_reason'")->fetchAll();
-        if (empty($cols)) {
+        if (!dbHasColumnPhp($pdo, 'order_items', 'rejection_reason')) {
             $pdo->exec("ALTER TABLE `order_items` ADD COLUMN `rejection_reason` TEXT NULL DEFAULT NULL");
         }
     } catch (Throwable $e) {}
 
     try {
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `notifications` (
-                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
-                `title` VARCHAR(255) NOT NULL,
-                `message` TEXT NOT NULL,
-                `type` VARCHAR(50) NOT NULL DEFAULT 'order',
-                `data` JSON NULL DEFAULT NULL,
-                `is_read` TINYINT(1) NOT NULL DEFAULT 0,
-                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (`id`),
-                INDEX `idx_notifications_user` (`user_id`),
-                INDEX `idx_notifications_phone` (`buyer_phone`),
-                INDEX `idx_notifications_read` (`is_read`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
+        if ($isSqlite) {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NULL DEFAULT NULL,
+                    buyer_phone TEXT NULL DEFAULT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'order',
+                    data TEXT NULL DEFAULT NULL,
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `notifications` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
+                    `title` VARCHAR(255) NOT NULL,
+                    `message` TEXT NOT NULL,
+                    `type` VARCHAR(50) NOT NULL DEFAULT 'order',
+                    `data` JSON NULL DEFAULT NULL,
+                    `is_read` TINYINT(1) NOT NULL DEFAULT 0,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    INDEX `idx_notifications_user` (`user_id`),
+                    INDEX `idx_notifications_phone` (`buyer_phone`),
+                    INDEX `idx_notifications_read` (`is_read`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+        }
     } catch (Throwable $e) {}
 
     try {
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `device_tokens` (
-                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                `phone` VARCHAR(30) NULL DEFAULT NULL,
-                `token` VARCHAR(255) NOT NULL,
-                `platform` VARCHAR(20) NOT NULL DEFAULT 'android',
-                `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `uniq_token` (`token`),
-                INDEX `idx_device_tokens_user` (`user_id`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
+        if ($isSqlite) {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS device_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NULL DEFAULT NULL,
+                    phone TEXT NULL DEFAULT NULL,
+                    token TEXT NOT NULL UNIQUE,
+                    platform TEXT NOT NULL DEFAULT 'android',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `device_tokens` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `phone` VARCHAR(30) NULL DEFAULT NULL,
+                    `token` VARCHAR(255) NOT NULL,
+                    `platform` VARCHAR(20) NOT NULL DEFAULT 'android',
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uniq_token` (`token`),
+                    INDEX `idx_device_tokens_user` (`user_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+        }
     } catch (Throwable $e) {}
 
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM `users` LIKE 'fcm_token'")->fetchAll();
-        if (empty($cols)) {
+        if (!dbHasColumnPhp($pdo, 'users', 'fcm_token')) {
             $pdo->exec("ALTER TABLE `users` ADD COLUMN `fcm_token` VARCHAR(255) NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        if (!dbHasColumnPhp($pdo, 'products', 'images')) {
+            $driver = strtolower((string)$pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+            if ($driver === 'sqlite') {
+                $pdo->exec("ALTER TABLE `products` ADD COLUMN `images` TEXT NULL DEFAULT NULL");
+            } else {
+                $pdo->exec("ALTER TABLE `products` ADD COLUMN `images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`");
+            }
         }
     } catch (Throwable $e) {}
 
@@ -896,6 +989,25 @@ function apiCreateOrder(PDO $pdo): void
     $distinctSellers = array_values(array_unique(array_filter(array_column($processedItems, 'seller_id'))));
     $primarySellerId = !empty($input['seller_id']) ? (int)$input['seller_id'] : ($distinctSellers[0] ?? 1);
 
+    // Block new orders if any involved seller is undergoing deletion or locked/deleted
+    $sellersToCheck = array_values(array_unique(array_merge($distinctSellers, [$primarySellerId])));
+    if (!empty($sellersToCheck)) {
+        $ph = implode(',', array_fill(0, count($sellersToCheck), '?'));
+        $sChkStmt = $pdo->prepare("SELECT id, seller_name, name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id IN ({$ph})");
+        $sChkStmt->execute($sellersToCheck);
+        while ($sRow = $sChkStmt->fetch(PDO::FETCH_ASSOC)) {
+            $accStatus = strtoupper((string) ($sRow['account_status'] ?? 'ACTIVE'));
+            if (in_array($accStatus, ['DELETION_PENDING', 'LOCKED', 'DELETED'], true)) {
+                $sLabel = $sRow['seller_name'] ?: ($sRow['name'] ?: ('Seller #' . $sRow['id']));
+                errorResponse(
+                    "New orders are blocked for {$sLabel} because their seller account status is {$accStatus}.",
+                    ['seller_id' => [(int) $sRow['id']], 'account_status' => [$accStatus]],
+                    403
+                );
+            }
+        }
+    }
+
     $deliveryFee = isset($input['delivery_fee']) ? max(0, (float)$input['delivery_fee']) : ($subtotal >= 1000 ? 0.00 : 50.00);
     $discount = max(0, (float)($input['discount'] ?? 0));
     $totalAmount = max(0, round($subtotal + $deliveryFee - $discount, 2));
@@ -1066,8 +1178,19 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
     }
     $id = (int)$existing['id'];
 
+    $hasItemsUpdate = isset($input['items']) && is_array($input['items']);
+    $orderStatus = isset($input['order_status']) ? trim(strtolower($input['order_status'])) : (isset($input['status']) ? trim(strtolower($input['status'])) : $existing['order_status']);
+
     // Ownership check for sellers: must own at least one product in this order
     if ($user && ($user['role'] ?? '') === 'seller') {
+        $accStatus = strtoupper((string) ($user['account_status'] ?? 'ACTIVE'));
+        if (in_array($accStatus, ['LOCKED', 'DELETED'], true)) {
+            errorResponse("Seller account is {$accStatus}; order modifications are disabled.", ['account_status' => [$accStatus]], 403);
+        }
+        $existingStatusLower = strtolower((string) ($existing['order_status'] ?? 'pending'));
+        if ($accStatus === 'DELETION_PENDING' && $existingStatusLower === 'pending' && (in_array($orderStatus, ['accepted', 'processing', 'packed', 'shipped', 'delivered'], true) || $hasItemsUpdate)) {
+            errorResponse('Order processing is blocked: seller account is in DELETION_PENDING status.', ['account_status' => [$accStatus]], 403);
+        }
         $sellerId = (int)$user['id'];
         if ($routeSellerId !== null && $routeSellerId !== $sellerId) {
             errorResponse('Access denied. You can only access your own orders.', [], 403);
@@ -1079,8 +1202,6 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
             errorResponse('Access denied. You do not have permission to update this order.', [], 403);
         }
     }
-
-    $orderStatus = isset($input['order_status']) ? trim(strtolower($input['order_status'])) : (isset($input['status']) ? trim(strtolower($input['status'])) : $existing['order_status']);
 
     // Cancellation Permission Check
     if ($orderStatus === 'cancelled') {
@@ -1197,6 +1318,20 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
     }
 
     $primarySellerId = isset($input['seller_id']) ? (int)$input['seller_id'] : (!empty($existing['seller_id']) ? (int)$existing['seller_id'] : 1);
+    if ($hasItemsUpdate) {
+        $chkSellers = array_values(array_unique(array_merge([$primarySellerId], array_filter(array_column($processedItems, 'seller_id')))));
+        if (!empty($chkSellers)) {
+            $ph = implode(',', array_fill(0, count($chkSellers), '?'));
+            $sChk = $pdo->prepare("SELECT id, seller_name, name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id IN ({$ph})");
+            $sChk->execute($chkSellers);
+            while ($sr = $sChk->fetch(PDO::FETCH_ASSOC)) {
+                $ast = strtoupper((string) ($sr['account_status'] ?? 'ACTIVE'));
+                if (in_array($ast, ['DELETION_PENDING', 'LOCKED', 'DELETED'], true)) {
+                    errorResponse("Cannot assign items to seller #{$sr['id']} while account status is {$ast}.", ['account_status' => [$ast]], 403);
+                }
+            }
+        }
+    }
     $totalAmount = max(0, round($subtotal + $deliveryFee - $discount, 2));
 
     $pdo->beginTransaction();
@@ -1220,6 +1355,8 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
             }
         }
 
+        $cfgDel = getSellerDeletionConfigPhp();
+        $computedReturnWindowEnd = gmdate('Y-m-d H:i:s', time() + ($cfgDel['return_window_days'] * 86400));
         $updateStmt = $pdo->prepare("
             UPDATE `orders`
             SET seller_id = :seller_id,
@@ -1241,7 +1378,8 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
                 rejection_reason = :rejection_reason,
                 cancellation_reason = :cancellation_reason,
                 shipped_at = CASE WHEN :os1 = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
-                delivered_at = CASE WHEN :os2 = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END
+                delivered_at = CASE WHEN :os2 = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END,
+                return_window_ends_at = CASE WHEN :os3 = 'delivered' AND return_window_ends_at IS NULL THEN :rwend ELSE return_window_ends_at END
             WHERE id = :id
         ");
 
@@ -1266,6 +1404,8 @@ function apiUpdateOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null)
             ':cancellation_reason' => $cancellationReason,
             ':os1' => $orderStatus,
             ':os2' => $orderStatus,
+            ':os3' => $orderStatus,
+            ':rwend' => $computedReturnWindowEnd,
             ':id' => $id,
         ]);
 
@@ -1350,10 +1490,10 @@ function apiDeleteOrder(PDO $pdo, mixed $idOrNumber): void
     $user = getAuthenticatedUserOptional($pdo);
 
     if (is_numeric($idOrNumber)) {
-        $stmt = $pdo->prepare("SELECT id, order_number FROM `orders` WHERE id = :id OR order_number = :num LIMIT 1");
+        $stmt = $pdo->prepare("SELECT id, order_number, payment_status, captured_amount FROM `orders` WHERE id = :id OR order_number = :num LIMIT 1");
         $stmt->execute([':id' => (int)$idOrNumber, ':num' => (string)$idOrNumber]);
     } else {
-        $stmt = $pdo->prepare("SELECT id, order_number FROM `orders` WHERE order_number = :num LIMIT 1");
+        $stmt = $pdo->prepare("SELECT id, order_number, payment_status, captured_amount FROM `orders` WHERE order_number = :num LIMIT 1");
         $stmt->execute([':num' => (string)$idOrNumber]);
     }
     $order = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -1362,6 +1502,46 @@ function apiDeleteOrder(PDO $pdo, mixed $idOrNumber): void
         errorResponse('Order not found.', [], 404);
     }
     $id = (int)$order['id'];
+
+    // Preserve historical orders for any seller in deletion workflow or deleted
+    $delChk = $pdo->prepare("
+        SELECT u.id FROM users u
+        WHERE COALESCE(u.account_status, 'ACTIVE') IN ('DELETION_PENDING', 'LOCKED', 'DELETED')
+          AND (u.id IN (SELECT seller_id FROM order_items WHERE order_id = :oid1 AND seller_id IS NOT NULL)
+               OR u.id = (SELECT seller_id FROM orders WHERE id = :oid2))
+        LIMIT 1
+    ");
+    $delChk->execute([':oid1' => $id, ':oid2' => $id]);
+    if ($delChk->fetch()) {
+        errorResponse('Historical orders associated with a seller in deletion/deleted state cannot be deleted and must be preserved for auditing.', [], 403);
+    }
+
+    // Preserve paid/financial orders & orders with payment/refund/dispute history
+    $isPaidOrder = strtolower((string) ($order['payment_status'] ?? '')) === 'paid' || ((float) ($order['captured_amount'] ?? 0) > 0);
+    if (!$isPaidOrder) {
+        try {
+            $ptChk = $pdo->prepare("SELECT 1 FROM payment_transactions WHERE order_id = :oid LIMIT 1");
+            $ptChk->execute([':oid' => $id]);
+            if ($ptChk->fetch()) $isPaidOrder = true;
+        } catch (Throwable $e) {}
+    }
+    if (!$isPaidOrder) {
+        try {
+            $rfChk = $pdo->prepare("SELECT 1 FROM seller_refund_records WHERE order_id = :oid LIMIT 1");
+            $rfChk->execute([':oid' => $id]);
+            if ($rfChk->fetch()) $isPaidOrder = true;
+        } catch (Throwable $e) {}
+    }
+    if (!$isPaidOrder) {
+        try {
+            $dpChk = $pdo->prepare("SELECT 1 FROM order_disputes WHERE order_id = :oid LIMIT 1");
+            $dpChk->execute([':oid' => $id]);
+            if ($dpChk->fetch()) $isPaidOrder = true;
+        } catch (Throwable $e) {}
+    }
+    if ($isPaidOrder) {
+        errorResponse('Orders with payment, refund, or dispute history cannot be deleted and must be preserved for financial auditing.', [], 409);
+    }
 
     // Ownership check for sellers: seller can only delete if admin or seller of items
     if ($user && ($user['role'] ?? '') === 'seller') {
@@ -1710,17 +1890,29 @@ function apiRegisterDeviceToken(PDO $pdo): void
         errorResponse('Device token is required.', [], 422);
     }
 
-    $stmt = $pdo->prepare("
-        INSERT INTO `device_tokens` (user_id, phone, token, platform)
-        VALUES (:uid, :phone, :token, :platform)
-        ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP
-    ");
-    $stmt->execute([
-        ':uid' => $userId,
-        ':phone' => $phone,
-        ':token' => $token,
-        ':platform' => $platform,
-    ]);
+    $chkTok = $pdo->prepare("SELECT id FROM device_tokens WHERE token = :token LIMIT 1");
+    $chkTok->execute([':token' => $token]);
+    $exTok = $chkTok->fetch(PDO::FETCH_ASSOC);
+    if ($exTok) {
+        $updTok = $pdo->prepare("UPDATE device_tokens SET user_id = :uid, phone = :phone, platform = :platform, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
+        $updTok->execute([
+            ':uid' => $userId,
+            ':phone' => $phone,
+            ':platform' => $platform,
+            ':id' => (int) $exTok['id'],
+        ]);
+    } else {
+        $insTok = $pdo->prepare("
+            INSERT INTO device_tokens (user_id, phone, token, platform, created_at, updated_at)
+            VALUES (:uid, :phone, :token, :platform, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ");
+        $insTok->execute([
+            ':uid' => $userId,
+            ':phone' => $phone,
+            ':token' => $token,
+            ':platform' => $platform,
+        ]);
+    }
     if ($userId) {
         $uStmt = $pdo->prepare("UPDATE `users` SET fcm_token = :token WHERE id = :uid");
         $uStmt->execute([':token' => $token, ':uid' => $userId]);

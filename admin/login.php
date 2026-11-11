@@ -15,9 +15,12 @@ $pdo = getDatabaseConnection();
 $error = null;
 
 // Already logged in? Redirect to dashboard
-if (!empty($_SESSION['admin_logged_in']) || !empty($_COOKIE['admin_logged_in'])) {
+$existingAdminJwt = !empty($_COOKIE['admin_token']) ? verifyJwtToken((string) $_COOKIE['admin_token'], getJwtSecret()) : null;
+if (!empty($_SESSION['admin_logged_in']) || ($existingAdminJwt && strtolower((string) ($existingAdminJwt['role'] ?? '')) === 'admin')) {
     if (empty($_SESSION['admin_logged_in'])) {
         $_SESSION['admin_logged_in'] = true;
+        $_SESSION['admin_id'] = (int) ($existingAdminJwt['id'] ?? 1);
+        $_SESSION['admin_email'] = $existingAdminJwt['email'] ?? ($_COOKIE['admin_email'] ?? 'admin@vendor.app');
     }
     header('Location: /admin');
     exit;
@@ -38,12 +41,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Auto-provision admin user if empty or fresh database
             if (!$admin && ($email === 'admin@vendor.app' || $email === 'admin@venter.app' || $email === 'admin') && $password === 'Admin123!') {
                 $adminHash = password_hash('Admin123!', PASSWORD_BCRYPT);
-                $insertStmt = $pdo->prepare("
-                    INSERT INTO users (id, name, email, password, role, created_at, updated_at)
-                    VALUES (1, 'Vendor Administrator', 'admin@vendor.app', :pass, 'admin', NOW(), NOW())
-                    ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), password = VALUES(password), role = 'admin'
-                ");
-                $insertStmt->execute([':pass' => $adminHash]);
+                $chkOne = $pdo->query("SELECT id FROM users WHERE id = 1 LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+                if ($chkOne) {
+                    $upOne = $pdo->prepare("UPDATE users SET name = 'Vendor Administrator', email = 'admin@vendor.app', password = :pass, role = 'admin', updated_at = CURRENT_TIMESTAMP WHERE id = 1");
+                    $upOne->execute([':pass' => $adminHash]);
+                } else {
+                    $insertStmt = $pdo->prepare("
+                        INSERT INTO users (id, name, email, password, role, created_at, updated_at)
+                        VALUES (1, 'Vendor Administrator', 'admin@vendor.app', :pass, 'admin', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ");
+                    $insertStmt->execute([':pass' => $adminHash]);
+                }
 
                 $stmt = $pdo->prepare("SELECT * FROM users WHERE (LOWER(email) = 'admin@vendor.app' OR LOWER(email) = 'admin@venter.app') AND role = 'admin' LIMIT 1");
                 $stmt->execute();
@@ -66,9 +74,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['admin_name'] = $admin['name'];
                 $_SESSION['admin_email'] = $admin['email'];
 
-                // Set browser cookies so sessions survive across PHP and Node.js
+                // Mint Admin JWT + browser cookies so API endpoints and PHP/Node sessions stay authenticated
+                $adminJwt = createToken(
+                    $pdo,
+                    (int) $admin['id'],
+                    $admin['phone'] ?? null,
+                    'admin-dashboard',
+                    $admin['email'] ?? null,
+                    'admin',
+                    isset($admin['token_version']) ? (int) $admin['token_version'] : 1
+                );
                 setcookie('admin_logged_in', '1', time() + 86400 * 7, '/');
                 setcookie('admin_email', $admin['email'], time() + 86400 * 7, '/');
+                setcookie('admin_token', $adminJwt, time() + 86400 * 7, '/');
 
                 header('Location: /admin');
                 exit;

@@ -18,11 +18,17 @@ CREATE TABLE IF NOT EXISTS `users` (
   `country` VARCHAR(100) NULL DEFAULT NULL,
   `avatar_url` LONGTEXT NULL DEFAULT NULL,
   `role` VARCHAR(20) NOT NULL DEFAULT 'seller',
+  `account_status` VARCHAR(40) NOT NULL DEFAULT 'ACTIVE',
+  `deletion_requested_at` TIMESTAMP NULL DEFAULT NULL,
+  `deleted_at` TIMESTAMP NULL DEFAULT NULL,
+  `deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `token_version` INT NOT NULL DEFAULT 1,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   INDEX `idx_users_role` (`role`),
-  INDEX `idx_users_phone` (`phone`)
+  INDEX `idx_users_phone` (`phone`),
+  INDEX `idx_users_account_status` (`account_status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `personal_access_tokens` (
@@ -165,12 +171,20 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `cancellation_reason` TEXT NULL DEFAULT NULL,
   `shipped_at` TIMESTAMP NULL DEFAULT NULL,
   `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+  `payment_gateway` VARCHAR(40) NULL DEFAULT NULL,
+  `gateway_order_id` VARCHAR(120) NULL DEFAULT NULL,
+  `gateway_payment_id` VARCHAR(120) NULL DEFAULT NULL,
+  `captured_amount` DECIMAL(10,2) NULL DEFAULT NULL,
+  `refunded_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `return_window_ends_at` TIMESTAMP NULL DEFAULT NULL,
+  `settled_at` TIMESTAMP NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   INDEX `idx_orders_seller` (`seller_id`),
   INDEX `idx_orders_status` (`order_status`),
-  INDEX `idx_orders_phone` (`buyer_phone`)
+  INDEX `idx_orders_phone` (`buyer_phone`),
+  INDEX `idx_orders_gateway_payment` (`gateway_payment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `order_items` (
@@ -309,6 +323,172 @@ CREATE TABLE IF NOT EXISTS `seller_gst_verification_logs` (
   PRIMARY KEY (`id`),
   INDEX `idx_gstlog_seller` (`seller_id`),
   INDEX `idx_gstlog_gst` (`gst_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ======================================================
+-- Seller Account Deletion, Refund & Settlement Schema
+-- (Zero cascading deletes on financial or order history)
+-- ======================================================
+
+CREATE TABLE IF NOT EXISTS `payment_transactions` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `order_id` BIGINT UNSIGNED NOT NULL,
+  `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `gateway` VARCHAR(40) NOT NULL DEFAULT 'razorpay',
+  `gateway_order_id` VARCHAR(120) NULL DEFAULT NULL,
+  `gateway_payment_id` VARCHAR(120) NOT NULL,
+  `transaction_type` VARCHAR(40) NOT NULL DEFAULT 'capture',
+  `amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `currency` VARCHAR(10) NOT NULL DEFAULT 'INR',
+  `status` VARCHAR(40) NOT NULL DEFAULT 'captured',
+  `gateway_payload` LONGTEXT NULL DEFAULT NULL,
+  `settled_at` TIMESTAMP NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_pt_order` (`order_id`),
+  INDEX `idx_pt_seller` (`seller_id`),
+  INDEX `idx_pt_gateway_payment` (`gateway_payment_id`),
+  INDEX `idx_pt_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_deletion_requests` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `requested_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `stage` VARCHAR(50) NOT NULL DEFAULT 'DELETION_REQUESTED',
+  `status` VARCHAR(50) NOT NULL DEFAULT 'DELETION_REQUESTED',
+  `request_reason` TEXT NULL DEFAULT NULL,
+  `admin_remarks` TEXT NULL DEFAULT NULL,
+  `hold_reason` TEXT NULL DEFAULT NULL,
+  `rejection_reason` TEXT NULL DEFAULT NULL,
+  `confirmation_token` VARCHAR(128) NULL DEFAULT NULL,
+  `confirmation_expires_at` TIMESTAMP NULL DEFAULT NULL,
+  `snapshot_json` LONGTEXT NULL DEFAULT NULL,
+  `financial_summary_json` LONGTEXT NULL DEFAULT NULL,
+  `approved_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `approved_at` TIMESTAMP NULL DEFAULT NULL,
+  `deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `deleted_at` TIMESTAMP NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_sdr_seller` (`seller_id`),
+  INDEX `idx_sdr_stage` (`stage`),
+  INDEX `idx_sdr_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_deletion_checks` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `deletion_request_id` BIGINT UNSIGNED NOT NULL,
+  `check_key` VARCHAR(60) NOT NULL,
+  `label` VARCHAR(255) NOT NULL,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+  `is_blocking` TINYINT(1) NOT NULL DEFAULT 1,
+  `details_json` LONGTEXT NULL DEFAULT NULL,
+  `resolved_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `resolved_at` TIMESTAMP NULL DEFAULT NULL,
+  `notes` TEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_del_check` (`deletion_request_id`, `check_key`),
+  INDEX `idx_sdc_req` (`deletion_request_id`),
+  INDEX `idx_sdc_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_refund_records` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `idempotency_key` VARCHAR(120) NOT NULL,
+  `deletion_request_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `order_id` BIGINT UNSIGNED NOT NULL,
+  `order_item_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `payment_transaction_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `gateway` VARCHAR(40) NOT NULL DEFAULT 'razorpay',
+  `gateway_payment_id` VARCHAR(120) NULL DEFAULT NULL,
+  `gateway_refund_id` VARCHAR(120) NULL DEFAULT NULL,
+  `order_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `eligible_refund_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `refunded_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `status` VARCHAR(40) NOT NULL DEFAULT 'REFUND_PENDING',
+  `gateway_response` LONGTEXT NULL DEFAULT NULL,
+  `failure_reason` TEXT NULL DEFAULT NULL,
+  `attempts` INT NOT NULL DEFAULT 0,
+  `initiated_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `last_attempted_at` TIMESTAMP NULL DEFAULT NULL,
+  `confirmed_at` TIMESTAMP NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_srr_idempotency` (`idempotency_key`),
+  INDEX `idx_srr_del` (`deletion_request_id`),
+  INDEX `idx_srr_order` (`order_id`),
+  INDEX `idx_srr_seller` (`seller_id`),
+  INDEX `idx_srr_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_payouts` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `deletion_request_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `commission_deducted` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `refund_recovery_deducted` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `net_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `status` VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+  `payout_reference` VARCHAR(120) NULL DEFAULT NULL,
+  `gateway_payout_id` VARCHAR(120) NULL DEFAULT NULL,
+  `settled_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `settled_at` TIMESTAMP NULL DEFAULT NULL,
+  `notes` TEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_sp_seller` (`seller_id`),
+  INDEX `idx_sp_del` (`deletion_request_id`),
+  INDEX `idx_sp_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `order_disputes` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `order_id` BIGINT UNSIGNED NOT NULL,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
+  `dispute_type` VARCHAR(50) NOT NULL DEFAULT 'complaint',
+  `status` VARCHAR(40) NOT NULL DEFAULT 'OPEN',
+  `claim_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `description` TEXT NULL DEFAULT NULL,
+  `resolution_notes` TEXT NULL DEFAULT NULL,
+  `resolved_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `resolved_at` TIMESTAMP NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_od_order` (`order_id`),
+  INDEX `idx_od_seller` (`seller_id`),
+  INDEX `idx_od_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_deletion_audit_logs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `deletion_request_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `action` VARCHAR(80) NOT NULL,
+  `previous_stage` VARCHAR(50) NULL DEFAULT NULL,
+  `new_stage` VARCHAR(50) NULL DEFAULT NULL,
+  `previous_status` VARCHAR(50) NULL DEFAULT NULL,
+  `new_status` VARCHAR(50) NULL DEFAULT NULL,
+  `actor_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `actor_role` VARCHAR(30) NOT NULL DEFAULT 'admin',
+  `remarks` TEXT NULL DEFAULT NULL,
+  `metadata_json` LONGTEXT NULL DEFAULT NULL,
+  `ip_address` VARCHAR(64) NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_sdal_del` (`deletion_request_id`),
+  INDEX `idx_sdal_seller` (`seller_id`),
+  INDEX `idx_sdal_action` (`action`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

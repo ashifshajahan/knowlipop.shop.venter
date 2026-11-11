@@ -6,6 +6,7 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../helpers/seller_deletion.php';
 
 function extractFieldPhp(array $input, array $candidates, string $default = ''): string
 {
@@ -269,6 +270,14 @@ function apiRegister(PDO $pdo): void
     }
 
     if ($phoneMatch) {
+        $pmStatus = strtoupper((string) ($phoneMatch['account_status'] ?? 'ACTIVE'));
+        if (in_array($pmStatus, ['LOCKED', 'DELETED'], true)) {
+            errorResponse(
+                $pmStatus === 'DELETED' ? 'This seller account has been permanently deactivated and cannot be registered again.' : 'This seller account is locked during deletion verification.',
+                ['account_status' => [$pmStatus]],
+                403
+            );
+        }
         if (verifyPassword($password, $phoneMatch['password'])) {
             if ($emailMatch && (int) $emailMatch['id'] !== (int) $phoneMatch['id']) {
                 errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
@@ -286,7 +295,7 @@ function apiRegister(PDO $pdo): void
             $role = $phoneMatch['role'] ?? 'seller';
             $publicEmail = getPublicSellerEmailPhp($resolvedEmail, $role);
             $resolvedPhone = !empty($phoneMatch['phone']) ? $phoneMatch['phone'] : $phone;
-            $token = createToken($pdo, (int) $phoneMatch['id'], $resolvedPhone, 'vendor-app', $publicEmail, $role);
+            $token = createToken($pdo, (int) $phoneMatch['id'], $resolvedPhone, 'vendor-app', $publicEmail, $role, (int) ($phoneMatch['token_version'] ?? 1));
             jsonResponse([
                 'message' => 'Seller account already exists. Successfully signed in.',
                 'user' => safeSeller([
@@ -298,6 +307,7 @@ function apiRegister(PDO $pdo): void
                     'landmark' => $landmark ?: ($phoneMatch['landmark'] ?? null),
                     'state' => $state ?: ($phoneMatch['state'] ?? null),
                     'country' => $country ?: ($phoneMatch['country'] ?? 'India'),
+                    'account_status' => $phoneMatch['account_status'] ?? 'ACTIVE',
                     'role' => $role,
                 ]),
                 'token' => $token,
@@ -308,6 +318,14 @@ function apiRegister(PDO $pdo): void
     }
 
     if ($emailMatch) {
+        $emStatus = strtoupper((string) ($emailMatch['account_status'] ?? 'ACTIVE'));
+        if (in_array($emStatus, ['LOCKED', 'DELETED'], true)) {
+            errorResponse(
+                $emStatus === 'DELETED' ? 'This seller account has been permanently deactivated.' : 'This seller account is locked during deletion verification.',
+                ['account_status' => [$emStatus]],
+                403
+            );
+        }
         errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
     }
 
@@ -399,7 +417,7 @@ function apiLogin(PDO $pdo): void
     }
 
     $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
-    $invalidCredsMsg = 'The supplied login credentials (email/phone or password) are incorrect.';
+   $invalidCredsMsg = 'Invalid email/phone number or password. Please try again.';
     $invalidCredsErrors = [
         'email_or_phone' => [$invalidCredsMsg],
         'email' => [$invalidCredsMsg],
@@ -439,10 +457,18 @@ function apiLogin(PDO $pdo): void
         errorResponse($invalidCredsMsg, $invalidCredsErrors, 422);
     }
 
+    $accStatus = strtoupper((string) ($user['account_status'] ?? 'ACTIVE'));
+    if (($user['role'] ?? 'seller') !== 'admin' && in_array($accStatus, ['LOCKED', 'DELETED'], true)) {
+        $msg = $accStatus === 'DELETED'
+            ? 'This seller account has been permanently deactivated and can no longer sign in.'
+            : 'This seller account is locked pending administrative account deletion.';
+        errorResponse($msg, ['account_status' => [$accStatus]], 403);
+    }
+
     $role = $user['role'] ?? 'seller';
     $publicEmail = getPublicSellerEmailPhp($user['email'] ?? null, $role);
     $userPhone = isset($user['phone']) && trim((string)$user['phone']) !== '' ? trim((string)$user['phone']) : null;
-    $token = createToken($pdo, (int) $user['id'], $userPhone, 'vendor-app', $publicEmail, $role);
+    $token = createToken($pdo, (int) $user['id'], $userPhone, 'vendor-app', $publicEmail, $role, (int) ($user['token_version'] ?? 1));
 
     jsonResponse([
         'message' => 'Login successful.',
@@ -462,6 +488,16 @@ function apiLogout(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
     deleteCurrentToken($pdo, (int) $user['token_id']);
+    try {
+        $pdo->prepare("UPDATE users SET token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+            ->execute([':id' => (int) $user['id']]);
+    } catch (Throwable $e) {
+    }
+    try {
+        $pdo->prepare("DELETE FROM personal_access_tokens WHERE tokenable_id = :id")
+            ->execute([':id' => (int) $user['id']]);
+    } catch (Throwable $e) {
+    }
     jsonResponse(['message' => 'Logout successful.']);
 }
 
@@ -539,13 +575,13 @@ function ensurePasswordResetSchemaPhp(PDO $pdo): void
 function findPasswordResetUserPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): ?array
 {
     if ($email !== '' && $rawPhone !== '') {
-        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = :email LIMIT 1");
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = :email LIMIT 1");
         $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':email' => $email]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
     }
     if ($email !== '') {
-        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE LOWER(email) = :email LIMIT 1");
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = :email LIMIT 1");
         $stmt->execute([':email' => $email]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
@@ -553,7 +589,7 @@ function findPasswordResetUserPhp(PDO $pdo, string $email, string $rawPhone, str
     if ($rawPhone !== '' || $phone !== '') {
         $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
         $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
-        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
         $stmt->execute([':phone' => $phone, ':rawPhone' => $effRaw, ':rawNoPrefix' => $effNoPrefix]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
@@ -661,6 +697,9 @@ function apiForgotPassword(PDO $pdo): void
     $activeChannel = ($requestedChannel === 'email' || ($rawPhone === '' && $email !== '')) ? 'email' : 'phone';
 
     $user = findPasswordResetUserPhp($pdo, $email, $rawPhone, $phone, $rawNoPrefix);
+    if ($user && ($user['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($user['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$user['account_status']]], 403);
+    }
 
     $otp = null;
     $gatewayResult = null;
@@ -789,6 +828,9 @@ function apiVerifyOtp(PDO $pdo): void
 
     $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
     $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    if ($matchedUser && ($matchedUser['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($matchedUser['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403);
+    }
 
     $firebaseApproved = !empty($firebaseRes['approved']);
     $localValid = $row && $code !== '' && verifyPassword($code, $row['token']);
@@ -829,6 +871,7 @@ function apiVerifyOtp(PDO $pdo): void
 function apiResetPassword(PDO $pdo): void
 {
     ensurePasswordResetSchemaPhp($pdo);
+    ensureSellerDeletionSchemaPhp($pdo);
     $input = getJsonInput();
     $ids = extractAuthIdentifiersPhp($input, false);
     $email = $ids['email'];
@@ -914,6 +957,9 @@ function apiResetPassword(PDO $pdo): void
 
     $resolvedRawNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $resolvedPhone);
     $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    if ($matchedUser && ($matchedUser['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($matchedUser['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403);
+    }
 
     if (!$matchedUser && !isFirebaseTestPhone($resolvedPhone) && !isFirebaseTestEmail($resolvedEmail)) {
         errorResponse('No seller account matches the supplied email or phone number.', [], 422);
@@ -929,14 +975,17 @@ function apiResetPassword(PDO $pdo): void
 
     $hashed = hashPassword($password);
     if ($matchedUser) {
-        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
             ->execute([':password' => $hashed, ':id' => (int) $matchedUser['id']]);
+        try {
+            $pdo->prepare("DELETE FROM personal_access_tokens WHERE tokenable_id = :id")->execute([':id' => (int) $matchedUser['id']]);
+        } catch (Throwable $e) {}
     } elseif ($resolvedEmail !== '' && $resolvedPhone === '') {
-        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = :email")
+        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = :email")
             ->execute([':password' => $hashed, ':email' => $resolvedEmail]);
     } elseif ($resolvedPhone !== '') {
         $effRaw = $rawPhone !== '' ? $rawPhone : $resolvedPhone;
-        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
+        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
             ->execute([
                 ':password' => $hashed,
                 ':phone' => $resolvedPhone,

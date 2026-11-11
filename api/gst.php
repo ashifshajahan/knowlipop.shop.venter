@@ -63,6 +63,7 @@ function apiSellerSubmitGst(PDO $pdo): void
 {
     ensureGstTables($pdo);
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     $sellerId = (int) $user['id'];
 
     $input = getJsonInput();
@@ -157,8 +158,8 @@ function apiSellerSubmitGst(PDO $pdo): void
                 pincode = :pincode,
                 status = :status,
                 rejection_reason = NULL,
-                submitted_at = NOW(),
-                updated_at = NOW()
+                submitted_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = :id
         ");
         $updateStmt->execute([
@@ -174,7 +175,7 @@ function apiSellerSubmitGst(PDO $pdo): void
         $insertStmt = $pdo->prepare("
             INSERT INTO seller_gst_details
             (seller_id, gstin, business_name, business_address, state, pincode, status, submitted_at, created_at, updated_at)
-            VALUES (:seller_id, :gstin, :business_name, :business_address, :state, :pincode, :status, NOW(), NOW(), NOW())
+            VALUES (:seller_id, :gstin, :business_name, :business_address, :state, :pincode, :status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ");
         $insertStmt->execute([
             ':seller_id' => $sellerId,
@@ -206,7 +207,7 @@ function apiSellerSubmitGst(PDO $pdo): void
             $docStmt = $pdo->prepare("
                 INSERT INTO seller_gst_documents
                 (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
-                VALUES (:seller_id, :gst_id, :document_type, :original_name, :file_name, :file_path, :file_size, :mime_type, :is_primary, NOW(), NOW())
+                VALUES (:seller_id, :gst_id, :document_type, :original_name, :file_name, :file_path, :file_size, :mime_type, :is_primary, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ");
             $docStmt->execute([
                 ':seller_id' => $sellerId,
@@ -356,6 +357,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
 {
     ensureGstTables($pdo);
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     $sellerId = (int) $user['id'];
 
     $fileField = null;
@@ -419,7 +421,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
     $insDoc = $pdo->prepare("
         INSERT INTO seller_gst_documents
         (seller_id, gst_id, document_type, original_name, file_name, file_path, file_size, mime_type, is_primary, created_at, updated_at)
-        VALUES (:seller_id, :gst_id, :document_type, :original_name, :file_name, :file_path, :file_size, :mime_type, :is_primary, NOW(), NOW())
+        VALUES (:seller_id, :gst_id, :document_type, :original_name, :file_name, :file_path, :file_size, :mime_type, :is_primary, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ");
     $insDoc->execute([
         ':seller_id' => $sellerId,
@@ -436,7 +438,7 @@ function apiSellerUploadGstDocument(PDO $pdo): void
 
     // If seller's GST was previously Rejected, reset to Pending on new document submission
     if ($gst && $prevStatus === 'Rejected') {
-        $pdo->prepare("UPDATE seller_gst_details SET status = 'Pending', rejection_reason = NULL, updated_at = NOW() WHERE id = :id")
+        $pdo->prepare("UPDATE seller_gst_details SET status = 'Pending', rejection_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
             ->execute([':id' => $gstId]);
         logGstVerification($pdo, $sellerId, $gstId, 'resubmitted', 'Rejected', 'Pending', 'Seller uploaded new document after rejection.', $sellerId, 'seller');
     } else {
@@ -469,6 +471,7 @@ function apiSellerDeleteGstDocument(PDO $pdo, int $docId): void
 {
     ensureGstTables($pdo);
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     $sellerId = (int) $user['id'];
 
     $stmt = $pdo->prepare("SELECT * FROM seller_gst_documents WHERE id = :id AND seller_id = :seller_id LIMIT 1");
@@ -702,8 +705,8 @@ function apiAdminApproveGst(PDO $pdo, int $sellerId): void
         SET status = 'Approved',
             rejection_reason = NULL,
             verified_by = :admin_id,
-            verified_at = NOW(),
-            updated_at = NOW()
+            verified_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = :id
     ");
     $updateStmt->execute([
@@ -762,8 +765,8 @@ function apiAdminRejectGst(PDO $pdo, int $sellerId): void
         SET status = 'Rejected',
             rejection_reason = :reason,
             verified_by = :admin_id,
-            verified_at = NOW(),
-            updated_at = NOW()
+            verified_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = :id
     ");
     $updateStmt->execute([

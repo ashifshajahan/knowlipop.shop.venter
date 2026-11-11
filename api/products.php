@@ -6,6 +6,7 @@
 
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
+require_once __DIR__ . '/../helpers/seller_deletion.php';
 
 function getDefaultStarterCategoriesPhp(): array
 {
@@ -105,6 +106,38 @@ function ensureProductCategoriesTable(PDO $pdo): void
 
     try {
         if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    slug TEXT NOT NULL UNIQUE,
+                    description TEXT NULL,
+                    icon TEXT NULL,
+                    image_url TEXT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+            $cnt = (int) $pdo->query("SELECT COUNT(*) FROM categories")->fetchColumn();
+            if ($cnt === 0) {
+                $ins = $pdo->prepare("
+                    INSERT INTO categories (id, name, slug, description, icon, sort_order, is_active, created_at, updated_at)
+                    VALUES (:id, :name, :slug, :description, :icon, :sort_order, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ");
+                foreach (getDefaultStarterCategoriesPhp() as $cat) {
+                    $ins->execute([
+                        ':id' => $cat['id'],
+                        ':name' => $cat['name'],
+                        ':slug' => $cat['slug'],
+                        ':description' => $cat['description'],
+                        ':icon' => $cat['icon'],
+                        ':sort_order' => $cat['sort_order'],
+                        ':is_active' => $cat['is_active'],
+                    ]);
+                }
+            }
             $initializedPdos[$pdoKey] = true;
             return;
         }
@@ -142,7 +175,7 @@ function ensureProductCategoriesTable(PDO $pdo): void
         if ($cnt === 0) {
             $ins = $pdo->prepare("
                 INSERT INTO `categories` (`id`, `name`, `slug`, `description`, `icon`, `sort_order`, `is_active`, `created_at`, `updated_at`)
-                VALUES (:id, :name, :slug, :description, :icon, :sort_order, :is_active, NOW(), NOW())
+                VALUES (:id, :name, :slug, :description, :icon, :sort_order, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ");
             foreach (getDefaultStarterCategoriesPhp() as $cat) {
                 $ins->execute([
@@ -615,6 +648,7 @@ function performCategoryMutationPhp(PDO $pdo, string $action, array $input, bool
 function apiManageProductCategoriesViaProducts(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
 
     $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'PUT');
@@ -944,30 +978,38 @@ function formatProductRecord(array $p, bool $isSellerView = false): array
 
 function ensureProductPriceColumns(PDO $pdo): void
 {
+    ensureSellerDeletionSchemaPhp($pdo);
     try {
-        $addColumnIfNotExists = function(string $colName, string $colDef) use ($pdo) {
+        $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+        $isSqlite = ($driver === 'sqlite');
+        $addColumnIfNotExists = function(string $colName, string $colDef, string $sqliteDef = '') use ($pdo, $isSqlite) {
             try {
-                $cols = $pdo->query("SHOW COLUMNS FROM `products` LIKE '{$colName}'")->fetchAll();
-                if (empty($cols)) {
+                if (dbHasColumnPhp($pdo, 'products', $colName)) {
+                    return;
+                }
+                if ($isSqlite) {
+                    $def = $sqliteDef !== '' ? $sqliteDef : preg_replace('/\s+AFTER\s+`?[^`\s]+`?/i', '', $colDef);
+                    $pdo->exec("ALTER TABLE `products` ADD COLUMN {$def}");
+                } else {
                     $pdo->exec("ALTER TABLE `products` ADD COLUMN {$colDef}");
                 }
             } catch (\Throwable $e) {}
         };
 
-        $addColumnIfNotExists('seller_price', '`seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `description`');
-        $addColumnIfNotExists('commission', '`commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `seller_price`');
-        $addColumnIfNotExists('delivery_charge', '`delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission`');
-        $addColumnIfNotExists('gst', '`gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `delivery_charge`');
-        $addColumnIfNotExists('other_charges', '`other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `gst`');
-        $addColumnIfNotExists('mrp', '`mrp` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `price`');
-        $addColumnIfNotExists('sku', '`sku` VARCHAR(100) NULL AFTER `mrp`');
-        $addColumnIfNotExists('category', '`category` VARCHAR(100) NULL AFTER `sku`');
-        $addColumnIfNotExists('category_id', '`category_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `category`');
-        $addColumnIfNotExists('brand', '`brand` VARCHAR(100) NULL AFTER `category_id`');
+        $addColumnIfNotExists('seller_price', '`seller_price` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `description`', '`seller_price` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('commission', '`commission` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `seller_price`', '`commission` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('delivery_charge', '`delivery_charge` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission`', '`delivery_charge` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('gst', '`gst` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `delivery_charge`', '`gst` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('other_charges', '`other_charges` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `gst`', '`other_charges` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('mrp', '`mrp` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `price`', '`mrp` REAL NOT NULL DEFAULT 0.00');
+        $addColumnIfNotExists('sku', '`sku` VARCHAR(100) NULL AFTER `mrp`', '`sku` TEXT NULL');
+        $addColumnIfNotExists('category', '`category` VARCHAR(100) NULL AFTER `sku`', '`category` TEXT NULL');
+        $addColumnIfNotExists('category_id', '`category_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `category`', '`category_id` INTEGER NULL DEFAULT NULL');
+        $addColumnIfNotExists('brand', '`brand` VARCHAR(100) NULL AFTER `category_id`', '`brand` TEXT NULL');
         ensureProductCategoriesTable($pdo);
-        $addColumnIfNotExists('rating', '`rating` DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER `brand`');
-        $addColumnIfNotExists('ratings_count', '`ratings_count` INT NOT NULL DEFAULT 15 AFTER `rating`');
-        $addColumnIfNotExists('images', '`images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`');
+        $addColumnIfNotExists('rating', '`rating` DECIMAL(3,2) NOT NULL DEFAULT 4.50 AFTER `brand`', '`rating` REAL NOT NULL DEFAULT 4.50');
+        $addColumnIfNotExists('ratings_count', '`ratings_count` INT NOT NULL DEFAULT 15 AFTER `rating`', '`ratings_count` INTEGER NOT NULL DEFAULT 15');
+        $addColumnIfNotExists('images', '`images` LONGTEXT NULL DEFAULT NULL AFTER `image_url`', '`images` TEXT NULL DEFAULT NULL');
 
         // Safe database repair:
         // 1. Recover any prices that compounded above seller_price
@@ -1005,23 +1047,40 @@ function ensureProductPriceColumns(PDO $pdo): void
         } catch (\Throwable $e) {}
         // Ensure product_images table exists
         try {
-            $pdo->exec("
-                CREATE TABLE IF NOT EXISTS `product_images` (
-                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    `seller_id` BIGINT UNSIGNED NOT NULL,
-                    `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                    `image_url` LONGTEXT NOT NULL,
-                    `relative_path` VARCHAR(255) NOT NULL,
-                    `file_name` VARCHAR(255) NOT NULL,
-                    `file_size` BIGINT UNSIGNED NULL DEFAULT NULL,
-                    `mime_type` VARCHAR(50) NULL DEFAULT NULL,
-                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (`id`),
-                    INDEX `idx_pi_seller` (`seller_id`),
-                    INDEX `idx_pi_product` (`product_id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-            ");
+            if ($isSqlite) {
+                $pdo->exec("
+                    CREATE TABLE IF NOT EXISTS product_images (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        seller_id INTEGER NOT NULL,
+                        product_id INTEGER NULL DEFAULT NULL,
+                        image_url TEXT NOT NULL,
+                        relative_path TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        file_size INTEGER NULL DEFAULT NULL,
+                        mime_type TEXT NULL DEFAULT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                ");
+            } else {
+                $pdo->exec("
+                    CREATE TABLE IF NOT EXISTS `product_images` (
+                        `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                        `seller_id` BIGINT UNSIGNED NOT NULL,
+                        `product_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                        `image_url` LONGTEXT NOT NULL,
+                        `relative_path` VARCHAR(255) NOT NULL,
+                        `file_name` VARCHAR(255) NOT NULL,
+                        `file_size` BIGINT UNSIGNED NULL DEFAULT NULL,
+                        `mime_type` VARCHAR(50) NULL DEFAULT NULL,
+                        `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                        `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (`id`),
+                        INDEX `idx_pi_seller` (`seller_id`),
+                        INDEX `idx_pi_product` (`product_id`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                ");
+            }
         } catch (\Throwable $e) {}
     } catch (\Throwable $e) {
         // ignore
@@ -1039,7 +1098,7 @@ function apiGetProducts(PDO $pdo): void
     $category = trim((string) ($_GET['category'] ?? ''));
     $categoryIdParam = trim((string) ($_GET['category_id'] ?? ''));
 
-    $where = "WHERE p.is_active = 1";
+    $where = "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
     $params = [];
     if ($sellerId !== null) {
         $where .= " AND p.seller_id = :seller_id";
@@ -1074,7 +1133,7 @@ function apiGetProducts(PDO $pdo): void
         }
     }
 
-    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
+    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p LEFT JOIN users u ON p.seller_id = u.id {$where}");
     foreach ($params as $k => $v) {
         $countStmt->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
     }
@@ -1113,6 +1172,13 @@ function apiGetProducts(PDO $pdo): void
         'success' => true,
         'status' => true,
         'data' => $products,
+        'products' => [
+            'current_page' => $page,
+            'data' => $products,
+            'total' => $total,
+            'per_page' => $limit,
+            'last_page' => $lastPage,
+        ],
         'categories' => $categoriesList,
         'total' => $total,
         'current_page' => $page,
@@ -1137,7 +1203,7 @@ function apiGetProduct(PDO $pdo, int $id): void
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
-        WHERE p.id = :id AND p.is_active = 1
+        WHERE p.id = :id AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
         LIMIT 1
     ");
     $stmt->execute([':id' => $id]);
@@ -1794,13 +1860,13 @@ function syncProductImagesRecordPHP(PDO $pdo, int $sellerId, ?int $productId, ar
 
             if ($existing) {
                 if ($productId) {
-                    $upd = $pdo->prepare("UPDATE product_images SET product_id = :pid, updated_at = NOW() WHERE id = :id");
+                    $upd = $pdo->prepare("UPDATE product_images SET product_id = :pid, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
                     $upd->execute([':pid' => $productId, ':id' => $existing['id']]);
                 }
             } else {
                 $ins = $pdo->prepare("
                     INSERT INTO product_images (seller_id, product_id, image_url, relative_path, file_name, file_size, mime_type, created_at, updated_at)
-                    VALUES (:seller_id, :product_id, :image_url, :relative_path, :file_name, :file_size, :mime_type, NOW(), NOW())
+                    VALUES (:seller_id, :product_id, :image_url, :relative_path, :file_name, :file_size, :mime_type, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ");
                 $ins->execute([
                     ':seller_id' => $sellerId,
@@ -1868,6 +1934,7 @@ function safeDeleteLocalImageFilePHP(PDO $pdo, string $fileName, ?int $excludePr
 function apiUploadImage(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
     $input = array_merge($_POST, getJsonInput());
     $res = saveUploadedProductImages($input);
@@ -1923,7 +1990,7 @@ function apiUploadImage(PDO $pdo): void
         $primaryUrl = $combinedImgs[0] ?? $res['primaryImageUrl'];
         $imagesJson = !empty($combinedImgs) ? json_encode($combinedImgs) : null;
 
-        $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+        $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
         $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $targetProductId]);
 
         syncProductImagesRecordPHP($pdo, (int)$user['id'], $targetProductId, $combinedImgs, $res['filesInfo'] ?? []);
@@ -2070,6 +2137,7 @@ function apiGetProductImageDetail(PDO $pdo, int $productId, mixed $targetIdOrFil
 function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile = null): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
 
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
@@ -2205,7 +2273,7 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
     $primaryUrl = $newImages[0] ?? null;
     $imagesJson = !empty($newImages) ? json_encode($newImages) : null;
 
-    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
     $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $productId]);
 
     syncProductImagesRecordPHP($pdo, (int)$user['id'], $productId, $newImages, $res['filesInfo'] ?? []);
@@ -2246,6 +2314,7 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
 function apiDeleteProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile = null): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
 
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
@@ -2310,7 +2379,7 @@ function apiDeleteProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile =
     $primaryUrl = !empty($currentImgs) ? $currentImgs[0] : null;
     $imagesJson = !empty($currentImgs) ? json_encode($currentImgs) : null;
 
-    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = NOW() WHERE id = :id");
+    $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
     $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $productId]);
 
     if ($removedUrl) {
@@ -2346,6 +2415,7 @@ function apiDeleteProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile =
 function apiDeleteStandaloneImage(PDO $pdo, string $filename): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
     $safeFn = basename(explode('?', $filename)[0]);
     if (empty($safeFn)) {
@@ -2375,6 +2445,7 @@ function apiDeleteStandaloneImage(PDO $pdo, string $filename): void
 function apiCreateProduct(PDO $pdo): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
     $input = array_merge($_POST, getJsonInput());
 
@@ -2457,11 +2528,11 @@ function apiCreateProduct(PDO $pdo): void
     // ONLY check unattached if client provided ZERO images
     if (empty($finalImages)) {
         try {
-            $unStmt = $pdo->prepare("
-                SELECT image_url FROM product_images 
-                WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE 
-                ORDER BY id ASC LIMIT 4
-            ");
+            $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+            $unSql = ($driver === 'sqlite')
+                ? "SELECT image_url FROM product_images WHERE seller_id = :sid AND product_id IS NULL AND created_at >= datetime('now', '-5 minutes') ORDER BY id ASC LIMIT 4"
+                : "SELECT image_url FROM product_images WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE ORDER BY id ASC LIMIT 4";
+            $unStmt = $pdo->prepare($unSql);
             $unStmt->execute([':sid' => (int)$user['id']]);
             $unRows = $unStmt->fetchAll(PDO::FETCH_ASSOC);
             foreach ($unRows as $ur) {
@@ -2492,7 +2563,7 @@ function apiCreateProduct(PDO $pdo): void
 
     $stmt = $pdo->prepare("
         INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, NOW(), NOW())
+        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ");
     $stmt->execute([
         ':seller_id' => $user['id'],
@@ -2597,7 +2668,7 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
         }
     }
 
-    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p {$where}");
+    $countStmt = $pdo->prepare("SELECT COUNT(*) FROM products p LEFT JOIN users u ON p.seller_id = u.id {$where}");
     $countStmt->execute($params);
     $total = (int)$countStmt->fetchColumn();
 
@@ -2634,6 +2705,13 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
         'status' => true,
         'seller_id' => $targetSellerId,
         'data' => $products,
+        'products' => [
+            'current_page' => $page,
+            'data' => $products,
+            'total' => $total,
+            'per_page' => $limit,
+            'last_page' => $lastPage,
+        ],
         'categories' => $categoriesList,
         'total' => $total,
         'current_page' => $page,
@@ -2651,6 +2729,7 @@ function apiGetSellerProducts(PDO $pdo, ?int $routeSellerId = null): void
 function apiUpdateProduct(PDO $pdo, int $id): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     ensureProductPriceColumns($pdo);
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
     $stmt->execute([':id' => $id]);
@@ -2828,7 +2907,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     }
 
     if (!empty($updates)) {
-        $updates[] = "updated_at = NOW()";
+        $updates[] = "updated_at = CURRENT_TIMESTAMP";
         $sql = "UPDATE products SET " . implode(', ', $updates) . " WHERE id = :id";
         $updStmt = $pdo->prepare($sql);
         $updStmt->execute($params);
@@ -2869,6 +2948,7 @@ function apiUpdateProduct(PDO $pdo, int $id): void
 function apiDeleteProduct(PDO $pdo, int $id): void
 {
     $user = authenticateUser($pdo);
+    requireActiveSellerForMutationPhp($user);
     $stmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
     $stmt->execute([':id' => $id]);
     $product = $stmt->fetch(PDO::FETCH_ASSOC);

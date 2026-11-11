@@ -63,6 +63,48 @@ async function runMigration() {
     // ignore
   }
 
+  // Ensure users table has Seller Deletion & token revocation columns
+  const ensureColumn = async (table, colName, alterSql) => {
+    try {
+      const [cols] = await conn.query(`SHOW COLUMNS FROM \`${table}\` LIKE ?`, [colName]);
+      if (cols.length === 0) {
+        await conn.query(`ALTER TABLE \`${table}\` ADD COLUMN ${alterSql}`);
+        console.log(`✅ Added missing column ${colName} to ${table}`);
+      }
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  await ensureColumn('users', 'account_status', "`account_status` VARCHAR(40) NOT NULL DEFAULT 'ACTIVE' AFTER `role`");
+  await ensureColumn('users', 'deletion_requested_at', '`deletion_requested_at` TIMESTAMP NULL DEFAULT NULL AFTER `account_status`');
+  await ensureColumn('users', 'deleted_at', '`deleted_at` TIMESTAMP NULL DEFAULT NULL AFTER `deletion_requested_at`');
+  await ensureColumn('users', 'deleted_by', '`deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `deleted_at`');
+  await ensureColumn('users', 'token_version', '`token_version` INT NOT NULL DEFAULT 1 AFTER `deleted_by`');
+
+  try {
+    const [uIdx] = await conn.query('SHOW INDEX FROM users WHERE Key_name = "idx_users_account_status"');
+    if (uIdx.length === 0) {
+      await conn.query('ALTER TABLE users ADD INDEX idx_users_account_status (account_status)');
+    }
+  } catch (e) {}
+
+  // Ensure orders table has payment gateway, refund, return window & settlement columns
+  await ensureColumn('orders', 'payment_gateway', '`payment_gateway` VARCHAR(40) NULL DEFAULT NULL AFTER `delivered_at`');
+  await ensureColumn('orders', 'gateway_order_id', '`gateway_order_id` VARCHAR(120) NULL DEFAULT NULL AFTER `payment_gateway`');
+  await ensureColumn('orders', 'gateway_payment_id', '`gateway_payment_id` VARCHAR(120) NULL DEFAULT NULL AFTER `gateway_order_id`');
+  await ensureColumn('orders', 'captured_amount', '`captured_amount` DECIMAL(10,2) NULL DEFAULT NULL AFTER `gateway_payment_id`');
+  await ensureColumn('orders', 'refunded_amount', '`refunded_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `captured_amount`');
+  await ensureColumn('orders', 'return_window_ends_at', '`return_window_ends_at` TIMESTAMP NULL DEFAULT NULL AFTER `refunded_amount`');
+  await ensureColumn('orders', 'settled_at', '`settled_at` TIMESTAMP NULL DEFAULT NULL AFTER `return_window_ends_at`');
+
+  try {
+    const [oIdx] = await conn.query('SHOW INDEX FROM orders WHERE Key_name = "idx_orders_gateway_payment"');
+    if (oIdx.length === 0) {
+      await conn.query('ALTER TABLE orders ADD INDEX idx_orders_gateway_payment (gateway_payment_id)');
+    }
+  } catch (e) {}
+
   // Ensure products table has category_id column
   try {
     const [cols] = await conn.query('SHOW COLUMNS FROM products LIKE "category_id"');

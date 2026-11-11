@@ -103,21 +103,71 @@ The platform features built-in multi-vendor marketplace routing and privacy isol
 
 ### Admin Panel
 * `GET /admin/login` — Administrator login page
-* `POST /admin/login` — Sign in with email and password
+* `POST /admin/login` — Sign in with email and password (mints `admin_token` JWT cookie)
 * `GET /admin` — Administrator dashboard
+* `GET /admin/seller-deletions` — **Seller Management → Seller Deletion Requests** workspace (Preflight metrics, 6-gate checklist, Rules A–E verification, Razorpay refund runner, financial settlement, Approve/Hold/Reject, 2-step Final Delete, Activity History)
+
+---
+
+## Seller Account Deletion, Refund & Settlement System
+
+A complete, multi-stage deletion workflow implemented identically across both **Node.js (Express)** (`helpers/seller_deletion.js`, `routes/seller_deletion_routes.js`) and **Pure PHP** (`helpers/seller_deletion.php`, `api/seller_deletion.php`) with MySQL transactional row locking (`FOR UPDATE`) and strict preservation of order and financial history.
+
+### Deletion Stages & Status Badges
+* **Stages**: `DELETION_REQUESTED` → `ACCOUNT_LOCKED` → `ORDER_VERIFICATION` → `REFUND_PROCESSING` → `FINANCIAL_SETTLEMENT` → `ADMIN_REVIEW` → `APPROVED_FOR_DELETION` → `DELETED`
+* **Additional Statuses**: `DELETION_REJECTED`, `DELETION_ON_HOLD`, `REFUND_FAILED`, `SETTLEMENT_PENDING`
+* **Color Mapping**: **PENDING** (Yellow), **PROCESSING** (Blue), **SUCCESS** (Green), **FAILED** (Red), **ON HOLD** (Orange)
+
+### Order Verification Rules (A–E)
+* **Rule A (`pending`)**: Blocks further seller processing (`403`), auto-cancels during order verification, restores stock, queues Razorpay refund if paid, and notifies buyer.
+* **Rule B (`accepted` / `processing` / `packed`)**: Requires explicit Admin cancellation approval (`approve_accepted_cancellations` or `approve_cancellation_order_ids`), restores stock, and queues eligible buyer refund.
+* **Rule C (`shipped`)**: Never auto-cancelled/refunded; blocks deletion until delivery/return or dispute resolution.
+* **Rule D (`delivered`)**: Holds deletion until `RETURN_WINDOW_DAYS` (default `7`) elapses and open complaints/disputes reach `0`.
+* **Rule E (`cancelled` / `rejected`)**: Audits refund delivery and queues any outstanding eligible refund.
+
+### Automatic Razorpay Refund & Financial Settlement
+* Uses `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_API_BASE_URL`, `MARKETPLACE_COMMISSION_RATE` (`0.05`), and `RETURN_WINDOW_DAYS` (`7`).
+* Enforces unique `idempotency_key` (`X-Razorpay-Idempotency`), proportional multi-vendor refund calculation capped at `captured_amount - refunded_amount`, and authentic Razorpay confirmation (`status === 'processed'`) before marking `REFUND_SUCCESS`.
+* Missing gateway payment ID routes to `REFUND_REQUIRES_REVIEW`; gateway errors set `REFUND_FAILED` and block deletion.
+* Prevents double payouts and blocks payout release while unresolved orders, pending/failed refunds, unsettled gateway captures, or open disputes remain.
+
+### Admin Deletion API Endpoints (`Authorization: Bearer <admin_token>`)
+* `GET /api/admin/seller-deletions/preflight/:seller_id` — Live seller details + 13+ metrics (products, A–E order breakdown, successful payments, pending refunds, wallet balance, pending payouts, commissions, disputes)
+* `POST /api/admin/seller-deletions` — Create deletion request, set `users.account_status = 'DELETION_PENDING'`, block new buyer orders, notify seller
+* `GET /api/admin/seller-deletions` & `GET /api/admin/seller-deletions/:id` — Filtered request list & full review workspace payload
+* `POST /api/admin/seller-deletions/:id/lock` — Lock seller account (`LOCKED`) and revoke seller mutations
+* `POST /api/admin/seller-deletions/:id/verify-orders` — Execute Rules A–E verification & queue eligible refunds
+* `GET /api/admin/seller-deletions/:id/refunds` & `POST /api/admin/seller-deletions/:id/process-refunds` — Track & execute idempotent Razorpay refunds
+* `POST /api/admin/seller-deletions/:id/verify-settlement` & `POST /api/admin/seller-deletions/:id/settle-payout` — Audit financial obligations & safely release payouts
+* `POST /api/admin/seller-deletions/:id/resolve-dispute` — Resolve order disputes/complaints & close return window
+* `POST /api/admin/seller-deletions/:id/approve` — Validate all 6 checks `SUCCESS` & issue single-use `confirmation_token`
+* `POST /api/admin/seller-deletions/:id/hold` & `POST /api/admin/seller-deletions/:id/reject` — Put on hold or reject & restore `ACTIVE`
+* `POST /api/admin/seller-deletions/:id/final-delete` — Validate `confirmation_token` + exact phrase `"DELETE SELLER #<seller_id>"`, soft-delete seller (`DELETED`), bump `token_version` (revoke JWTs), clear tokens, hide products (`is_active = 0`), preserve all historical records
+* `POST /api/orders/:id/payment-verify` — Record/verify Razorpay payment capture & settlement state
+* `POST /api/orders/:id/disputes` — Record buyer complaints & disputes on an order (viewed in Deletion Workspace `GET /api/admin/seller-deletions/:id`)
 
 ---
 
 ## Automated Verification & Test Suites
 
-Both backend engines include automated test suites covering all 8 requirements:
+Both backend engines include comprehensive automated test suites:
 
 ```bash
-# 1. Run Node.js Express End-to-End Suite (20 assertions)
+# 1. Node.js Express End-to-End Multi-Vendor Suite
 node tests/test_e2e_node.js
 
-# 2. Run Pure PHP End-to-End Suite (18 assertions)
+# 2. Pure PHP End-to-End Multi-Vendor Suite
 php tests/test_php_multi_vendor.php
+
+# 3. Node.js Seller Deletion & Refund 11-Scenario Suite
+node tests/test_seller_deletion_node.js
+
+# 4. Pure PHP Seller Deletion & Refund 11-Scenario Suite
+php tests/test_seller_deletion_php.php
+
+# 5. API Cleanliness & Postman JSON Validation
+node tests/test_response_cleanliness.js
+node tests/validate_postman_json.js
 ```
 
 All 38 integration assertions verify:

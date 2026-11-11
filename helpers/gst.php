@@ -10,80 +10,141 @@ function ensureGstTables(PDO $pdo): void
     static $ensured = false;
     if ($ensured) return;
 
+    $isSqlite = ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite');
+
     try {
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `seller_gst_details` (
-              `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-              `seller_id` BIGINT UNSIGNED NOT NULL,
-              `gstin` VARCHAR(30) NULL DEFAULT NULL,
-              `business_name` VARCHAR(255) NULL DEFAULT NULL,
-              `business_address` TEXT NULL DEFAULT NULL,
-              `state` VARCHAR(100) NULL DEFAULT NULL,
-              `pincode` VARCHAR(20) NULL DEFAULT NULL,
-              `status` VARCHAR(30) NOT NULL DEFAULT 'Pending',
-              `rejection_reason` TEXT NULL DEFAULT NULL,
-              `verified_by` BIGINT UNSIGNED NULL DEFAULT NULL,
-              `verified_at` TIMESTAMP NULL DEFAULT NULL,
-              `submitted_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-              `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-              `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              PRIMARY KEY (`id`),
-              UNIQUE KEY `uniq_gst_seller` (`seller_id`),
-              INDEX `idx_gst_status` (`status`),
-              INDEX `idx_gst_gstin` (`gstin`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
-
-        try {
+        if ($isSqlite) {
             $pdo->exec("
-                ALTER TABLE `seller_gst_details`
-                MODIFY `gstin` VARCHAR(30) NULL DEFAULT NULL,
-                MODIFY `business_name` VARCHAR(255) NULL DEFAULT NULL,
-                MODIFY `business_address` TEXT NULL DEFAULT NULL,
-                MODIFY `state` VARCHAR(100) NULL DEFAULT NULL,
-                MODIFY `pincode` VARCHAR(20) NULL DEFAULT NULL;
+                CREATE TABLE IF NOT EXISTS `seller_gst_details` (
+                  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+                  `seller_id` INTEGER NOT NULL UNIQUE,
+                  `gstin` VARCHAR(30) NULL DEFAULT NULL,
+                  `business_name` VARCHAR(255) NULL DEFAULT NULL,
+                  `business_address` TEXT NULL DEFAULT NULL,
+                  `state` VARCHAR(100) NULL DEFAULT NULL,
+                  `pincode` VARCHAR(20) NULL DEFAULT NULL,
+                  `status` VARCHAR(30) NOT NULL DEFAULT 'Pending',
+                  `rejection_reason` TEXT NULL DEFAULT NULL,
+                  `verified_by` INTEGER NULL DEFAULT NULL,
+                  `verified_at` DATETIME NULL DEFAULT NULL,
+                  `submitted_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                  `created_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                  `updated_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP
+                );
             ");
-        } catch (Throwable $ignoreAlter) {
-            // Already altered or non-critical
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gst_status` ON `seller_gst_details` (`status`);");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gst_gstin` ON `seller_gst_details` (`gstin`);");
+
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `seller_gst_documents` (
+                  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+                  `seller_id` INTEGER NOT NULL,
+                  `gst_id` INTEGER NULL DEFAULT NULL,
+                  `document_type` VARCHAR(50) NOT NULL DEFAULT 'gst_certificate',
+                  `original_name` VARCHAR(255) NOT NULL,
+                  `file_name` VARCHAR(255) NOT NULL,
+                  `file_path` VARCHAR(255) NOT NULL,
+                  `file_size` INTEGER NOT NULL,
+                  `mime_type` VARCHAR(100) NOT NULL,
+                  `is_primary` INTEGER NOT NULL DEFAULT 1,
+                  `created_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                  `updated_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gstdoc_seller` ON `seller_gst_documents` (`seller_id`);");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gstdoc_gst` ON `seller_gst_documents` (`gst_id`);");
+
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `seller_gst_verification_logs` (
+                  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+                  `seller_id` INTEGER NOT NULL,
+                  `gst_id` INTEGER NULL DEFAULT NULL,
+                  `action` VARCHAR(40) NOT NULL,
+                  `previous_status` VARCHAR(30) NULL DEFAULT NULL,
+                  `new_status` VARCHAR(30) NOT NULL,
+                  `notes` TEXT NULL DEFAULT NULL,
+                  `performed_by` INTEGER NULL DEFAULT NULL,
+                  `performer_role` VARCHAR(20) NOT NULL DEFAULT 'seller',
+                  `created_at` DATETIME NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            ");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gstlog_seller` ON `seller_gst_verification_logs` (`seller_id`);");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS `idx_gstlog_gst` ON `seller_gst_verification_logs` (`gst_id`);");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `seller_gst_details` (
+                  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                  `seller_id` BIGINT UNSIGNED NOT NULL,
+                  `gstin` VARCHAR(30) NULL DEFAULT NULL,
+                  `business_name` VARCHAR(255) NULL DEFAULT NULL,
+                  `business_address` TEXT NULL DEFAULT NULL,
+                  `state` VARCHAR(100) NULL DEFAULT NULL,
+                  `pincode` VARCHAR(20) NULL DEFAULT NULL,
+                  `status` VARCHAR(30) NOT NULL DEFAULT 'Pending',
+                  `rejection_reason` TEXT NULL DEFAULT NULL,
+                  `verified_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+                  `verified_at` TIMESTAMP NULL DEFAULT NULL,
+                  `submitted_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uniq_gst_seller` (`seller_id`),
+                  INDEX `idx_gst_status` (`status`),
+                  INDEX `idx_gst_gstin` (`gstin`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+
+            try {
+                $pdo->exec("
+                    ALTER TABLE `seller_gst_details`
+                    MODIFY `gstin` VARCHAR(30) NULL DEFAULT NULL,
+                    MODIFY `business_name` VARCHAR(255) NULL DEFAULT NULL,
+                    MODIFY `business_address` TEXT NULL DEFAULT NULL,
+                    MODIFY `state` VARCHAR(100) NULL DEFAULT NULL,
+                    MODIFY `pincode` VARCHAR(20) NULL DEFAULT NULL;
+                ");
+            } catch (Throwable $ignoreAlter) {
+                // Already altered or non-critical
+            }
+
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `seller_gst_documents` (
+                  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                  `seller_id` BIGINT UNSIGNED NOT NULL,
+                  `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                  `document_type` VARCHAR(50) NOT NULL DEFAULT 'gst_certificate',
+                  `original_name` VARCHAR(255) NOT NULL,
+                  `file_name` VARCHAR(255) NOT NULL,
+                  `file_path` VARCHAR(255) NOT NULL,
+                  `file_size` BIGINT UNSIGNED NOT NULL,
+                  `mime_type` VARCHAR(100) NOT NULL,
+                  `is_primary` TINYINT(1) NOT NULL DEFAULT 1,
+                  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  PRIMARY KEY (`id`),
+                  INDEX `idx_gstdoc_seller` (`seller_id`),
+                  INDEX `idx_gstdoc_gst` (`gst_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `seller_gst_verification_logs` (
+                  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                  `seller_id` BIGINT UNSIGNED NOT NULL,
+                  `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                  `action` VARCHAR(40) NOT NULL,
+                  `previous_status` VARCHAR(30) NULL DEFAULT NULL,
+                  `new_status` VARCHAR(30) NOT NULL,
+                  `notes` TEXT NULL DEFAULT NULL,
+                  `performed_by` BIGINT UNSIGNED NULL DEFAULT NULL,
+                  `performer_role` VARCHAR(20) NOT NULL DEFAULT 'seller',
+                  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (`id`),
+                  INDEX `idx_gstlog_seller` (`seller_id`),
+                  INDEX `idx_gstlog_gst` (`gst_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
         }
-
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `seller_gst_documents` (
-              `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-              `seller_id` BIGINT UNSIGNED NOT NULL,
-              `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-              `document_type` VARCHAR(50) NOT NULL DEFAULT 'gst_certificate',
-              `original_name` VARCHAR(255) NOT NULL,
-              `file_name` VARCHAR(255) NOT NULL,
-              `file_path` VARCHAR(255) NOT NULL,
-              `file_size` BIGINT UNSIGNED NOT NULL,
-              `mime_type` VARCHAR(100) NOT NULL,
-              `is_primary` TINYINT(1) NOT NULL DEFAULT 1,
-              `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-              `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              PRIMARY KEY (`id`),
-              INDEX `idx_gstdoc_seller` (`seller_id`),
-              INDEX `idx_gstdoc_gst` (`gst_id`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
-
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS `seller_gst_verification_logs` (
-              `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-              `seller_id` BIGINT UNSIGNED NOT NULL,
-              `gst_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-              `action` VARCHAR(40) NOT NULL,
-              `previous_status` VARCHAR(30) NULL DEFAULT NULL,
-              `new_status` VARCHAR(30) NOT NULL,
-              `notes` TEXT NULL DEFAULT NULL,
-              `performed_by` BIGINT UNSIGNED NULL DEFAULT NULL,
-              `performer_role` VARCHAR(20) NOT NULL DEFAULT 'seller',
-              `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-              PRIMARY KEY (`id`),
-              INDEX `idx_gstlog_seller` (`seller_id`),
-              INDEX `idx_gstlog_gst` (`gst_id`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
 
         $ensured = true;
     } catch (Throwable $e) {
@@ -191,7 +252,7 @@ function logGstVerification(
         $stmt = $pdo->prepare("
             INSERT INTO seller_gst_verification_logs
             (seller_id, gst_id, action, previous_status, new_status, notes, performed_by, performer_role, created_at)
-            VALUES (:seller_id, :gst_id, :action, :previous_status, :new_status, :notes, :performed_by, :performer_role, NOW())
+            VALUES (:seller_id, :gst_id, :action, :previous_status, :new_status, :notes, :performed_by, :performer_role, CURRENT_TIMESTAMP)
         ");
         $stmt->execute([
             ':seller_id' => $sellerId,

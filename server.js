@@ -14,6 +14,13 @@ const {
   convertImageBufferToWebp,
   getConverterCapabilities
 } = require('./helpers/webp_converter');
+const {
+  createDefaultFallbackDeletionStore,
+  checkDbReachable,
+  ensureSellerDeletionSchemaNode,
+  deletionListRequestsNode
+} = require('./helpers/seller_deletion');
+const { createSellerDeletionRouter } = require('./routes/seller_deletion_routes');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -93,6 +100,28 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use((req, res, next) => {
+  if (!req.cookies) {
+    const parsed = {};
+    const cookieHeader = req.headers && req.headers.cookie;
+    if (cookieHeader && typeof cookieHeader === 'string') {
+      for (const pair of cookieHeader.split(';')) {
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx > 0) {
+          const k = pair.slice(0, eqIdx).trim();
+          const v = pair.slice(eqIdx + 1).trim();
+          try {
+            parsed[k] = decodeURIComponent(v);
+          } catch (e) {
+            parsed[k] = v;
+          }
+        }
+      }
+    }
+    req.cookies = parsed;
+  }
+  next();
+});
 // File Upload & Persistent Image Storage Configuration
 function getPersistentMediaDir(subFolder = 'products') {
   const safeSub = subFolder === 'avatars' ? 'avatars' : 'products';
@@ -1106,6 +1135,7 @@ function resolveAvatarImage(req) {
 }
 
 // Database Connection Pool
+let dbAvailable = null;
 let pool = mysql.createPool({
   host: dbHost,
   port: parseInt(process.env.DB_PORT || '3306', 10),
@@ -1162,12 +1192,13 @@ async function autoMigrateIfEmpty(p) {
       // Already exists or ignore
     }
 
-    // Ensure orders, order_items, and GST tables exist
+    // Ensure orders, order_items, GST, and Seller Deletion Management tables exist
     try {
       await ensureOrdersTables(p);
       await ensureProductPriceColumns(p);
       await ensureGstTables(p);
-      console.log('✅ [Vendor DB] Ensured orders, order_items, GST tables, and product pricing columns exist');
+      await ensureSellerDeletionSchemaNode(p);
+      console.log('✅ [Vendor DB] Ensured orders, order_items, GST, Seller Deletion tables, and product pricing columns exist');
     } catch (e) {
       // ignore
     }
@@ -1192,6 +1223,7 @@ async function autoMigrateIfEmpty(p) {
       await conn.end();
 
       console.log(`✅ [Vendor DB] Connected to Hostinger DB: ${c.database} (user: ${c.user})`);
+      dbAvailable = true;
       activeConfig = c;
       pool = mysql.createPool({
         host: dbHost,
@@ -1210,15 +1242,17 @@ async function autoMigrateIfEmpty(p) {
       // try next candidate
     }
   }
+  dbAvailable = false;
   console.warn('[Vendor DB] Warning: Could not connect to any candidate database.');
 })();
 
 // Fallback seed sellers for testing and offline resilience
 let fallbackSellers = [
-  { id: 1, name: 'Vendor Administrator', seller_name: 'Administrator', email: 'admin@vendor.app', phone: '+919876543210', role: 'admin', address: 'Tech Park', landmark: 'Gate 1', state: 'Kerala', country: 'India', products_count: 6 },
-  { id: 2, name: 'Seller Two Shop', seller_name: 'Verified Seller 2', email: 'seller2@vendor.app', phone: '+919633426254', role: 'seller', address: 'Market Road', landmark: 'Near Clock Tower', state: 'Karnataka', country: 'India', products_count: 2 },
-  { id: 7, name: 'Seller Seven Shop', seller_name: 'Verified Seller 7', email: 'seller7@vendor.app', phone: '+919633426257', role: 'seller', address: 'Bazaar Street', landmark: 'Near City Mall', state: 'Maharashtra', country: 'India', products_count: 2 }
+  { id: 1, name: 'Vendor Administrator', seller_name: 'Administrator', email: 'admin@vendor.app', phone: '+919876543210', role: 'admin', account_status: 'ACTIVE', token_version: 1, address: 'Tech Park', landmark: 'Gate 1', state: 'Kerala', country: 'India', products_count: 6 },
+  { id: 2, name: 'Seller Two Shop', seller_name: 'Verified Seller 2', email: 'seller2@vendor.app', phone: '+919633426254', role: 'seller', account_status: 'ACTIVE', token_version: 1, address: 'Market Road', landmark: 'Near Clock Tower', state: 'Karnataka', country: 'India', products_count: 2 },
+  { id: 7, name: 'Seller Seven Shop', seller_name: 'Verified Seller 7', email: 'seller7@vendor.app', phone: '+919633426257', role: 'seller', account_status: 'ACTIVE', token_version: 1, address: 'Bazaar Street', landmark: 'Near City Mall', state: 'Maharashtra', country: 'India', products_count: 2 }
 ];
+let fallbackDeletionStore = createDefaultFallbackDeletionStore();
 
 let userAvatarColEnsured = false;
 async function ensureUserAvatarColumn(p) {
@@ -1248,6 +1282,9 @@ function safeSeller(user) {
     state: user.state || null,
     country: user.country || null,
     avatar_url: user.avatar_url || null,
+    account_status: user.account_status || 'ACTIVE',
+    deletion_requested_at: user.deletion_requested_at || null,
+    deleted_at: user.deleted_at || null
   };
 
   if (user.role) {
@@ -1257,17 +1294,29 @@ function safeSeller(user) {
   return data;
 }
 
-// Middleware: Authenticate Bearer Token
-async function authenticateToken(req, res, next) {
-  let token = null;
+function isTokenVersionValid(userRow, decoded) {
+  const userTv = Math.max(1, Number((userRow && userRow.token_version) || 1));
+  const tokTv = (decoded && decoded.tv !== undefined && decoded.tv !== null) ? Math.max(1, Number(decoded.tv)) : 1;
+  return tokTv === userTv;
+}
+
+function extractTokenFromReq(req) {
   const authHeader = req.headers['authorization'] || req.headers['token'] || req.headers['x-access-token'];
   if (authHeader) {
-    token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  } else if (req.query && (req.query.token || req.query.api_token || req.query.bearer_token)) {
-    token = (req.query.token || req.query.api_token || req.query.bearer_token).trim();
-  } else if (req.cookies && (req.cookies.token || req.cookies.seller_token || req.cookies.admin_token)) {
-    token = req.cookies.token || req.cookies.seller_token || req.cookies.admin_token;
+    return String(authHeader).replace(/^Bearer\s+/i, '').trim();
   }
+  if (req.query && (req.query.token || req.query.api_token || req.query.bearer_token)) {
+    return String(req.query.token || req.query.api_token || req.query.bearer_token).trim();
+  }
+  if (req.cookies && (req.cookies.token || req.cookies.seller_token || req.cookies.admin_token)) {
+    return String(req.cookies.token || req.cookies.seller_token || req.cookies.admin_token).trim();
+  }
+  return null;
+}
+
+// Middleware: Authenticate Bearer Token
+async function authenticateToken(req, res, next) {
+  const token = extractTokenFromReq(req);
 
   if (!token) {
     return res.status(401).json({
@@ -1280,45 +1329,213 @@ async function authenticateToken(req, res, next) {
   // Support both JWT tokens and legacy personal_access_tokens
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    try {
-      const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.id]);
-      if (rows.length > 0) {
-        req.user = rows[0];
-        return next();
+    const useDb = dbAvailable !== false;
+    if (useDb) {
+      try {
+        const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.id]);
+        if (rows.length > 0) {
+          const user = rows[0];
+          if (!isTokenVersionValid(user, decoded)) {
+            return res.status(401).json({ status: 'error', message: 'Session expired or revoked. Please log in again.' });
+          }
+          const effectiveRole = decoded.role || user.role || 'seller';
+          const accStatus = String(user.account_status || 'ACTIVE').toUpperCase();
+          if (effectiveRole !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
+            const msg = accStatus === 'DELETED'
+              ? 'Seller account has been permanently deleted and access is revoked.'
+              : 'Seller account is locked due to an active deletion workflow.';
+            return res.status(403).json({ status: 'error', message: msg, errors: { account_status: [accStatus] } });
+          }
+          req.user = { ...user, role: effectiveRole };
+          return next();
+        }
+        return res.status(401).json({ message: 'Unauthenticated.' });
+      } catch (dbErr) {
+        // Fall through to offline / fallback mode when DB is unreachable
       }
-    } catch (dbErr) {
-      // In offline / fallback mode when DB is not reachable, authenticate using fallbackSellers or decoded JWT payload
-      const fb = fallbackSellers.find(s => Number(s.id) === Number(decoded.id));
-      req.user = fb || {
-        id: decoded.id,
-        role: decoded.role || (decoded.id === 1 ? 'admin' : 'seller'),
-        email: decoded.email || null,
-        phone: decoded.phone || null,
-        name: decoded.name || decoded.seller_name || 'Verified Seller',
-        seller_name: decoded.seller_name || decoded.name || 'Verified Seller'
-      };
+    }
+
+    // In offline / fallback mode when DB is not reachable, authenticate using fallbackSellers or decoded JWT payload
+    const fb = fallbackSellers.find(s => Number(s.id) === Number(decoded.id));
+    if (fb) {
+      if (!isTokenVersionValid(fb, decoded)) {
+        return res.status(401).json({ status: 'error', message: 'Session expired or revoked. Please log in again.' });
+      }
+      const effectiveRole = decoded.role || fb.role || 'seller';
+      const accStatus = String(fb.account_status || 'ACTIVE').toUpperCase();
+      if (effectiveRole !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
+        const msg = accStatus === 'DELETED'
+          ? 'Seller account has been permanently deleted and access is revoked.'
+          : 'Seller account is locked due to an active deletion workflow.';
+        return res.status(403).json({ status: 'error', message: msg, errors: { account_status: [accStatus] } });
+      }
+      req.user = { ...fb, role: effectiveRole };
       return next();
     }
-    return res.status(401).json({ message: 'Unauthenticated.' });
+    req.user = {
+      id: decoded.id,
+      role: decoded.role || (decoded.id === 1 ? 'admin' : 'seller'),
+      email: decoded.email || null,
+      phone: decoded.phone || null,
+      name: decoded.name || decoded.seller_name || 'Verified Seller',
+      seller_name: decoded.seller_name || decoded.name || 'Verified Seller',
+      account_status: 'ACTIVE',
+      token_version: decoded.tv || 1
+    };
+    return next();
   } catch (err) {
     // If not valid JWT, check personal_access_tokens table
     const parts = token.split('|');
-    if (parts.length === 2) {
+    if (parts.length === 2 && dbAvailable !== false) {
       try {
-        const crypto = require('crypto');
         const hash = crypto.createHash('sha256').update(parts[1]).digest('hex');
         const [tokenRows] = await pool.query(
           'SELECT u.* FROM personal_access_tokens pat JOIN users u ON pat.tokenable_id = u.id WHERE pat.id = ? AND pat.token = ? LIMIT 1',
           [parts[0], hash]
         );
         if (tokenRows.length > 0) {
-          req.user = tokenRows[0];
+          const user = tokenRows[0];
+          const accStatus = String(user.account_status || 'ACTIVE').toUpperCase();
+          if ((user.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
+            return res.status(403).json({
+              status: 'error',
+              message: `Seller account is ${accStatus}; access denied.`,
+              errors: { account_status: [accStatus] }
+            });
+          }
+          req.user = user;
           return next();
         }
       } catch (patErr) {}
     }
     return res.status(401).json({ message: 'Unauthenticated.' });
   }
+}
+
+async function resolveOptionalUserDetailsAsync(req) {
+  if (req.user) return { user: req.user, authError: null };
+  const token = extractTokenFromReq(req);
+  if (!token) return { user: null, authError: null };
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (dbAvailable !== false) {
+      try {
+        const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.id]);
+        if (rows.length > 0) {
+          const user = rows[0];
+          if (!isTokenVersionValid(user, decoded)) {
+            return { user: null, authError: { code: 401, message: 'Session expired or revoked. Please log in again.' } };
+          }
+          return { user: { ...user, role: decoded.role || user.role || 'seller' }, authError: null };
+        }
+        return { user: null, authError: { code: 401, message: 'Unauthenticated.' } };
+      } catch (dbErr) {
+        // Fallback offline resolution
+      }
+    }
+    const fb = fallbackSellers.find(s => Number(s.id) === Number(decoded.id));
+    if (fb) {
+      if (!isTokenVersionValid(fb, decoded)) {
+        return { user: null, authError: { code: 401, message: 'Session expired or revoked. Please log in again.' } };
+      }
+      return { user: { ...fb, role: decoded.role || fb.role || 'seller' }, authError: null };
+    }
+    return {
+      user: {
+        id: decoded.id,
+        role: decoded.role || (decoded.id === 1 ? 'admin' : 'seller'),
+        email: decoded.email || null,
+        phone: decoded.phone || null,
+        name: decoded.name || decoded.seller_name || 'Verified Seller',
+        seller_name: decoded.seller_name || decoded.name || 'Verified Seller',
+        account_status: 'ACTIVE',
+        token_version: decoded.tv || 1
+      },
+      authError: null
+    };
+  } catch (jwtErr) {
+    const parts = token.split('|');
+    if (parts.length === 2 && dbAvailable !== false) {
+      try {
+        const hash = crypto.createHash('sha256').update(parts[1]).digest('hex');
+        const [tokenRows] = await pool.query(
+          'SELECT u.* FROM personal_access_tokens pat JOIN users u ON pat.tokenable_id = u.id WHERE pat.id = ? AND pat.token = ? LIMIT 1',
+          [parts[0], hash]
+        );
+        if (tokenRows.length > 0) {
+          return { user: tokenRows[0], authError: null };
+        }
+      } catch (patErr) {}
+    }
+    return { user: null, authError: { code: 401, message: 'Unauthenticated.' } };
+  }
+}
+
+async function resolveOptionalUserAsync(req) {
+  const { user } = await resolveOptionalUserDetailsAsync(req);
+  return user;
+}
+
+// Middleware: Require Admin Role
+function requireAdminRole(req, res, next) {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Unauthorized. Admin access required.' });
+  }
+  next();
+}
+
+// Middleware: Block mutations when seller is in DELETION_PENDING, LOCKED, or DELETED status
+function requireActiveSellerForMutation(req, res, next) {
+  if (!req.user || req.user.role === 'admin') {
+    return next();
+  }
+  const accStatus = String(req.user.account_status || 'ACTIVE').toUpperCase();
+  if (['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(accStatus)) {
+    return res.status(403).json({
+      status: 'error',
+      message: `Action blocked: seller account status is ${accStatus}.`,
+      errors: { account_status: [accStatus] }
+    });
+  }
+  next();
+}
+
+// Middleware: Protect Admin Dashboard UI routes with valid Admin JWT cookie or Bearer token
+async function requireAdminDashboardAuth(req, res, next) {
+  const token = extractTokenFromReq(req);
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (String(decoded.role || '').toLowerCase() === 'admin') {
+        const dbActive = await checkDbReachable(pool, deletionCtx);
+        if (dbActive) {
+          try {
+            const [rows] = await pool.query('SELECT * FROM users WHERE id = ? AND role = "admin" LIMIT 1', [decoded.id]);
+            if (rows.length > 0 && isTokenVersionValid(rows[0], decoded)) {
+              req.adminUser = rows[0];
+              return next();
+            }
+          } catch (e) {}
+        }
+        const fb = fallbackSellers.find(s => Number(s.id) === Number(decoded.id) && s.role === 'admin');
+        if (fb && isTokenVersionValid(fb, decoded)) {
+          req.adminUser = fb;
+          return next();
+        }
+        if (!dbActive) {
+          req.adminUser = { id: decoded.id || 1, email: decoded.email || 'admin@vendor.app', role: 'admin' };
+          return next();
+        }
+      }
+    } catch (e) {}
+  }
+
+  const wantsJson = req.path === '/admin/get_gst_details' || (req.headers.accept && req.headers.accept.includes('application/json') && !req.headers.accept.includes('text/html'));
+  if (wantsJson) {
+    return res.status(401).json({ status: 'error', message: 'Admin authentication required.' });
+  }
+  return res.redirect('/admin/login');
 }
 
 // ==========================================
@@ -1715,6 +1932,16 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     }
 
     if (phoneMatch) {
+      const pmStatus = String(phoneMatch.account_status || 'ACTIVE').toUpperCase();
+      if ((phoneMatch.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(pmStatus)) {
+        return res.status(403).json({
+          status: 'error',
+          message: pmStatus === 'DELETED'
+            ? 'This seller account has been permanently deactivated and cannot be registered again.'
+            : 'This seller account is locked during deletion verification.',
+          errors: { account_status: [pmStatus] }
+        });
+      }
       const isSamePassword = await bcrypt.compare(password, phoneMatch.password);
       if (isSamePassword) {
         if (emailMatch && Number(emailMatch.id) !== Number(phoneMatch.id)) {
@@ -1737,7 +1964,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
         }
         const publicEmail = getPublicSellerEmail(resolvedEmail, phoneMatch.role || 'seller');
         const token = jwt.sign(
-          { id: phoneMatch.id, email: publicEmail, phone: phoneMatch.phone || phone, role: phoneMatch.role || 'seller', seller_name },
+          { id: phoneMatch.id, email: publicEmail, phone: phoneMatch.phone || phone, role: phoneMatch.role || 'seller', seller_name, tv: Number(phoneMatch.token_version || 1) },
           JWT_SECRET,
           { expiresIn: '30d' }
         );
@@ -1764,6 +1991,16 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     }
 
     if (emailMatch) {
+      const emStatus = String(emailMatch.account_status || 'ACTIVE').toUpperCase();
+      if ((emailMatch.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(emStatus)) {
+        return res.status(403).json({
+          status: 'error',
+          message: emStatus === 'DELETED'
+            ? 'This seller account has been permanently deactivated.'
+            : 'This seller account is locked during deletion verification.',
+          errors: { account_status: [emStatus] }
+        });
+      }
       return res.status(422).json({
         message: 'The email has already been taken.',
         errors: { email: ['The email has already been taken.'] }
@@ -1783,7 +2020,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     const userId = result.insertId;
     const publicEmail = email || null;
     const token = jwt.sign(
-      { id: userId, email: publicEmail, phone: dbPhone, role: 'seller', seller_name },
+      { id: userId, email: publicEmail, phone: dbPhone, role: 'seller', seller_name, tv: 1 },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
@@ -1799,7 +2036,8 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
         landmark,
         state,
         country: country || 'India',
-        role: 'seller'
+        role: 'seller',
+        account_status: 'ACTIVE'
       }),
       token,
       token_type: 'Bearer'
@@ -1813,6 +2051,16 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
       : null;
 
     if (phoneMatchFb) {
+      const pmStatusFb = String(phoneMatchFb.account_status || 'ACTIVE').toUpperCase();
+      if ((phoneMatchFb.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(pmStatusFb)) {
+        return res.status(403).json({
+          status: 'error',
+          message: pmStatusFb === 'DELETED'
+            ? 'This seller account has been permanently deactivated and cannot be registered again.'
+            : 'This seller account is locked during deletion verification.',
+          errors: { account_status: [pmStatusFb] }
+        });
+      }
       const samePass = phoneMatchFb._password !== undefined && phoneMatchFb._password === password;
       if (samePass) {
         if (emailMatchFb && Number(emailMatchFb.id) !== Number(phoneMatchFb.id)) {
@@ -1833,7 +2081,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
         }
         const publicEmail = getPublicSellerEmail(phoneMatchFb.email, phoneMatchFb.role || 'seller');
         const token = jwt.sign(
-          { id: phoneMatchFb.id, email: publicEmail, phone: phoneMatchFb.phone || phone, role: phoneMatchFb.role || 'seller', seller_name: phoneMatchFb.seller_name },
+          { id: phoneMatchFb.id, email: publicEmail, phone: phoneMatchFb.phone || phone, role: phoneMatchFb.role || 'seller', seller_name: phoneMatchFb.seller_name, tv: Number(phoneMatchFb.token_version || 1) },
           JWT_SECRET,
           { expiresIn: '30d' }
         );
@@ -1851,6 +2099,16 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     }
 
     if (emailMatchFb) {
+      const emStatusFb = String(emailMatchFb.account_status || 'ACTIVE').toUpperCase();
+      if ((emailMatchFb.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(emStatusFb)) {
+        return res.status(403).json({
+          status: 'error',
+          message: emStatusFb === 'DELETED'
+            ? 'This seller account has been permanently deactivated.'
+            : 'This seller account is locked during deletion verification.',
+          errors: { account_status: [emStatusFb] }
+        });
+      }
       return res.status(422).json({
         message: 'The email has already been taken.',
         errors: { email: ['The email has already been taken.'] }
@@ -1871,11 +2129,13 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
       state,
       country: country || 'India',
       role: 'seller',
+      account_status: 'ACTIVE',
+      token_version: 1,
       _password: password
     };
     fallbackSellers.push(newSeller);
     const token = jwt.sign(
-      { id: newId, email: email || null, phone: storedPhone, role: 'seller', seller_name },
+      { id: newId, email: email || null, phone: storedPhone, role: 'seller', seller_name, tv: 1 },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
@@ -1977,6 +2237,18 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
       });
     }
 
+    const accStatus = String(user.account_status || 'ACTIVE').toUpperCase();
+    if ((user.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
+      const statusMsg = accStatus === 'DELETED'
+        ? 'This seller account has been permanently deleted and can no longer sign in.'
+        : 'This seller account is locked pending deletion verification.';
+      return res.status(403).json({
+        status: 'error',
+        message: statusMsg,
+        errors: { account_status: [accStatus] }
+      });
+    }
+
     const publicEmail = getPublicSellerEmail(user.email, user.role || 'seller');
     const token = jwt.sign(
       {
@@ -1984,7 +2256,8 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
         email: publicEmail,
         phone: user.phone || null,
         role: user.role || 'seller',
-        seller_name: user.seller_name || user.name || ''
+        seller_name: user.seller_name || user.name || '',
+        tv: Math.max(1, Number(user.token_version || 1))
       },
       JWT_SECRET,
       { expiresIn: '30d' }
@@ -2039,6 +2312,18 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
       });
     }
 
+    const accStatusFb = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
+    if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatusFb)) {
+      const statusMsg = accStatusFb === 'DELETED'
+        ? 'This seller account has been permanently deleted and can no longer sign in.'
+        : 'This seller account is locked pending deletion verification.';
+      return res.status(403).json({
+        status: 'error',
+        message: statusMsg,
+        errors: { account_status: [accStatusFb] }
+      });
+    }
+
     const publicEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller');
     const token = jwt.sign(
       {
@@ -2046,7 +2331,8 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
         email: publicEmail,
         phone: matchedUser.phone || null,
         role: matchedUser.role || 'seller',
-        seller_name: matchedUser.seller_name || matchedUser.name || ''
+        seller_name: matchedUser.seller_name || matchedUser.name || '',
+        tv: Math.max(1, Number(matchedUser.token_version || 1))
       },
       JWT_SECRET,
       { expiresIn: '30d' }
@@ -2147,7 +2433,14 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       if (!currentPassword) {
         errors.current_password = ['The current password field is required to change password.'];
       } else {
-        const matches = await bcrypt.compare(currentPassword, existing.password);
+        let matches = false;
+        if (existing._password !== undefined) {
+          matches = currentPassword === existing._password;
+        } else if (existing.password) {
+          matches = await bcrypt.compare(currentPassword, existing.password);
+        } else {
+          matches = currentPassword === (existing.role === 'admin' ? 'Admin123!' : 'Password123!');
+        }
         if (!matches) {
           errors.current_password = ['The supplied current password is incorrect.'];
         }
@@ -2209,10 +2502,11 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     updates.push('email = ?');
     params.push(email.toLowerCase());
   }
+  let hashedNewPassword = null;
   if (newPassword) {
-    const hashed = await bcrypt.hash(newPassword, 10);
+    hashedNewPassword = await bcrypt.hash(newPassword, 10);
     updates.push('password = ?');
-    params.push(hashed);
+    params.push(hashedNewPassword);
   }
   if (avatarUrl) {
     try {
@@ -2244,7 +2538,8 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       ...(state ? { state } : {}),
       ...(country ? { country } : {}),
       ...(phone ? { phone } : {}),
-      ...(email ? { email: email.toLowerCase() } : {})
+      ...(email ? { email: email.toLowerCase() } : {}),
+      ...(newPassword ? { _password: newPassword, password: hashedNewPassword } : {})
     });
     sellerData = safeSeller(existing);
   }
@@ -2259,11 +2554,24 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
 // Dedicated Change Password Handler: requires (current_password, new_password, confirm_password)
 async function handleChangePassword(req, res) {
   const sellerId = req.user.id;
-  const [existingRows] = await pool.query('SELECT id, password FROM users WHERE id = ? LIMIT 1', [sellerId]);
-  if (existingRows.length === 0) {
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+  let existing = null;
+  let usingFallback = !dbActive;
+
+  if (dbActive) {
+    try {
+      const [existingRows] = await pool.query('SELECT id, password, role FROM users WHERE id = ? LIMIT 1', [sellerId]);
+      if (existingRows.length > 0) existing = existingRows[0];
+    } catch (e) {
+      usingFallback = true;
+    }
+  }
+  if (usingFallback && !existing) {
+    existing = fallbackSellers.find(s => Number(s.id) === Number(sellerId)) || req.user;
+  }
+  if (!existing) {
     return res.status(404).json({ message: 'User not found.' });
   }
-  const existing = existingRows[0];
 
   const body = req.body || {};
   const currentPassword = extractField(body, ['current_password', 'currentPassword', 'old_password', 'oldPassword', 'current']);
@@ -2275,7 +2583,14 @@ async function handleChangePassword(req, res) {
   if (!currentPassword) {
     errors.current_password = ['The current password field is required.'];
   } else {
-    const matches = await bcrypt.compare(currentPassword, existing.password);
+    let matches = false;
+    if (existing._password !== undefined) {
+      matches = currentPassword === existing._password;
+    } else if (existing.password) {
+      matches = await bcrypt.compare(currentPassword, existing.password);
+    } else {
+      matches = currentPassword === (existing.role === 'admin' ? 'Admin123!' : 'Password123!');
+    }
     if (!matches) {
       errors.current_password = ['The supplied current password is incorrect.'];
     }
@@ -2298,7 +2613,19 @@ async function handleChangePassword(req, res) {
   }
 
   const hashed = await bcrypt.hash(newPassword, 10);
-  await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?', [hashed, sellerId]);
+  if (!usingFallback) {
+    try {
+      await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?', [hashed, sellerId]);
+      return res.json({ status: 'success', message: 'Password updated successfully.' });
+    } catch (e) {
+      usingFallback = true;
+    }
+  }
+
+  const fbTarget = fallbackSellers.find(s => Number(s.id) === Number(sellerId)) || existing;
+  fbTarget._password = newPassword;
+  fbTarget.password = hashed;
+  fbTarget.updated_at = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   res.json({ status: 'success', message: 'Password updated successfully.' });
 }
@@ -2309,8 +2636,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   res.json({ status: 'success', seller: sellerData, user: sellerData });
 });
 
-app.put('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
-app.patch('/api/me', authenticateToken, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
+app.put('/api/me', authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
+app.patch('/api/me', authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res) => handleSellerProfileUpdate(req, res, null));
 
 // GET /api/seller/profile (supports ?seller_id=X or ?id=X, or Bearer token)
 app.get('/api/seller/profile', async (req, res) => {
@@ -2329,31 +2656,16 @@ app.get('/api/seller/profile', async (req, res) => {
       user = fallbackSellers.find(s => s.id === sellerId);
       if (!user) return res.status(404).json({ message: 'Seller not found.' });
     }
+    const accSt = String(user.account_status || 'ACTIVE').toUpperCase();
+    if (['LOCKED', 'DELETED'].includes(accSt)) {
+      return res.status(404).json({ message: 'Seller not found.' });
+    }
   } else {
-    // Authenticate token
-    const authHeader = req.headers['authorization'];
-    if (!authHeader) {
-      return res.status(401).json({ message: 'Unauthenticated.' });
-    }
-    const token = authHeader.replace(/^Bearer\s+/i, '');
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      try {
-        const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.id || decoded.sub]);
-        if (rows.length > 0) user = rows[0];
-      } catch (e) {
-        user = fallbackSellers.find(s => s.id === (decoded.id || decoded.sub)) || {
-          id: decoded.id,
-          phone: decoded.phone,
-          seller_name: decoded.seller_name || 'Verified Seller'
-        };
-      }
-      if (!user) {
-        return res.status(401).json({ message: 'User not found.' });
-      }
-    } catch (err) {
-      return res.status(401).json({ message: 'Invalid or expired token.' });
-    }
+    authenticateToken(req, res, () => {
+      const sellerData = safeSeller(req.user);
+      return res.json({ status: 'success', seller: sellerData, user: sellerData });
+    });
+    return;
   }
 
   const sellerData = safeSeller(user);
@@ -2361,7 +2673,7 @@ app.get('/api/seller/profile', async (req, res) => {
 });
 
 // PUT / PATCH / POST /api/seller/profile and /api/seller/profile/update
-app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken, avatarUpload.any(), (req, res) => {
+app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res) => {
   if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
     return handleSellerProfileUpdate(req, res, null);
   }
@@ -2369,7 +2681,7 @@ app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken
 });
 
 // Separate Password Update: (current_password, new_password, confirm_password)
-app.all(['/api/seller/change-password', '/api/change-password', '/api/seller/password'], authenticateToken, (req, res) => {
+app.all(['/api/seller/change-password', '/api/change-password', '/api/seller/password'], authenticateToken, requireActiveSellerForMutation, (req, res) => {
   if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
     return handleChangePassword(req, res);
   }
@@ -2383,7 +2695,7 @@ app.get('/api/sellers', async (req, res) => {
   const offset = (page - 1) * limit;
   const search = (req.query.search || req.query.q || '').trim();
 
-  let where = "WHERE (role = 'seller' OR role = 'admin')";
+  let where = "WHERE (role = 'seller' OR role = 'admin') AND COALESCE(account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
   const params = [];
 
   if (search) {
@@ -2395,7 +2707,7 @@ app.get('/api/sellers', async (req, res) => {
     await ensureUserAvatarColumn(pool);
     const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM users ${where}`, params);
     const [rows] = await pool.query(
-      `SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, u.created_at, u.updated_at,
+      `SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.avatar_url, u.role, u.account_status, u.created_at, u.updated_at,
               (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count
        FROM users u
        ${where}
@@ -2421,7 +2733,10 @@ app.get('/api/sellers', async (req, res) => {
       }
     });
   } catch (err) {
-    const filtered = fallbackSellers.filter(s => !search || (s.seller_name && s.seller_name.toLowerCase().includes(search.toLowerCase())));
+    const filtered = fallbackSellers.filter(s =>
+      !['LOCKED', 'DELETED'].includes(String(s.account_status || 'ACTIVE').toUpperCase())
+      && (!search || (s.seller_name && s.seller_name.toLowerCase().includes(search.toLowerCase())))
+    );
     res.json({
       status: 'success',
       sellers: {
@@ -2446,12 +2761,15 @@ app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], asyn
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Seller not found.' });
     }
+    if (['LOCKED', 'DELETED'].includes(String(rows[0].account_status || 'ACTIVE').toUpperCase())) {
+      return res.status(404).json({ message: 'Seller not found.' });
+    }
 
     const sellerData = safeSeller(rows[0]);
     res.json({ status: 'success', seller: sellerData });
   } catch (err) {
     const found = fallbackSellers.find(s => s.id === sellerId);
-    if (found) {
+    if (found && !['LOCKED', 'DELETED'].includes(String(found.account_status || 'ACTIVE').toUpperCase())) {
       return res.json({ status: 'success', seller: safeSeller(found) });
     }
     res.status(404).json({ message: 'Seller not found.' });
@@ -2459,7 +2777,7 @@ app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], asyn
 });
 
 // PUT / PATCH / POST /api/sellers/:id and /api/seller/:id (edit seller by ID)
-app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, avatarUpload.any(), (req, res, next) => {
+app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res, next) => {
   if (!/^\d+$/.test(req.params.id)) {
     return next();
   }
@@ -2469,7 +2787,15 @@ app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, avatarUpload
   res.status(405).json({ message: 'Method Not Allowed' });
 });
 
-app.post('/api/logout', authenticateToken, (req, res) => {
+app.post('/api/logout', authenticateToken, async (req, res) => {
+  const uid = Number(req.user.id);
+  try {
+    await pool.query('UPDATE users SET token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = ?', [uid]);
+    try { await pool.query('DELETE FROM personal_access_tokens WHERE tokenable_id = ?', [uid]); } catch (e) {}
+  } catch (e) {
+    const fb = fallbackSellers.find(s => Number(s.id) === uid);
+    if (fb) fb.token_version = Number(fb.token_version || 1) + 1;
+  }
   res.json({ message: 'Logout successful.' });
 });
 
@@ -2861,18 +3187,18 @@ async function verifyFirebaseOtpNode(phone, code = '', sessionInfo = '', idToken
 async function findPasswordResetUserDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
   if (email && rawPhone) {
     const [rows] = await p.query(
-      'SELECT id, email, phone, role FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1',
+      "SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1",
       [phone, rawPhone, rawNoPrefix, email]
     );
     return rows[0] || null;
   }
   if (email) {
-    const [rows] = await p.query('SELECT id, email, phone, role FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+    const [rows] = await p.query("SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE LOWER(email) = ? LIMIT 1", [email]);
     return rows[0] || null;
   }
   if (rawPhone || phone) {
     const [rows] = await p.query(
-      'SELECT id, email, phone, role FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+      "SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1",
       [phone, rawPhone || phone, rawNoPrefix || String(phone).replace(/^\+91/, '').replace(/^\+/, '')]
     );
     return rows[0] || null;
@@ -3025,6 +3351,14 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
   let gatewayResult = null;
 
   if (matchedUser) {
+    const accSt = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
+    if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accSt)) {
+      return res.status(403).json({
+        status: 'error',
+        message: `Password reset is disabled: seller account status is ${accSt}.`,
+        errors: { account_status: [accSt] }
+      });
+    }
     const targetPhone = matchedUser.phone ? String(matchedUser.phone).trim() : (phone || null);
     const targetEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller') || (email || null);
     if (activeChannel === 'email' && !targetEmail && targetPhone) {
@@ -3378,6 +3712,16 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
       if (!matchedUser && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail)) {
         return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
       }
+      if (matchedUser) {
+        const accSt = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
+        if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accSt)) {
+          return res.status(403).json({
+            status: 'error',
+            message: `Password reset is disabled: seller account status is ${accSt}.`,
+            errors: { account_status: [accSt] }
+          });
+        }
+      }
       if (oobCode && !reset_token) {
         const applied = await applyFirebaseOobPasswordResetNode(oobCode, password);
         if (!applied.ok) {
@@ -3387,12 +3731,13 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
       }
       const hashed = await bcrypt.hash(password, 10);
       if (matchedUser) {
-        await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?', [hashed, matchedUser.id]);
+        await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = ?', [hashed, matchedUser.id]);
+        try { await pool.query('DELETE FROM personal_access_tokens WHERE tokenable_id = ?', [matchedUser.id]); } catch (e) {}
       } else if (resolvedEmail && !resolvedPhone) {
-        await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE LOWER(email) = ?', [hashed, resolvedEmail]);
+        await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE LOWER(email) = ?', [hashed, resolvedEmail]);
       } else if (resolvedPhone) {
         await pool.query(
-          'UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ? OR phone = ? OR phone = ?',
+          'UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE phone = ? OR phone = ? OR phone = ?',
           [hashed, resolvedPhone, rawPhone || resolvedPhone, resolvedRawNoPrefix]
         );
       }
@@ -3413,7 +3758,16 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
     return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
   }
   if (matchedUser) {
+    const accStFb = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
+    if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStFb)) {
+      return res.status(403).json({
+        status: 'error',
+        message: `Password reset is disabled: seller account status is ${accStFb}.`,
+        errors: { account_status: [accStFb] }
+      });
+    }
     matchedUser._password = password;
+    matchedUser.token_version = Number(matchedUser.token_version || 1) + 1;
   }
   clearOtpRecordsFallback(lookupCriteria);
 
@@ -4367,9 +4721,9 @@ async function handleProductsCollectionCategoryMutation(req, res) {
   return res.status(mutRes.statusCode).json(mutRes.ok ? mutRes.payload : mutRes.errorBody);
 }
 
-app.put('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
-app.patch('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
-app.delete('/api/products', authenticateToken, upload.any(), handleProductsCollectionCategoryMutation);
+app.put('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
+app.patch('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
+app.delete('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
 
 app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
@@ -4383,7 +4737,7 @@ app.get('/api/products', async (req, res) => {
 
   try {
     await ensureProductPriceColumns(pool);
-    let whereSql = 'WHERE p.is_active = 1';
+    let whereSql = "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
     const whereParams = [];
 
     if (sellerId !== null && !isNaN(sellerId)) {
@@ -4415,7 +4769,7 @@ app.get('/api/products', async (req, res) => {
       }
     }
 
-    const countSql = `SELECT COUNT(*) as total FROM products p ${whereSql}`;
+    const countSql = `SELECT COUNT(*) as total FROM products p LEFT JOIN users u ON p.seller_id = u.id ${whereSql}`;
     const querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
               p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
               p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
@@ -4432,20 +4786,28 @@ app.get('/api/products', async (req, res) => {
     // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
     const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
 
+    const lastPage = Math.ceil(total / limit) || 1;
     res.json({
       success: true,
       status: true,
       data: formatted,
+      products: {
+        current_page: page,
+        data: formatted,
+        total,
+        per_page: limit,
+        last_page: lastPage
+      },
       categories: categoriesList,
       total,
       current_page: page,
       per_page: limit,
-      last_page: Math.ceil(total / limit) || 1,
+      last_page: lastPage,
       pagination: {
         current_page: page,
         per_page: limit,
         total,
-        last_page: Math.ceil(total / limit) || 1
+        last_page: lastPage
       }
     });
   } catch (err) {
@@ -4454,6 +4816,9 @@ app.get('/api/products', async (req, res) => {
       ? fallbackCategories.find(c => String(c.id) === categoryIdParam)
       : (category ? fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase() || String(c.id) === category) : null);
     const filtered = fallbackProducts.filter(p => {
+      if (Number(p.is_active === false ? 0 : (p.is_active ?? 1)) !== 1) return false;
+      const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
+      if (sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase())) return false;
       if (sellerId && p.seller_id !== sellerId) return false;
       if (categoryIdParam) {
         const matchesId = Number(p.category_id) === Number(categoryIdParam);
@@ -4472,6 +4837,13 @@ app.get('/api/products', async (req, res) => {
       success: true,
       status: true,
       data: filtered,
+      products: {
+        current_page: 1,
+        data: filtered,
+        total: filtered.length,
+        per_page: limit,
+        last_page: 1
+      },
       categories: categoriesList,
       total: filtered.length,
       current_page: 1,
@@ -4504,7 +4876,7 @@ app.get([
               p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
        FROM products p
        LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ? AND p.is_active = 1
+       WHERE p.id = ? AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
        LIMIT 1`,
       [req.params.id]
     );
@@ -4523,7 +4895,11 @@ app.get([
     });
   } catch (err) {
     const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
-    if (found) {
+    if (found && Number(found.is_active === false ? 0 : (found.is_active ?? 1)) === 1) {
+      const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(found.seller_id));
+      if (sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase())) {
+        return res.status(404).json({ message: 'Product not found.' });
+      }
       const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
       const product = formatProductRecord(found, { isSellerView, req });
       const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
@@ -4540,7 +4916,7 @@ app.get([
 });
 
 // Dedicated Image Upload Endpoint (Supports single or multiple images, base64, multipart)
-app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(), async (req, res) => {
+app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActiveSellerForMutation, upload.any(), async (req, res) => {
   const imgResult = await resolveProductImages(req);
   if (!imgResult.hasImages || imgResult.images.length === 0) {
     return res.status(422).json({
@@ -4552,25 +4928,75 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
   const targetProductId = req.body.product_id ? parseInt(req.body.product_id, 10) : (req.query.product_id ? parseInt(req.query.product_id, 10) : null);
   const sellerId = req.user.id;
   let attachedProduct = null;
+  const dbActive = await checkDbReachable(pool, deletionCtx);
 
   if (targetProductId) {
-    try {
-      await ensureProductPriceColumns(pool);
-      const [pRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
-      if (pRows.length === 0) {
+    let handledDb = false;
+    if (dbActive) {
+      try {
+        await ensureProductPriceColumns(pool);
+        const [pRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
+        if (pRows.length === 0) {
+          return res.status(404).json({ message: 'Target product not found.' });
+        }
+        if (req.user.role !== 'admin' && Number(pRows[0].seller_id) !== Number(sellerId)) {
+          return res.status(403).json({ message: 'Access denied. You do not own this product.' });
+        }
+
+        const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
+        let existingImgs = [];
+        try {
+          existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
+        } catch (e) {}
+
+        let combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
+        if (combinedImgs.length > 4) {
+          return res.status(422).json({
+            message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
+            current_count: existingImgs.length,
+            attempted_to_add: imgResult.images.length,
+            limit: 4
+          });
+        }
+
+        const primaryUrl = combinedImgs[0] || null;
+        const imagesJson = combinedImgs.length > 0 ? JSON.stringify(combinedImgs) : null;
+
+        await pool.query(
+          'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+          [primaryUrl, imagesJson, targetProductId]
+        );
+
+        // Sync permanent records in product_images table in MySQL
+        await syncProductImagesRecord(pool, sellerId, targetProductId, combinedImgs, imgResult.filesInfo);
+
+        const [updatedRows] = await pool.query(
+          `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+           FROM products p
+           LEFT JOIN users u ON p.seller_id = u.id
+           WHERE p.id = ? LIMIT 1`,
+          [targetProductId]
+        );
+        attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true, req });
+        handledDb = true;
+      } catch (dbErr) {
+        if (dbActive) {
+          console.error('[Upload Product Attach Error]:', dbErr.message);
+        }
+      }
+    }
+    if (!handledDb) {
+      const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === Number(targetProductId));
+      if (fbIdx === -1) {
         return res.status(404).json({ message: 'Target product not found.' });
       }
-      if (req.user.role !== 'admin' && Number(pRows[0].seller_id) !== Number(sellerId)) {
+      if (req.user.role !== 'admin' && Number(fallbackProducts[fbIdx].seller_id) !== Number(sellerId)) {
         return res.status(403).json({ message: 'Access denied. You do not own this product.' });
       }
-
       const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
-      let existingImgs = [];
-      try {
-        existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
-      } catch (e) {}
-
-      let combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
+      const existingImgs = parseImagesJson(fallbackProducts[fbIdx].images || fallbackProducts[fbIdx].image_url)
+        .filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
+      const combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
       if (combinedImgs.length > 4) {
         return res.status(422).json({
           message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
@@ -4579,36 +5005,15 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, upload.any(
           limit: 4
         });
       }
-
-      const primaryUrl = combinedImgs[0] || null;
-      const imagesJson = combinedImgs.length > 0 ? JSON.stringify(combinedImgs) : null;
-
-      await pool.query(
-        'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
-        [primaryUrl, imagesJson, targetProductId]
-      );
-
-      // Sync permanent records in product_images table in MySQL
-      await syncProductImagesRecord(pool, sellerId, targetProductId, combinedImgs, imgResult.filesInfo);
-
-      const [updatedRows] = await pool.query(
-        `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
-         FROM products p
-         LEFT JOIN users u ON p.seller_id = u.id
-         WHERE p.id = ? LIMIT 1`,
-        [targetProductId]
-      );
-      attachedProduct = formatProductRecord(updatedRows[0], { isSellerView: true, req });
-    } catch (dbErr) {
-      console.error('[Upload Product Attach Error]:', dbErr.message);
-      return res.status(500).json({ message: 'Failed to update product images in database: ' + dbErr.message });
+      fallbackProducts[fbIdx].images = combinedImgs;
+      fallbackProducts[fbIdx].image_url = combinedImgs[0] || null;
+      attachedProduct = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
     }
-  } else {
+  } else if (dbActive) {
     try {
       await syncProductImagesRecord(pool, sellerId, null, imgResult.images, imgResult.filesInfo);
     } catch (dbErr) {
       console.error('[Upload Sync Error]:', dbErr.message);
-      return res.status(500).json({ message: 'Failed to record image in database: ' + dbErr.message });
     }
   }
 
@@ -4938,12 +5343,12 @@ const handleProductImageReplacement = async (req, res) => {
   }
 };
 
-app.put(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
-app.post(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
-app.patch(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, upload.any(), handleProductImageReplacement);
+app.put(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductImageReplacement);
+app.post(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductImageReplacement);
+app.patch(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductImageReplacement);
 
 // Dedicated Image Deletion Endpoint
-app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:image_id', '/api/products/:id/images/:filename?'], authenticateToken, async (req, res) => {
+app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:image_id', '/api/products/:id/images/:filename?'], authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
   let existing = [];
   try {
@@ -5030,7 +5435,7 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
 });
 
 // Standalone Physical Image Deletion API: DELETE /api/images/:filename
-app.delete('/api/images/:filename', authenticateToken, async (req, res) => {
+app.delete('/api/images/:filename', authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   const safeFilename = path.basename(req.params.filename || '');
   if (!safeFilename) return res.status(400).json({ message: 'Filename required.' });
 
@@ -5053,7 +5458,7 @@ app.delete('/api/images/:filename', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/products', authenticateToken, upload.any(), async (req, res) => {
+app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), async (req, res) => {
   const body = req.body || {};
 
   // Handle category create / update / delete actions directly inside Product API
@@ -5300,21 +5705,29 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
     const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true, req }));
     const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
 
+    const lastPage = Math.ceil(total / limit) || 1;
     res.json({
       success: true,
       status: true,
       seller_id: targetSellerId,
       data: formatted,
+      products: {
+        current_page: page,
+        data: formatted,
+        total,
+        per_page: limit,
+        last_page: lastPage
+      },
       categories: categoriesList,
       total,
       current_page: page,
       per_page: limit,
-      last_page: Math.ceil(total / limit) || 1,
+      last_page: lastPage,
       pagination: {
         current_page: page,
         per_page: limit,
         total,
-        last_page: Math.ceil(total / limit) || 1
+        last_page: lastPage
       }
     });
   } catch (err) {
@@ -5340,6 +5753,13 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
       status: true,
       seller_id: targetSellerId,
       data: filtered,
+      products: {
+        current_page: 1,
+        data: filtered,
+        total: filtered.length,
+        per_page: limit,
+        last_page: 1
+      },
       categories: categoriesList,
       total: filtered.length,
       current_page: 1,
@@ -5631,11 +6051,11 @@ async function handleProductUpdateRoute(req, res) {
   }
 }
 
-app.put(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
-app.patch(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
-app.post(productUpdatePaths, authenticateToken, upload.any(), handleProductUpdateRoute);
+app.put(productUpdatePaths, authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductUpdateRoute);
+app.patch(productUpdatePaths, authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductUpdateRoute);
+app.post(productUpdatePaths, authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductUpdateRoute);
 
-app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   let existing = [];
   try {
     const [rows] = await pool.query('SELECT id, seller_id, image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
@@ -5675,6 +6095,8 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
 // 4. Seller Bank Account & Payments
 // ==========================================
 
+const fallbackBankAccounts = {};
+
 app.post('/api/seller/bank-account/onboarding', authenticateToken, async (req, res) => {
   const body = req.body || {};
   const account_reference = body.account_reference || body.account_number || body.upi_id;
@@ -5688,6 +6110,14 @@ app.post('/api/seller/bank-account/onboarding', authenticateToken, async (req, r
       [req.user.id, account_reference]
     );
   } catch (e) {}
+
+  fallbackBankAccounts[req.user.id] = {
+    seller_id: req.user.id,
+    provider: 'razorpay',
+    account_reference,
+    status: 'created',
+    updated_at: new Date().toISOString()
+  };
 
   res.json({
     message: 'Bank account reference stored successfully.',
@@ -5704,12 +6134,59 @@ app.get('/api/seller/bank-account/status', authenticateToken, async (req, res) =
     }
     res.json(rows[0]);
   } catch (err) {
+    if (fallbackBankAccounts[req.user.id]) {
+      return res.json(fallbackBankAccounts[req.user.id]);
+    }
     res.json({ status: 'verified', provider: 'razorpay', account_reference: 'ACC-9876543210' });
   }
 });
 
-app.get('/api/seller/payouts', authenticateToken, (req, res) => {
-  res.json({ message: 'Payout service integration scheduled for live merchant phase.', payouts: [] });
+app.get('/api/seller/payouts', authenticateToken, async (req, res) => {
+  const sellerId = (req.user.role === 'admin' && req.query.seller_id)
+    ? parseInt(req.query.seller_id, 10)
+    : Number(req.user.id);
+  const useDb = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
+
+  if (useDb) {
+    try {
+      await ensureSellerDeletionSchemaNode(pool);
+      const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE seller_id = ? ORDER BY id DESC', [sellerId]);
+      const pendingAmt = rows
+        .filter(p => ['PENDING', 'PROCESSING', 'HELD', 'FAILED'].includes(String(p.status || '').toUpperCase()))
+        .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+      const settledAmt = rows
+        .filter(p => String(p.status || '').toUpperCase() === 'SETTLED')
+        .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+      return res.json({
+        status: 'success',
+        payouts: rows,
+        summary: {
+          pending_amount: Math.round(pendingAmt * 100) / 100,
+          settled_amount: Math.round(settledAmt * 100) / 100
+        },
+        message: rows.length > 0 ? 'Seller payouts retrieved successfully.' : 'No payout records found yet.'
+      });
+    } catch (err) {}
+  }
+
+  const fbPayouts = (typeof deletionCtx !== 'undefined' ? deletionCtx.getFallbackDeletionStore().payouts : [])
+    .filter(p => Number(p.seller_id) === sellerId)
+    .sort((a, b) => Number(b.id) - Number(a.id));
+  const pendingAmt = fbPayouts
+    .filter(p => ['PENDING', 'PROCESSING', 'HELD', 'FAILED'].includes(String(p.status || '').toUpperCase()))
+    .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+  const settledAmt = fbPayouts
+    .filter(p => String(p.status || '').toUpperCase() === 'SETTLED')
+    .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+  return res.json({
+    status: 'success',
+    payouts: fbPayouts,
+    summary: {
+      pending_amount: Math.round(pendingAmt * 100) / 100,
+      settled_amount: Math.round(settledAmt * 100) / 100
+    },
+    message: fbPayouts.length > 0 ? 'Seller payouts retrieved successfully.' : 'No payout records found yet.'
+  });
 });
 
 app.post('/api/marketplace/commission-preview', authenticateToken, (req, res) => {
@@ -7096,6 +7573,28 @@ app.get(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/s
 app.get(['/api/orders', '/api/order'], handleGetOrders);
 app.get(['/api/orders/:id', '/api/order/:id'], handleGetOrderDetail);
 
+const deletionCtx = {
+  getFallbackSellers: () => fallbackSellers,
+  getFallbackProducts: () => fallbackProducts,
+  setFallbackProducts: (v) => { fallbackProducts = v; },
+  getFallbackOrders: () => fallbackOrders,
+  getFallbackNotifications: () => fallbackNotifications,
+  getFallbackDeviceTokens: () => fallbackDeviceTokens,
+  getFallbackDeletionStore: () => fallbackDeletionStore,
+  createNotification,
+  safeSeller,
+  isDbAvailable: () => dbAvailable,
+  forceFallback: false
+};
+
+app.use(createSellerDeletionRouter({
+  getPool: () => pool,
+  deletionCtx,
+  authenticateToken,
+  requireAdminRole,
+  resolveOptionalUserAsync
+}));
+
 // Fallback map for seed catalog products (shared by handleCreateOrder & handleOrderUpdate)
 const defaultProductCatalogMap = {
   1: { id: 1, seller_id: 1, name: 'Smart Wireless Headset Pro', price: 2999.00, image_url: null },
@@ -7107,6 +7606,18 @@ const defaultProductCatalogMap = {
   7: { id: 7, seller_id: 2, name: 'Noise-Cancelling Studio Earbuds', price: 1899.00, image_url: null },
   8: { id: 8, seller_id: 2, name: 'Ergonomic Vertical Mouse Pro', price: 1499.00, image_url: null }
 };
+
+function makeBlockedSellerOrderError(sellerObj) {
+  const st = String(sellerObj.account_status || 'DELETION_PENDING').toUpperCase();
+  return {
+    status: 'error',
+    message: `Seller #${sellerObj.id} (${sellerObj.seller_name || sellerObj.name || 'Seller'}) cannot accept new orders because their account status is ${st}.`,
+    errors: {
+      seller_id: [`Seller #${sellerObj.id} is in ${st} status and blocked from receiving new orders.`],
+      account_status: [st]
+    }
+  };
+}
 
 // POST /api/orders and /api/order
 const handleCreateOrder = async (req, res) => {
@@ -7132,19 +7643,27 @@ const handleCreateOrder = async (req, res) => {
     return res.status(422).json({ message: 'Validation error.', errors });
   }
 
-  // 1. Pre-query product catalog from MySQL to auto-resolve accurate prices, names, images, and seller_ids
+  const useDb = await checkDbReachable(pool, deletionCtx);
+
+  // 1. Pre-query product catalog from MySQL (or fallback catalog) to resolve prices, names, images, and seller_ids
   const productIds = items
     .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
     .filter(Boolean);
 
   let productCatalogMap = {};
-  if (productIds.length > 0) {
+  if (useDb && productIds.length > 0) {
     try {
       const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url, images FROM products WHERE id IN (?)', [productIds]);
       for (const pr of pRows) {
         productCatalogMap[pr.id] = pr;
       }
     } catch (e) {}
+  } else if (productIds.length > 0) {
+    for (const pr of fallbackProducts) {
+      if (productIds.includes(Number(pr.id))) {
+        productCatalogMap[Number(pr.id)] = pr;
+      }
+    }
   }
 
   let subtotal = 0;
@@ -7197,7 +7716,8 @@ const handleCreateOrder = async (req, res) => {
       subtotal: lineSubtotal,
       line_total: lineSubtotal,
       total: lineSubtotal,
-      total_price: lineSubtotal
+      total_price: lineSubtotal,
+      item_status: 'pending'
     };
   });
 
@@ -7209,195 +7729,239 @@ const handleCreateOrder = async (req, res) => {
 
   const distinctSellers = [...new Set(processedItems.map(i => i.seller_id).filter(Boolean))];
   const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (distinctSellers[0] || 1);
+  const checkSellerIds = [...new Set([primarySellerId, ...distinctSellers].filter(Boolean))];
 
-  try {
-    await ensureOrdersTables(pool);
-    const conn = await pool.getConnection();
+  if (useDb) {
     try {
-      await conn.beginTransaction();
-      const [orderRes] = await conn.query(
-        `INSERT INTO orders (
-           seller_id, order_number, buyer_name, buyer_phone,
-           shipping_address, landmark, city, state, pincode,
-           order_status, payment_method, payment_status,
-           subtotal, delivery_fee, discount, total_amount, notes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'unpaid', ?, ?, ?, ?, ?)`,
-        [
-          primarySellerId, orderNumber, buyerName, buyerPhone,
-          shippingAddress, landmark || null, city || null, state || null, pincode || null,
-          paymentMethod, subtotal, deliveryFee, discount, totalAmount, notes || null
-        ]
-      );
-      const newOrderId = orderRes.insertId;
-
-      for (const pi of processedItems) {
-        const itemSellerId = pi.seller_id || primarySellerId;
-        const [iRes] = await conn.query(
-          `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [newOrderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+      await ensureOrdersTables(pool);
+      await ensureSellerDeletionSchemaNode(pool);
+      if (checkSellerIds.length > 0) {
+        const [sStatusRows] = await pool.query(
+          "SELECT id, seller_name, name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id IN (?)",
+          [checkSellerIds]
         );
-        pi.id = iRes.insertId;
-        pi.order_id = newOrderId;
-        pi.seller_id = itemSellerId;
-
-        // Decrease stock count for the ordered product
-        if (pi.product_id) {
-          await conn.query(
-            `UPDATE products
-             SET stock = GREATEST(0, stock - ?)
-             WHERE id = ?`,
-            [pi.quantity, pi.product_id]
-          );
+        const blockedSeller = sStatusRows.find(sr => ['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(String(sr.account_status || 'ACTIVE').toUpperCase()));
+        if (blockedSeller) {
+          return res.status(403).json(makeBlockedSellerOrderError(blockedSeller));
         }
       }
 
-      await conn.commit();
-      conn.release();
-
-      // Dispatch Notifications to Sellers and Buyer
+      const conn = await pool.getConnection();
       try {
-        for (const sid of distinctSellers) {
-          const sItems = processedItems.filter(i => i.seller_id === sid);
-          const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
+        await conn.beginTransaction();
+        const [orderRes] = await conn.query(
+          `INSERT INTO orders (
+             seller_id, order_number, buyer_name, buyer_phone,
+             shipping_address, landmark, city, state, pincode,
+             order_status, payment_method, payment_status,
+             subtotal, delivery_fee, discount, total_amount, notes
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'unpaid', ?, ?, ?, ?, ?)`,
+          [
+            primarySellerId, orderNumber, buyerName, buyerPhone,
+            shippingAddress, landmark || null, city || null, state || null, pincode || null,
+            paymentMethod, subtotal, deliveryFee, discount, totalAmount, notes || null
+          ]
+        );
+        const newOrderId = orderRes.insertId;
+
+        for (const pi of processedItems) {
+          const itemSellerId = pi.seller_id || primarySellerId;
+          const [iRes] = await conn.query(
+            `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [newOrderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
+          );
+          pi.id = iRes.insertId;
+          pi.order_id = newOrderId;
+          pi.seller_id = itemSellerId;
+
+          // Decrease stock count for the ordered product
+          if (pi.product_id) {
+            await conn.query(
+              `UPDATE products
+               SET stock = GREATEST(0, stock - ?)
+               WHERE id = ?`,
+              [pi.quantity, pi.product_id]
+            );
+          }
+        }
+
+        await conn.commit();
+        conn.release();
+
+        // Dispatch Notifications to Sellers and Buyer
+        try {
+          for (const sid of distinctSellers) {
+            const sItems = processedItems.filter(i => i.seller_id === sid);
+            const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
+            await createNotification(pool, {
+              userId: sid,
+              title: 'New Order Received! 🛍️',
+              message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
+              type: 'order_created',
+              data: {
+                order_id: newOrderId,
+                order_number: orderNumber,
+                items_count: sItems.length,
+                subtotal: sSubtotal
+              }
+            });
+          }
           await createNotification(pool, {
-            userId: sid,
-            title: 'New Order Received! 🛍️',
-            message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
+            userId: body.buyer_id || null,
+            phone: buyerPhone,
+            title: 'Order Placed Successfully! 🎉',
+            message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
             type: 'order_created',
             data: {
               order_id: newOrderId,
               order_number: orderNumber,
-              items_count: sItems.length,
-              subtotal: sSubtotal
+              total: totalAmount
             }
           });
-        }
-        await createNotification(pool, {
-          userId: body.buyer_id || null,
-          phone: buyerPhone,
-          title: 'Order Placed Successfully! 🎉',
-          message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
-          type: 'order_created',
-          data: {
-            order_id: newOrderId,
+        } catch (notifErr) {}
+
+        let sellerName = 'Verified Seller';
+        try {
+          const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
+          if (sRows.length > 0) {
+            sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
+          }
+        } catch (e) {}
+
+        return res.status(201).json({
+          message: 'Order created successfully.',
+          order: {
+            id: newOrderId,
+            seller_id: primarySellerId,
+            seller_name: sellerName,
             order_number: orderNumber,
-            total: totalAmount
+            buyer_name: buyerName,
+            buyer_phone: buyerPhone,
+            shipping_address: shippingAddress,
+            delivery_address: shippingAddress,
+            address: shippingAddress,
+            landmark: landmark || null,
+            city: city || null,
+            state: state || null,
+            pincode: pincode || null,
+            notes: notes || null,
+            order_status: 'pending',
+            status: 'pending',
+            payment_method: paymentMethod,
+            payment_status: 'unpaid',
+            subtotal,
+            items_subtotal: subtotal,
+            seller_subtotal: subtotal,
+            delivery_fee: deliveryFee,
+            shipping_fee: deliveryFee,
+            discount,
+            total_amount: totalAmount,
+            total_price: totalAmount,
+            grand_total: totalAmount,
+            total: totalAmount,
+            order_price: totalAmount,
+            price: totalAmount,
+            amount: totalAmount,
+            items: processedItems,
+            order_items: processedItems,
+            items_count: processedItems.length,
+            total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
+            created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
           }
         });
-      } catch (notifErr) {}
-
-      let sellerName = 'Verified Seller';
-      try {
-        const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
-        if (sRows.length > 0) {
-          sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
-        }
-      } catch (e) {}
-
-      return res.status(201).json({
-        message: 'Order created successfully.',
-        order: {
-          id: newOrderId,
-          seller_id: primarySellerId,
-          seller_name: sellerName,
-          order_number: orderNumber,
-          buyer_name: buyerName,
-          buyer_phone: buyerPhone,
-          shipping_address: shippingAddress,
-          delivery_address: shippingAddress,
-          address: shippingAddress,
-          landmark: landmark || null,
-          city: city || null,
-          state: state || null,
-          pincode: pincode || null,
-          notes: notes || null,
-          order_status: 'pending',
-          status: 'pending',
-          payment_method: paymentMethod,
-          payment_status: 'unpaid',
-          subtotal,
-          items_subtotal: subtotal,
-          seller_subtotal: subtotal,
-          delivery_fee: deliveryFee,
-          shipping_fee: deliveryFee,
-          discount,
-          total_amount: totalAmount,
-          total_price: totalAmount,
-          grand_total: totalAmount,
-          total: totalAmount,
-          order_price: totalAmount,
-          price: totalAmount,
-          amount: totalAmount,
-          items: processedItems,
-          order_items: processedItems,
-          items_count: processedItems.length,
-          total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
-          created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
-        }
-      });
-    } catch (txErr) {
-      await conn.rollback();
-      conn.release();
-      throw txErr;
-    }
-  } catch (err) {
-    // Offline / fallback save
-    const newOrderId = fallbackOrders.length ? Math.max(...fallbackOrders.map(o => o.id)) + 1 : 1;
-    const newOrder = {
-      id: newOrderId,
-      seller_id: primarySellerId,
-      order_number: orderNumber,
-      buyer_name: buyerName,
-      buyer_phone: buyerPhone,
-      shipping_address: shippingAddress,
-      landmark,
-      city,
-      state,
-      pincode,
-      order_status: 'pending',
-      payment_method: paymentMethod,
-      payment_status: 'unpaid',
-      subtotal,
-      delivery_fee: deliveryFee,
-      discount,
-      total_amount: totalAmount,
-      notes,
-      items: processedItems.map((pi, idx) => ({ ...pi, id: idx + 1, order_id: newOrderId, seller_id: pi.seller_id || primarySellerId })),
-      items_count: processedItems.length,
-      total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
-      created_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
-      updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
-    };
-    fallbackOrders.unshift(newOrder);
-
-    try {
-      for (const sid of distinctSellers) {
-        const sItems = processedItems.filter(i => (i.seller_id || primarySellerId) === sid);
-        const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
-        createNotification(null, {
-          userId: sid,
-          title: 'New Order Received! 🛍️',
-          message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
-          type: 'order_created',
-          data: { order_id: newOrderId, order_number: orderNumber, items_count: sItems.length, subtotal: sSubtotal }
-        });
+      } catch (txErr) {
+        await conn.rollback();
+        conn.release();
+        throw txErr;
       }
-      createNotification(null, {
-        userId: body.buyer_id || null,
-        phone: buyerPhone,
-        title: 'Order Placed Successfully! 🎉',
-        message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
-        type: 'order_created',
-        data: { order_id: newOrderId, order_number: orderNumber, total: totalAmount }
-      });
-    } catch (nErr) {}
-
-    return res.status(201).json({
-      message: 'Order created successfully (local sync mode).',
-      order: newOrder
-    });
+    } catch (err) {
+      // Fall through to offline / fallback save
+    }
   }
+
+  // Block new orders when any involved seller is in DELETION_PENDING, LOCKED, or DELETED status
+  const blockedFb = fallbackSellers.find(s =>
+    checkSellerIds.includes(Number(s.id)) &&
+    ['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(String(s.account_status || 'ACTIVE').toUpperCase())
+  );
+  if (blockedFb) {
+    return res.status(403).json(makeBlockedSellerOrderError(blockedFb));
+  }
+
+  // Offline / fallback save
+  const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const newOrderId = fallbackOrders.length ? Math.max(...fallbackOrders.map(o => o.id)) + 1 : 1;
+  const newOrder = {
+    id: newOrderId,
+    seller_id: primarySellerId,
+    order_number: orderNumber,
+    buyer_name: buyerName,
+    buyer_phone: buyerPhone,
+    shipping_address: shippingAddress,
+    landmark,
+    city,
+    state,
+    pincode,
+    order_status: 'pending',
+    payment_method: paymentMethod,
+    payment_status: 'unpaid',
+    payment_gateway: null,
+    gateway_order_id: null,
+    gateway_payment_id: null,
+    captured_amount: null,
+    refunded_amount: 0,
+    shipped_at: null,
+    delivered_at: null,
+    return_window_ends_at: null,
+    settled_at: null,
+    subtotal,
+    delivery_fee: deliveryFee,
+    discount,
+    total_amount: totalAmount,
+    notes,
+    items: processedItems.map((pi, idx) => ({ ...pi, id: idx + 1, order_id: newOrderId, seller_id: pi.seller_id || primarySellerId, item_status: 'pending' })),
+    items_count: processedItems.length,
+    total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
+    created_at: nowStr,
+    updated_at: nowStr
+  };
+  for (const pi of processedItems) {
+    if (pi.product_id) {
+      const fbProd = fallbackProducts.find(p => Number(p.id) === Number(pi.product_id));
+      if (fbProd) {
+        fbProd.stock = Math.max(0, Number(fbProd.stock || 0) - Number(pi.quantity || 1));
+      }
+    }
+  }
+  fallbackOrders.unshift(newOrder);
+
+  try {
+    for (const sid of distinctSellers) {
+      const sItems = processedItems.filter(i => (i.seller_id || primarySellerId) === sid);
+      const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
+      createNotification(null, {
+        userId: sid,
+        title: 'New Order Received! 🛍️',
+        message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
+        type: 'order_created',
+        data: { order_id: newOrderId, order_number: orderNumber, items_count: sItems.length, subtotal: sSubtotal }
+      });
+    }
+    createNotification(null, {
+      userId: body.buyer_id || null,
+      phone: buyerPhone,
+      title: 'Order Placed Successfully! 🎉',
+      message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
+      type: 'order_created',
+      data: { order_id: newOrderId, order_number: orderNumber, total: totalAmount }
+    });
+  } catch (nErr) {}
+
+  return res.status(201).json({
+    message: 'Order created successfully (local sync mode).',
+    order: newOrder
+  });
 };
 app.post(['/api/orders', '/api/order'], handleCreateOrder);
 
@@ -7407,497 +7971,719 @@ const handleOrderUpdate = async (req, res) => {
   const numId = parseInt(rawParam, 10);
   const isNumeric = !isNaN(numId) && String(numId) === rawParam;
   const body = req.body || {};
-  const optUser = req.user || getOptionalUser(req);
+  const { user: optUser, authError } = await resolveOptionalUserDetailsAsync(req);
+  if (authError) {
+    return res.status(authError.code).json({ status: 'error', message: authError.message });
+  }
 
-  try {
-    await ensureOrdersTables(pool);
-    let existingRows;
-    if (isNumeric) {
-      [existingRows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
-    } else {
-      [existingRows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
-    }
-    if (existingRows.length === 0) {
-      return res.status(404).json({ message: 'Order not found.' });
-    }
-    const existing = existingRows[0];
-    const orderId = Number(existing.id);
+  const rDays = parseInt(process.env.RETURN_WINDOW_DAYS || '7', 10);
+  const returnWindowDays = Number.isFinite(rDays) && rDays >= 1 ? rDays : 7;
+  const useDb = await checkDbReachable(pool, deletionCtx);
 
-    // Ownership check for sellers: must own at least one product in this order
-    if (optUser && optUser.role === 'seller') {
-      const sellerId = Number(optUser.id);
-      if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
-        return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
-      }
-      const [checkItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, sellerId]);
-      if (checkItems.length === 0) {
-        return res.status(403).json({ message: 'Access denied. You do not have permission to update this order.' });
-      }
-    }
-
-    const orderStatus = body.order_status !== undefined
-      ? body.order_status.toLowerCase().trim()
-      : (body.status !== undefined ? body.status.toLowerCase().trim() : existing.order_status);
-
-    // Cancellation Permission Check
-    if (orderStatus === 'cancelled') {
-      if (['shipped', 'delivered'].includes(existing.order_status)) {
-        return res.status(400).json({ message: `Cannot cancel order that is already ${existing.order_status}.` });
-      }
-      if (existing.order_status === 'cancelled') {
-        return res.status(400).json({ message: 'Order is already cancelled.' });
-      }
-      if (existing.order_status === 'rejected') {
-        return res.status(400).json({ message: 'Order is already rejected.' });
-      }
-    }
-
-    // Rejection reason handling
-    let rejectionReason = body.rejection_reason !== undefined
-      ? String(body.rejection_reason).trim()
-      : (body.reason !== undefined ? String(body.reason).trim() : (existing.rejection_reason || null));
-    if (orderStatus === 'rejected' && !rejectionReason) {
-      rejectionReason = 'Seller is unable to fulfill this order at this time.';
-    }
-
-    // Cancellation reason handling
-    let cancellationReason = body.cancellation_reason !== undefined
-      ? String(body.cancellation_reason).trim()
-      : (body.reason !== undefined ? String(body.reason).trim() : (existing.cancellation_reason || null));
-    if (orderStatus === 'cancelled' && !cancellationReason) {
-      cancellationReason = 'Cancelled by seller.';
-    }
-
-    const buyerName = body.buyer_name !== undefined ? body.buyer_name.trim() : existing.buyer_name;
-    const buyerPhone = body.buyer_phone !== undefined ? body.buyer_phone.trim() : existing.buyer_phone;
-    const shippingAddress = body.shipping_address !== undefined ? body.shipping_address.trim() : existing.shipping_address;
-    const landmark = body.landmark !== undefined ? body.landmark.trim() : existing.landmark;
-    const city = body.city !== undefined ? body.city.trim() : existing.city;
-    const state = body.state !== undefined ? body.state.trim() : existing.state;
-    const pincode = body.pincode !== undefined ? body.pincode.trim() : existing.pincode;
-    const notes = body.notes !== undefined ? body.notes.trim() : existing.notes;
-    const paymentMethod = body.payment_method !== undefined ? body.payment_method.trim() : existing.payment_method;
-
-    let paymentStatus = body.payment_status !== undefined ? body.payment_status.trim() : existing.payment_status;
-    if (orderStatus === 'delivered' && (paymentStatus === 'unpaid' || !paymentStatus)) {
-      paymentStatus = 'paid';
-    }
-
-    let subtotal = parseFloat(existing.subtotal);
-    const deliveryFee = body.delivery_fee !== undefined ? Math.max(0, parseFloat(body.delivery_fee)) : parseFloat(existing.delivery_fee);
-    const discount = body.discount !== undefined ? Math.max(0, parseFloat(body.discount)) : parseFloat(existing.discount);
-
-    const hasItemsUpdate = Array.isArray(body.items);
-    let processedItems = [];
-
-    if (hasItemsUpdate) {
-      if (body.items.length === 0) {
-        return res.status(422).json({ message: 'Order must contain at least one item.' });
-      }
-      const pIds = body.items
-        .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
-        .filter(Boolean);
-
-      let pMap = {};
-      if (pIds.length > 0) {
-        try {
-          const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url, images FROM products WHERE id IN (?)', [pIds]);
-          for (const pr of pRows) {
-            pMap[pr.id] = pr;
-          }
-        } catch (e) {}
-      }
-
-      subtotal = 0;
-      processedItems = body.items.map(item => {
-        const prodId = item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null);
-        const catalogItem = (prodId && pMap[prodId]) || (prodId && defaultProductCatalogMap[prodId]) || null;
-
-        let resolvedPrice = 0;
-        if (item.price !== undefined && item.price !== null && item.price !== '' && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
-          resolvedPrice = parseFloat(item.price);
-        } else if (item.unit_price !== undefined && item.unit_price !== null && !isNaN(parseFloat(item.unit_price)) && parseFloat(item.unit_price) > 0) {
-          resolvedPrice = parseFloat(item.unit_price);
-        } else if (item.product_price !== undefined && item.product_price !== null && !isNaN(parseFloat(item.product_price)) && parseFloat(item.product_price) > 0) {
-          resolvedPrice = parseFloat(item.product_price);
-        } else if (catalogItem && parseFloat(catalogItem.price) > 0) {
-          resolvedPrice = parseFloat(catalogItem.price);
-        }
-
-        const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
-        const catalogGallery = catalogItem && catalogItem.images ? parseImagesJson(catalogItem.images) : [];
-        const image = item.product_image || item.image_url || item.image || (catalogItem ? (catalogItem.image_url || catalogGallery[0] || null) : null);
-        const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
-        const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
-        subtotal += lineSubtotal;
-
-        let sellerId = item.seller_id ? parseInt(item.seller_id, 10) : null;
-        if (!sellerId && catalogItem && catalogItem.seller_id) {
-          sellerId = parseInt(catalogItem.seller_id, 10);
-        }
-        if (!sellerId && body.seller_id) {
-          sellerId = parseInt(body.seller_id, 10);
-        }
-        if (!sellerId) {
-          sellerId = existing.seller_id || 1;
-        }
-
-        return {
-          product_id: prodId,
-          seller_id: sellerId,
-          product_name: name,
-          name,
-          product_image: image,
-          image_url: image,
-          price: resolvedPrice,
-          unit_price: resolvedPrice,
-          product_price: resolvedPrice,
-          quantity: qty,
-          qty,
-          subtotal: lineSubtotal,
-          line_total: lineSubtotal,
-          total: lineSubtotal,
-          total_price: lineSubtotal
-        };
-      });
-    }
-
-    const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (existing.seller_id || (processedItems.find(i => i.seller_id)?.seller_id || 1));
-    const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
-
-    const conn = await pool.getConnection();
+  if (useDb) {
     try {
-      await conn.beginTransaction();
+      await ensureOrdersTables(pool);
+      await ensureSellerDeletionSchemaNode(pool);
+      let existingRows;
+      if (isNumeric) {
+        [existingRows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+      } else {
+        [existingRows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+      }
+      if (existingRows.length === 0) {
+        return res.status(404).json({ message: 'Order not found.' });
+      }
+      const existing = existingRows[0];
+      const orderId = Number(existing.id);
 
-      // If order is transitioning into cancelled or rejected, restore inventory
-      if (!['cancelled', 'rejected'].includes(existing.order_status) && ['cancelled', 'rejected'].includes(orderStatus)) {
-        const [itemsToRestore] = await conn.query(
-          'SELECT product_id, quantity FROM order_items WHERE order_id = ?' + (optUser && optUser.role === 'seller' ? ' AND seller_id = ?' : ''),
-          optUser && optUser.role === 'seller' ? [orderId, Number(optUser.id)] : [orderId]
+      const hasItemsUpdate = Array.isArray(body.items);
+      const orderStatus = body.order_status !== undefined
+        ? body.order_status.toLowerCase().trim()
+        : (body.status !== undefined ? body.status.toLowerCase().trim() : String(existing.order_status || 'pending').toLowerCase());
+      const existingStatusLower = String(existing.order_status || 'pending').toLowerCase();
+
+      // Ownership and deletion workflow lock checks for sellers & public endpoints
+      if (optUser && optUser.role === 'seller') {
+        const accStatus = String(optUser.account_status || 'ACTIVE').toUpperCase();
+        if (['LOCKED', 'DELETED'].includes(accStatus)) {
+          return res.status(403).json({
+            status: 'error',
+            message: `Seller account is ${accStatus}; order modifications are disabled.`,
+            errors: { account_status: [accStatus] }
+          });
+        }
+        if (
+          accStatus === 'DELETION_PENDING' &&
+          existingStatusLower === 'pending' &&
+          (['accepted', 'processing', 'packed', 'shipped', 'delivered'].includes(orderStatus) || hasItemsUpdate)
+        ) {
+          return res.status(403).json({
+            status: 'error',
+            message: 'Order processing is blocked: seller account is in DELETION_PENDING status.',
+            errors: { account_status: [accStatus] }
+          });
+        }
+        const sellerId = Number(optUser.id);
+        if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
+          return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
+        }
+        const [checkItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, sellerId]);
+        if (checkItems.length === 0 && Number(existing.seller_id || 0) !== sellerId) {
+          return res.status(403).json({ message: 'Access denied. You do not have permission to update this order.' });
+        }
+      } else if (!optUser || optUser.role !== 'admin') {
+        const [invSellers] = await pool.query(
+          `SELECT DISTINCT u.id, COALESCE(u.account_status, 'ACTIVE') AS account_status
+           FROM users u
+           WHERE u.id = ? OR u.id IN (SELECT DISTINCT seller_id FROM order_items WHERE order_id = ? AND seller_id IS NOT NULL)`,
+          [existing.seller_id || 0, orderId]
         );
-        for (const oi of itemsToRestore) {
-          if (oi.product_id) {
-            try {
-              await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
-            } catch (e) {}
+        for (const sr of invSellers) {
+          const st = String(sr.account_status || 'ACTIVE').toUpperCase();
+          if (['LOCKED', 'DELETED'].includes(st)) {
+            return res.status(403).json({ status: 'error', message: `Order modification blocked: seller #${sr.id} account is ${st}.`, errors: { account_status: [st] } });
+          }
+          if (st === 'DELETION_PENDING' && existingStatusLower === 'pending' && (['accepted', 'processing', 'packed', 'shipped', 'delivered'].includes(orderStatus) || hasItemsUpdate)) {
+            return res.status(403).json({ status: 'error', message: 'Order processing is blocked: seller account is in DELETION_PENDING status.', errors: { account_status: [st] } });
           }
         }
       }
 
-      await conn.query(
-        `UPDATE orders
-         SET seller_id = ?, buyer_name = ?, buyer_phone = ?,
-             shipping_address = ?, landmark = ?, city = ?, state = ?, pincode = ?,
-             order_status = ?, payment_method = ?, payment_status = ?,
-             subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?,
-             rejection_reason = ?, cancellation_reason = ?,
-             shipped_at = CASE WHEN ? = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
-             delivered_at = CASE WHEN ? = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END
-         WHERE id = ?`,
-        [
-          primarySellerId,
-          buyerName, buyerPhone,
-          shippingAddress, landmark || null, city || null, state || null, pincode || null,
-          orderStatus, paymentMethod, paymentStatus,
-          subtotal, deliveryFee, discount, totalAmount, notes || null,
-          rejectionReason, cancellationReason,
-          orderStatus, orderStatus,
-          orderId
-        ]
-      );
-
-      if (optUser && optUser.role === 'seller') {
-        await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ? AND seller_id = ?', [orderStatus, rejectionReason, orderId, Number(optUser.id)]);
-      } else {
-        await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ?', [orderStatus, rejectionReason, orderId]);
+      // Cancellation Permission Check
+      if (orderStatus === 'cancelled') {
+        if (['shipped', 'delivered'].includes(existingStatusLower)) {
+          return res.status(400).json({ message: `Cannot cancel order that is already ${existing.order_status}.` });
+        }
+        if (existingStatusLower === 'cancelled') {
+          return res.status(400).json({ message: 'Order is already cancelled.' });
+        }
+        if (existingStatusLower === 'rejected') {
+          return res.status(400).json({ message: 'Order is already rejected.' });
+        }
       }
+
+      // Rejection reason handling
+      let rejectionReason = body.rejection_reason !== undefined
+        ? String(body.rejection_reason).trim()
+        : (body.reason !== undefined ? String(body.reason).trim() : (existing.rejection_reason || null));
+      if (orderStatus === 'rejected' && !rejectionReason) {
+        rejectionReason = 'Seller is unable to fulfill this order at this time.';
+      }
+
+      // Cancellation reason handling
+      let cancellationReason = body.cancellation_reason !== undefined
+        ? String(body.cancellation_reason).trim()
+        : (body.reason !== undefined ? String(body.reason).trim() : (existing.cancellation_reason || null));
+      if (orderStatus === 'cancelled' && !cancellationReason) {
+        cancellationReason = 'Cancelled by seller.';
+      }
+
+      const buyerName = body.buyer_name !== undefined ? body.buyer_name.trim() : existing.buyer_name;
+      const buyerPhone = body.buyer_phone !== undefined ? body.buyer_phone.trim() : existing.buyer_phone;
+      const shippingAddress = body.shipping_address !== undefined ? body.shipping_address.trim() : existing.shipping_address;
+      const landmark = body.landmark !== undefined ? body.landmark.trim() : existing.landmark;
+      const city = body.city !== undefined ? body.city.trim() : existing.city;
+      const state = body.state !== undefined ? body.state.trim() : existing.state;
+      const pincode = body.pincode !== undefined ? body.pincode.trim() : existing.pincode;
+      const notes = body.notes !== undefined ? body.notes.trim() : existing.notes;
+      const paymentMethod = body.payment_method !== undefined ? body.payment_method.trim() : existing.payment_method;
+
+      let paymentStatus = body.payment_status !== undefined ? body.payment_status.trim() : existing.payment_status;
+      if (orderStatus === 'delivered' && (paymentStatus === 'unpaid' || !paymentStatus)) {
+        paymentStatus = 'paid';
+      }
+
+      let subtotal = parseFloat(existing.subtotal);
+      const deliveryFee = body.delivery_fee !== undefined ? Math.max(0, parseFloat(body.delivery_fee)) : parseFloat(existing.delivery_fee);
+      const discount = body.discount !== undefined ? Math.max(0, parseFloat(body.discount)) : parseFloat(existing.discount);
+
+      let processedItems = [];
 
       if (hasItemsUpdate) {
-        // Restore stock of previously ordered items before updating
-        const [oldItems] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
-        for (const oi of oldItems) {
-          if (oi.product_id) {
-            try {
-              await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
-            } catch (e) {}
-          }
+        if (body.items.length === 0) {
+          return res.status(422).json({ message: 'Order must contain at least one item.' });
         }
+        const pIds = body.items
+          .map(i => i.product_id ? parseInt(i.product_id, 10) : (i.id ? parseInt(i.id, 10) : null))
+          .filter(Boolean);
 
-        await conn.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
-        for (const pi of processedItems) {
-          const itemSellerId = pi.seller_id || primarySellerId;
-          const [iRes] = await conn.query(
-            `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [orderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal]
-          );
-          pi.id = iRes.insertId;
-          pi.order_id = orderId;
-          pi.seller_id = itemSellerId;
-
-          // Decrease stock for new items
-          if (pi.product_id) {
-            try {
-              await conn.query(
-                `UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?`,
-                [pi.quantity, pi.product_id]
-              );
-            } catch (e) {}
-          }
-        }
-      }
-
-      await conn.commit();
-      conn.release();
-
-      // Dispatch Notifications on Status Change
-      if (orderStatus !== existing.order_status) {
-        let notifTitle = '';
-        let notifMsg = '';
-        let notifType = 'order_status_update';
-
-        if (orderStatus === 'accepted') {
-          notifTitle = 'Order Accepted! ✅';
-          notifMsg = `Great news! Your order #${existing.order_number} has been accepted by the seller and will be processed soon.`;
-          notifType = 'order_accepted';
-        } else if (orderStatus === 'rejected') {
-          notifTitle = 'Order Rejected ❌';
-          notifMsg = `Your order #${existing.order_number} was rejected. Reason: ${rejectionReason}`;
-          notifType = 'order_rejected';
-        } else if (orderStatus === 'processing') {
-          notifTitle = 'Order Processing ⚙️';
-          notifMsg = `Your order #${existing.order_number} is now being processed.`;
-          notifType = 'order_processing';
-        } else if (orderStatus === 'packed') {
-          notifTitle = 'Order Packed 📦';
-          notifMsg = `Your order #${existing.order_number} has been packed and is ready for dispatch.`;
-          notifType = 'order_packed';
-        } else if (orderStatus === 'shipped') {
-          notifTitle = 'Order Shipped 🚚';
-          notifMsg = `Your order #${existing.order_number} is on the way!`;
-          notifType = 'order_shipped';
-        } else if (orderStatus === 'delivered') {
-          notifTitle = 'Order Delivered 🎉';
-          notifMsg = `Your order #${existing.order_number} has been delivered. Thank you for shopping with us!`;
-          notifType = 'order_delivered';
-        } else if (orderStatus === 'cancelled') {
-          notifTitle = 'Order Cancelled ❌';
-          notifMsg = `Your order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`;
-          notifType = 'order_cancelled';
-        }
-
-        if (notifTitle) {
+        let pMap = {};
+        if (pIds.length > 0) {
           try {
-            await createNotification(pool, {
-              userId: existing.buyer_id || null,
-              phone: existing.buyer_phone,
-              title: notifTitle,
-              message: notifMsg,
-              type: notifType,
-              data: {
-                order_id: existing.id,
-                order_number: existing.order_number,
-                status: orderStatus,
-                rejection_reason: rejectionReason,
-                cancellation_reason: cancellationReason
-              }
-            });
-          } catch (nErr) {}
-        }
-
-        // Notify seller when order is cancelled by buyer or admin
-        if (orderStatus === 'cancelled' && (!optUser || optUser.role !== 'seller')) {
-          try {
-            const [sRows] = await pool.query('SELECT DISTINCT seller_id FROM order_items WHERE order_id = ?', [orderId]);
-            for (const sr of sRows) {
-              if (sr.seller_id) {
-                await createNotification(pool, {
-                  userId: sr.seller_id,
-                  title: 'Order Cancelled ❌',
-                  message: `Order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`,
-                  type: 'order_cancelled',
-                  data: { order_id: existing.id, order_number: existing.order_number, reason: cancellationReason }
-                });
-              }
+            const [pRows] = await pool.query('SELECT id, seller_id, name, price, stock, image_url, images FROM products WHERE id IN (?)', [pIds]);
+            for (const pr of pRows) {
+              pMap[pr.id] = pr;
             }
-          } catch (sErr) {}
+          } catch (e) {}
+        }
+
+        subtotal = 0;
+        processedItems = body.items.map(item => {
+          const prodId = item.product_id ? parseInt(item.product_id, 10) : (item.id ? parseInt(item.id, 10) : null);
+          const catalogItem = (prodId && pMap[prodId]) || (prodId && defaultProductCatalogMap[prodId]) || null;
+
+          let resolvedPrice = 0;
+          if (item.price !== undefined && item.price !== null && item.price !== '' && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
+            resolvedPrice = parseFloat(item.price);
+          } else if (item.unit_price !== undefined && item.unit_price !== null && !isNaN(parseFloat(item.unit_price)) && parseFloat(item.unit_price) > 0) {
+            resolvedPrice = parseFloat(item.unit_price);
+          } else if (item.product_price !== undefined && item.product_price !== null && !isNaN(parseFloat(item.product_price)) && parseFloat(item.product_price) > 0) {
+            resolvedPrice = parseFloat(item.product_price);
+          } else if (catalogItem && parseFloat(catalogItem.price) > 0) {
+            resolvedPrice = parseFloat(catalogItem.price);
+          }
+
+          const name = item.product_name || item.name || (catalogItem ? catalogItem.name : 'Product');
+          const catalogGallery = catalogItem && catalogItem.images ? parseImagesJson(catalogItem.images) : [];
+          const image = item.product_image || item.image_url || item.image || (catalogItem ? (catalogItem.image_url || catalogGallery[0] || null) : null);
+          const qty = Math.max(1, parseInt(item.quantity || item.qty || item.count || 1, 10));
+          const lineSubtotal = Math.round(resolvedPrice * qty * 100) / 100;
+          subtotal += lineSubtotal;
+
+          let sellerId = item.seller_id ? parseInt(item.seller_id, 10) : null;
+          if (!sellerId && catalogItem && catalogItem.seller_id) {
+            sellerId = parseInt(catalogItem.seller_id, 10);
+          }
+          if (!sellerId && body.seller_id) {
+            sellerId = parseInt(body.seller_id, 10);
+          }
+          if (!sellerId) {
+            sellerId = existing.seller_id || 1;
+          }
+
+          return {
+            product_id: prodId,
+            seller_id: sellerId,
+            product_name: name,
+            name,
+            product_image: image,
+            image_url: image,
+            price: resolvedPrice,
+            unit_price: resolvedPrice,
+            product_price: resolvedPrice,
+            quantity: qty,
+            qty,
+            subtotal: lineSubtotal,
+            line_total: lineSubtotal,
+            total: lineSubtotal,
+            total_price: lineSubtotal
+          };
+        });
+      }
+
+      const primarySellerId = body.seller_id ? parseInt(body.seller_id, 10) : (existing.seller_id || (processedItems.find(i => i.seller_id)?.seller_id || 1));
+      if (hasItemsUpdate) {
+        const chkSellers = [...new Set([primarySellerId, ...processedItems.map(i => i.seller_id)].filter(Boolean))];
+        if (chkSellers.length > 0) {
+          const [sChkRows] = await pool.query(
+            "SELECT id, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id IN (?)",
+            [chkSellers]
+          );
+          const badSeller = sChkRows.find(sr => ['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(String(sr.account_status || 'ACTIVE').toUpperCase()));
+          if (badSeller) {
+            const ast = String(badSeller.account_status).toUpperCase();
+            return res.status(403).json({
+              status: 'error',
+              message: `Cannot assign items to seller #${badSeller.id} while account status is ${ast}.`,
+              errors: { account_status: [ast] }
+            });
+          }
         }
       }
 
-      let sellerName = 'Verified Seller';
+      const totalAmount = Math.max(0, Math.round((subtotal + deliveryFee - discount) * 100) / 100);
+      const computedReturnWindowEnds = new Date(Date.now() + returnWindowDays * 86400 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+
+      const conn = await pool.getConnection();
       try {
-        const [sRows] = await pool.query('SELECT seller_name, name FROM users WHERE id = ? LIMIT 1', [primarySellerId]);
-        if (sRows.length > 0) {
-          sellerName = sRows[0].seller_name || sRows[0].name || 'Verified Seller';
+        await conn.beginTransaction();
+
+        // If order is transitioning into cancelled or rejected, restore inventory
+        if (!['cancelled', 'rejected'].includes(existingStatusLower) && ['cancelled', 'rejected'].includes(orderStatus)) {
+          const [itemsToRestore] = await conn.query(
+            'SELECT product_id, quantity FROM order_items WHERE order_id = ?' + (optUser && optUser.role === 'seller' ? ' AND seller_id = ?' : ''),
+            optUser && optUser.role === 'seller' ? [orderId, Number(optUser.id)] : [orderId]
+          );
+          for (const oi of itemsToRestore) {
+            if (oi.product_id) {
+              try {
+                await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
+              } catch (e) {}
+            }
+          }
         }
-      } catch (e) {}
 
-      // Return updated
-      return handleGetOrderDetail(req, res);
-    } catch (txErr) {
-      await conn.rollback();
-      conn.release();
-      throw txErr;
-    }
-  } catch (err) {
-    const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
-    if (idx === -1) {
-      return res.status(404).json({ message: 'Order not found.' });
-    }
-    const current = fallbackOrders[idx];
-    const orderId = current.id;
+        await conn.query(
+          `UPDATE orders
+           SET seller_id = ?, buyer_name = ?, buyer_phone = ?,
+               shipping_address = ?, landmark = ?, city = ?, state = ?, pincode = ?,
+               order_status = ?, payment_method = ?, payment_status = ?,
+               subtotal = ?, delivery_fee = ?, discount = ?, total_amount = ?, notes = ?,
+               rejection_reason = ?, cancellation_reason = ?,
+               shipped_at = CASE WHEN ? = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
+               delivered_at = CASE WHEN ? = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END,
+               return_window_ends_at = CASE WHEN ? = 'delivered' AND return_window_ends_at IS NULL THEN ? ELSE return_window_ends_at END
+           WHERE id = ?`,
+          [
+            primarySellerId,
+            buyerName, buyerPhone,
+            shippingAddress, landmark || null, city || null, state || null, pincode || null,
+            orderStatus, paymentMethod, paymentStatus,
+            subtotal, deliveryFee, discount, totalAmount, notes || null,
+            rejectionReason, cancellationReason,
+            orderStatus, orderStatus,
+            orderStatus, computedReturnWindowEnds,
+            orderId
+          ]
+        );
 
-    if (optUser && optUser.role === 'seller') {
-      const sellerId = Number(optUser.id);
-      if (!(current.items || []).some(i => Number(i.seller_id || current.seller_id || 1) === sellerId)) {
-        return res.status(403).json({ message: 'Access denied. You do not have permission to update this order.' });
+        if (optUser && optUser.role === 'seller') {
+          await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ? AND seller_id = ?', [orderStatus, rejectionReason, orderId, Number(optUser.id)]);
+        } else {
+          await conn.query('UPDATE order_items SET item_status = ?, rejection_reason = ? WHERE order_id = ?', [orderStatus, rejectionReason, orderId]);
+        }
+
+        if (hasItemsUpdate) {
+          // Restore stock of previously ordered items before updating
+          const [oldItems] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+          for (const oi of oldItems) {
+            if (oi.product_id) {
+              try {
+                await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [oi.quantity, oi.product_id]);
+              } catch (e) {}
+            }
+          }
+
+          await conn.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+          for (const pi of processedItems) {
+            const itemSellerId = pi.seller_id || primarySellerId;
+            const [iRes] = await conn.query(
+              `INSERT INTO order_items (order_id, product_id, seller_id, product_name, product_image, price, quantity, subtotal, item_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [orderId, pi.product_id, itemSellerId, pi.product_name, pi.product_image, pi.price, pi.quantity, pi.subtotal, orderStatus]
+            );
+            pi.id = iRes.insertId;
+            pi.order_id = orderId;
+            pi.seller_id = itemSellerId;
+
+            // Decrease stock for new items
+            if (pi.product_id) {
+              try {
+                await conn.query(
+                  `UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?`,
+                  [pi.quantity, pi.product_id]
+                );
+              } catch (e) {}
+            }
+          }
+        }
+
+        await conn.commit();
+        conn.release();
+
+        // Dispatch Notifications on Status Change
+        if (orderStatus !== existing.order_status) {
+          let notifTitle = '';
+          let notifMsg = '';
+          let notifType = 'order_status_update';
+
+          if (orderStatus === 'accepted') {
+            notifTitle = 'Order Accepted! ✅';
+            notifMsg = `Great news! Your order #${existing.order_number} has been accepted by the seller and will be processed soon.`;
+            notifType = 'order_accepted';
+          } else if (orderStatus === 'rejected') {
+            notifTitle = 'Order Rejected ❌';
+            notifMsg = `Your order #${existing.order_number} was rejected. Reason: ${rejectionReason}`;
+            notifType = 'order_rejected';
+          } else if (orderStatus === 'processing') {
+            notifTitle = 'Order Processing ⚙️';
+            notifMsg = `Your order #${existing.order_number} is now being processed.`;
+            notifType = 'order_processing';
+          } else if (orderStatus === 'packed') {
+            notifTitle = 'Order Packed 📦';
+            notifMsg = `Your order #${existing.order_number} has been packed and is ready for dispatch.`;
+            notifType = 'order_packed';
+          } else if (orderStatus === 'shipped') {
+            notifTitle = 'Order Shipped 🚚';
+            notifMsg = `Your order #${existing.order_number} is on the way!`;
+            notifType = 'order_shipped';
+          } else if (orderStatus === 'delivered') {
+            notifTitle = 'Order Delivered 🎉';
+            notifMsg = `Your order #${existing.order_number} has been delivered. Thank you for shopping with us!`;
+            notifType = 'order_delivered';
+          } else if (orderStatus === 'cancelled') {
+            notifTitle = 'Order Cancelled ❌';
+            notifMsg = `Your order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`;
+            notifType = 'order_cancelled';
+          }
+
+          if (notifTitle) {
+            try {
+              await createNotification(pool, {
+                userId: existing.buyer_id || null,
+                phone: existing.buyer_phone,
+                title: notifTitle,
+                message: notifMsg,
+                type: notifType,
+                data: {
+                  order_id: existing.id,
+                  order_number: existing.order_number,
+                  status: orderStatus,
+                  rejection_reason: rejectionReason,
+                  cancellation_reason: cancellationReason
+                }
+              });
+            } catch (nErr) {}
+          }
+
+          // Notify seller when order is cancelled by buyer or admin
+          if (orderStatus === 'cancelled' && (!optUser || optUser.role !== 'seller')) {
+            try {
+              const [sRows] = await pool.query('SELECT DISTINCT seller_id FROM order_items WHERE order_id = ?', [orderId]);
+              for (const sr of sRows) {
+                if (sr.seller_id) {
+                  await createNotification(pool, {
+                    userId: sr.seller_id,
+                    title: 'Order Cancelled ❌',
+                    message: `Order #${existing.order_number} has been cancelled.${cancellationReason ? ` Reason: ${cancellationReason}` : ''}`,
+                    type: 'order_cancelled',
+                    data: { order_id: existing.id, order_number: existing.order_number, reason: cancellationReason }
+                  });
+                }
+              }
+            } catch (sErr) {}
+          }
+        }
+
+        return handleGetOrderDetail(req, res);
+      } catch (txErr) {
+        await conn.rollback();
+        conn.release();
+        throw txErr;
       }
+    } catch (err) {
+      // Fall through to fallback update
     }
+  }
 
-    const orderStatus = body.order_status !== undefined
-      ? body.order_status.toLowerCase().trim()
-      : (body.status !== undefined ? body.status.toLowerCase().trim() : current.order_status);
+  // Fallback mode update
+  const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
+  if (idx === -1) {
+    return res.status(404).json({ message: 'Order not found.' });
+  }
+  const current = fallbackOrders[idx];
+  const orderId = current.id;
+  const hasItemsUpdate = Array.isArray(body.items);
+  const currentStatusLower = String(current.order_status || 'pending').toLowerCase();
+  const orderStatus = body.order_status !== undefined
+    ? body.order_status.toLowerCase().trim()
+    : (body.status !== undefined ? body.status.toLowerCase().trim() : currentStatusLower);
 
-    if (orderStatus === 'cancelled' && ['shipped', 'delivered'].includes(current.order_status)) {
-      return res.status(400).json({ message: `Cannot cancel order that is already ${current.order_status}.` });
-    }
-
-    let rejectionReason = body.rejection_reason || body.reason || current.rejection_reason || null;
-    if (orderStatus === 'rejected' && !rejectionReason) rejectionReason = 'Seller is unable to fulfill this order at this time.';
-
-    let cancellationReason = body.cancellation_reason || body.reason || current.cancellation_reason || null;
-    if (orderStatus === 'cancelled' && !cancellationReason) cancellationReason = 'Cancelled by seller.';
-
-    let newItems = current.items;
-    let newSubtotal = current.subtotal;
-
-    if (Array.isArray(body.items)) {
-      newSubtotal = 0;
-      newItems = body.items.map((it, i) => {
-        const price = Math.max(0, parseFloat(it.price || 0));
-        const qty = Math.max(1, parseInt(it.quantity || it.qty || 1, 10));
-        const line = Math.round(price * qty * 100) / 100;
-        newSubtotal += line;
-        const fbImg = it.product_image || it.image_url || it.image || null;
-        return {
-          id: it.id || i + 1,
-          order_id: orderId,
-          product_id: it.product_id || it.id || null,
-          seller_id: it.seller_id || current.seller_id || 1,
-          product_name: it.product_name || it.name || 'Product',
-          product_image: fbImg,
-          image_url: fbImg,
-          price,
-          quantity: qty,
-          subtotal: line
-        };
+  if (optUser && optUser.role === 'seller') {
+    const sellerId = Number(optUser.id);
+    const accStatus = String(optUser.account_status || 'ACTIVE').toUpperCase();
+    if (['LOCKED', 'DELETED'].includes(accStatus)) {
+      return res.status(403).json({
+        status: 'error',
+        message: `Seller account is ${accStatus}; order modifications are disabled.`,
+        errors: { account_status: [accStatus] }
       });
     }
-
-    const deliveryFee = body.delivery_fee !== undefined ? parseFloat(body.delivery_fee) : current.delivery_fee;
-    const discount = body.discount !== undefined ? parseFloat(body.discount) : current.discount;
-    const totalAmount = Math.max(0, Math.round((newSubtotal + deliveryFee - discount) * 100) / 100);
-
-    fallbackOrders[idx] = {
-      ...current,
-      buyer_name: body.buyer_name || current.buyer_name,
-      buyer_phone: body.buyer_phone || current.buyer_phone,
-      shipping_address: body.shipping_address || current.shipping_address,
-      landmark: body.landmark !== undefined ? body.landmark : current.landmark,
-      city: body.city !== undefined ? body.city : current.city,
-      state: body.state !== undefined ? body.state : current.state,
-      pincode: body.pincode !== undefined ? body.pincode : current.pincode,
-      notes: body.notes !== undefined ? body.notes : current.notes,
-      order_status: orderStatus,
-      payment_method: body.payment_method || current.payment_method,
-      payment_status: orderStatus === 'delivered' ? 'paid' : (body.payment_status || current.payment_status),
-      rejection_reason: rejectionReason,
-      cancellation_reason: cancellationReason,
-      subtotal: newSubtotal,
-      delivery_fee: deliveryFee,
-      discount,
-      total_amount: totalAmount,
-      items: newItems,
-      items_count: newItems.length,
-      total_quantity: newItems.reduce((acc, cur) => acc + cur.quantity, 0),
-      updated_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
-    };
-
-    return res.json({
-      message: 'Order updated successfully (local sync mode).',
-      order: fallbackOrders[idx]
-    });
+    if (
+      accStatus === 'DELETION_PENDING' &&
+      currentStatusLower === 'pending' &&
+      (['accepted', 'processing', 'packed', 'shipped', 'delivered'].includes(orderStatus) || hasItemsUpdate)
+    ) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Order processing is blocked: seller account is in DELETION_PENDING status.',
+        errors: { account_status: [accStatus] }
+      });
+    }
+    if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
+      return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
+    }
+    if (!(current.items || []).some(i => Number(i.seller_id || current.seller_id || 1) === sellerId)) {
+      return res.status(403).json({ message: 'Access denied. You do not have permission to update this order.' });
+    }
+  } else if (!optUser || optUser.role !== 'admin') {
+    const invIds = [...new Set([current.seller_id, ...(current.items || []).map(i => i.seller_id || current.seller_id)].map(Number).filter(Boolean))];
+    for (const sid of invIds) {
+      const sObj = fallbackSellers.find(s => Number(s.id) === sid);
+      const st = String((sObj && sObj.account_status) || 'ACTIVE').toUpperCase();
+      if (['LOCKED', 'DELETED'].includes(st)) {
+        return res.status(403).json({ status: 'error', message: `Order modification blocked: seller #${sid} account is ${st}.`, errors: { account_status: [st] } });
+      }
+      if (st === 'DELETION_PENDING' && currentStatusLower === 'pending' && (['accepted', 'processing', 'packed', 'shipped', 'delivered'].includes(orderStatus) || hasItemsUpdate)) {
+        return res.status(403).json({ status: 'error', message: 'Order processing is blocked: seller account is in DELETION_PENDING status.', errors: { account_status: [st] } });
+      }
+    }
   }
+
+  if (orderStatus === 'cancelled') {
+    if (['shipped', 'delivered'].includes(currentStatusLower)) {
+      return res.status(400).json({ message: `Cannot cancel order that is already ${current.order_status}.` });
+    }
+    if (currentStatusLower === 'cancelled') {
+      return res.status(400).json({ message: 'Order is already cancelled.' });
+    }
+    if (currentStatusLower === 'rejected') {
+      return res.status(400).json({ message: 'Order is already rejected.' });
+    }
+  }
+
+  let rejectionReason = body.rejection_reason || body.reason || current.rejection_reason || null;
+  if (orderStatus === 'rejected' && !rejectionReason) rejectionReason = 'Seller is unable to fulfill this order at this time.';
+
+  let cancellationReason = body.cancellation_reason || body.reason || current.cancellation_reason || null;
+  if (orderStatus === 'cancelled' && !cancellationReason) cancellationReason = 'Cancelled by seller.';
+
+  let newItems = (current.items || []).map(it => ({
+    ...it,
+    item_status: (!optUser || optUser.role !== 'seller' || Number(it.seller_id || current.seller_id || 1) === Number(optUser.id)) ? orderStatus : (it.item_status || 'pending'),
+    rejection_reason: (!optUser || optUser.role !== 'seller' || Number(it.seller_id || current.seller_id || 1) === Number(optUser.id)) ? rejectionReason : (it.rejection_reason || null)
+  }));
+  let newSubtotal = parseFloat(current.subtotal || 0);
+
+  if (hasItemsUpdate) {
+    if (body.items.length === 0) {
+      return res.status(422).json({ message: 'Order must contain at least one item.' });
+    }
+    newSubtotal = 0;
+    newItems = body.items.map((it, i) => {
+      const prodId = it.product_id || it.id || null;
+      const fbCatalog = prodId ? (fallbackProducts.find(p => Number(p.id) === Number(prodId)) || defaultProductCatalogMap[Number(prodId)]) : null;
+      const price = (it.price !== undefined && parseFloat(it.price) > 0) ? parseFloat(it.price) : (fbCatalog ? parseFloat(fbCatalog.price || 0) : 0);
+      const qty = Math.max(1, parseInt(it.quantity || it.qty || 1, 10));
+      const line = Math.round(price * qty * 100) / 100;
+      newSubtotal += line;
+      const fbImg = it.product_image || it.image_url || it.image || (fbCatalog ? fbCatalog.image_url : null);
+      const itemSeller = it.seller_id ? parseInt(it.seller_id, 10) : ((fbCatalog && fbCatalog.seller_id) ? parseInt(fbCatalog.seller_id, 10) : (current.seller_id || 1));
+      return {
+        id: it.id || i + 1,
+        order_id: orderId,
+        product_id: prodId,
+        seller_id: itemSeller,
+        product_name: it.product_name || it.name || (fbCatalog ? fbCatalog.name : 'Product'),
+        product_image: fbImg,
+        image_url: fbImg,
+        price,
+        quantity: qty,
+        subtotal: line,
+        item_status: orderStatus
+      };
+    });
+    const newSellerIds = [...new Set(newItems.map(i => Number(i.seller_id)).filter(Boolean))];
+    const blockedTarget = fallbackSellers.find(s => newSellerIds.includes(Number(s.id)) && ['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(String(s.account_status || 'ACTIVE').toUpperCase()));
+    if (blockedTarget) {
+      const ast = String(blockedTarget.account_status).toUpperCase();
+      return res.status(403).json({ status: 'error', message: `Cannot assign items to seller #${blockedTarget.id} while account status is ${ast}.`, errors: { account_status: [ast] } });
+    }
+  }
+
+  // Restore stock if transitioning into cancelled/rejected
+  if (!['cancelled', 'rejected'].includes(currentStatusLower) && ['cancelled', 'rejected'].includes(orderStatus)) {
+    for (const it of current.items || []) {
+      if (it.product_id && (!optUser || optUser.role !== 'seller' || Number(it.seller_id || current.seller_id || 1) === Number(optUser.id))) {
+        const fbProd = fallbackProducts.find(p => Number(p.id) === Number(it.product_id));
+        if (fbProd) fbProd.stock = Number(fbProd.stock || 0) + Number(it.quantity || 0);
+      }
+    }
+  }
+
+  const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const returnWinStr = new Date(Date.now() + returnWindowDays * 86400 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  const deliveryFee = body.delivery_fee !== undefined ? parseFloat(body.delivery_fee) : current.delivery_fee;
+  const discount = body.discount !== undefined ? parseFloat(body.discount) : current.discount;
+  const totalAmount = Math.max(0, Math.round((newSubtotal + deliveryFee - discount) * 100) / 100);
+
+  fallbackOrders[idx] = {
+    ...current,
+    buyer_name: body.buyer_name || current.buyer_name,
+    buyer_phone: body.buyer_phone || current.buyer_phone,
+    shipping_address: body.shipping_address || current.shipping_address,
+    landmark: body.landmark !== undefined ? body.landmark : current.landmark,
+    city: body.city !== undefined ? body.city : current.city,
+    state: body.state !== undefined ? body.state : current.state,
+    pincode: body.pincode !== undefined ? body.pincode : current.pincode,
+    notes: body.notes !== undefined ? body.notes : current.notes,
+    order_status: orderStatus,
+    payment_method: body.payment_method || current.payment_method,
+    payment_status: orderStatus === 'delivered' ? 'paid' : (body.payment_status || current.payment_status),
+    rejection_reason: rejectionReason,
+    cancellation_reason: cancellationReason,
+    shipped_at: (orderStatus === 'shipped' && !current.shipped_at) ? nowStr : (current.shipped_at || null),
+    delivered_at: (orderStatus === 'delivered' && !current.delivered_at) ? nowStr : (current.delivered_at || null),
+    return_window_ends_at: (orderStatus === 'delivered' && !current.return_window_ends_at) ? returnWinStr : (current.return_window_ends_at || null),
+    subtotal: newSubtotal,
+    delivery_fee: deliveryFee,
+    discount,
+    total_amount: totalAmount,
+    items: newItems,
+    items_count: newItems.length,
+    total_quantity: newItems.reduce((acc, cur) => acc + cur.quantity, 0),
+    updated_at: nowStr
+  };
+
+  return res.json({
+    message: 'Order updated successfully (local sync mode).',
+    order: fallbackOrders[idx]
+  });
 };
 
-app.put(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
-app.patch(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
-app.post(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleOrderUpdate);
+app.put(['/api/orders/:id', '/api/order/:id'], handleOrderUpdate);
+app.patch(['/api/orders/:id', '/api/order/:id'], handleOrderUpdate);
+app.post(['/api/orders/:id', '/api/order/:id'], handleOrderUpdate);
+app.put(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleOrderUpdate);
+app.patch(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleOrderUpdate);
+app.post(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleOrderUpdate);
 
 // DELETE /api/orders/:id and /api/order/:id (also supports seller routes)
 const handleDeleteOrder = async (req, res) => {
   const rawParam = String(req.params.id || '').trim();
   const numId = parseInt(rawParam, 10);
   const isNumeric = !isNaN(numId) && String(numId) === rawParam;
-  const optUser = req.user || getOptionalUser(req);
+  const { user: optUser, authError } = await resolveOptionalUserDetailsAsync(req);
+  if (authError) {
+    return res.status(authError.code).json({ status: 'error', message: authError.message });
+  }
 
-  try {
-    await ensureOrdersTables(pool);
-    let existing;
-    if (isNumeric) {
-      [existing] = await pool.query('SELECT id, order_number FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
-    } else {
-      [existing] = await pool.query('SELECT id, order_number FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
-    }
-    if (existing.length === 0) {
-      return res.status(404).json({ message: 'Order not found.' });
-    }
-    const orderId = Number(existing[0].id);
-
-    if (optUser && optUser.role === 'seller') {
-      const sellerId = Number(optUser.id);
-      if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
-        return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
+  const useDb = await checkDbReachable(pool, deletionCtx);
+  if (useDb) {
+    try {
+      await ensureOrdersTables(pool);
+      await ensureSellerDeletionSchemaNode(pool);
+      let existing;
+      if (isNumeric) {
+        [existing] = await pool.query('SELECT id, order_number, payment_status, captured_amount FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+      } else {
+        [existing] = await pool.query('SELECT id, order_number, payment_status, captured_amount FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
       }
-      const [checkItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, sellerId]);
-      if (checkItems.length === 0) {
-        return res.status(403).json({ message: 'Access denied. You do not have permission to delete this order.' });
+      if (existing.length === 0) {
+        return res.status(404).json({ message: 'Order not found.' });
       }
-    }
+      const order = existing[0];
+      const orderId = Number(order.id);
 
-    // Restore stock for deleted order items
-    const [delItems] = await pool.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
-    for (const it of delItems) {
-      if (it.product_id) {
-        try {
-          await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [it.quantity, it.product_id]);
-        } catch (e) {}
+      // Preserve historical orders for any seller in deletion workflow or deleted
+      const [delChkRows] = await pool.query(
+        `SELECT u.id, COALESCE(u.account_status, 'ACTIVE') AS account_status
+         FROM users u
+         WHERE COALESCE(u.account_status, 'ACTIVE') IN ('DELETION_PENDING', 'LOCKED', 'DELETED')
+           AND (u.id IN (SELECT seller_id FROM order_items WHERE order_id = ? AND seller_id IS NOT NULL)
+                OR u.id = (SELECT seller_id FROM orders WHERE id = ?))
+         LIMIT 1`,
+        [orderId, orderId]
+      );
+      if (delChkRows.length > 0) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Historical orders associated with a seller in deletion/deleted state cannot be deleted and must be preserved for auditing.'
+        });
       }
-    }
 
-    await pool.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
-    await pool.query('DELETE FROM orders WHERE id = ?', [orderId]);
-    res.json({ message: 'Order deleted successfully.', id: orderId, order_number: existing[0].order_number });
-  } catch (err) {
-    const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
-    if (idx !== -1) {
+      // Preserve paid/financial orders & orders with payment/refund/dispute history
+      const payStLower = String(order.payment_status || '').toLowerCase();
+      let hasFinHistory = ['paid', 'partially_refunded', 'refunded'].includes(payStLower) || Number(order.captured_amount || 0) > 0;
+      if (!hasFinHistory) {
+        const [ptChk] = await pool.query('SELECT 1 FROM payment_transactions WHERE order_id = ? LIMIT 1', [orderId]);
+        if (ptChk.length > 0) hasFinHistory = true;
+      }
+      if (!hasFinHistory) {
+        const [rfChk] = await pool.query('SELECT 1 FROM seller_refund_records WHERE order_id = ? LIMIT 1', [orderId]);
+        if (rfChk.length > 0) hasFinHistory = true;
+      }
+      if (!hasFinHistory) {
+        const [dpChk] = await pool.query('SELECT 1 FROM order_disputes WHERE order_id = ? LIMIT 1', [orderId]);
+        if (dpChk.length > 0) hasFinHistory = true;
+      }
+      if (hasFinHistory) {
+        return res.status(409).json({
+          status: 'error',
+          message: 'Orders with payment, refund, or dispute history cannot be deleted and must be preserved for financial auditing.'
+        });
+      }
+
       if (optUser && optUser.role === 'seller') {
         const sellerId = Number(optUser.id);
         if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
           return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
         }
-        if (!(fallbackOrders[idx].items || []).some(i => Number(i.seller_id || fallbackOrders[idx].seller_id || 1) === sellerId)) {
+        const [checkItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, sellerId]);
+        if (checkItems.length === 0) {
           return res.status(403).json({ message: 'Access denied. You do not have permission to delete this order.' });
         }
       }
-      const removed = fallbackOrders.splice(idx, 1)[0];
-      return res.json({ message: 'Order deleted successfully.', id: removed.id, order_number: removed.order_number });
+
+      // Restore stock for deleted order items
+      const [delItems] = await pool.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+      for (const it of delItems) {
+        if (it.product_id) {
+          try {
+            await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [it.quantity, it.product_id]);
+          } catch (e) {}
+        }
+      }
+
+      await pool.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+      await pool.query('DELETE FROM orders WHERE id = ?', [orderId]);
+      return res.json({ message: 'Order deleted successfully.', id: orderId, order_number: order.order_number });
+    } catch (err) {
+      // Fall through to fallback
     }
-    res.status(404).json({ message: 'Order not found.' });
   }
+
+  const idx = fallbackOrders.findIndex(o => String(o.id) === rawParam || o.order_number === rawParam);
+  if (idx === -1) {
+    return res.status(404).json({ message: 'Order not found.' });
+  }
+  const current = fallbackOrders[idx];
+  const orderId = Number(current.id);
+  const store = deletionCtx.getFallbackDeletionStore();
+
+  const invIds = [...new Set([current.seller_id, ...(current.items || []).map(i => i.seller_id || current.seller_id)].map(Number).filter(Boolean))];
+  if (fallbackSellers.some(s => invIds.includes(Number(s.id)) && ['DELETION_PENDING', 'LOCKED', 'DELETED'].includes(String(s.account_status || 'ACTIVE').toUpperCase()))) {
+    return res.status(403).json({
+      status: 'error',
+      message: 'Historical orders associated with a seller in deletion/deleted state cannot be deleted and must be preserved for auditing.'
+    });
+  }
+
+  const payStLower = String(current.payment_status || '').toLowerCase();
+  const hasFinHistory = ['paid', 'partially_refunded', 'refunded'].includes(payStLower) ||
+    Number(current.captured_amount || 0) > 0 ||
+    store.paymentTransactions.some(t => Number(t.order_id) === orderId) ||
+    store.refundRecords.some(r => Number(r.order_id) === orderId) ||
+    store.disputes.some(d => Number(d.order_id) === orderId);
+  if (hasFinHistory) {
+    return res.status(409).json({
+      status: 'error',
+      message: 'Orders with payment, refund, or dispute history cannot be deleted and must be preserved for financial auditing.'
+    });
+  }
+
+  if (optUser && optUser.role === 'seller') {
+    const sellerId = Number(optUser.id);
+    if (req.params.seller_id && parseInt(req.params.seller_id, 10) !== sellerId) {
+      return res.status(403).json({ message: 'Access denied. You can only access your own orders.' });
+    }
+    if (!(current.items || []).some(i => Number(i.seller_id || current.seller_id || 1) === sellerId)) {
+      return res.status(403).json({ message: 'Access denied. You do not have permission to delete this order.' });
+    }
+  }
+
+  for (const it of current.items || []) {
+    if (it.product_id) {
+      const fbProd = fallbackProducts.find(p => Number(p.id) === Number(it.product_id));
+      if (fbProd) fbProd.stock = Number(fbProd.stock || 0) + Number(it.quantity || 0);
+    }
+  }
+  const removed = fallbackOrders.splice(idx, 1)[0];
+  return res.json({ message: 'Order deleted successfully.', id: removed.id, order_number: removed.order_number });
 };
 
-app.delete(['/api/orders/:id', '/api/order/:id', '/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], handleDeleteOrder);
+app.delete(['/api/orders/:id', '/api/order/:id'], handleDeleteOrder);
+app.delete(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleDeleteOrder);
 
 // ==========================================
 // 4c. Provider Invoice Generator & Downloader
@@ -8383,41 +9169,74 @@ app.get('/admin/login', (req, res) => {
 
 app.post('/admin/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    let [rows] = await pool.query('SELECT * FROM users WHERE (email = ? OR (? IN ("admin@vendor.app", "admin@venter.app") AND email IN ("admin@vendor.app", "admin@venter.app"))) AND role = "admin" LIMIT 1', [email, email]);
-    
-    // Auto-seed admin user on newly created databases
-    if (rows.length === 0 && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
-      const adminHash = await bcrypt.hash('Admin123!', 10);
-      await pool.query(
-        `INSERT INTO users (id, name, email, password, role)
-         VALUES (1, 'Vendor Administrator', 'admin@vendor.app', ?, 'admin')
-         ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), password = VALUES(password), role = 'admin'`,
-        [adminHash]
-      );
-      [rows] = await pool.query('SELECT * FROM users WHERE (email = "admin@vendor.app" OR email = "admin@venter.app") AND role = "admin" LIMIT 1');
-    }
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    const password = String((req.body && req.body.password) || '');
+    const dbActive = await checkDbReachable(pool, deletionCtx);
 
-    if (rows.length > 0 && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
-      const match = await bcrypt.compare(password, rows[0].password);
-      if (!match) {
+    if (dbActive) {
+      let [rows] = await pool.query('SELECT * FROM users WHERE (LOWER(email) = ? OR (? IN ("admin@vendor.app", "admin@venter.app") AND LOWER(email) IN ("admin@vendor.app", "admin@venter.app"))) AND role = "admin" LIMIT 1', [email, email]);
+
+      // Auto-seed admin user on newly created databases
+      if (rows.length === 0 && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
         const adminHash = await bcrypt.hash('Admin123!', 10);
-        await pool.query('UPDATE users SET password = ? WHERE id = ?', [adminHash, rows[0].id]);
-        rows[0].password = adminHash;
+        await pool.query(
+          `INSERT INTO users (id, name, email, password, role)
+           VALUES (1, 'Vendor Administrator', 'admin@vendor.app', ?, 'admin')
+           ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), password = VALUES(password), role = 'admin'`,
+          [adminHash]
+        );
+        [rows] = await pool.query('SELECT * FROM users WHERE (LOWER(email) = "admin@vendor.app" OR LOWER(email) = "admin@venter.app") AND role = "admin" LIMIT 1');
       }
+
+      if (rows.length > 0 && (email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') {
+        const match = await bcrypt.compare(password, rows[0].password);
+        if (!match) {
+          const adminHash = await bcrypt.hash('Admin123!', 10);
+          await pool.query('UPDATE users SET password = ? WHERE id = ?', [adminHash, rows[0].id]);
+          rows[0].password = adminHash;
+        }
+      }
+
+      if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
+        return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
+      }
+
+      const adminToken = jwt.sign(
+        { id: rows[0].id, role: 'admin', email: rows[0].email, tv: Number(rows[0].token_version || 1) },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+      res.setHeader('Set-Cookie', [
+        `admin_logged_in=1; Path=/; Max-Age=604800; SameSite=Lax`,
+        `admin_email=${encodeURIComponent(rows[0].email)}; Path=/; Max-Age=604800; SameSite=Lax`,
+        `admin_token=${adminToken}; Path=/; HttpOnly; Max-Age=604800; SameSite=Lax`
+      ]);
+      return res.redirect('/admin');
     }
 
-    if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
+    // Fallback offline admin auth when MySQL is unavailable
+    const fbAdmin = fallbackSellers.find(s => s.role === 'admin' && (
+      String(s.email || '').toLowerCase() === email ||
+      ((email === 'admin@vendor.app' || email === 'admin@venter.app') && ['admin@vendor.app', 'admin@venter.app'].includes(String(s.email || '').toLowerCase()))
+    ));
+    const fbValid = fbAdmin && (
+      ((email === 'admin@vendor.app' || email === 'admin@venter.app') && password === 'Admin123!') ||
+      (fbAdmin.password && (await bcrypt.compare(password, fbAdmin.password)))
+    );
+    if (!fbValid) {
       return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
     }
-
-    const adminToken = jwt.sign({ id: rows[0].id, role: 'admin', email: rows[0].email }, JWT_SECRET, { expiresIn: '7d' });
+    const adminToken = jwt.sign(
+      { id: fbAdmin.id, role: 'admin', email: fbAdmin.email || 'admin@vendor.app', tv: Number(fbAdmin.token_version || 1) },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     res.setHeader('Set-Cookie', [
       `admin_logged_in=1; Path=/; Max-Age=604800; SameSite=Lax`,
-      `admin_email=${encodeURIComponent(rows[0].email)}; Path=/; Max-Age=604800; SameSite=Lax`,
+      `admin_email=${encodeURIComponent(fbAdmin.email || 'admin@vendor.app')}; Path=/; Max-Age=604800; SameSite=Lax`,
       `admin_token=${adminToken}; Path=/; HttpOnly; Max-Age=604800; SameSite=Lax`
     ]);
-    res.redirect('/admin');
+    return res.redirect('/admin');
   } catch (err) {
     console.error('Admin Login Error:', err);
     return res.status(500).send(`
@@ -8455,16 +9274,21 @@ DB_PASSWORD=Xtragclub_vendor2026</pre>
   }
 });
 
-app.post('/admin', async (req, res) => {
-  await ensureGstTables(pool);
-  await ensureProductCategoriesTable(pool);
+app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+  if (dbActive) {
+    await ensureGstTables(pool);
+    await ensureProductCategoriesTable(pool);
+  }
   let feedbackMsg = null;
   let feedbackErr = null;
   try {
     const body = req.body || {};
     const action = body.action;
 
-    if (action === 'approve_gst') {
+    if (!dbActive) {
+      feedbackErr = 'Direct MySQL actions (GST/Category/Seller edit) require MySQL connection; use the Seller Deletion API workspace above in fallback mode.';
+    } else if (action === 'approve_gst') {
       const sellerId = parseInt(body.seller_id, 10);
       const notes = (body.notes || 'Approved by administrator').trim();
       const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
@@ -8880,17 +9704,24 @@ app.get('/admin/gst_storage_info', authenticateToken, requireAdminRole, async (r
 });
 
 // GET /admin/view_gst_doc - Preview or download document for admin
-app.get('/admin/view_gst_doc', async (req, res) => {
+app.get('/admin/view_gst_doc', requireAdminDashboardAuth, async (req, res) => {
   const docId = parseInt(req.query.id, 10);
   const mode = req.query.mode === 'download' ? 'download' : 'preview';
   if (!docId) return res.status(400).send('Invalid document ID');
 
   try {
-    const [rows] = await pool.query('SELECT * FROM seller_gst_documents WHERE id = ? LIMIT 1', [docId]);
-    if (rows.length === 0) {
+    const dbActive = await checkDbReachable(pool, deletionCtx);
+    let doc = null;
+    if (dbActive) {
+      const [rows] = await pool.query('SELECT * FROM seller_gst_documents WHERE id = ? LIMIT 1', [docId]);
+      doc = rows[0] || null;
+    } else {
+      const store = fallbackDeletionStore;
+      doc = (store.gstDocuments || []).find(d => Number(d.id) === docId) || null;
+    }
+    if (!doc) {
       return res.status(404).send('Document not found in database.');
     }
-    const doc = rows[0];
     const realPath = resolveGstDocumentPath(doc);
     if (!realPath) {
       const safeName = String(doc.original_name || 'Document.pdf').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -8933,11 +9764,17 @@ app.get('/admin/view_gst_doc', async (req, res) => {
 });
 
 // GET /admin/get_gst_details - Fetch seller GST details and documents for review modal
-app.get('/admin/get_gst_details', async (req, res) => {
+app.get('/admin/get_gst_details', requireAdminDashboardAuth, async (req, res) => {
   const targetId = parseInt(req.query.seller_id, 10);
   if (!targetId) return res.status(400).json({ status: 'error', message: 'Missing seller_id' });
 
   try {
+    const dbActive = await checkDbReachable(pool, deletionCtx);
+    if (!dbActive) {
+      const store = fallbackDeletionStore;
+      const gst = (store.gstDetails || []).find(g => Number(g.seller_id) === targetId) || null;
+      return res.json({ status: 'success', gst, documents: [], logs: [] });
+    }
     const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [targetId]);
     const [docs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [targetId]);
     const [logs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC', [targetId]);
@@ -8958,107 +9795,150 @@ app.get('/admin/get_gst_details', async (req, res) => {
   }
 });
 
-// GET /admin - Upgraded Admin Dashboard tailored to project
-app.get('/admin', async (req, res) => {
-  await ensureGstTables(pool);
-  await ensureProductPriceColumns(pool);
-  await ensureProductCategoriesTable(pool);
+// GET /admin & /admin/seller-deletions - Admin Dashboard with Seller Deletion & Refund Management
+app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async (req, res) => {
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+  if (dbActive) {
+    await ensureGstTables(pool);
+    await ensureProductPriceColumns(pool);
+    await ensureProductCategoriesTable(pool);
+    await ensureSellerDeletionSchemaNode(pool);
+  }
+  const focusDeletionTab = req.path === '/admin/seller-deletions' || String(req.query.tab || '').toLowerCase() === 'seller-deletions';
+
   try {
-    const [[{ count }]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
-
+    let count = 0;
     let productCount = 0;
-    try {
-      const [[p]] = await pool.query('SELECT COUNT(*) as cnt FROM products WHERE is_active = 1');
-      productCount = p.cnt;
-    } catch (e) {}
-
     let categoryCount = 0;
     let categoriesList = [];
-    try {
-      const [[cCnt]] = await pool.query('SELECT COUNT(*) as cnt FROM categories WHERE is_active = 1');
-      categoryCount = Number(cCnt.cnt || 0);
-      const [cRows] = await pool.query(`
-        SELECT c.*,
-               (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
-        FROM categories c
-        ORDER BY c.sort_order ASC, c.id ASC
-      `);
-      categoriesList = cRows;
-    } catch (e) {}
-
     let adminProducts = [];
-    try {
-      const [pRows] = await pool.query(`
-        SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
-               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
-        FROM products p
-        LEFT JOIN users u ON p.seller_id = u.id
-        ORDER BY p.id DESC
-        LIMIT 80
-      `);
-      adminProducts = pRows;
-    } catch (e) {}
-
     let orderCount = 0;
-    try {
-      const [[o]] = await pool.query('SELECT COUNT(*) as cnt FROM orders');
-      orderCount = o.cnt;
-    } catch (e) {}
-
     let metrics = { total_gst: 0, pending_gst: 0, approved_gst: 0, rejected_gst: 0 };
-    try {
-      const [[m]] = await pool.query(`
-        SELECT
-          COUNT(*) as total_gst,
-          SUM(CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
-          SUM(CASE WHEN g.status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
-          SUM(CASE WHEN g.status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
-        FROM seller_gst_details g
-        JOIN users u ON g.seller_id = u.id
-      `);
-      metrics = m || metrics;
-    } catch (e) {}
-
     let gstSellers = [];
-    try {
-      const [rows] = await pool.query(`
-        SELECT g.*, u.seller_name, u.name as user_name, u.phone, u.email, u.address as user_address, u.state as user_state,
-               (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id) as doc_count,
-               (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
-               (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
-               (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
-               (SELECT d.file_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_name,
-               (SELECT d.file_path FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_path,
-               (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
-        FROM seller_gst_details g
-        JOIN users u ON g.seller_id = u.id
-        ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
-        LIMIT 100
-      `);
-      gstSellers = rows.map(g => ({
-        ...g,
-        latest_doc_exists: g.latest_doc_id ? Boolean(resolveGstDocumentPath({
-          id: g.latest_doc_id,
-          seller_id: g.seller_id,
-          file_name: g.latest_doc_file_name,
-          file_path: g.latest_doc_file_path
-        })) : false
-      }));
-    } catch (e) {}
-
     let sellers = [];
+    let deletionRequestsData = { requests: [], kpis: { total: 0, pending: 0, processing: 0, failed: 0, on_hold: 0, approved: 0, deleted: 0, rejected: 0 } };
+
+    if (dbActive) {
+      const [[cRow]] = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = "seller"');
+      count = Number((cRow && cRow.count) || 0);
+
+      try {
+        const [[p]] = await pool.query('SELECT COUNT(*) as cnt FROM products WHERE is_active = 1');
+        productCount = Number((p && p.cnt) || 0);
+      } catch (e) {}
+
+      try {
+        const [[cCnt]] = await pool.query('SELECT COUNT(*) as cnt FROM categories WHERE is_active = 1');
+        categoryCount = Number((cCnt && cCnt.cnt) || 0);
+        const [cRows] = await pool.query(`
+          SELECT c.*,
+                 (SELECT COUNT(*) FROM products p WHERE p.is_active = 1 AND (p.category_id = c.id OR LOWER(p.category) = LOWER(c.name))) AS products_count
+          FROM categories c
+          ORDER BY c.sort_order ASC, c.id ASC
+        `);
+        categoriesList = cRows;
+      } catch (e) {}
+
+      try {
+        const [pRows] = await pool.query(`
+          SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
+                 COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+          FROM products p
+          LEFT JOIN users u ON p.seller_id = u.id
+          ORDER BY p.id DESC
+          LIMIT 80
+        `);
+        adminProducts = pRows;
+      } catch (e) {}
+
+      try {
+        const [[o]] = await pool.query('SELECT COUNT(*) as cnt FROM orders');
+        orderCount = Number((o && o.cnt) || 0);
+      } catch (e) {}
+
+      try {
+        const [[m]] = await pool.query(`
+          SELECT
+            COUNT(*) as total_gst,
+            SUM(CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 1 ELSE 0 END) as pending_gst,
+            SUM(CASE WHEN g.status = 'Approved' THEN 1 ELSE 0 END) as approved_gst,
+            SUM(CASE WHEN g.status = 'Rejected' THEN 1 ELSE 0 END) as rejected_gst
+          FROM seller_gst_details g
+          JOIN users u ON g.seller_id = u.id
+        `);
+        metrics = m || metrics;
+      } catch (e) {}
+
+      try {
+        const [rows] = await pool.query(`
+          SELECT g.*, u.seller_name, u.name as user_name, u.phone, u.email, u.address as user_address, u.state as user_state,
+                 (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id) as doc_count,
+                 (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
+                 (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
+                 (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
+                 (SELECT d.file_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_name,
+                 (SELECT d.file_path FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_path,
+                 (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
+          FROM seller_gst_details g
+          JOIN users u ON g.seller_id = u.id
+          ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
+          LIMIT 100
+        `);
+        gstSellers = rows.map(g => ({
+          ...g,
+          latest_doc_exists: g.latest_doc_id ? Boolean(resolveGstDocumentPath({
+            id: g.latest_doc_id,
+            seller_id: g.seller_id,
+            file_name: g.latest_doc_file_name,
+            file_path: g.latest_doc_file_path
+          })) : false
+        }));
+      } catch (e) {}
+
+      try {
+        const [rows] = await pool.query(`
+          SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
+                 COALESCE(u.account_status, 'ACTIVE') AS account_status, u.deletion_requested_at, u.deleted_at,
+                 (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count,
+                 (SELECT g.status FROM seller_gst_details g WHERE g.seller_id = u.id LIMIT 1) AS doc_status,
+                 (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id,
+                 (SELECT sdr.id FROM seller_deletion_requests sdr WHERE sdr.seller_id = u.id AND sdr.status NOT IN ('DELETED', 'DELETION_REJECTED') ORDER BY sdr.id DESC LIMIT 1) AS active_deletion_request_id
+          FROM users u
+          WHERE u.role = 'seller'
+          ORDER BY u.id DESC
+          LIMIT 50
+        `);
+        sellers = rows;
+      } catch (e) {}
+    } else {
+      const fbSellerUsers = fallbackSellers.filter(s => s.role !== 'admin');
+      count = fbSellerUsers.length;
+      productCount = fallbackProducts.filter(p => Number(p.is_active ?? 1) === 1).length;
+      categoryCount = fallbackCategories.filter(c => Number(c.is_active ?? 1) === 1).length;
+      categoriesList = fallbackCategories.map(c => ({
+        ...c,
+        products_count: fallbackProducts.filter(p => Number(p.is_active ?? 1) === 1 && (Number(p.category_id) === Number(c.id) || String(p.category || '').toLowerCase() === String(c.name || '').toLowerCase())).length
+      }));
+      adminProducts = fallbackProducts.slice(0, 80).map(p => {
+        const u = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
+        return { ...p, seller_name: (u && (u.seller_name || u.name)) || 'Verified Seller' };
+      });
+      orderCount = fallbackOrders.length;
+      sellers = fbSellerUsers.map(u => {
+        const activeReq = fallbackDeletionStore.deletionRequests.find(r => Number(r.seller_id) === Number(u.id) && !['DELETED', 'DELETION_REJECTED'].includes(r.status));
+        return {
+          ...u,
+          account_status: u.account_status || 'ACTIVE',
+          products_count: fallbackProducts.filter(p => Number(p.seller_id) === Number(u.id) && Number(p.is_active ?? 1) === 1).length,
+          doc_status: null,
+          latest_doc_id: null,
+          active_deletion_request_id: activeReq ? Number(activeReq.id) : null
+        };
+      }).sort((a, b) => Number(b.id) - Number(a.id));
+    }
+
     try {
-      const [rows] = await pool.query(`
-        SELECT u.id, u.name, u.seller_name, u.email, u.phone, u.address, u.landmark, u.state, u.country, u.created_at,
-               (SELECT COUNT(*) FROM products p WHERE p.seller_id = u.id AND p.is_active = 1) AS products_count,
-               (SELECT g.status FROM seller_gst_details g WHERE g.seller_id = u.id LIMIT 1) AS doc_status,
-               (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = u.id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) AS latest_doc_id
-        FROM users u
-        WHERE u.role = 'seller'
-        ORDER BY u.id DESC
-        LIMIT 50
-      `);
-      sellers = rows;
+      deletionRequestsData = await deletionListRequestsNode(pool, deletionCtx, {});
     } catch (e) {}
 
     function formatBytes(bytes) {
@@ -9093,12 +9973,24 @@ app.get('/admin', async (req, res) => {
       }[tag] || tag));
     }
 
+    function delBadgeClass(colorOrStatus) {
+      const s = String(colorOrStatus || '').toUpperCase();
+      if (s === 'YELLOW' || s.includes('PENDING') || s.includes('REQUESTED')) return 'del-badge del-yellow';
+      if (s === 'BLUE' || s.includes('PROCESSING') || s.includes('VERIFICATION') || s.includes('REVIEW') || s.includes('LOCKED')) return 'del-badge del-blue';
+      if (s === 'GREEN' || s.includes('SUCCESS') || s === 'APPROVED_FOR_DELETION' || s === 'DELETED' || s === 'ACTIVE' || s === 'SETTLED') return 'del-badge del-green';
+      if (s === 'RED' || s.includes('FAILED') || s.includes('REJECTED')) return 'del-badge del-red';
+      if (s === 'ORANGE' || s.includes('HOLD') || s.includes('OPEN') || s.includes('REQUIRES_REVIEW')) return 'del-badge del-orange';
+      return 'del-badge del-yellow';
+    }
+
     const pendingGstCount = Number(metrics.pending_gst || 0);
     const approvedGstCount = Number(metrics.approved_gst || 0);
     const rejectedGstCount = Number(metrics.rejected_gst || 0);
     const totalGstCount = Number(metrics.total_gst || 0);
     const flashMsg = req.query.msg ? String(req.query.msg) : '';
     const flashErr = req.query.err ? String(req.query.err) : '';
+    const delKpis = deletionRequestsData.kpis || {};
+    const delRequests = deletionRequestsData.requests || [];
 
     res.send(`
     <!doctype html>
@@ -9110,19 +10002,23 @@ app.get('/admin', async (req, res) => {
       <style>
         * { box-sizing: border-box; }
         body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
-        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; }
+        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
         .brand { font-size: 21px; font-weight: 800; }
-        .wrap { max-width: 1100px; margin: 32px auto; padding: 0 18px; }
+        .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; }
+        .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
+        .wrap { max-width: 1180px; margin: 28px auto; padding: 0 18px; }
         .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
         .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
         p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
         label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
-        input { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
-        input:focus { border-color: #6366f1; }
+        input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
+        input:focus, textarea:focus, select:focus { border-color: #6366f1; }
         button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
         button:hover, .btn:hover { background: #4a3cb8; }
+        button:disabled { opacity: 0.45; cursor: not-allowed; }
         table { width: 100%; border-collapse: collapse; margin-top: 14px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
         th { color: #64748b; font-weight: 600; font-size: 13px; }
@@ -9133,10 +10029,20 @@ app.get('/admin', async (req, res) => {
         .btn-approve-sm:hover { background: #15803d; }
         .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
         .btn-reject-sm:hover { background: #b91c1c; }
+        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
+        .btn-hold-sm:hover { background: #c2410c; }
+        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-del-req:hover { background: #fee2e2; }
         .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
         .badge-pending { background: #fef3c7; color: #b45309; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
         .badge-approved { background: #dcfce7; color: #15803d; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
         .badge-rejected { background: #fee2e2; color: #b91c1c; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
+        .del-badge { font-weight: 700; font-size: 11px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+        .del-yellow { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
+        .del-blue { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
+        .del-green { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+        .del-red { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+        .del-orange { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
         .badge-pdf { background: #fee2e2; color: #dc2626; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #fca5a5; }
         .badge-img { background: #e0f2fe; color: #0284c7; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #bae6fd; }
         .tabs-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; flex-wrap: wrap; }
@@ -9149,29 +10055,53 @@ app.get('/admin', async (req, res) => {
         .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
         .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
         .search-box input:focus { border-color: #6366f1; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
         .modal-overlay.active { display: flex; }
-        .modal-box { background: #fff; width: 92%; max-width: 740px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
-        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
+        .modal-box { background: #fff; width: 94%; max-width: 780px; max-height: 92vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
+        .modal-box.wide { max-width: 1040px; }
+        .modal-header { padding: 18px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
         .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
-        .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
+        .modal-close { background: transparent; border: none; font-size: 22px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
         .modal-body { padding: 24px; }
         .doc-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
         .log-row { padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; display: flex; justify-content: space-between; gap: 12px; }
+        .metric-mini { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+        .metric-mini .k { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
+        .metric-mini .v { font-size: 17px; font-weight: 800; color: #1e1b4b; margin-top: 3px; }
+        .ws-section { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #fff; }
+        .ws-section h4 { margin: 0 0 10px; color: #1e1b4b; font-size: 15px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .status-legend { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 6px; }
       </style>
     </head>
     <body>
       <header class="top">
         <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></div>
-        <div style="display:flex; align-items:center; gap:16px;">
+        <nav class="top-nav">
+          <a href="/admin#sellersSection" class="nav-pill ${!focusDeletionTab ? 'active' : ''}">Seller Management</a>
+          <a href="/admin/seller-deletions" class="nav-pill ${focusDeletionTab ? 'active' : ''}">Seller Deletion Requests (${Number(delKpis.total || 0)})</a>
+          <a href="/admin#gstSection" class="nav-pill">PDF Verifications</a>
+          <a href="/admin#categoriesSection" class="nav-pill">Categories</a>
+        </nav>
+        <div style="display:flex; align-items:center; gap:14px;">
           <span style="font-size:14px; opacity:.9;">admin@vendor.app</span>
           <a href="/admin/logout" class="logout-btn">Sign out</a>
         </div>
       </header>
 
       <main class="wrap">
-        <h1>Dashboard</h1>
-        <p class="muted">Manage your marketplace sellers, product categories, PDF document verifications, and compliance.</p>
+        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+          <div>
+            <h1 style="margin-bottom:6px;">${focusDeletionTab ? 'Seller Management → Seller Deletion Requests' : 'Dashboard'}</h1>
+            <p class="muted" style="margin:0;">Manage marketplace sellers, Seller Account Deletion & Refund workflows, categories, and PDF verifications.</p>
+          </div>
+          <div class="status-legend">
+            <span class="del-badge del-yellow">PENDING</span>
+            <span class="del-badge del-blue">PROCESSING</span>
+            <span class="del-badge del-green">SUCCESS</span>
+            <span class="del-badge del-red">FAILED</span>
+            <span class="del-badge del-orange">ON HOLD</span>
+          </div>
+        </div>
 
         ${flashMsg ? `<div style="background:#ecfdf5; color:#047857; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashMsg)}</div>` : ''}
         ${flashErr ? `<div style="background:#fef2f2; color:#b91c1c; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashErr)}</div>` : ''}
@@ -9330,12 +10260,12 @@ app.get('/admin', async (req, res) => {
           </table>
         </section>
 
-        <!-- Section 2: Seller Accounts Overview with Document Status -->
-        <section class="card" style="margin-top:24px;">
+        <!-- Section 2: Seller Accounts Overview with Account Status & Request Deletion -->
+        <section class="card" id="sellersSection" style="margin-top:24px;">
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
             <div>
               <h2>Seller Accounts</h2>
-              <p class="muted">All registered sellers on Venter App with inventory counts and verification status.</p>
+              <p class="muted">All registered sellers on Venter App with inventory counts, verification status, and deletion controls.</p>
             </div>
           </div>
           <table>
@@ -9347,17 +10277,20 @@ app.get('/admin', async (req, res) => {
                 <th>Location</th>
                 <th>Products</th>
                 <th>Document Status</th>
+                <th>Account Status</th>
                 <th>Created</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               ${sellers.length === 0 ? `
-                <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
+                <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
               ` : sellers.map(s => {
                 let dSt = (s.doc_status || '').toLowerCase();
                 if (dSt === 'resubmitted') dSt = 'pending';
                 const docBadgeClass = (dSt === 'approved') ? 'badge-approved' : ((dSt === 'rejected') ? 'badge-rejected' : ((dSt === 'pending') ? 'badge-pending' : ''));
+                const accStatus = String(s.account_status || 'ACTIVE').toUpperCase();
+                const accBadgeCls = accStatus === 'ACTIVE' ? 'del-badge del-green' : (accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : (accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
 
                 return `
                   <tr>
@@ -9379,9 +10312,101 @@ app.get('/admin', async (req, res) => {
                         <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
                       `}
                     </td>
+                    <td><span class="${accBadgeCls}">${escapeHtml(accStatus)}</span></td>
                     <td>${String(s.created_at || '').slice(0, 10)}</td>
                     <td>
-                      <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                        <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
+                        ${s.active_deletion_request_id ? `
+                          <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(${Number(s.active_deletion_request_id)})">Manage Deletion #${Number(s.active_deletion_request_id)}</button>
+                        ` : (accStatus !== 'DELETED' ? `
+                          <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(${Number(s.id)})">Request Seller Deletion</button>
+                        ` : '')}
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Section 2B: Seller Management → Seller Deletion Requests -->
+        <section class="card" id="deletionRequestsSection" style="margin-top:24px; border-top: 4px solid #dc2626;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
+            <div>
+              <h2>Seller Management → Seller Deletion Requests</h2>
+              <p class="muted">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <div class="search-box" style="max-width:260px;">
+                <input type="text" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
+              </div>
+              <button type="button" class="btn-sm" onclick="reloadDeletionRequestsList()">↻ Refresh</button>
+            </div>
+          </div>
+
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap:10px; margin-bottom:14px;">
+            <div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal">${Number(delKpis.total || 0)}</div></div>
+            <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Pending (Yellow)</div><div class="v" style="color:#b45309;" id="delKpiPending">${Number(delKpis.pending || 0)}</div></div>
+            <div class="metric-mini" style="background:#eff6ff;"><div class="k" style="color:#1d4ed8;">Processing (Blue)</div><div class="v" style="color:#1d4ed8;" id="delKpiProcessing">${Number(delKpis.processing || 0)}</div></div>
+            <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Failed (Red)</div><div class="v" style="color:#b91c1c;" id="delKpiFailed">${Number(delKpis.failed || 0)}</div></div>
+            <div class="metric-mini" style="background:#fff7ed;"><div class="k" style="color:#c2410c;">On Hold (Orange)</div><div class="v" style="color:#c2410c;" id="delKpiHold">${Number(delKpis.on_hold || 0)}</div></div>
+            <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Approved / Deleted</div><div class="v" style="color:#15803d;" id="delKpiApprovedDeleted">${Number(delKpis.approved || 0) + Number(delKpis.deleted || 0)}</div></div>
+          </div>
+
+          <div class="tabs-bar" id="delFilterTabs">
+            <button type="button" class="tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
+            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Req ID</th>
+                <th>Seller &amp; ID</th>
+                <th>Requested Date</th>
+                <th>Deletion Stage</th>
+                <th>Status</th>
+                <th>Metrics / Balance Snapshot</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="deletionRequestsTbody">
+              ${delRequests.length === 0 ? `
+                <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
+              ` : delRequests.map(dr => {
+                const reqDate = formatDateStr(dr.created_at);
+                const snapMetrics = dr.metrics || {};
+                const finSum = dr.financial_summary || {};
+                const badgeCls = delBadgeClass(dr.badge_color || dr.status);
+                const searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
+                return `
+                  <tr class="del-req-row" data-status="${escapeHtml(dr.status)}" data-search="${escapeHtml(searchTxt)}">
+                    <td><strong>#${dr.id}</strong></td>
+                    <td>
+                      <strong style="color:#1e1b4b;">${escapeHtml(dr.seller_name)}</strong>
+                      <div style="font-size:12px; color:#64748b;">Seller ID #${dr.seller_id} ${dr.seller_phone ? '&bull; ' + escapeHtml(dr.seller_phone) : ''}</div>
+                      ${dr.seller_email ? `<div style="font-size:11px; color:#94a3b8;">${escapeHtml(dr.seller_email)}</div>` : ''}
+                    </td>
+                    <td>
+                      <div style="font-size:13px;">${reqDate.date}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${reqDate.time}</div>
+                    </td>
+                    <td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">${escapeHtml(dr.stage)}</code></td>
+                    <td><span class="${badgeCls}">${escapeHtml(dr.status)}</span></td>
+                    <td style="font-size:12px; color:#475569;">
+                      Orders: <strong>${Number(snapMetrics.total_orders || 0)}</strong> &bull;
+                      Balance: <strong>₹${Number(finSum.available_seller_balance || snapMetrics.seller_wallet_balance || 0).toFixed(2)}</strong>
+                    </td>
+                    <td>
+                      <button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(${dr.id})">Manage Deletion</button>
                     </td>
                   </tr>
                 `;
@@ -9781,6 +10806,34 @@ app.get('/admin', async (req, res) => {
         </div>
       </div>
 
+      <!-- Seller Deletion Preflight Modal -->
+      <div id="deletionPreflightModal" class="modal-overlay" onclick="if(event.target.id==='deletionPreflightModal') closeDeletionPreflightModal();">
+        <div class="modal-box wide">
+          <div class="modal-header">
+            <h3 id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
+            <button type="button" class="modal-close" onclick="closeDeletionPreflightModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div id="delPreflightLoading" style="text-align:center; padding:32px; color:#64748b;">Computing orders, refunds, payouts &amp; settlement snapshot...</div>
+            <div id="delPreflightBody" style="display:none;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Seller Deletion Review Workspace Modal -->
+      <div id="deletionWorkspaceModal" class="modal-overlay" onclick="if(event.target.id==='deletionWorkspaceModal') closeDeletionWorkspaceModal();">
+        <div class="modal-box wide">
+          <div class="modal-header">
+            <h3 id="delWsTitle">Seller Deletion Review Workspace</h3>
+            <button type="button" class="modal-close" onclick="closeDeletionWorkspaceModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div id="delWsLoading" style="text-align:center; padding:32px; color:#64748b;">Loading seller deletion workspace...</div>
+            <div id="delWsBody" style="display:none;"></div>
+          </div>
+        </div>
+      </div>
+
       <script>
         function openCategoryModal(btnOrObj) {
           var cat = (btnOrObj && btnOrObj.getAttribute) ? JSON.parse(btnOrObj.getAttribute('data-cat')) : btnOrObj;
@@ -9838,7 +10891,7 @@ app.get('/admin', async (req, res) => {
         }
 
         function filterGstRows(status, btn) {
-          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          document.querySelectorAll('#gstSection .tab-btn').forEach(b => b.classList.remove('active'));
           if (btn) btn.classList.add('active');
 
           const rows = document.querySelectorAll('.gst-row');
@@ -9915,7 +10968,7 @@ app.get('/admin', async (req, res) => {
           document.getElementById('gstModalContent').style.display = 'none';
           document.getElementById('gstReviewModal').classList.add('active');
 
-          fetch('/admin/get_gst_details?seller_id=' + sellerId)
+          fetch('/admin/get_gst_details?seller_id=' + sellerId, { credentials: 'same-origin' })
             .then(res => res.json())
             .then(data => {
               document.getElementById('gstModalLoading').style.display = 'none';
@@ -9978,7 +11031,6 @@ app.get('/admin', async (req, res) => {
                 });
                 docsContainer.innerHTML = docsHtml;
 
-                // Automatically display the primary document in the inline preview viewer
                 const firstDoc = docs[0];
                 if (firstDoc) {
                   showInlineDocPreview(firstDoc.id);
@@ -10044,6 +11096,440 @@ app.get('/admin', async (req, res) => {
             "'": '&#39;',
             '"': '&quot;'
           }[tag] || tag));
+        }
+
+        // === Seller Deletion & Refund Management UI Controller ===
+        window._activeDelStatusFilter = 'all';
+        window._currentWsData = null;
+
+        function delStatusBadgeHtml(statusOrColor, textOverride) {
+          var s = String(statusOrColor || '').toUpperCase();
+          var cls = 'del-yellow';
+          if (s === 'GREEN' || s === 'SUCCESS' || s === 'REFUND_SUCCESS' || s === 'APPROVED_FOR_DELETION' || s === 'DELETED' || s === 'SETTLED' || s === 'ACTIVE' || s === 'RESOLVED') cls = 'del-green';
+          else if (s === 'BLUE' || s.indexOf('PROCESSING') !== -1 || s.indexOf('VERIFICATION') !== -1 || s.indexOf('REVIEW') !== -1 || s === 'LOCKED') cls = 'del-blue';
+          else if (s === 'RED' || s.indexOf('FAILED') !== -1 || s.indexOf('REJECTED') !== -1) cls = 'del-red';
+          else if (s === 'ORANGE' || s.indexOf('HOLD') !== -1 || s === 'OPEN' || s.indexOf('REQUIRES_REVIEW') !== -1) cls = 'del-orange';
+          return '<span class="del-badge ' + cls + '">' + escapeHtml(textOverride || statusOrColor || 'PENDING') + '</span>';
+        }
+
+        function fmtCur(v) {
+          return '₹' + Number(v || 0).toFixed(2);
+        }
+
+        function filterDeletionStatus(status, btn) {
+          window._activeDelStatusFilter = status || 'all';
+          document.querySelectorAll('#delFilterTabs .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+          if (btn) btn.classList.add('active');
+          applyDeletionTableFilters();
+        }
+
+        function filterDeletionTableSearch(q) {
+          window._activeDelSearch = (q || '').toLowerCase().trim();
+          applyDeletionTableFilters();
+        }
+
+        function applyDeletionTableFilters() {
+          var st = window._activeDelStatusFilter || 'all';
+          var q = window._activeDelSearch || '';
+          document.querySelectorAll('.del-req-row').forEach(function(r) {
+            var rSt = r.getAttribute('data-status') || '';
+            var rTxt = r.getAttribute('data-search') || '';
+            var matchSt = (st === 'all' || rSt === st);
+            var matchQ = (!q || rTxt.indexOf(q) !== -1);
+            r.style.display = (matchSt && matchQ) ? '' : 'none';
+          });
+        }
+
+        function reloadDeletionRequestsList() {
+          fetch('/api/admin/seller-deletions', { credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              if (!data || !data.requests) return;
+              var k = data.kpis || {};
+              var el;
+              if ((el = document.getElementById('delKpiTotal'))) el.innerText = Number(k.total || 0);
+              if ((el = document.getElementById('delKpiPending'))) el.innerText = Number(k.pending || 0);
+              if ((el = document.getElementById('delKpiProcessing'))) el.innerText = Number(k.processing || 0);
+              if ((el = document.getElementById('delKpiFailed'))) el.innerText = Number(k.failed || 0);
+              if ((el = document.getElementById('delKpiHold'))) el.innerText = Number(k.on_hold || 0);
+              if ((el = document.getElementById('delKpiApprovedDeleted'))) el.innerText = Number(k.approved || 0) + Number(k.deleted || 0);
+
+              var tbody = document.getElementById('deletionRequestsTbody');
+              if (!tbody) return;
+              if (data.requests.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                return;
+              }
+              var html = '';
+              data.requests.forEach(function(dr) {
+                var snapM = dr.metrics || {};
+                var finS = dr.financial_summary || {};
+                var searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
+                html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
+                  '<td><strong>#' + Number(dr.id) + '</strong></td>' +
+                  '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
+                  '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
+                  (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
+                  '</td>' +
+                  '<td><div style="font-size:13px;">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div style="font-size:11px; color:#94a3b8;">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
+                  '<td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">' + escapeHtml(dr.stage) + '</code></td>' +
+                  '<td>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</td>' +
+                  '<td style="font-size:12px; color:#475569;">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
+                  '<td><button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
+                  '</tr>';
+              });
+              tbody.innerHTML = html;
+              applyDeletionTableFilters();
+            })
+            .catch(function() {});
+        }
+
+        function closeDeletionPreflightModal() {
+          document.getElementById('deletionPreflightModal').classList.remove('active');
+        }
+
+        function openDeletionPreflightModal(sellerId) {
+          document.getElementById('delPreflightTitle').innerText = 'Request Seller Deletion — Seller #' + sellerId;
+          document.getElementById('delPreflightLoading').style.display = 'block';
+          document.getElementById('delPreflightBody').style.display = 'none';
+          document.getElementById('deletionPreflightModal').classList.add('active');
+
+          fetch('/api/admin/seller-deletions/preflight/' + Number(sellerId), { credentials: 'same-origin' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(resObj) {
+              document.getElementById('delPreflightLoading').style.display = 'none';
+              var bodyEl = document.getElementById('delPreflightBody');
+              bodyEl.style.display = 'block';
+              if (!resObj.ok || !resObj.d || !resObj.d.seller) {
+                bodyEl.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:14px;border-radius:8px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
+                return;
+              }
+              var s = resObj.d.seller;
+              var m = resObj.d.metrics || {};
+              var cards = [
+                ['Total Products (Active / Total)', Number(m.active_products || 0) + ' / ' + Number(m.total_products || 0)],
+                ['Total Orders', Number(m.total_orders || 0)],
+                ['Pending Orders (Rule A)', Number(m.pending_orders || 0)],
+                ['Confirmed / Accepted Orders (Rule B)', Number(m.confirmed_orders || 0)],
+                ['Shipped Orders (Rule C)', Number(m.shipped_orders || 0)],
+                ['Delivered Orders (Rule D)', Number(m.delivered_orders || 0)],
+                ['Cancelled Orders (Rule E)', Number(m.cancelled_orders || 0)],
+                ['Total Successful Payments', fmtCur(m.total_successful_payments || 0)],
+                ['Pending Refunds', Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')'],
+                ['Seller Wallet Balance', fmtCur(m.seller_wallet_balance || 0)],
+                ['Pending Payouts', Number(m.pending_payouts_count || 0) + ' (' + fmtCur(m.pending_payouts_amount || 0) + ')'],
+                ['Outstanding Commissions', fmtCur(m.outstanding_commissions || 0)],
+                ['Open Disputes', Number(m.open_disputes_count || 0)]
+              ];
+              var html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
+                '<div><strong style="font-size:16px;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
+                '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '—') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
+                '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div>' +
+                '<div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(175px, 1fr));gap:10px;margin-bottom:16px;">';
+              cards.forEach(function(c) {
+                html += '<div class="metric-mini"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div>';
+              });
+              html += '</div>' +
+                '<div style="background:#fffbeb;border:1px solid #fcd34d;padding:12px;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:14px;">' +
+                'Submitting this request sets the seller account immediately to <strong>DELETION_PENDING</strong>, notifies the seller, and blocks new buyer orders without deleting any historical data.' +
+                '</div>' +
+                '<label>Deletion Request Reason *</label>' +
+                '<input type="text" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255">' +
+                '<label>Admin Remarks</label>' +
+                '<textarea id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea>' +
+                '<div id="preflightErrBox" style="color:#b91c1c;font-size:13px;margin-top:8px;"></div>' +
+                '<div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end;">' +
+                '<button type="button" onclick="closeDeletionPreflightModal()" style="background:#e2e8f0;color:#334155;">Cancel</button>' +
+                '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" style="background:#dc2626;">Confirm Deletion Request (DELETION_PENDING)</button>' +
+                '</div>';
+              bodyEl.innerHTML = html;
+            })
+            .catch(function(err) {
+              document.getElementById('delPreflightLoading').style.display = 'none';
+              document.getElementById('delPreflightBody').style.display = 'block';
+              document.getElementById('delPreflightBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+            });
+        }
+
+        function submitCreateDeletionRequest(sellerId) {
+          var reason = (document.getElementById('preflightReason') || {}).value || '';
+          var remarks = (document.getElementById('preflightRemarks') || {}).value || '';
+          var errBox = document.getElementById('preflightErrBox');
+          if (errBox) errBox.innerText = '';
+          fetch('/api/admin/seller-deletions', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ seller_id: sellerId, reason: reason, remarks: remarks })
+          })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+          .then(function(resObj) {
+            if (!resObj.ok) {
+              if (errBox) errBox.innerText = (resObj.d && resObj.d.message) || 'Failed to create deletion request.';
+              return;
+            }
+            closeDeletionPreflightModal();
+            reloadDeletionRequestsList();
+            if (resObj.d && resObj.d.deletion_request) {
+              openDeletionWorkspaceModal(resObj.d.deletion_request.id);
+            }
+          })
+          .catch(function(err) {
+            if (errBox) errBox.innerText = err.message;
+          });
+        }
+
+        function closeDeletionWorkspaceModal() {
+          document.getElementById('deletionWorkspaceModal').classList.remove('active');
+        }
+
+        function openDeletionWorkspaceModal(reqId) {
+          document.getElementById('delWsTitle').innerText = 'Seller Deletion Request #' + Number(reqId);
+          document.getElementById('delWsLoading').style.display = 'block';
+          document.getElementById('delWsBody').style.display = 'none';
+          document.getElementById('deletionWorkspaceModal').classList.add('active');
+
+          fetch('/api/admin/seller-deletions/' + Number(reqId), { credentials: 'same-origin' })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(resObj) {
+              document.getElementById('delWsLoading').style.display = 'none';
+              var bodyEl = document.getElementById('delWsBody');
+              bodyEl.style.display = 'block';
+              if (!resObj.ok || !resObj.d || !resObj.d.deletion_request) {
+                bodyEl.innerHTML = '<div style="color:#b91c1c;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load deletion request.') + '</div>';
+                return;
+              }
+              renderDeletionWorkspace(resObj.d);
+            })
+            .catch(function(err) {
+              document.getElementById('delWsLoading').style.display = 'none';
+              document.getElementById('delWsBody').style.display = 'block';
+              document.getElementById('delWsBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+            });
+        }
+
+        function runDelAction(reqId, subPath, bodyObj) {
+          var remarksInput = document.getElementById('wsAdminRemarks');
+          var payload = Object.assign({}, bodyObj || {});
+          if (remarksInput && remarksInput.value.trim() && !payload.remarks) {
+            payload.remarks = remarksInput.value.trim();
+          }
+          var msgBox = document.getElementById('wsFeedbackBox');
+          if (msgBox) msgBox.innerHTML = '<span style="color:#1d4ed8;">Processing action...</span>';
+
+          fetch('/api/admin/seller-deletions/' + Number(reqId) + '/' + subPath, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+          .then(function(resObj) {
+            if (!resObj.ok) {
+              if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
+              return;
+            }
+            if (resObj.d && resObj.d.deletion_request) {
+              renderDeletionWorkspace(resObj.d, (resObj.d.message || 'Action completed.'));
+            }
+            reloadDeletionRequestsList();
+          })
+          .catch(function(err) {
+            if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
+          });
+        }
+
+        function handleSettlePayoutClick(reqId) {
+          var chk = document.getElementById('wsConfirmGatewaySettled');
+          var ref = document.getElementById('wsPayoutRef');
+          runDelAction(reqId, 'settle-payout', {
+            confirm_gateway_settled: Boolean(chk && chk.checked),
+            payout_reference: (ref && ref.value.trim()) || ''
+          });
+        }
+
+        function handleHoldClick(reqId) {
+          var reason = prompt('Enter reason for putting this seller deletion request ON HOLD:', 'Awaiting manual verification / return period');
+          if (reason === null) return;
+          runDelAction(reqId, 'hold', { reason: reason });
+        }
+
+        function handleRejectClick(reqId) {
+          var reason = prompt('Enter MANDATORY reason to REJECT seller deletion and restore seller to ACTIVE:', '');
+          if (!reason || !reason.trim()) return;
+          runDelAction(reqId, 'reject', { reason: reason.trim() });
+        }
+
+        function toggleFinalDeleteConfirm() {
+          var b = document.getElementById('wsFinalConfirmBox');
+          if (b) b.style.display = (b.style.display === 'none' || !b.style.display) ? 'block' : 'none';
+        }
+
+        function submitFinalDelete(reqId) {
+          var dr = (window._currentWsData && window._currentWsData.deletion_request) || {};
+          var phraseInput = document.getElementById('wsConfirmPhraseInput');
+          var phrase = phraseInput ? phraseInput.value.trim() : '';
+          runDelAction(reqId, 'final-delete', {
+            confirmation_token: dr.confirmation_token || '',
+            confirmation_phrase: phrase
+          });
+        }
+
+        function renderDeletionWorkspace(data, successBanner) {
+          window._currentWsData = data;
+          var dr = data.deletion_request || {};
+          var s = data.seller || {};
+          var m = data.metrics || {};
+          var set = data.settlement || {};
+          var orders = data.orders || [];
+          var refunds = data.refunds || [];
+          var payouts = data.payouts || [];
+          var disputes = data.disputes || [];
+          var checks = data.checks || [];
+          var logs = data.audit_logs || [];
+          var isTerminal = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED');
+
+          var html = '<div id="wsFeedbackBox">' +
+            (successBanner ? '<div style="background:#dcfce7;color:#15803d;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;">' + escapeHtml(successBanner) + '</div>' : '') +
+            '</div>';
+
+          // Header Card: Seller Info, ID, Request Date, Stage & Status
+          html += '<div class="ws-section" style="background:#f8fafc;">' +
+            '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">' +
+            '<div>' +
+            '<div style="font-size:17px;font-weight:800;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span style="font-size:13px;color:#64748b;">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
+            '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '—') + ' &bull; Email: ' + escapeHtml(s.email || '—') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
+            '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '—') + '</div>' +
+            '</div>' +
+            '<div style="text-align:right;">' +
+            '<div style="margin-bottom:6px;">Stage: <code style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-weight:700;">' + escapeHtml(dr.stage) + '</code></div>' +
+            '<div>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</div>' +
+            '</div></div></div>';
+
+          // Verification Checklist Section
+          html += '<div class="ws-section"><h4><span>6-Gate Verification Checklist</span><span>' +
+            (data.all_checks_passed ? delStatusBadgeHtml('GREEN', 'ALL CHECKS PASSED') : delStatusBadgeHtml('YELLOW', 'VERIFICATION INCOMPLETE')) +
+            '</span></h4><table><thead><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
+          checks.forEach(function(ck) {
+            html += '<tr><td><strong>' + escapeHtml(ck.label) + '</strong></td><td>' + delStatusBadgeHtml(ck.status, ck.status) + '</td></tr>';
+          });
+          html += '</tbody></table></div>';
+
+          // Order Summary (Rules A-E)
+          html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+            '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'lock\', {})">Lock Account</button>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-orders\', { approve_accepted_cancellations: Boolean(document.getElementById(\'wsApproveRuleB\') && document.getElementById(\'wsApproveRuleB\').checked) })">Verify Orders</button>' +
+            '</div></h4>' +
+            '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
+            '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div>' +
+            '</div>';
+          if (orders.length > 0) {
+            html += '<table><thead><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
+            orders.forEach(function(o) {
+              html += '<tr><td>#' + Number(o.id) + ' (' + escapeHtml(o.order_number || '') + ')</td>' +
+                '<td><strong>' + escapeHtml(o.effective_status) + '</strong></td>' +
+                '<td>' + escapeHtml(o.payment_method || '') + ' / ' + escapeHtml(o.payment_status || '') + '</td>' +
+                '<td>' + fmtCur(o.seller_gross || 0) + '</td>' +
+                '<td style="font-size:12px;">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
+            });
+            html += '</tbody></table>';
+          }
+          html += '</div>';
+
+          // Payment & Refund Summary
+          html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'process-refunds\', {})">Process Eligible Refunds (Razorpay)</button></h4>' +
+            '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
+          if (refunds.length === 0) {
+            html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
+          } else {
+            html += '<table><thead><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
+            refunds.forEach(function(rf) {
+              html += '<tr><td>#' + Number(rf.id) + '</td><td>#' + Number(rf.order_id) + '</td><td>' + fmtCur(rf.eligible_refund_amount) + ' / ' + fmtCur(rf.refunded_amount) + '</td>' +
+                '<td><code>' + escapeHtml(rf.gateway_refund_id || '—') + '</code></td>' +
+                '<td>' + delStatusBadgeHtml(rf.badge_color || rf.status, rf.status) + '</td>' +
+                '<td style="font-size:11px;color:#b91c1c;">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
+            });
+            html += '</tbody></table>';
+          }
+          html += '</div>';
+
+          // Financial Settlement & Disputes Summary
+          html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-settlement\', {})">Verify Settlement</button></h4>' +
+            '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
+            '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
+            '<div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v" style="font-size:14px;">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div>' +
+            '<div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div>' +
+            '</div>' +
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:10px;">' +
+            '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;"><input type="checkbox" id="wsConfirmGatewaySettled" style="width:auto;" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
+            '<input type="text" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;padding:6px 10px;font-size:12px;">' +
+            '<button type="button" class="btn-approve-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
+            '</div>';
+          if (disputes.length > 0) {
+            html += '<table><thead><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+            disputes.forEach(function(dp) {
+              var isOpen = ['OPEN', 'UNDER_REVIEW', 'ESCALATED'].indexOf(String(dp.status || '').toUpperCase()) !== -1;
+              html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
+                '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
+                '<td>' + (isOpen && !isTerminal
+                  ? '<button type="button" class="btn-sm" onclick="runDelAction(' + Number(dr.id) + ', \'resolve-dispute\', { dispute_id: ' + Number(dp.id) + ', resolution: \'RESOLVED\', mark_delivered: true, close_return_window: true })">Mark Delivered &amp; Resolve</button>'
+                  : 'Resolved') + '</td></tr>';
+            });
+            html += '</tbody></table>';
+          }
+          html += '</div>';
+
+          // Admin Remarks & Final Action Controls
+          html += '<div class="ws-section"><h4>Admin Decision &amp; Final Confirmation</h4>' +
+            '<label style="margin-top:0;">Admin Remarks</label>' +
+            '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
+            '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
+            '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'approve\', {})">✓ Approve Deletion</button>' +
+            '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleHoldClick(' + Number(dr.id) + ')">⏸ Put On Hold</button>' +
+            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleRejectClick(' + Number(dr.id) + ')">✕ Reject Request</button>' +
+            '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
+            '</div>' +
+            (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
+            '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
+            '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
+            '<p style="font-size:13px;color:#7f1d1d;margin:6px 0;">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
+            '<input type="text" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
+            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
+            '</div></div></div>';
+
+          // Admin Activity History
+          html += '<div class="ws-section"><h4>Admin Activity History (' + logs.length + ')</h4>';
+          if (logs.length === 0) {
+            html += '<div style="font-size:12px;color:#94a3b8;">No admin activity recorded yet.</div>';
+          } else {
+            logs.forEach(function(lg) {
+              html += '<div class="log-row"><div style="color:#64748b;font-size:12px;min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
+                '<div style="flex:1;"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div style="color:#475569;font-size:12px;">' + escapeHtml(lg.remarks || '') + '</div></div>' +
+                '<div>' + delStatusBadgeHtml(lg.new_status || lg.new_stage || 'INFO', lg.new_status || lg.new_stage || '') + '</div></div>';
+            });
+          }
+          html += '</div>';
+
+          document.getElementById('delWsBody').innerHTML = html;
+        }
+
+        if (window.location.pathname.indexOf('seller-deletions') !== -1 || window.location.search.indexOf('seller-deletions') !== -1) {
+          window.addEventListener('DOMContentLoaded', function() {
+            var sec = document.getElementById('deletionRequestsSection');
+            if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth' });
+          });
         }
       </script>
     </body>
@@ -10308,14 +11794,6 @@ function streamGstDocumentFile(res, doc, mode = 'preview') {
   stream.pipe(res);
 }
 
-// Middleware: Require Admin
-function requireAdminRole(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') {
-    return res.status(403).json({ message: 'Unauthorized. Admin access required.' });
-  }
-  next();
-}
-
 // --- SELLER GST ENDPOINTS ---
 
 // POST /api/seller/gst/upload, /api/seller/gst/submit, /api/seller/gst, or /api/seller/gst/documents
@@ -10323,6 +11801,7 @@ function requireAdminRole(req, res, next) {
 app.post(
   ['/api/seller/gst/upload', '/api/seller/gst/submit', '/api/seller/gst', '/api/seller/gst/documents'],
   authenticateToken,
+  requireActiveSellerForMutation,
   handleGstUpload,
   async (req, res) => {
     await ensureGstTables(pool);
@@ -10598,7 +12077,7 @@ app.get(
 });
 
 // DELETE /api/seller/gst/documents/:id
-app.delete('/api/seller/gst/documents/:id', authenticateToken, async (req, res) => {
+app.delete('/api/seller/gst/documents/:id', authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   await ensureGstTables(pool);
   const sellerId = req.user.id;
   const docId = parseInt(req.params.id, 10);
@@ -10902,6 +12381,21 @@ app.get(['/api/admin/sellers/gst/documents/:id/preview', '/api/admin/sellers/gst
   }
 });
 
+
+app.__deletionTestContext = {
+  deletionCtx,
+  getPool: () => pool,
+  setForceFallback: (flag) => {
+    deletionCtx.forceFallback = Boolean(flag);
+    dbAvailable = flag ? false : null;
+  },
+  getFallbackSellers: () => fallbackSellers,
+  getFallbackProducts: () => fallbackProducts,
+  getFallbackOrders: () => fallbackOrders,
+  getFallbackNotifications: () => fallbackNotifications,
+  getFallbackDeviceTokens: () => fallbackDeviceTokens,
+  getFallbackDeletionStore: () => fallbackDeletionStore
+};
 
 // Start server
 if (require.main === module) {
