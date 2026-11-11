@@ -245,7 +245,7 @@
           ]
         },
         {
-          "name": "Forgot Password (Request OTP)",
+          "name": "Forgot Password (Request OTP / Email Reset)",
           "request": {
             "method": "POST",
             "header": [
@@ -256,7 +256,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919876543210\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/forgot-password",
@@ -267,11 +267,30 @@
                 "api",
                 "forgot-password"
               ]
+            },
+            "description": "Accepts email, phone, or unified identifier/email_or_phone via Firebase Gateway."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"Status code is 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.dev_otp) {",
+                  "    pm.collectionVariables.set(\"otp_code\", jsonData.dev_otp);",
+                  "    if (pm.environment) pm.environment.set(\"otp_code\", jsonData.dev_otp);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
             }
-          }
+          ]
         },
         {
-          "name": "Verify OTP",
+          "name": "Verify OTP (Email or Phone / Firebase Token)",
           "request": {
             "method": "POST",
             "header": [
@@ -282,7 +301,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"otp\": \"000000\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"otp\": \"{{otp_code}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/verify-otp",
@@ -293,7 +312,8 @@
                 "api",
                 "verify-otp"
               ]
-            }
+            },
+            "description": "Accepts email, phone, or identifier plus otp/code, Firebase id_token, or Firebase email oob_code."
           },
           "event": [
             {
@@ -315,7 +335,7 @@
           ]
         },
         {
-          "name": "Reset Password",
+          "name": "Reset Password (Email or Phone)",
           "request": {
             "method": "POST",
             "header": [
@@ -326,7 +346,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"+919876543210\",\n  \"otp\": \"000000\",\n  \"new_password\": \"NewPassword2026!\",\n  \"confirm_password\": \"NewPassword2026!\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"new_password\": \"NewPassword2026!\",\n  \"confirm_password\": \"NewPassword2026!\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/reset-password",
@@ -337,7 +357,8 @@
                 "api",
                 "reset-password"
               ]
-            }
+            },
+            "description": "Resets password for email or phone account using reset_token (or Firebase oob_code / id_token)."
           }
         },
         {

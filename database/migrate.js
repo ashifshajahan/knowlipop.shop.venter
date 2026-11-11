@@ -74,6 +74,47 @@ async function runMigration() {
     // ignore
   }
 
+  // Ensure password_reset_otps supports nullable phone, email, and channel
+  try {
+    const [phoneCol] = await conn.query('SHOW COLUMNS FROM password_reset_otps LIKE "phone"');
+    if (phoneCol.length > 0 && (phoneCol[0].Null !== 'YES' || /varchar\(30\)/i.test(phoneCol[0].Type || ''))) {
+      await conn.query('ALTER TABLE password_reset_otps MODIFY COLUMN phone VARCHAR(255) NULL DEFAULT NULL');
+      console.log('✅ Updated password_reset_otps.phone to VARCHAR(255) NULL');
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    const [emailCol] = await conn.query('SHOW COLUMNS FROM password_reset_otps LIKE "email"');
+    if (emailCol.length === 0) {
+      await conn.query('ALTER TABLE password_reset_otps ADD COLUMN email VARCHAR(255) NULL DEFAULT NULL AFTER phone');
+      console.log('✅ Added missing column email to password_reset_otps');
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    const [emailIdx] = await conn.query('SHOW INDEX FROM password_reset_otps WHERE Key_name = "idx_otp_email"');
+    if (emailIdx.length === 0) {
+      await conn.query('ALTER TABLE password_reset_otps ADD INDEX idx_otp_email (email)');
+      console.log('✅ Added idx_otp_email index to password_reset_otps');
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    const [channelCol] = await conn.query('SHOW COLUMNS FROM password_reset_otps LIKE "channel"');
+    if (channelCol.length === 0) {
+      await conn.query('ALTER TABLE password_reset_otps ADD COLUMN channel VARCHAR(20) NOT NULL DEFAULT "phone" AFTER email');
+      console.log('✅ Added missing column channel to password_reset_otps');
+    }
+  } catch (e) {
+    // ignore
+  }
+
   // Ensure default 5 product categories are seeded if categories table is empty
   try {
     const [[catCnt]] = await conn.query('SELECT COUNT(*) as cnt FROM categories');

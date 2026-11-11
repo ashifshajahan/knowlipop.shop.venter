@@ -99,11 +99,14 @@ INSERT IGNORE INTO `categories` (`id`, `name`, `slug`, `description`, `icon`, `s
 
 CREATE TABLE IF NOT EXISTS `password_reset_otps` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  `phone` VARCHAR(30) NOT NULL,
+  `phone` VARCHAR(255) NULL DEFAULT NULL,
+  `email` VARCHAR(255) NULL DEFAULT NULL,
+  `channel` VARCHAR(20) NOT NULL DEFAULT 'phone',
   `token` VARCHAR(255) NOT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  INDEX `idx_otp_phone` (`phone`)
+  INDEX `idx_otp_phone` (`phone`),
+  INDEX `idx_otp_email` (`email`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `seller_payment_accounts` (

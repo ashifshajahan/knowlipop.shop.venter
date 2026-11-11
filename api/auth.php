@@ -465,49 +465,264 @@ function apiLogout(PDO $pdo): void
     jsonResponse(['message' => 'Logout successful.']);
 }
 
+function ensurePasswordResetSchemaPhp(PDO $pdo): void
+{
+    static $ensured = false;
+    if ($ensured) {
+        return;
+    }
+
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    if ($driver === 'sqlite') {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS password_reset_otps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NULL,
+                email TEXT NULL,
+                channel TEXT NOT NULL DEFAULT 'phone',
+                token TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
+        $cols = $pdo->query("PRAGMA table_info(password_reset_otps)")->fetchAll(PDO::FETCH_ASSOC);
+        $colNames = array_map(fn($c) => strtolower((string) ($c['name'] ?? '')), $cols);
+        if (!in_array('email', $colNames, true)) {
+            $pdo->exec("ALTER TABLE password_reset_otps ADD COLUMN email TEXT NULL");
+        }
+        if (!in_array('channel', $colNames, true)) {
+            $pdo->exec("ALTER TABLE password_reset_otps ADD COLUMN channel TEXT NOT NULL DEFAULT 'phone'");
+        }
+        $ensured = true;
+        return;
+    }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `password_reset_otps` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `phone` VARCHAR(255) NULL DEFAULT NULL,
+            `email` VARCHAR(255) NULL DEFAULT NULL,
+            `channel` VARCHAR(20) NOT NULL DEFAULT 'phone',
+            `token` VARCHAR(255) NOT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            INDEX `idx_otp_phone` (`phone`),
+            INDEX `idx_otp_email` (`email`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $phoneCol = $pdo->query("SHOW COLUMNS FROM `password_reset_otps` LIKE 'phone'")->fetch(PDO::FETCH_ASSOC);
+    if ($phoneCol && (($phoneCol['Null'] ?? '') !== 'YES' || preg_match('/varchar\(30\)/i', (string) ($phoneCol['Type'] ?? '')))) {
+        $pdo->exec("ALTER TABLE `password_reset_otps` MODIFY COLUMN `phone` VARCHAR(255) NULL DEFAULT NULL");
+    }
+
+    $emailCol = $pdo->query("SHOW COLUMNS FROM `password_reset_otps` LIKE 'email'")->fetch(PDO::FETCH_ASSOC);
+    if (!$emailCol) {
+        $pdo->exec("ALTER TABLE `password_reset_otps` ADD COLUMN `email` VARCHAR(255) NULL DEFAULT NULL AFTER `phone`");
+    }
+
+    try {
+        $emailIdx = $pdo->query("SHOW INDEX FROM `password_reset_otps` WHERE Key_name = 'idx_otp_email'")->fetch(PDO::FETCH_ASSOC);
+        if (!$emailIdx) {
+            $pdo->exec("ALTER TABLE `password_reset_otps` ADD INDEX `idx_otp_email` (`email`)");
+        }
+    } catch (Throwable $e) {
+    }
+
+    $channelCol = $pdo->query("SHOW COLUMNS FROM `password_reset_otps` LIKE 'channel'")->fetch(PDO::FETCH_ASSOC);
+    if (!$channelCol) {
+        $pdo->exec("ALTER TABLE `password_reset_otps` ADD COLUMN `channel` VARCHAR(20) NOT NULL DEFAULT 'phone' AFTER `email`");
+    }
+
+    $ensured = true;
+}
+
+function findPasswordResetUserPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): ?array
+{
+    if ($email !== '' && $rawPhone !== '') {
+        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = :email LIMIT 1");
+        $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':email' => $email]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    if ($email !== '') {
+        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE LOWER(email) = :email LIMIT 1");
+        $stmt->execute([':email' => $email]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    if ($rawPhone !== '' || $phone !== '') {
+        $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
+        $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
+        $stmt = $pdo->prepare("SELECT id, email, phone, role FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
+        $stmt->execute([':phone' => $phone, ':rawPhone' => $effRaw, ':rawNoPrefix' => $effNoPrefix]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    return null;
+}
+
+function findLatestOtpRecordPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): ?array
+{
+    $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
+    $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
+
+    if ($email !== '' && ($rawPhone !== '' || $phone !== '')) {
+        $stmt = $pdo->prepare("
+            SELECT * FROM password_reset_otps
+            WHERE (LOWER(email) = :email1 AND (phone IS NULL OR phone = :p1 OR phone = :rp1 OR phone = :np1))
+               OR ((email IS NULL OR LOWER(email) = :email2) AND (phone = :p2 OR phone = :rp2 OR phone = :np2))
+            ORDER BY id DESC LIMIT 1
+        ");
+        $stmt->execute([
+            ':email1' => $email, ':p1' => $phone, ':rp1' => $effRaw, ':np1' => $effNoPrefix,
+            ':email2' => $email, ':p2' => $phone, ':rp2' => $effRaw, ':np2' => $effNoPrefix
+        ]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    if ($email !== '') {
+        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE LOWER(email) = :email ORDER BY id DESC LIMIT 1");
+        $stmt->execute([':email' => $email]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    if ($rawPhone !== '' || $phone !== '') {
+        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY id DESC LIMIT 1");
+        $stmt->execute([':phone' => $phone, ':rawPhone' => $effRaw, ':rawNoPrefix' => $effNoPrefix]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+    return null;
+}
+
+function clearOtpRecordsPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): void
+{
+    $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
+    $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
+    $clauses = [];
+    $params = [];
+
+    if ($email !== '') {
+        $clauses[] = "LOWER(email) = :email";
+        $params[':email'] = strtolower(trim($email));
+    }
+    if ($phone !== '' || $rawPhone !== '') {
+        $clauses[] = "phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix";
+        $params[':phone'] = $phone !== '' ? $phone : $effRaw;
+        $params[':rawPhone'] = $effRaw;
+        $params[':rawNoPrefix'] = $effNoPrefix;
+    }
+
+    if (!empty($clauses)) {
+        $sql = "DELETE FROM password_reset_otps WHERE " . implode(' OR ', $clauses);
+        $pdo->prepare($sql)->execute($params);
+    }
+}
+
 function apiForgotPassword(PDO $pdo): void
 {
+    ensurePasswordResetSchemaPhp($pdo);
     $input = getJsonInput();
-    $rawPhone = extractPhonePhp($input);
-    if (empty($rawPhone)) {
-        errorResponse('The phone field is required.', ['phone' => ['The phone field is required.']], 422);
+    $ids = extractAuthIdentifiersPhp($input, false);
+    $email = $ids['email'];
+    $rawPhone = $ids['rawPhone'];
+    $phone = $ids['phone'];
+    $identifierError = $ids['identifierError'];
+
+    $recaptchaToken = extractFieldPhp($input, ['recaptcha_token', 'recaptchaToken', 'recaptcha'], '');
+    $continueUrl = extractFieldPhp($input, ['continue_url', 'continueUrl', 'redirect_url', 'redirectUrl'], '');
+    $authMode = strtolower(extractFieldPhp($input, ['auth_mode', 'authMode', 'flow'], 'password_reset'));
+    $requestedChannel = strtolower(extractFieldPhp($input, ['channel', 'gateway_channel'], ''));
+
+    $errors = [];
+    if ($identifierError !== '') {
+        $errors['email_or_phone'] = [$identifierError];
+        $errors['email'] = [$identifierError];
+        $errors['phone'] = [$identifierError];
+    } elseif ($email === '' && $rawPhone === '') {
+        $msg = 'Please provide an email address or phone number.';
+        $errors['email_or_phone'] = [$msg];
+        $errors['email'] = [$msg];
+        $errors['phone'] = [$msg];
+    } else {
+        if ($email !== '' && !isValidEmailAddressPhp($email)) {
+            $errors['email'] = ['The email address format is invalid.'];
+        }
+        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        }
     }
 
-    $phone = normalizePhonePhp($rawPhone);
-    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+    if (!empty($errors)) {
+        errorResponse('Validation error occurred.', $errors, 422);
+    }
 
-    $stmt = $pdo->prepare("SELECT id, phone FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
-    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-    $user = $stmt->fetch();
+    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
+    $activeChannel = ($requestedChannel === 'email' || ($rawPhone === '' && $email !== '')) ? 'email' : 'phone';
+
+    $user = findPasswordResetUserPhp($pdo, $email, $rawPhone, $phone, $rawNoPrefix);
 
     $otp = null;
-    $smsResult = null;
+    $gatewayResult = null;
     if ($user) {
-        $targetPhone = $user['phone'] ?? $phone;
-        $otp = isFirebaseTestPhone($targetPhone) ? getFirebaseTestOtp() : sprintf('%06d', mt_rand(100000, 999999));
+        $targetPhone = (!empty($user['phone'])) ? trim((string) $user['phone']) : ($phone !== '' ? $phone : null);
+        $publicEmail = getPublicSellerEmailPhp($user['email'] ?? null, (string) ($user['role'] ?? 'seller'));
+        $targetEmail = $publicEmail ?: ($email !== '' ? $email : null);
+
+        if ($activeChannel === 'email' && !$targetEmail && $targetPhone) {
+            $activeChannel = 'phone';
+        } elseif ($activeChannel === 'phone' && !$targetPhone && $targetEmail) {
+            $activeChannel = 'email';
+        }
+
+        $isTestTarget = ($activeChannel === 'email' && $targetEmail)
+            ? isFirebaseTestEmail($targetEmail)
+            : ($targetPhone ? isFirebaseTestPhone($targetPhone) : false);
+        $otp = $isTestTarget ? getFirebaseTestOtp() : sprintf('%06d', mt_rand(100000, 999999));
         $hashedOtp = hashPassword($otp);
 
-        $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
-            ->execute([':phone' => $targetPhone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-        $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, token, created_at) VALUES (:phone, :token, NOW())");
-        $ins->execute([':phone' => $targetPhone, ':token' => $hashedOtp]);
+        clearOtpRecordsPhp($pdo, $targetEmail ?: $email, $rawPhone, $targetPhone ?: $phone, $rawNoPrefix);
+        $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (:phone, :email, :channel, :token, CURRENT_TIMESTAMP)");
+        $ins->execute([
+            ':phone' => $targetPhone,
+            ':email' => $targetEmail,
+            ':channel' => $activeChannel,
+            ':token' => $hashedOtp
+        ]);
 
-        // Dispatch SMS via configured gateway (Firebase / Fast2SMS) or return mock in dev
-        $recaptchaToken = extractFieldPhp($input, ['recaptcha_token', 'recaptchaToken', 'recaptcha']);
-        $smsResult = sendOtpSms($targetPhone, $otp, $recaptchaToken);
+        $gatewayResult = $activeChannel === 'email'
+            ? sendPasswordResetEmail((string) $targetEmail, $otp, $continueUrl, $authMode)
+            : sendOtpSms((string) $targetPhone, $otp, $recaptchaToken);
     }
 
-    $response = ['message' => 'If this phone number is registered, an OTP will be sent.'];
+    $response = [
+        'message' => 'If this email or phone number is registered, a verification OTP / reset link will be sent.',
+        'channel' => $activeChannel
+    ];
     if ($otp !== null) {
-        $response['dev_otp'] = $otp; // Included for Postman & frontend developer testing
-        if ($smsResult && isset($smsResult['provider'])) {
-            $response['sms_status'] = $smsResult['sent'] ? 'dispatched' : 'mock_mode';
-            $response['gateway'] = $smsResult['provider'];
-            if (!empty($smsResult['session_info'])) {
-                $response['session_info'] = $smsResult['session_info'];
+        $response['dev_otp'] = $otp; // Included for Postman & developer testing
+        if ($gatewayResult && isset($gatewayResult['provider'])) {
+            $dispatched = !empty($gatewayResult['sent']) ? 'dispatched' : 'mock_mode';
+            $response['gateway'] = $gatewayResult['provider'];
+            $response['delivery_status'] = $dispatched;
+            if ($activeChannel === 'email') {
+                $response['email_status'] = $dispatched;
+            } else {
+                $response['sms_status'] = $dispatched;
             }
-            if (!$smsResult['sent'] && isset($smsResult['reason'])) {
-                $response['sms_note'] = $smsResult['reason'];
+            if (!empty($gatewayResult['session_info'])) {
+                $response['session_info'] = $gatewayResult['session_info'];
+            }
+            if (!empty($gatewayResult['flow'])) {
+                $response['firebase_flow'] = $gatewayResult['flow'];
+            }
+            if (empty($gatewayResult['sent']) && isset($gatewayResult['reason'])) {
+                $response['gateway_note'] = $gatewayResult['reason'];
+                if ($activeChannel === 'phone') {
+                    $response['sms_note'] = $gatewayResult['reason'];
+                } else {
+                    $response['email_note'] = $gatewayResult['reason'];
+                }
             }
         }
     }
@@ -516,61 +731,137 @@ function apiForgotPassword(PDO $pdo): void
 
 function apiVerifyOtp(PDO $pdo): void
 {
+    ensurePasswordResetSchemaPhp($pdo);
     $input = getJsonInput();
-    $rawPhone = extractPhonePhp($input);
-    $code = trim(extractFieldPhp($input, ['code', 'otp', 'otp_code', 'verification_code']));
-    $sessionInfo = trim(extractFieldPhp($input, ['session_info', 'sessionInfo', 'session']));
-    $idToken = trim(extractFieldPhp($input, ['id_token', 'idToken', 'firebase_token']));
+    $ids = extractAuthIdentifiersPhp($input, false);
+    $email = $ids['email'];
+    $rawPhone = $ids['rawPhone'];
+    $phone = $ids['phone'];
+    $identifierError = $ids['identifierError'];
 
-    if (empty($rawPhone) || (empty($code) && empty($idToken))) {
-        errorResponse('Validation error', ['phone' => ['Phone and OTP code (or Firebase ID Token) are required.']], 422);
+    $code = trim(extractFieldPhp($input, ['code', 'otp', 'otp_code', 'verification_code'], ''));
+    $sessionInfo = trim(extractFieldPhp($input, ['session_info', 'sessionInfo', 'session'], ''));
+    $idToken = trim(extractFieldPhp($input, ['id_token', 'idToken', 'firebase_token'], ''));
+    $oobCode = trim(extractFieldPhp($input, ['oob_code', 'oobCode'], ''));
+
+    $errors = [];
+    if ($identifierError !== '') {
+        $errors['email_or_phone'] = [$identifierError];
+        $errors['email'] = [$identifierError];
+        $errors['phone'] = [$identifierError];
+    } else {
+        if ($email !== '' && !isValidEmailAddressPhp($email)) {
+            $errors['email'] = ['The email address format is invalid.'];
+        }
+        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        }
+        if ($email === '' && $rawPhone === '' && $idToken === '' && $oobCode === '') {
+            $errors['email_or_phone'] = ['Email or phone number (or Firebase ID Token / OOB code) is required.'];
+        }
+        if ($code === '' && $idToken === '' && $oobCode === '') {
+            $errors['code'] = ['Verification OTP code, Firebase OOB code, or Firebase ID Token is required.'];
+        }
     }
 
-    $phone = normalizePhonePhp($rawPhone);
-    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+    if (!empty($errors)) {
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse($firstMsg, $errors, 422);
+    }
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY created_at DESC LIMIT 1");
-    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-    $row = $stmt->fetch();
+    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
+    $firebaseRes = verifyFirebaseIdentity([
+        'phone' => $phone,
+        'email' => $email,
+        'code' => $code,
+        'sessionInfo' => $sessionInfo,
+        'idToken' => $idToken,
+        'oobCode' => $oobCode
+    ]);
 
-    $firebaseApproved = verifyFirebaseOtp($phone, $code, $sessionInfo, $idToken);
-    $localValid = $row && !empty($code) && verifyPassword($code, $row['token']);
+    $resolvedEmail = $email !== '' ? $email : (string) ($firebaseRes['resolvedEmail'] ?? '');
+    $resolvedPhone = $phone !== '' ? $phone : (string) ($firebaseRes['resolvedPhone'] ?? '');
+    $resolvedRawNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $resolvedPhone);
+
+    if ($resolvedEmail !== '' && !isValidEmailAddressPhp($resolvedEmail)) {
+        errorResponse('The email address format is invalid.', ['email' => ['The email address format is invalid.']], 422);
+    }
+
+    $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+
+    $firebaseApproved = !empty($firebaseRes['approved']);
+    $localValid = $row && $code !== '' && verifyPassword($code, $row['token']);
 
     if (!$firebaseApproved && !$localValid) {
         errorResponse('Invalid or expired OTP code.', ['code' => ['Invalid or expired OTP code.']], 422);
     }
 
+    if ($firebaseApproved && !$localValid && !isFirebaseTestPhone($resolvedPhone) && !isFirebaseTestEmail($resolvedEmail) && !$matchedUser) {
+        errorResponse('No seller account matches this verified Firebase email or phone number.', [], 422);
+    }
+
     $resetToken = bin2hex(random_bytes(32));
     $hashedResetToken = hashPassword($resetToken);
-    $targetPhone = $row['phone'] ?? $phone;
 
-    $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
-        ->execute([':phone' => $targetPhone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-    $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, token, created_at) VALUES (:phone, :token, NOW())");
-    $ins->execute([':phone' => $targetPhone, ':token' => $hashedResetToken]);
+    $targetPhone = ($matchedUser['phone'] ?? null) ?: (($row['phone'] ?? null) ?: ($resolvedPhone !== '' ? $resolvedPhone : null));
+    $targetEmail = ($matchedUser ? getPublicSellerEmailPhp($matchedUser['email'] ?? null, (string) ($matchedUser['role'] ?? 'seller')) : null)
+        ?: (($row['email'] ?? null) ?: ($resolvedEmail !== '' ? $resolvedEmail : null));
+    $resolvedChannel = ($row['channel'] ?? null) ?: (($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone');
+
+    clearOtpRecordsPhp($pdo, $targetEmail ?: $resolvedEmail, $rawPhone, $targetPhone ?: $resolvedPhone, $resolvedRawNoPrefix);
+    $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (:phone, :email, :channel, :token, CURRENT_TIMESTAMP)");
+    $ins->execute([
+        ':phone' => $targetPhone,
+        ':email' => $targetEmail,
+        ':channel' => $resolvedChannel,
+        ':token' => $hashedResetToken
+    ]);
 
     jsonResponse([
         'message' => 'OTP verified successfully.',
-        'reset_token' => $resetToken
+        'reset_token' => $resetToken,
+        'channel' => $resolvedChannel,
+        'gateway' => $firebaseApproved ? 'firebase' : 'local'
     ]);
 }
 
 function apiResetPassword(PDO $pdo): void
 {
+    ensurePasswordResetSchemaPhp($pdo);
     $input = getJsonInput();
-    $rawPhone = extractPhonePhp($input);
-    $resetToken = trim(extractFieldPhp($input, ['reset_token', 'resetToken', 'token']));
-    $password = extractPasswordPhp($input);
+    $ids = extractAuthIdentifiersPhp($input, false);
+    $email = $ids['email'];
+    $rawPhone = $ids['rawPhone'];
+    $phone = $ids['phone'];
+    $identifierError = $ids['identifierError'];
+
+    $resetToken = trim(extractFieldPhp($input, ['reset_token', 'resetToken', 'token'], ''));
+    $oobCode = trim(extractFieldPhp($input, ['oob_code', 'oobCode'], ''));
+    $idToken = trim(extractFieldPhp($input, ['id_token', 'idToken', 'firebase_token'], ''));
+    $password = trim(extractFieldPhp($input, ['password', 'new_password', 'newPassword', 'pass'], ''));
     $confirmPassword = extractConfirmPasswordPhp($input, $password);
 
     $errors = [];
-    if (empty($rawPhone)) {
-        $errors['phone'] = ['The phone field is required.'];
+    if ($identifierError !== '') {
+        $errors['email_or_phone'] = [$identifierError];
+        $errors['email'] = [$identifierError];
+        $errors['phone'] = [$identifierError];
+    } else {
+        if ($email !== '' && !isValidEmailAddressPhp($email)) {
+            $errors['email'] = ['The email address format is invalid.'];
+        }
+        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
+            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        }
+        if ($email === '' && $rawPhone === '' && $idToken === '' && $oobCode === '') {
+            $errors['email_or_phone'] = ['Please provide an email address or phone number.'];
+        }
     }
-    if (empty($resetToken)) {
-        $errors['reset_token'] = ['The reset token field is required.'];
+    if ($resetToken === '' && $oobCode === '' && $idToken === '') {
+        $errors['reset_token'] = ['The reset_token field (or Firebase OOB/ID token) is required.'];
     }
-    if (empty($password)) {
+    if ($password === '') {
         $errors['password'] = ['The password field is required.'];
     } elseif (strlen($password) < 8) {
         $errors['password'] = ['The password must be at least 8 characters.'];
@@ -579,41 +870,90 @@ function apiResetPassword(PDO $pdo): void
     }
 
     if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse($firstMsg, $errors, 422);
     }
 
-    $phone = normalizePhonePhp($rawPhone);
-    $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
+    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
+    $resolvedEmail = $email;
+    $resolvedPhone = $phone;
+    $resolvedChannel = ($email !== '' && $rawPhone === '') ? 'email' : 'phone';
+    $firebaseResetDone = false;
 
-    $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY created_at DESC LIMIT 1");
-    $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-    $row = $stmt->fetch();
-
-    if (!$row || !verifyPassword($resetToken, $row['token'])) {
-        errorResponse('The reset token is invalid or expired. Verify your OTP again.', [], 422);
-    }
-
-    $targetPhone = $row['phone'] ?? $phone;
-    $hashed = hashPassword($password);
-
-    $upd = $pdo->prepare("UPDATE users SET password = :password, updated_at = NOW() WHERE phone = :targetPhone OR phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix");
-    $upd->execute([
-        ':password' => $hashed,
-        ':targetPhone' => $targetPhone,
-        ':phone' => $phone,
-        ':rawPhone' => $rawPhone,
-        ':rawNoPrefix' => $rawNoPrefix
-    ]);
-
-    // Delete token after successful password reset
-    $pdo->prepare("DELETE FROM password_reset_otps WHERE phone = :targetPhone OR phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
-        ->execute([
-            ':targetPhone' => $targetPhone,
-            ':phone' => $phone,
-            ':rawPhone' => $rawPhone,
-            ':rawNoPrefix' => $rawNoPrefix
+    if ($resetToken !== '') {
+        $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $rawNoPrefix);
+        if (!$row || !verifyPassword($resetToken, $row['token'])) {
+            errorResponse('Invalid or expired reset token.', ['reset_token' => ['The reset token is invalid or expired. Verify your OTP again.']], 422);
+        }
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($row['email'] ?? '');
+        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : (string) ($row['phone'] ?? '');
+        $resolvedChannel = ($row['channel'] ?? null) ?: (($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone');
+    } elseif ($idToken !== '') {
+        $fbCheck = verifyFirebaseIdentity([
+            'phone' => $resolvedPhone,
+            'email' => $resolvedEmail,
+            'idToken' => $idToken
         ]);
+        if (empty($fbCheck['approved'])) {
+            errorResponse('Invalid or expired Firebase ID token.', ['id_token' => ['Invalid or expired Firebase ID token.']], 422);
+        }
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($fbCheck['resolvedEmail'] ?? '');
+        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : (string) ($fbCheck['resolvedPhone'] ?? '');
+        $resolvedChannel = ($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone';
+    } elseif ($oobCode !== '') {
+        $fbCheck = verifyFirebaseIdentity([
+            'email' => $resolvedEmail,
+            'oobCode' => $oobCode
+        ]);
+        if (empty($fbCheck['approved'])) {
+            errorResponse('Invalid or expired Firebase OOB reset code.', ['oob_code' => ['Invalid or expired Firebase OOB reset code.']], 422);
+        }
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($fbCheck['resolvedEmail'] ?? '');
+        $resolvedChannel = 'email';
+    }
 
-    jsonResponse(['message' => 'Password reset successful. Please log in again.']);
+    $resolvedRawNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $resolvedPhone);
+    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+
+    if (!$matchedUser && !isFirebaseTestPhone($resolvedPhone) && !isFirebaseTestEmail($resolvedEmail)) {
+        errorResponse('No seller account matches the supplied email or phone number.', [], 422);
+    }
+
+    if ($oobCode !== '' && $resetToken === '') {
+        $applied = applyFirebaseOobPasswordResetPhp($oobCode, $password);
+        if (empty($applied['ok'])) {
+            errorResponse((string) ($applied['error'] ?? 'Invalid or expired Firebase OOB reset code.'), [], 422);
+        }
+        $firebaseResetDone = true;
+    }
+
+    $hashed = hashPassword($password);
+    if ($matchedUser) {
+        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+            ->execute([':password' => $hashed, ':id' => (int) $matchedUser['id']]);
+    } elseif ($resolvedEmail !== '' && $resolvedPhone === '') {
+        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = :email")
+            ->execute([':password' => $hashed, ':email' => $resolvedEmail]);
+    } elseif ($resolvedPhone !== '') {
+        $effRaw = $rawPhone !== '' ? $rawPhone : $resolvedPhone;
+        $pdo->prepare("UPDATE users SET password = :password, updated_at = CURRENT_TIMESTAMP WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
+            ->execute([
+                ':password' => $hashed,
+                ':phone' => $resolvedPhone,
+                ':rawPhone' => $effRaw,
+                ':rawNoPrefix' => $resolvedRawNoPrefix
+            ]);
+    }
+
+    clearOtpRecordsPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+
+    $resPayload = [
+        'message' => 'Password reset successful. Please log in again.',
+        'channel' => $resolvedChannel
+    ];
+    if ($firebaseResetDone) {
+        $resPayload['firebase_synced'] = true;
+    }
+    jsonResponse($resPayload);
 }
 

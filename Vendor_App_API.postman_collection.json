@@ -1242,10 +1242,10 @@
       ]
     },
     {
-      "name": "6. Password Reset Flow (OTP)",
+      "name": "6. Password Reset Flow (Firebase Email or Phone)",
       "item": [
         {
-          "name": "1. Request OTP (POST /api/forgot-password)",
+          "name": "1. Request OTP / Reset via Phone (POST /api/forgot-password)",
           "event": [
             {
               "listen": "test",
@@ -1290,12 +1290,62 @@
                 "forgot-password"
               ]
             },
-            "description": "Sends password reset OTP. In dev/testing mode, the response also includes dev_otp, which is automatically saved to {{otp_code}}!"
+            "description": "Sends password reset OTP via Firebase Phone Gateway (or Fast2SMS). Accepts phone, email, or unified identifier. In dev/testing mode, dev_otp is saved to {{otp_code}}."
           },
           "response": []
         },
         {
-          "name": "2. Verify OTP (POST /api/verify-otp)",
+          "name": "1b. Request OTP / Reset via Email (POST /api/forgot-password)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.dev_otp) {",
+                  "    pm.collectionVariables.set('otp_code', jsonData.dev_otp);",
+                  "    if (pm.environment) pm.environment.set('otp_code', jsonData.dev_otp);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{seller_email}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/forgot-password",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "forgot-password"
+              ]
+            },
+            "description": "Triggers Firebase Email Password Reset Gateway (sendOobCode) and stores hashed OTP. Also accepts single-field identifier or email_or_phone."
+          },
+          "response": []
+        },
+        {
+          "name": "2. Verify OTP / Firebase Token (POST /api/verify-otp)",
           "event": [
             {
               "listen": "test",
@@ -1328,7 +1378,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"code\": \"{{otp_code}}\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"code\": \"{{otp_code}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/verify-otp",
@@ -1340,7 +1390,7 @@
                 "verify-otp"
               ]
             },
-            "description": "Verifies OTP code and returns reset_token, saving it to {{reset_token}}."
+            "description": "Verifies OTP code, Firebase id_token, or Firebase email oob_code for either email or phone, returning reset_token."
           },
           "response": []
         },
@@ -1377,7 +1427,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"phone\": \"{{seller_phone}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"password\": \"{{seller_password}}\"\n}"
+              "raw": "{\n  \"identifier\": \"{{seller_email}}\",\n  \"reset_token\": \"{{reset_token}}\",\n  \"password\": \"{{seller_password}}\",\n  \"password_confirmation\": \"{{seller_password}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/reset-password",
@@ -1389,7 +1439,7 @@
                 "reset-password"
               ]
             },
-            "description": "Sets new password using verified reset_token."
+            "description": "Sets new password for email or phone user using verified reset_token (or direct Firebase oob_code / id_token)."
           },
           "response": []
         }

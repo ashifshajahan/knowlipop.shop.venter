@@ -274,12 +274,24 @@ function getEnvVar(string $key, string $default = ''): string
             }
         }
     }
-    return $env[$key] ?? (getenv($key) !== false ? (string)getenv($key) : $default);
+    $runtimeEnv = getenv($key);
+    if ($runtimeEnv !== false && trim((string)$runtimeEnv) !== '') {
+        return trim((string)$runtimeEnv);
+    }
+    if (isset($env[$key]) && $env[$key] !== '') {
+        return $env[$key];
+    }
+    return $default;
 }
 
 function getFirebaseTestPhone(): string
 {
     return getEnvVar('FIREBASE_TEST_PHONE', '+919633426254');
+}
+
+function getFirebaseTestEmail(): string
+{
+    return getEnvVar('FIREBASE_TEST_EMAIL', '');
 }
 
 function getFirebaseTestOtp(): string
@@ -291,7 +303,87 @@ function isFirebaseTestPhone(string $phone): bool
 {
     $clean1 = preg_replace('/\D+/', '', $phone);
     $clean2 = preg_replace('/\D+/', '', getFirebaseTestPhone());
-    return !empty($clean1) && !empty($clean2) && str_ends_with($clean1, substr($clean2, -10));
+    return !empty($clean1) && !empty($clean2) && strlen($clean1) >= 10 && strlen($clean2) >= 10 && str_ends_with($clean1, substr($clean2, -10));
+}
+
+function isFirebaseTestEmail(string $email): bool
+{
+    $rawList = trim(getFirebaseTestEmail());
+    if ($rawList === '' || trim($email) === '') {
+        return false;
+    }
+    $target = strtolower(trim($email));
+    $items = array_filter(array_map(fn($v) => strtolower(trim($v)), explode(',', $rawList)));
+    return in_array($target, $items, true);
+}
+
+function firebaseHttpJsonPostPhp(string $url, array $payload): array
+{
+    $body = json_encode($payload);
+    $statusCode = 0;
+    $raw = '';
+    $err = '';
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+        $res = curl_exec($ch);
+        $statusCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        if ($res === false) {
+            $err = curl_error($ch);
+        } else {
+            $raw = (string) $res;
+        }
+        curl_close($ch);
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'POST',
+                'header' => "Content-Type: application/json\r\nContent-Length: " . strlen((string)$body) . "\r\n",
+                'content' => $body,
+                'timeout' => 15,
+                'ignore_errors' => true
+            ]
+        ]);
+        $res = @file_get_contents($url, false, $ctx);
+        $raw = $res !== false ? (string) $res : '';
+        if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
+            $statusCode = (int) $m[1];
+        }
+    }
+
+    $decoded = $raw !== '' ? json_decode($raw, true) : null;
+    return [
+        'ok' => $statusCode >= 200 && $statusCode < 300,
+        'statusCode' => $statusCode,
+        'data' => is_array($decoded) ? $decoded : null,
+        'raw' => $raw,
+        'error' => $err
+    ];
+}
+
+function normalizePhoneSimplePhp(string $raw): string
+{
+    if ($raw === '') return '';
+    $str = preg_replace('/[\s\-\(\)]/', '', trim($raw));
+    if ($str === '' || $str === null) return '';
+    if (str_starts_with($str, '+')) return $str;
+    if (preg_match('/^\d{10}$/', $str)) return '+91' . $str;
+    if (preg_match('/^91\d{10}$/', $str)) return '+' . $str;
+    return '+' . $str;
+}
+
+function isValidEmailForGatewayPhp(string $email): bool
+{
+    $trimmed = strtolower(trim($email));
+    if ($trimmed === '' || str_ends_with($trimmed, '@phone.vendor.local')) {
+        return false;
+    }
+    return filter_var($trimmed, FILTER_VALIDATE_EMAIL) !== false;
 }
 
 function sendOtpSms(string $phone, string $otp, string $recaptchaToken = ''): array
@@ -301,6 +393,7 @@ function sendOtpSms(string $phone, string $otp, string $recaptchaToken = ''): ar
         return [
             'sent' => true,
             'provider' => 'firebase',
+            'channel' => 'phone',
             'status' => 'dispatched',
             'test_mode' => true,
             'note' => 'Firebase test phone number active. Verified with test OTP ' . getFirebaseTestOtp()
@@ -312,35 +405,25 @@ function sendOtpSms(string $phone, string $otp, string $recaptchaToken = ''): ar
 
     // 1. Firebase Identity Toolkit REST API (Phone OTP)
     if (!empty($firebaseApiKey)) {
-        $url = "https://identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key={$firebaseApiKey}";
+        $url = 'https://identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key=' . urlencode($firebaseApiKey);
         $payload = ['phoneNumber' => $phone];
         if (!empty($recaptchaToken)) {
             $payload['recaptchaToken'] = $recaptchaToken;
         }
-
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-        $res = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        $json = json_decode((string)$res, true);
-        if ($httpCode >= 200 && $httpCode < 300 && !empty($json['sessionInfo'])) {
+        $res = firebaseHttpJsonPostPhp($url, $payload);
+        if ($res['ok']) {
             return [
                 'sent' => true,
                 'provider' => 'firebase',
+                'channel' => 'phone',
                 'status' => 'dispatched',
-                'session_info' => $json['sessionInfo']
+                ...(!empty($res['data']['sessionInfo']) ? ['session_info' => $res['data']['sessionInfo']] : [])
             ];
         }
     }
 
     // 2. Fast2SMS (Indian numbers)
-    if (!empty($fast2smsKey)) {
+    if (!empty($fast2smsKey) && function_exists('curl_init')) {
         $digits = preg_replace('/\D+/', '', $phone);
         $num = substr($digits, -10);
         $ch = curl_init('https://www.fast2sms.com/dev/bulkV2');
@@ -358,82 +441,228 @@ function sendOtpSms(string $phone, string $otp, string $recaptchaToken = ''): ar
         curl_close($ch);
 
         if ($httpCode >= 200 && $httpCode < 300) {
-            return ['sent' => true, 'provider' => 'fast2sms', 'status' => 'delivered'];
+            return ['sent' => true, 'provider' => 'fast2sms', 'channel' => 'phone', 'status' => 'dispatched'];
         }
-        return ['sent' => false, 'provider' => 'fast2sms', 'error' => "HTTP {$httpCode}: {$res}"];
+        return ['sent' => false, 'provider' => 'fast2sms', 'channel' => 'phone', 'error' => "HTTP {$httpCode}: {$res}"];
     }
 
     // 3. Fallback: Firebase / SMS credentials not configured (developer mock mode)
     return [
         'sent' => false,
-        'provider' => 'mock',
-        'reason' => 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+        'provider' => !empty($firebaseApiKey) ? 'firebase' : 'mock',
+        'channel' => 'phone',
+        'reason' => !empty($firebaseApiKey)
+            ? 'Firebase Phone Gateway could not dispatch SMS automatically (recaptchaToken may be required by client). dev_otp returned for verification testing.'
+            : 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
     ];
 }
 
-function verifyFirebaseOtp(string $phone, string $code, string $sessionInfo = '', string $idToken = ''): bool
+function sendPasswordResetEmail(string $email, string $otp, string $continueUrl = '', string $authMode = 'password_reset'): array
 {
-    // 0. Firebase Test Phone & Test OTP Check
-    if (isFirebaseTestPhone($phone) && ($code === getFirebaseTestOtp() || $code === '000000')) {
-        return true;
+    if (isFirebaseTestEmail($email)) {
+        return [
+            'sent' => true,
+            'provider' => 'firebase',
+            'channel' => 'email',
+            'status' => 'dispatched',
+            'test_mode' => true,
+            'flow' => 'test_email',
+            'note' => 'Firebase test email active. Verified with test OTP ' . getFirebaseTestOtp()
+        ];
     }
 
     $firebaseApiKey = getEnvVar('FIREBASE_API_KEY');
     if (empty($firebaseApiKey)) {
-        return false;
+        return [
+            'sent' => false,
+            'provider' => 'mock',
+            'channel' => 'email',
+            'reason' => 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+        ];
+    }
+
+    $requestType = (strtolower($authMode) === 'email_link' && !empty($continueUrl)) ? 'EMAIL_SIGNIN' : 'PASSWORD_RESET';
+    $payload = ['requestType' => $requestType, 'email' => $email];
+    if (!empty($continueUrl)) {
+        $payload['continueUrl'] = $continueUrl;
+    }
+
+    $sendUrl = 'https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=' . urlencode($firebaseApiKey);
+    $res = firebaseHttpJsonPostPhp($sendUrl, $payload);
+
+    $errMsg = (string) ($res['data']['error']['message'] ?? '');
+    if (!$res['ok'] && str_contains($errMsg, 'EMAIL_NOT_FOUND')) {
+        $tempPass = bin2hex(random_bytes(16)) . 'Aa1!';
+        $signUpUrl = 'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' . urlencode($firebaseApiKey);
+        $signUpRes = firebaseHttpJsonPostPhp($signUpUrl, [
+            'email' => $email,
+            'password' => $tempPass,
+            'returnSecureToken' => false
+        ]);
+        $signUpErr = (string) ($signUpRes['data']['error']['message'] ?? '');
+        if ($signUpRes['ok'] || str_contains($signUpErr, 'EMAIL_EXISTS')) {
+            $res = firebaseHttpJsonPostPhp($sendUrl, $payload);
+        }
+    }
+
+    if ($res['ok']) {
+        return [
+            'sent' => true,
+            'provider' => 'firebase',
+            'channel' => 'email',
+            'status' => 'dispatched',
+            'flow' => strtolower($requestType),
+            'note' => 'Password reset instruction dispatched via Firebase Email Gateway.'
+        ];
+    }
+
+    $finalErr = (string) ($res['data']['error']['message'] ?? $res['error'] ?? 'Firebase Email Gateway rejected request.');
+    return [
+        'sent' => false,
+        'provider' => 'firebase',
+        'channel' => 'email',
+        'status' => 'mock_mode',
+        'firebase_error' => $finalErr,
+        'reason' => "Firebase Email Gateway did not dispatch an email automatically ({$finalErr}). dev_otp returned for verification testing."
+    ];
+}
+
+function verifyFirebaseIdentity(array $params): array
+{
+    $phone = trim((string) ($params['phone'] ?? ''));
+    $email = strtolower(trim((string) ($params['email'] ?? '')));
+    $code = trim((string) ($params['code'] ?? ''));
+    $sessionInfo = trim((string) ($params['sessionInfo'] ?? ''));
+    $idToken = trim((string) ($params['idToken'] ?? ''));
+    $oobCode = trim((string) ($params['oobCode'] ?? ''));
+
+    $testOtp = getFirebaseTestOtp();
+
+    // 0a. Firebase Test Phone & Test OTP Check
+    if ($phone !== '' && isFirebaseTestPhone($phone) && ($code === $testOtp || $code === '000000')) {
+        return [
+            'approved' => true,
+            'provider' => 'firebase',
+            'method' => 'test_phone',
+            'resolvedPhone' => $phone,
+            'resolvedEmail' => $email !== '' ? $email : null
+        ];
+    }
+
+    // 0b. Firebase Test Email & Test OTP Check
+    if ($email !== '' && isFirebaseTestEmail($email) && ($code === $testOtp || $code === '000000')) {
+        return [
+            'approved' => true,
+            'provider' => 'firebase',
+            'method' => 'test_email',
+            'resolvedPhone' => $phone !== '' ? $phone : null,
+            'resolvedEmail' => $email
+        ];
+    }
+
+    $firebaseApiKey = getEnvVar('FIREBASE_API_KEY');
+    if (empty($firebaseApiKey)) {
+        return ['approved' => false];
     }
 
     $cleanPhone = preg_replace('/\D+/', '', $phone);
 
-    // Flow A: Client-side Firebase Phone Auth ID Token
-    if (!empty($idToken)) {
-        $url = "https://identitytoolkit.googleapis.com/v1/accounts:lookup?key={$firebaseApiKey}";
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['idToken' => $idToken]));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-        $res = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+    // Flow A: Client-side Firebase Auth ID Token (Phone Auth, Email Link Sign-In, or Email Auth)
+    if ($idToken !== '') {
+        $url = 'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' . urlencode($firebaseApiKey);
+        $res = firebaseHttpJsonPostPhp($url, ['idToken' => $idToken]);
+        if ($res['ok'] && !empty($res['data']['users'][0])) {
+            $fbUser = $res['data']['users'][0];
+            $fbPhoneRaw = (string) ($fbUser['phoneNumber'] ?? '');
+            $fbPhoneDigits = preg_replace('/\D+/', '', $fbPhoneRaw);
+            $fbEmail = strtolower(trim((string) ($fbUser['email'] ?? '')));
 
-        if ($httpCode >= 200 && $httpCode < 300) {
-            $json = json_decode((string)$res, true);
-            if (!empty($json['users'][0]['phoneNumber'])) {
-                $userPhone = preg_replace('/\D+/', '', (string)$json['users'][0]['phoneNumber']);
-                if (str_ends_with($userPhone, substr($cleanPhone, -10))) {
-                    return true;
-                }
+            $phoneMatched = $fbPhoneDigits !== '' && ($cleanPhone === '' || (strlen($cleanPhone) >= 10 && str_ends_with($fbPhoneDigits, substr($cleanPhone, -10))));
+            $emailMatched = $fbEmail !== '' && isValidEmailForGatewayPhp($fbEmail) && ($email === '' || $fbEmail === $email);
+
+            if (
+                ($cleanPhone !== '' && $email !== '' && $phoneMatched && $emailMatched) ||
+                ($cleanPhone !== '' && $email === '' && $phoneMatched) ||
+                ($cleanPhone === '' && $email !== '' && $emailMatched) ||
+                ($cleanPhone === '' && $email === '' && ($phoneMatched || $emailMatched))
+            ) {
+                return [
+                    'approved' => true,
+                    'provider' => 'firebase',
+                    'method' => 'id_token',
+                    'resolvedPhone' => $phone !== '' ? $phone : ($fbPhoneRaw !== '' ? normalizePhoneSimplePhp($fbPhoneRaw) : null),
+                    'resolvedEmail' => $email !== '' ? $email : (isValidEmailForGatewayPhp($fbEmail) ? $fbEmail : null)
+                ];
             }
         }
     }
 
     // Flow B: Backend Firebase signInWithPhoneNumber (sessionInfo + code)
-    if (!empty($sessionInfo) && !empty($code)) {
-        $url = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPhoneNumber?key={$firebaseApiKey}";
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['sessionInfo' => $sessionInfo, 'code' => $code]));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-        $res = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($httpCode >= 200 && $httpCode < 300) {
-            $json = json_decode((string)$res, true);
-            if (!empty($json['phoneNumber'])) {
-                $userPhone = preg_replace('/\D+/', '', (string)$json['phoneNumber']);
-                if (str_ends_with($userPhone, substr($cleanPhone, -10))) {
-                    return true;
-                }
+    if ($sessionInfo !== '' && $code !== '') {
+        $url = 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPhoneNumber?key=' . urlencode($firebaseApiKey);
+        $res = firebaseHttpJsonPostPhp($url, ['sessionInfo' => $sessionInfo, 'code' => $code]);
+        if ($res['ok'] && !empty($res['data']['phoneNumber'])) {
+            $fbPhoneRaw = (string) $res['data']['phoneNumber'];
+            $fbPhoneDigits = preg_replace('/\D+/', '', $fbPhoneRaw);
+            if ($cleanPhone === '' || (strlen($cleanPhone) >= 10 && str_ends_with($fbPhoneDigits, substr($cleanPhone, -10)))) {
+                return [
+                    'approved' => true,
+                    'provider' => 'firebase',
+                    'method' => 'session_info',
+                    'resolvedPhone' => $phone !== '' ? $phone : normalizePhoneSimplePhp($fbPhoneRaw),
+                    'resolvedEmail' => $email !== '' ? $email : null
+                ];
             }
         }
     }
 
-    return false;
+    // Flow C: Firebase Password Reset OOB Code check (verifies code without consuming it)
+    if ($oobCode !== '') {
+        $url = 'https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=' . urlencode($firebaseApiKey);
+        $res = firebaseHttpJsonPostPhp($url, ['oobCode' => $oobCode]);
+        if ($res['ok'] && !empty($res['data']['email'])) {
+            $fbEmail = strtolower(trim((string) $res['data']['email']));
+            if (isValidEmailForGatewayPhp($fbEmail) && ($email === '' || $fbEmail === $email)) {
+                return [
+                    'approved' => true,
+                    'provider' => 'firebase',
+                    'method' => 'oob_code',
+                    'resolvedPhone' => $phone !== '' ? $phone : null,
+                    'resolvedEmail' => $email !== '' ? $email : $fbEmail
+                ];
+            }
+        }
+    }
+
+    return ['approved' => false];
+}
+
+function applyFirebaseOobPasswordResetPhp(string $oobCode, string $newPassword): array
+{
+    $firebaseApiKey = getEnvVar('FIREBASE_API_KEY');
+    if (empty($firebaseApiKey) || $oobCode === '') {
+        return ['ok' => false, 'error' => 'Missing Firebase API key or OOB code.'];
+    }
+    $url = 'https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=' . urlencode($firebaseApiKey);
+    $res = firebaseHttpJsonPostPhp($url, ['oobCode' => $oobCode, 'newPassword' => $newPassword]);
+    if ($res['ok'] && !empty($res['data']['email'])) {
+        return ['ok' => true, 'email' => strtolower(trim((string) $res['data']['email']))];
+    }
+    $errMsg = (string) ($res['data']['error']['message'] ?? $res['error'] ?? 'Invalid or expired Firebase reset code.');
+    return ['ok' => false, 'error' => $errMsg];
+}
+
+function verifyFirebaseOtp(string $phone, string $code, string $sessionInfo = '', string $idToken = '', string $email = '', string $oobCode = ''): bool
+{
+    $res = verifyFirebaseIdentity([
+        'phone' => $phone,
+        'email' => $email,
+        'code' => $code,
+        'sessionInfo' => $sessionInfo,
+        'idToken' => $idToken,
+        'oobCode' => $oobCode
+    ]);
+    return !empty($res['approved']);
 }
 
 

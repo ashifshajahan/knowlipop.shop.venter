@@ -241,21 +241,21 @@ if ($requestUri === '/api/logout') {
     apiLogout($pdo);
 }
 
-if ($requestUri === '/api/forgot-password') {
+if ($requestUri === '/api/forgot-password' || $requestUri === '/api/auth/forgot-password') {
     if ($method !== 'POST') {
         errorResponse('Method Not Allowed', [], 405);
     }
     apiForgotPassword($pdo);
 }
 
-if ($requestUri === '/api/verify-otp') {
+if ($requestUri === '/api/verify-otp' || $requestUri === '/api/auth/verify-otp') {
     if ($method !== 'POST') {
         errorResponse('Method Not Allowed', [], 405);
     }
     apiVerifyOtp($pdo);
 }
 
-if ($requestUri === '/api/reset-password') {
+if ($requestUri === '/api/reset-password' || $requestUri === '/api/auth/reset-password') {
     if ($method !== 'POST') {
         errorResponse('Method Not Allowed', [], 405);
     }

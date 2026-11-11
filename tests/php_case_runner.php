@@ -38,6 +38,18 @@ try {
             apiMe($pdo);
             break;
 
+        case 'forgot_password':
+            apiForgotPassword($pdo);
+            break;
+
+        case 'verify_otp':
+            apiVerifyOtp($pdo);
+            break;
+
+        case 'reset_password':
+            apiResetPassword($pdo);
+            break;
+
         case 'get_seller_orders':
             $routeSellerId = $post['route_seller_id'] ?? null;
             apiGetSellerOrders($pdo, $routeSellerId);

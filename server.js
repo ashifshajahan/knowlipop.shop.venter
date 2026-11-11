@@ -2473,10 +2473,100 @@ app.post('/api/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logout successful.' });
 });
 
+let fallbackPasswordResetOtps = [];
+let passwordResetSchemaEnsured = false;
+
+async function ensurePasswordResetSchema(p) {
+  if (passwordResetSchemaEnsured || !p) return;
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_otps (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      phone VARCHAR(255) NULL DEFAULT NULL,
+      email VARCHAR(255) NULL DEFAULT NULL,
+      channel VARCHAR(20) NOT NULL DEFAULT 'phone',
+      token VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      INDEX idx_otp_phone (phone),
+      INDEX idx_otp_email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  const [phoneCols] = await p.query("SHOW COLUMNS FROM password_reset_otps LIKE 'phone'");
+  if (phoneCols.length > 0 && (phoneCols[0].Null !== 'YES' || /varchar\(30\)/i.test(phoneCols[0].Type || ''))) {
+    await p.query('ALTER TABLE password_reset_otps MODIFY COLUMN phone VARCHAR(255) NULL DEFAULT NULL');
+  }
+
+  const [emailCols] = await p.query("SHOW COLUMNS FROM password_reset_otps LIKE 'email'");
+  if (emailCols.length === 0) {
+    await p.query('ALTER TABLE password_reset_otps ADD COLUMN email VARCHAR(255) NULL DEFAULT NULL AFTER phone');
+  }
+
+  try {
+    const [emailIdx] = await p.query("SHOW INDEX FROM password_reset_otps WHERE Key_name = 'idx_otp_email'");
+    if (emailIdx.length === 0) {
+      await p.query('ALTER TABLE password_reset_otps ADD INDEX idx_otp_email (email)');
+    }
+  } catch (e) {}
+
+  const [channelCols] = await p.query("SHOW COLUMNS FROM password_reset_otps LIKE 'channel'");
+  if (channelCols.length === 0) {
+    await p.query("ALTER TABLE password_reset_otps ADD COLUMN channel VARCHAR(20) NOT NULL DEFAULT 'phone' AFTER email");
+  }
+
+  passwordResetSchemaEnsured = true;
+}
+
+function httpJsonPostNode(hostname, apiPath, payloadObj = {}) {
+  const postData = JSON.stringify(payloadObj);
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname,
+      path: apiPath,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(data);
+        } catch (e) {}
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          statusCode: res.statusCode,
+          data: parsed,
+          raw: data
+        });
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, statusCode: 0, data: null, error: e.message }));
+    req.setTimeout(15000, () => {
+      req.destroy();
+      resolve({ ok: false, statusCode: 0, data: null, error: 'Timeout' });
+    });
+    req.write(postData);
+    req.end();
+  });
+}
+
 function isFirebaseTestPhoneNode(phone) {
+  if (!phone) return false;
   const testPhone = (process.env.FIREBASE_TEST_PHONE || '+919633426254').replace(/\D+/g, '');
-  const clean = phone.replace(/\D+/g, '');
+  const clean = String(phone).replace(/\D+/g, '');
   return clean.length >= 10 && testPhone.length >= 10 && clean.endsWith(testPhone.slice(-10));
+}
+
+function isFirebaseTestEmailNode(email) {
+  if (!email) return false;
+  const rawList = (process.env.FIREBASE_TEST_EMAIL || '').trim();
+  if (!rawList) return false;
+  const target = String(email).trim().toLowerCase();
+  return rawList.split(',').map(v => v.trim().toLowerCase()).filter(Boolean).includes(target);
 }
 
 async function sendOtpSmsNode(phone, otp, recaptchaToken = '') {
@@ -2485,6 +2575,7 @@ async function sendOtpSmsNode(phone, otp, recaptchaToken = '') {
     return {
       sent: true,
       provider: 'firebase',
+      channel: 'phone',
       status: 'dispatched',
       test_mode: true,
       note: 'Firebase test phone number active. Verified with test OTP: ' + (process.env.FIREBASE_TEST_OTP || '000000')
@@ -2499,43 +2590,21 @@ async function sendOtpSmsNode(phone, otp, recaptchaToken = '') {
     try {
       const payload = { phoneNumber: phone };
       if (recaptchaToken) payload.recaptchaToken = recaptchaToken;
-      const postData = JSON.stringify(payload);
-
-      const result = await new Promise((resolve) => {
-        const req = https.request({
-          hostname: 'identitytoolkit.googleapis.com',
-          path: `/v1/accounts:sendVerificationCode?key=${firebaseApiKey}`,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(postData)
-          }
-        }, (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              try {
-                const parsed = JSON.parse(data);
-                resolve({ sent: true, provider: 'firebase', session_info: parsed.sessionInfo });
-              } catch (e) {
-                resolve({ sent: true, provider: 'firebase' });
-              }
-            } else {
-              console.warn('[Firebase Send Error]', res.statusCode, data);
-              resolve({ sent: false, provider: 'firebase', error: data });
-            }
-          });
-        });
-        req.on('error', (e) => resolve({ sent: false, error: e.message }));
-        req.setTimeout(15000, () => {
-          req.destroy();
-          resolve({ sent: false, error: 'Timeout' });
-        });
-        req.write(postData);
-        req.end();
-      });
-      if (result.sent) return result;
+      const res = await httpJsonPostNode(
+        'identitytoolkit.googleapis.com',
+        `/v1/accounts:sendVerificationCode?key=${encodeURIComponent(firebaseApiKey)}`,
+        payload
+      );
+      if (res.ok) {
+        return {
+          sent: true,
+          provider: 'firebase',
+          channel: 'phone',
+          status: 'dispatched',
+          ...(res.data && res.data.sessionInfo ? { session_info: res.data.sessionInfo } : {})
+        };
+      }
+      console.warn('[Firebase Phone Send Error]', res.statusCode, res.raw || res.error);
     } catch (err) {
       console.warn('[Firebase Error]', err.message);
     }
@@ -2567,270 +2636,791 @@ async function sendOtpSmsNode(phone, otp, recaptchaToken = '') {
           res.on('data', chunk => data += chunk);
           res.on('end', () => {
             if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve({ sent: true, provider: 'fast2sms' });
+              resolve({ sent: true, provider: 'fast2sms', channel: 'phone', status: 'dispatched' });
             } else {
-              resolve({ sent: false, provider: 'fast2sms', error: data });
+              resolve({ sent: false, provider: 'fast2sms', channel: 'phone', error: data });
             }
           });
         });
-        req.on('error', (e) => resolve({ sent: false, error: e.message }));
+        req.on('error', (e) => resolve({ sent: false, channel: 'phone', error: e.message }));
         req.setTimeout(15000, () => {
           req.destroy();
-          resolve({ sent: false, error: 'Timeout' });
+          resolve({ sent: false, channel: 'phone', error: 'Timeout' });
         });
         req.write(postData);
         req.end();
       });
       return result;
     } catch (err) {
-      return { sent: false, error: err.message };
+      return { sent: false, channel: 'phone', error: err.message };
     }
   }
 
   return {
     sent: false,
-    provider: 'mock',
-    reason: 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+    provider: firebaseApiKey ? 'firebase' : 'mock',
+    channel: 'phone',
+    reason: firebaseApiKey
+      ? 'Firebase Phone Gateway could not dispatch SMS automatically (recaptchaToken may be required by client). dev_otp returned for verification testing.'
+      : 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
   };
 }
 
-async function verifyFirebaseOtpNode(phone, code = '', sessionInfo = '', idToken = '') {
-  // 0. Firebase Test Phone & OTP Check
-  const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
-  if (isFirebaseTestPhoneNode(phone) && (code === testOtp || code === '000000')) {
-    return true;
+async function sendPasswordResetEmailNode(email, otp, options = {}) {
+  // 0. Firebase Test Email Check
+  if (isFirebaseTestEmailNode(email)) {
+    return {
+      sent: true,
+      provider: 'firebase',
+      channel: 'email',
+      status: 'dispatched',
+      test_mode: true,
+      flow: 'test_email',
+      note: 'Firebase test email active. Verified with test OTP: ' + (process.env.FIREBASE_TEST_OTP || '000000')
+    };
   }
 
   const firebaseApiKey = process.env.FIREBASE_API_KEY;
-  if (!firebaseApiKey) return false;
+  if (!firebaseApiKey) {
+    return {
+      sent: false,
+      provider: 'mock',
+      channel: 'email',
+      reason: 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+    };
+  }
 
-  const cleanPhone = phone.replace(/\D+/g, '');
+  const requestType = (options.authMode === 'email_link' && options.continueUrl) ? 'EMAIL_SIGNIN' : 'PASSWORD_RESET';
+  const payload = { requestType, email };
+  if (options.continueUrl) {
+    payload.continueUrl = options.continueUrl;
+  }
 
-  // Flow A: Client-side Firebase Phone Auth ID Token
+  let res = await httpJsonPostNode(
+    'identitytoolkit.googleapis.com',
+    `/v1/accounts:sendOobCode?key=${encodeURIComponent(firebaseApiKey)}`,
+    payload
+  );
+
+  // If seller exists in MySQL but has not yet been provisioned in Firebase Auth, mirror once cleanly and retry
+  const errMessage = res.data && res.data.error && res.data.error.message ? String(res.data.error.message) : '';
+  if (!res.ok && errMessage.includes('EMAIL_NOT_FOUND')) {
+    const tempPassword = crypto.randomBytes(20).toString('hex') + 'Aa1!';
+    const signUpRes = await httpJsonPostNode(
+      'identitytoolkit.googleapis.com',
+      `/v1/accounts:signUp?key=${encodeURIComponent(firebaseApiKey)}`,
+      { email, password: tempPassword, returnSecureToken: false }
+    );
+    if (signUpRes.ok || (signUpRes.data && signUpRes.data.error && String(signUpRes.data.error.message || '').includes('EMAIL_EXISTS'))) {
+      res = await httpJsonPostNode(
+        'identitytoolkit.googleapis.com',
+        `/v1/accounts:sendOobCode?key=${encodeURIComponent(firebaseApiKey)}`,
+        payload
+      );
+    }
+  }
+
+  if (res.ok) {
+    return {
+      sent: true,
+      provider: 'firebase',
+      channel: 'email',
+      status: 'dispatched',
+      flow: requestType.toLowerCase(),
+      note: 'Password reset instruction dispatched via Firebase Email Gateway.'
+    };
+  }
+
+  const finalErr = (res.data && res.data.error && res.data.error.message) || res.error || 'Firebase Email Gateway rejected request.';
+  console.warn('[Firebase Email Send Error]', res.statusCode, res.raw || finalErr);
+  return {
+    sent: false,
+    provider: 'firebase',
+    channel: 'email',
+    status: 'mock_mode',
+    firebase_error: finalErr,
+    reason: 'Firebase Email Gateway did not dispatch an email automatically (' + finalErr + '). dev_otp returned for verification testing.'
+  };
+}
+
+async function verifyFirebaseIdentityNode({ phone = '', email = '', code = '', sessionInfo = '', idToken = '', oobCode = '' } = {}) {
+  const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
+
+  // 0a. Firebase Test Phone & OTP Check
+  if (phone && isFirebaseTestPhoneNode(phone) && (code === testOtp || code === '000000')) {
+    return { approved: true, provider: 'firebase', method: 'test_phone', resolvedPhone: phone, resolvedEmail: email || null };
+  }
+
+  // 0b. Firebase Test Email & OTP Check
+  if (email && isFirebaseTestEmailNode(email) && (code === testOtp || code === '000000')) {
+    return { approved: true, provider: 'firebase', method: 'test_email', resolvedPhone: phone || null, resolvedEmail: email };
+  }
+
+  const firebaseApiKey = process.env.FIREBASE_API_KEY;
+  if (!firebaseApiKey) return { approved: false };
+
+  const cleanPhone = String(phone || '').replace(/\D+/g, '');
+  const cleanEmail = String(email || '').trim().toLowerCase();
+
+  // Flow A: Client-side Firebase Auth ID Token (Phone Auth, Email Link Sign-In, or Email Auth)
   if (idToken) {
-    try {
-      const postData = JSON.stringify({ idToken });
-      const approved = await new Promise((resolve) => {
-        const req = https.request({
-          hostname: 'identitytoolkit.googleapis.com',
-          path: `/v1/accounts:lookup?key=${firebaseApiKey}`,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(postData)
-          }
-        }, (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              try {
-                const parsed = JSON.parse(data);
-                const userPhone = (parsed.users && parsed.users[0] && parsed.users[0].phoneNumber) ? parsed.users[0].phoneNumber.replace(/\D+/g, '') : '';
-                resolve(userPhone.endsWith(cleanPhone.slice(-10)));
-              } catch (e) {
-                resolve(false);
-              }
-            } else {
-              resolve(false);
-            }
-          });
-        });
-        req.on('error', () => resolve(false));
-        req.setTimeout(15000, () => {
-          req.destroy();
-          resolve(false);
-        });
-        req.write(postData);
-        req.end();
-      });
-      if (approved) return true;
-    } catch (err) {
-      // Continue to next check
+    const res = await httpJsonPostNode(
+      'identitytoolkit.googleapis.com',
+      `/v1/accounts:lookup?key=${encodeURIComponent(firebaseApiKey)}`,
+      { idToken }
+    );
+    if (res.ok && res.data && res.data.users && res.data.users[0]) {
+      const fbUser = res.data.users[0];
+      const fbPhoneRaw = fbUser.phoneNumber ? String(fbUser.phoneNumber) : '';
+      const fbPhoneDigits = fbPhoneRaw.replace(/\D+/g, '');
+      const fbEmail = fbUser.email ? String(fbUser.email).trim().toLowerCase() : '';
+
+      const phoneMatched = Boolean(fbPhoneDigits && (!cleanPhone || (cleanPhone.length >= 10 && fbPhoneDigits.endsWith(cleanPhone.slice(-10)))));
+      const emailMatched = Boolean(fbEmail && isValidEmailAddress(fbEmail) && (!cleanEmail || fbEmail === cleanEmail));
+
+      if ((cleanPhone && cleanEmail && phoneMatched && emailMatched) ||
+          (cleanPhone && !cleanEmail && phoneMatched) ||
+          (!cleanPhone && cleanEmail && emailMatched) ||
+          (!cleanPhone && !cleanEmail && (phoneMatched || emailMatched))) {
+        return {
+          approved: true,
+          provider: 'firebase',
+          method: 'id_token',
+          resolvedPhone: phone || (fbPhoneRaw ? normalizePhone(fbPhoneRaw) : null),
+          resolvedEmail: email || (isValidEmailAddress(fbEmail) ? fbEmail : null)
+        };
+      }
     }
   }
 
   // Flow B: Backend Firebase signInWithPhoneNumber (sessionInfo + code)
   if (sessionInfo && code) {
-    try {
-      const postData = JSON.stringify({ sessionInfo, code });
-      const approved = await new Promise((resolve) => {
-        const req = https.request({
-          hostname: 'identitytoolkit.googleapis.com',
-          path: `/v1/accounts:signInWithPhoneNumber?key=${firebaseApiKey}`,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(postData)
-          }
-        }, (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              try {
-                const parsed = JSON.parse(data);
-                const userPhone = parsed.phoneNumber ? parsed.phoneNumber.replace(/\D+/g, '') : '';
-                resolve(userPhone.endsWith(cleanPhone.slice(-10)));
-              } catch (e) {
-                resolve(false);
-              }
-            } else {
-              resolve(false);
-            }
-          });
-        });
-        req.on('error', () => resolve(false));
-        req.setTimeout(15000, () => {
-          req.destroy();
-          resolve(false);
-        });
-        req.write(postData);
-        req.end();
-      });
-      if (approved) return true;
-    } catch (err) {
-      // Return false
+    const res = await httpJsonPostNode(
+      'identitytoolkit.googleapis.com',
+      `/v1/accounts:signInWithPhoneNumber?key=${encodeURIComponent(firebaseApiKey)}`,
+      { sessionInfo, code }
+    );
+    if (res.ok && res.data && res.data.phoneNumber) {
+      const fbPhoneDigits = String(res.data.phoneNumber).replace(/\D+/g, '');
+      if (!cleanPhone || (cleanPhone.length >= 10 && fbPhoneDigits.endsWith(cleanPhone.slice(-10)))) {
+        return {
+          approved: true,
+          provider: 'firebase',
+          method: 'session_info',
+          resolvedPhone: phone || normalizePhone(res.data.phoneNumber),
+          resolvedEmail: email || null
+        };
+      }
     }
   }
 
-  return false;
+  // Flow C: Firebase Password Reset OOB Code verification (checks code without consuming it)
+  if (oobCode) {
+    const res = await httpJsonPostNode(
+      'identitytoolkit.googleapis.com',
+      `/v1/accounts:resetPassword?key=${encodeURIComponent(firebaseApiKey)}`,
+      { oobCode }
+    );
+    if (res.ok && res.data && res.data.email) {
+      const fbEmail = String(res.data.email).trim().toLowerCase();
+      if (isValidEmailAddress(fbEmail) && (!cleanEmail || fbEmail === cleanEmail)) {
+        return {
+          approved: true,
+          provider: 'firebase',
+          method: 'oob_code',
+          resolvedPhone: phone || null,
+          resolvedEmail: email || fbEmail
+        };
+      }
+    }
+  }
+
+  return { approved: false };
 }
 
-app.post('/api/forgot-password', async (req, res) => {
+async function applyFirebaseOobPasswordResetNode(oobCode, newPassword) {
+  const firebaseApiKey = process.env.FIREBASE_API_KEY;
+  if (!firebaseApiKey || !oobCode) return { ok: false, error: 'Missing Firebase API key or OOB code.' };
+  const res = await httpJsonPostNode(
+    'identitytoolkit.googleapis.com',
+    `/v1/accounts:resetPassword?key=${encodeURIComponent(firebaseApiKey)}`,
+    { oobCode, newPassword }
+  );
+  if (res.ok && res.data && res.data.email) {
+    return { ok: true, email: String(res.data.email).trim().toLowerCase() };
+  }
+  const errMsg = (res.data && res.data.error && res.data.error.message) || res.error || 'Invalid or expired Firebase reset code.';
+  return { ok: false, error: errMsg };
+}
+
+async function verifyFirebaseOtpNode(phone, code = '', sessionInfo = '', idToken = '', email = '', oobCode = '') {
+  const res = await verifyFirebaseIdentityNode({ phone, email, code, sessionInfo, idToken, oobCode });
+  return Boolean(res && res.approved);
+}
+
+async function findPasswordResetUserDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  if (email && rawPhone) {
+    const [rows] = await p.query(
+      'SELECT id, email, phone, role FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1',
+      [phone, rawPhone, rawNoPrefix, email]
+    );
+    return rows[0] || null;
+  }
+  if (email) {
+    const [rows] = await p.query('SELECT id, email, phone, role FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+    return rows[0] || null;
+  }
+  if (rawPhone || phone) {
+    const [rows] = await p.query(
+      'SELECT id, email, phone, role FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
+      [phone, rawPhone || phone, rawNoPrefix || String(phone).replace(/^\+91/, '').replace(/^\+/, '')]
+    );
+    return rows[0] || null;
+  }
+  return null;
+}
+
+function findPasswordResetUserFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  const emailMatch = email
+    ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === email)
+    : null;
+  const phoneMatch = (rawPhone || phone)
+    ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone || phone, rawNoPrefix || String(phone).replace(/^\+91/, '').replace(/^\+/, '')))
+    : null;
+  if (email && (rawPhone || phone)) {
+    return (emailMatch && phoneMatch && Number(emailMatch.id) === Number(phoneMatch.id)) ? emailMatch : null;
+  }
+  return emailMatch || phoneMatch || null;
+}
+
+async function findLatestOtpRecordDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  if (email && (rawPhone || phone)) {
+    const [rows] = await p.query(
+      `SELECT * FROM password_reset_otps
+       WHERE (LOWER(email) = ? AND (phone IS NULL OR phone = ? OR phone = ? OR phone = ?))
+          OR ((email IS NULL OR LOWER(email) = ?) AND (phone = ? OR phone = ? OR phone = ?))
+       ORDER BY id DESC LIMIT 1`,
+      [email, phone, rawPhone || phone, cleanNoPrefix, email, phone, rawPhone || phone, cleanNoPrefix]
+    );
+    return rows[0] || null;
+  }
+  if (email) {
+    const [rows] = await p.query(
+      'SELECT * FROM password_reset_otps WHERE LOWER(email) = ? ORDER BY id DESC LIMIT 1',
+      [email]
+    );
+    return rows[0] || null;
+  }
+  if (rawPhone || phone) {
+    const [rows] = await p.query(
+      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY id DESC LIMIT 1',
+      [phone, rawPhone || phone, cleanNoPrefix]
+    );
+    return rows[0] || null;
+  }
+  return null;
+}
+
+function findLatestOtpRecordFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  for (let i = fallbackPasswordResetOtps.length - 1; i >= 0; i--) {
+    const row = fallbackPasswordResetOtps[i];
+    const rowEmail = row.email ? String(row.email).toLowerCase() : '';
+    const emailOk = email ? rowEmail === email : true;
+    const phoneOk = (rawPhone || phone)
+      ? matchesPhoneRecord(row.phone, phone, rawPhone || phone, cleanNoPrefix)
+      : true;
+    if (email && (rawPhone || phone)) {
+      if ((rowEmail === email && (!row.phone || phoneOk)) || (phoneOk && (!rowEmail || emailOk))) {
+        return row;
+      }
+    } else if (email && rowEmail === email) {
+      return row;
+    } else if ((rawPhone || phone) && phoneOk) {
+      return row;
+    }
+  }
+  return null;
+}
+
+async function clearOtpRecordsDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  const clauses = [];
+  const params = [];
+  if (email) {
+    clauses.push('LOWER(email) = ?');
+    params.push(email.toLowerCase());
+  }
+  if (phone || rawPhone) {
+    clauses.push('phone = ? OR phone = ? OR phone = ?');
+    params.push(phone || rawPhone, rawPhone || phone, cleanNoPrefix);
+  }
+  if (clauses.length > 0) {
+    await p.query(`DELETE FROM password_reset_otps WHERE ${clauses.join(' OR ')}`, params);
+  }
+}
+
+function clearOtpRecordsFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  fallbackPasswordResetOtps = fallbackPasswordResetOtps.filter(row => {
+    const rowEmail = row.email ? String(row.email).toLowerCase() : '';
+    const matchesEmail = Boolean(email && rowEmail === email.toLowerCase());
+    const matchesPhone = Boolean((phone || rawPhone) && matchesPhoneRecord(row.phone, phone, rawPhone || phone, cleanNoPrefix));
+    return !matchesEmail && !matchesPhone;
+  });
+}
+
+app.get(['/api/forgot-password', '/api/auth/forgot-password'], (req, res) => {
+  res.status(405).json({
+    message: 'The forgot-password endpoint only accepts POST requests with email or phone number.'
+  });
+});
+
+app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res) => {
   const body = req.body || {};
-  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || body.mobile_no || '').toString().trim();
-  const recaptchaToken = (body.recaptcha_token || body.recaptchaToken || body.recaptcha || '').toString().trim();
-  const phone = normalizePhone(rawPhone);
-  if (!rawPhone) return res.status(422).json({ errors: { phone: ['Phone is required.'] } });
+  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const recaptchaToken = extractField(body, ['recaptcha_token', 'recaptchaToken', 'recaptcha'], '');
+  const continueUrl = extractField(body, ['continue_url', 'continueUrl', 'redirect_url', 'redirectUrl'], '');
+  const authMode = extractField(body, ['auth_mode', 'authMode', 'flow'], 'password_reset').toLowerCase();
+  const requestedChannel = extractField(body, ['channel', 'gateway_channel'], '').toLowerCase();
+
+  const errors = {};
+  if (identifierError) {
+    errors.email_or_phone = [identifierError];
+    errors.email = [identifierError];
+    errors.phone = [identifierError];
+  } else if (!email && !rawPhone) {
+    const msg = 'Please provide an email address or phone number.';
+    errors.email_or_phone = [msg];
+    errors.email = [msg];
+    errors.phone = [msg];
+  } else {
+    if (email && !isValidEmailAddress(email)) {
+      errors.email = ['The email address format is invalid.'];
+    }
+    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    }
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({ message: 'Validation error occurred.', errors });
+  }
+
+  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
+  let activeChannel = (requestedChannel === 'email' || (!rawPhone && email)) ? 'email' : 'phone';
+  let matchedUser = null;
+  let usingFallback = false;
 
   try {
-    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [rows] = await pool.query(
-      'SELECT id, phone FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
-      [phone, rawPhone, rawNoPrefix]
-    );
-    let otp = null;
-    let targetPhone = phone;
-    let smsResult = null;
-    if (rows.length > 0) {
-      targetPhone = rows[0].phone;
-      const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
-      otp = isFirebaseTestPhoneNode(targetPhone) ? testOtp : Math.floor(100000 + Math.random() * 900000).toString();
-      const hash = await bcrypt.hash(otp, 10);
-      await pool.query('DELETE FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ?', [targetPhone, rawPhone, rawNoPrefix]);
-      await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [targetPhone, hash]);
+    await ensurePasswordResetSchema(pool);
+    matchedUser = await findPasswordResetUserDb(pool, { email, rawPhone, phone, rawNoPrefix });
+  } catch (err) {
+    usingFallback = true;
+    matchedUser = findPasswordResetUserFallback({ email, rawPhone, phone, rawNoPrefix });
+  }
 
-      smsResult = await sendOtpSmsNode(targetPhone, otp, recaptchaToken);
+  let otp = null;
+  let gatewayResult = null;
+
+  if (matchedUser) {
+    const targetPhone = matchedUser.phone ? String(matchedUser.phone).trim() : (phone || null);
+    const targetEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller') || (email || null);
+    if (activeChannel === 'email' && !targetEmail && targetPhone) {
+      activeChannel = 'phone';
+    } else if (activeChannel === 'phone' && !targetPhone && targetEmail) {
+      activeChannel = 'email';
     }
-    const response = { message: 'If this phone number is registered, an OTP will be sent.' };
-    if (otp) {
-      response.dev_otp = otp; // Returned for Postman & frontend developer testing
-      if (smsResult && smsResult.provider) {
-        response.sms_status = smsResult.sent ? 'dispatched' : 'mock_mode';
-        response.gateway = smsResult.provider;
-        if (smsResult.session_info) {
-          response.session_info = smsResult.session_info;
-        }
-        if (!smsResult.sent && smsResult.reason) {
-          response.sms_note = smsResult.reason;
+
+    const testOtp = process.env.FIREBASE_TEST_OTP || '000000';
+    const isTestTarget = activeChannel === 'email'
+      ? isFirebaseTestEmailNode(targetEmail)
+      : isFirebaseTestPhoneNode(targetPhone);
+    otp = isTestTarget ? testOtp : Math.floor(100000 + Math.random() * 900000).toString();
+    const hash = await bcrypt.hash(otp, 10);
+
+    if (!usingFallback) {
+      try {
+        await clearOtpRecordsDb(pool, { email: targetEmail || email, rawPhone, phone: targetPhone || phone, rawNoPrefix });
+        await pool.query(
+          'INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (?, ?, ?, ?, NOW())',
+          [targetPhone, targetEmail, activeChannel, hash]
+        );
+      } catch (dbWriteErr) {
+        usingFallback = true;
+      }
+    }
+
+    if (usingFallback) {
+      clearOtpRecordsFallback({ email: targetEmail || email, rawPhone, phone: targetPhone || phone, rawNoPrefix });
+      fallbackPasswordResetOtps.push({
+        phone: targetPhone,
+        email: targetEmail,
+        channel: activeChannel,
+        token: hash,
+        created_at: new Date().toISOString()
+      });
+    }
+
+    gatewayResult = activeChannel === 'email'
+      ? await sendPasswordResetEmailNode(targetEmail, otp, { continueUrl, authMode })
+      : await sendOtpSmsNode(targetPhone, otp, recaptchaToken);
+  }
+
+  const response = {
+    message: 'If this email or phone number is registered, a verification OTP / reset link will be sent.',
+    channel: activeChannel
+  };
+  if (otp) {
+    response.dev_otp = otp; // Returned for Postman & developer verification testing
+    if (gatewayResult && gatewayResult.provider) {
+      const dispatched = gatewayResult.sent ? 'dispatched' : 'mock_mode';
+      response.gateway = gatewayResult.provider;
+      response.delivery_status = dispatched;
+      if (activeChannel === 'email') {
+        response.email_status = dispatched;
+      } else {
+        response.sms_status = dispatched;
+      }
+      if (gatewayResult.session_info) {
+        response.session_info = gatewayResult.session_info;
+      }
+      if (gatewayResult.flow) {
+        response.firebase_flow = gatewayResult.flow;
+      }
+      if (!gatewayResult.sent && gatewayResult.reason) {
+        response.gateway_note = gatewayResult.reason;
+        if (activeChannel === 'phone') {
+          response.sms_note = gatewayResult.reason;
+        } else {
+          response.email_note = gatewayResult.reason;
         }
       }
     }
-    res.json(response);
-  } catch (err) {
-    res.json({
-      message: 'If this phone number is registered, an OTP will be sent.',
-      dev_otp: '000000',
-      sms_status: 'mock_mode'
+  }
+  return res.json(response);
+});
+
+app.get(['/api/verify-otp', '/api/auth/verify-otp'], (req, res) => {
+  res.status(405).json({
+    message: 'The verify-otp endpoint only accepts POST requests with email or phone and OTP code / Firebase token.'
+  });
+});
+
+app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
+  const body = req.body || {};
+  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const code = extractField(body, ['code', 'otp', 'otp_code', 'verification_code'], '');
+  const sessionInfo = extractField(body, ['session_info', 'sessionInfo', 'session'], '');
+  const idToken = extractField(body, ['id_token', 'idToken', 'firebase_token'], '');
+  const oobCode = extractField(body, ['oob_code', 'oobCode'], '');
+
+  const errors = {};
+  if (identifierError) {
+    errors.email_or_phone = [identifierError];
+    errors.email = [identifierError];
+    errors.phone = [identifierError];
+  } else {
+    if (email && !isValidEmailAddress(email)) {
+      errors.email = ['The email address format is invalid.'];
+    }
+    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    }
+    if (!email && !rawPhone && !idToken && !oobCode) {
+      const msg = 'Email or phone number (or Firebase ID Token / OOB code) is required.';
+      errors.email_or_phone = [msg];
+    }
+    if (!code && !idToken && !oobCode) {
+      errors.code = ['Verification OTP code, Firebase OOB code, or Firebase ID Token is required.'];
+    }
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({
+      message: Object.values(errors)[0][0] || 'Validation error occurred.',
+      errors
     });
   }
-});
 
-app.post('/api/verify-otp', async (req, res) => {
-  const body = req.body || {};
-  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || '').toString().trim();
-  const phone = normalizePhone(rawPhone);
-  const code = (body.code || body.otp || '').toString().trim();
-  const sessionInfo = (body.session_info || body.sessionInfo || body.session || '').toString().trim();
-  const idToken = (body.id_token || body.idToken || body.firebase_token || '').toString().trim();
+  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
+  const firebaseRes = await verifyFirebaseIdentityNode({ phone, email, code, sessionInfo, idToken, oobCode });
 
-  if (!rawPhone || (!code && !idToken)) {
-    return res.status(422).json({ message: 'Phone and OTP code (or Firebase ID Token) are required.' });
+  const resolvedEmail = email || firebaseRes.resolvedEmail || '';
+  const resolvedPhone = phone || firebaseRes.resolvedPhone || '';
+  const resolvedRawNoPrefix = rawNoPrefix || String(resolvedPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+
+  if (resolvedEmail && !isValidEmailAddress(resolvedEmail)) {
+    return res.status(422).json({
+      message: 'The email address format is invalid.',
+      errors: { email: ['The email address format is invalid.'] }
+    });
   }
+
+  let latestRow = null;
+  let matchedUser = null;
+  let usingFallback = false;
 
   try {
-    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [rows] = await pool.query(
-      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY created_at DESC LIMIT 1',
-      [phone, rawPhone, rawNoPrefix]
-    );
-
-    const firebaseApproved = await verifyFirebaseOtpNode(phone, code, sessionInfo, idToken);
-    const localValid = rows.length > 0 && code && (await bcrypt.compare(code, rows[0].token));
-
-    if (!firebaseApproved && !localValid) {
-      return res.status(422).json({ message: 'Invalid or expired OTP code.' });
-    }
-
-    const resetToken = require('crypto').randomBytes(32).toString('hex');
-    const hashedReset = await bcrypt.hash(resetToken, 10);
-    const targetPhone = rows.length > 0 ? rows[0].phone : phone;
-    await pool.query('DELETE FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ?', [targetPhone, rawPhone, rawNoPrefix]);
-    await pool.query('INSERT INTO password_reset_otps (phone, token, created_at) VALUES (?, ?, NOW())', [targetPhone, hashedReset]);
-
-    res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
+    await ensurePasswordResetSchema(pool);
+    latestRow = await findLatestOtpRecordDb(pool, {
+      email: resolvedEmail,
+      rawPhone,
+      phone: resolvedPhone,
+      rawNoPrefix: resolvedRawNoPrefix
+    });
+    matchedUser = await findPasswordResetUserDb(pool, {
+      email: resolvedEmail,
+      rawPhone,
+      phone: resolvedPhone,
+      rawNoPrefix: resolvedRawNoPrefix
+    });
   } catch (err) {
-    if (code === '000000' || code === '123456') {
-      const resetToken = require('crypto').randomBytes(32).toString('hex');
-      return res.json({ message: 'OTP verified successfully.', reset_token: resetToken });
-    }
-    console.error('Verify-OTP Error:', err);
-    res.status(500).json({ error: 'Database error occurred.', details: err.message });
+    usingFallback = true;
+    latestRow = findLatestOtpRecordFallback({
+      email: resolvedEmail,
+      rawPhone,
+      phone: resolvedPhone,
+      rawNoPrefix: resolvedRawNoPrefix
+    });
+    matchedUser = findPasswordResetUserFallback({
+      email: resolvedEmail,
+      rawPhone,
+      phone: resolvedPhone,
+      rawNoPrefix: resolvedRawNoPrefix
+    });
   }
+
+  const localValid = Boolean(latestRow && code && (await bcrypt.compare(code, latestRow.token)));
+
+  if (!firebaseRes.approved && !localValid) {
+    return res.status(422).json({
+      message: 'Invalid or expired OTP code.',
+      errors: { code: ['Invalid or expired OTP code.'] }
+    });
+  }
+
+  // If authenticated purely via Firebase OOB/ID token without prior local row, verify an account exists
+  if (firebaseRes.approved && !localValid && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail) && !matchedUser) {
+    return res.status(422).json({
+      message: 'No seller account matches this verified Firebase email or phone number.'
+    });
+  }
+
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  const hashedReset = await bcrypt.hash(resetToken, 10);
+
+  const targetPhone = (matchedUser && matchedUser.phone) || (latestRow && latestRow.phone) || (resolvedPhone || null);
+  const targetEmail = (matchedUser ? getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller') : null)
+    || (latestRow && latestRow.email)
+    || (resolvedEmail || null);
+  const resolvedChannel = (latestRow && latestRow.channel)
+    || (resolvedEmail && !resolvedPhone ? 'email' : 'phone');
+
+  if (!usingFallback) {
+    try {
+      await clearOtpRecordsDb(pool, {
+        email: targetEmail || resolvedEmail,
+        rawPhone,
+        phone: targetPhone || resolvedPhone,
+        rawNoPrefix: resolvedRawNoPrefix
+      });
+      await pool.query(
+        'INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (?, ?, ?, ?, NOW())',
+        [targetPhone, targetEmail, resolvedChannel, hashedReset]
+      );
+    } catch (dbWriteErr) {
+      usingFallback = true;
+    }
+  }
+
+  if (usingFallback) {
+    clearOtpRecordsFallback({
+      email: targetEmail || resolvedEmail,
+      rawPhone,
+      phone: targetPhone || resolvedPhone,
+      rawNoPrefix: resolvedRawNoPrefix
+    });
+    fallbackPasswordResetOtps.push({
+      phone: targetPhone,
+      email: targetEmail,
+      channel: resolvedChannel,
+      token: hashedReset,
+      created_at: new Date().toISOString()
+    });
+  }
+
+  return res.json({
+    message: 'OTP verified successfully.',
+    reset_token: resetToken,
+    channel: resolvedChannel,
+    gateway: firebaseRes.approved ? 'firebase' : 'local'
+  });
 });
 
-app.post('/api/reset-password', async (req, res) => {
-  const body = req.body || {};
-  const rawPhone = (body.phone || body.phone_number || body.phoneNumber || body.mobile || '').toString().trim();
-  const phone = normalizePhone(rawPhone);
-  const reset_token = (body.reset_token || body.resetToken || body.token || '').toString().trim();
-  const password = (body.password || body.pass || '').toString();
-  const password_confirmation = (
-    body.password_confirmation !== undefined ? body.password_confirmation :
-    body.confirm_password !== undefined ? body.confirm_password :
-    body.confirmPassword !== undefined ? body.confirmPassword :
-    body.passwordConfirmation !== undefined ? body.passwordConfirmation :
-    password
-  ).toString();
+app.get(['/api/reset-password', '/api/auth/reset-password'], (req, res) => {
+  res.status(405).json({
+    message: 'The reset-password endpoint only accepts POST requests with email or phone, reset_token (or Firebase token), and password.'
+  });
+});
 
-  if (!rawPhone || !reset_token || !password) return res.status(422).json({ message: 'All fields required.' });
-  if (password.length < 8) return res.status(422).json({ message: 'Password must be at least 8 characters.' });
-  if (password !== password_confirmation) return res.status(422).json({ message: 'The password confirmation does not match.' });
+app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) => {
+  const body = req.body || {};
+  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const reset_token = extractField(body, ['reset_token', 'resetToken', 'token'], '');
+  const oobCode = extractField(body, ['oob_code', 'oobCode'], '');
+  const idToken = extractField(body, ['id_token', 'idToken', 'firebase_token'], '');
+  const password = extractField(body, ['password', 'new_password', 'newPassword', 'pass'], '').trim();
+  const password_confirmation = extractConfirmPassword(body, password);
+
+  const errors = {};
+  if (identifierError) {
+    errors.email_or_phone = [identifierError];
+    errors.email = [identifierError];
+    errors.phone = [identifierError];
+  } else {
+    if (email && !isValidEmailAddress(email)) {
+      errors.email = ['The email address format is invalid.'];
+    }
+    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
+      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    }
+    if (!email && !rawPhone && !idToken && !oobCode) {
+      errors.email_or_phone = ['Please provide an email address or phone number.'];
+    }
+  }
+  if (!reset_token && !oobCode && !idToken) {
+    errors.reset_token = ['The reset_token field (or Firebase OOB/ID token) is required.'];
+  }
+  if (!password) {
+    errors.password = ['The password field is required.'];
+  } else if (password.length < 8) {
+    errors.password = ['The password must be at least 8 characters.'];
+  } else if (password !== password_confirmation) {
+    errors.password = ['The password confirmation does not match.'];
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(422).json({
+      message: Object.values(errors)[0][0] || 'Validation error occurred.',
+      errors
+    });
+  }
+
+  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
+  let resolvedEmail = email;
+  let resolvedPhone = phone;
+  let resolvedChannel = email && !rawPhone ? 'email' : 'phone';
+  let firebaseResetDone = false;
+
+  // Verify proof (reset_token OR direct Firebase id_token / oob_code)
+  let latestRow = null;
+  let matchedUser = null;
+  let usingFallback = false;
 
   try {
-    const rawNoPrefix = rawPhone.replace(/^\+91/, '').replace(/^\+/, '');
-    const [rows] = await pool.query(
-      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY created_at DESC LIMIT 1',
-      [phone, rawPhone, rawNoPrefix]
-    );
-    if (rows.length === 0 || !(await bcrypt.compare(reset_token, rows[0].token))) {
-      return res.status(422).json({ message: 'Invalid or expired reset token.' });
+    await ensurePasswordResetSchema(pool);
+    if (reset_token) {
+      latestRow = await findLatestOtpRecordDb(pool, { email: resolvedEmail, rawPhone, phone: resolvedPhone, rawNoPrefix });
     }
-
-    const targetPhone = rows[0].phone;
-    const hashed = await bcrypt.hash(password, 10);
-    await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ?', [hashed, targetPhone]);
-    await pool.query('DELETE FROM password_reset_otps WHERE phone = ?', [targetPhone]);
-
-    res.json({ message: 'Password reset successful. Please log in again.' });
   } catch (err) {
-    if (reset_token && password && password === password_confirmation) {
-      return res.json({ message: 'Password reset successful. Please log in again.' });
+    usingFallback = true;
+    if (reset_token) {
+      latestRow = findLatestOtpRecordFallback({ email: resolvedEmail, rawPhone, phone: resolvedPhone, rawNoPrefix });
     }
-    console.error('Reset-Password Error:', err);
-    res.status(500).json({ error: 'Database error occurred.', details: err.message });
   }
+
+  if (reset_token) {
+    if (!latestRow || !(await bcrypt.compare(reset_token, latestRow.token))) {
+      return res.status(422).json({
+        message: 'Invalid or expired reset token.',
+        errors: { reset_token: ['Invalid or expired reset token.'] }
+      });
+    }
+    resolvedEmail = resolvedEmail || latestRow.email || '';
+    resolvedPhone = resolvedPhone || latestRow.phone || '';
+    resolvedChannel = latestRow.channel || (resolvedEmail && !resolvedPhone ? 'email' : 'phone');
+  } else if (idToken) {
+    const fbCheck = await verifyFirebaseIdentityNode({ phone: resolvedPhone, email: resolvedEmail, idToken });
+    if (!fbCheck.approved) {
+      return res.status(422).json({
+        message: 'Invalid or expired Firebase ID token.',
+        errors: { id_token: ['Invalid or expired Firebase ID token.'] }
+      });
+    }
+    resolvedEmail = resolvedEmail || fbCheck.resolvedEmail || '';
+    resolvedPhone = resolvedPhone || fbCheck.resolvedPhone || '';
+    resolvedChannel = resolvedEmail && !resolvedPhone ? 'email' : 'phone';
+  } else if (oobCode) {
+    const fbCheck = await verifyFirebaseIdentityNode({ email: resolvedEmail, oobCode });
+    if (!fbCheck.approved) {
+      return res.status(422).json({
+        message: 'Invalid or expired Firebase OOB reset code.',
+        errors: { oob_code: ['Invalid or expired Firebase OOB reset code.'] }
+      });
+    }
+    resolvedEmail = resolvedEmail || fbCheck.resolvedEmail || '';
+    resolvedChannel = 'email';
+  }
+
+  const resolvedRawNoPrefix = rawNoPrefix || String(resolvedPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  const lookupCriteria = {
+    email: resolvedEmail,
+    rawPhone,
+    phone: resolvedPhone,
+    rawNoPrefix: resolvedRawNoPrefix
+  };
+
+  if (!usingFallback) {
+    try {
+      matchedUser = await findPasswordResetUserDb(pool, lookupCriteria);
+      if (!matchedUser && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail)) {
+        return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
+      }
+      if (oobCode && !reset_token) {
+        const applied = await applyFirebaseOobPasswordResetNode(oobCode, password);
+        if (!applied.ok) {
+          return res.status(422).json({ message: applied.error || 'Invalid or expired Firebase OOB reset code.' });
+        }
+        firebaseResetDone = true;
+      }
+      const hashed = await bcrypt.hash(password, 10);
+      if (matchedUser) {
+        await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?', [hashed, matchedUser.id]);
+      } else if (resolvedEmail && !resolvedPhone) {
+        await pool.query('UPDATE users SET password = ?, updated_at = NOW() WHERE LOWER(email) = ?', [hashed, resolvedEmail]);
+      } else if (resolvedPhone) {
+        await pool.query(
+          'UPDATE users SET password = ?, updated_at = NOW() WHERE phone = ? OR phone = ? OR phone = ?',
+          [hashed, resolvedPhone, rawPhone || resolvedPhone, resolvedRawNoPrefix]
+        );
+      }
+      await clearOtpRecordsDb(pool, lookupCriteria);
+      return res.json({
+        message: 'Password reset successful. Please log in again.',
+        channel: resolvedChannel,
+        ...(firebaseResetDone ? { firebase_synced: true } : {})
+      });
+    } catch (err) {
+      usingFallback = true;
+    }
+  }
+
+  // Offline fallback execution
+  matchedUser = findPasswordResetUserFallback(lookupCriteria);
+  if (!matchedUser && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail)) {
+    return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
+  }
+  if (matchedUser) {
+    matchedUser._password = password;
+  }
+  clearOtpRecordsFallback(lookupCriteria);
+
+  return res.json({
+    message: 'Password reset successful. Please log in again.',
+    channel: resolvedChannel
+  });
 });
 
 // ==========================================

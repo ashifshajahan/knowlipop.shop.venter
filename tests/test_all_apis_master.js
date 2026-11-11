@@ -443,16 +443,16 @@ async function runMasterTestSuite() {
   assert(deleteProdRes.status === 200, 'DELETE /api/products/:id (Delete product returns 200)');
 
   // -----------------------------------------------------------------
-  // 5. PASSWORD RESET FLOW (OTP GATEWAY)
+  // 5. PASSWORD RESET FLOW (FIREBASE EMAIL & PHONE GATEWAY)
   // -----------------------------------------------------------------
-  console.log('\n--- Category 5: Password Reset Flow (OTP Gateway) ---');
+  console.log('\n--- Category 5: Password Reset Flow (Firebase Email & Phone Gateway) ---');
 
   const forgotRes = await dispatch(app, {
     method: 'POST',
     url: '/api/forgot-password',
     body: { phone: '+919633426254' }
   });
-  assert(forgotRes.status === 200 && forgotRes.body.message, 'POST /api/forgot-password returns 200 with dispatch confirmation');
+  assert(forgotRes.status === 200 && forgotRes.body.message && forgotRes.body.channel === 'phone', 'POST /api/forgot-password (phone) returns 200 with dispatch confirmation');
 
   const verifyOtpRes = await dispatch(app, {
     method: 'POST',
@@ -475,7 +475,43 @@ async function runMasterTestSuite() {
       password_confirmation: 'NewSecurePassword123!'
     }
   });
-  assert(resetPassRes.status === 200, 'POST /api/reset-password with valid token returns 200');
+  assert(resetPassRes.status === 200, 'POST /api/reset-password (phone) with valid token returns 200');
+
+  const forgotEmailRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/auth/forgot-password',
+    body: { email: emailOnlyAddr }
+  });
+  assert(forgotEmailRes.status === 200 && forgotEmailRes.body.channel === 'email' && forgotEmailRes.body.dev_otp, 'POST /api/auth/forgot-password (email) returns 200 with email channel & OTP');
+
+  const verifyEmailOtpRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/verify-otp',
+    body: {
+      identifier: emailOnlyAddr,
+      code: forgotEmailRes.body.dev_otp
+    }
+  });
+  assert(verifyEmailOtpRes.status === 200 && verifyEmailOtpRes.body.reset_token && verifyEmailOtpRes.body.channel === 'email', 'POST /api/verify-otp (email identifier) returns reset_token');
+
+  const resetEmailPassRes = await dispatch(app, {
+    method: 'POST',
+    url: '/api/reset-password',
+    body: {
+      email: emailOnlyAddr,
+      reset_token: verifyEmailOtpRes.body.reset_token,
+      new_password: 'EmailResetPass2026!',
+      confirm_password: 'EmailResetPass2026!'
+    }
+  });
+  assert(resetEmailPassRes.status === 200, 'POST /api/reset-password (email) returns 200');
+
+  const loginAfterEmailReset = await dispatch(app, {
+    method: 'POST',
+    url: '/api/login',
+    body: { email: emailOnlyAddr, password: 'EmailResetPass2026!' }
+  });
+  assert(loginAfterEmailReset.status === 200 && loginAfterEmailReset.body.token, 'POST /api/login succeeds with new password after email password reset');
 
   // -----------------------------------------------------------------
   // 6. ORDERS, MULTI-VENDOR ROUTING & SELLER ISOLATION

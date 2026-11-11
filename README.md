@@ -76,11 +76,11 @@ The platform features built-in multi-vendor marketplace routing and privacy isol
 * `PUT /api/products/{id}` — Update product (`Authorization: Bearer <token>`) — protected by seller ownership check (403 if unauthorized)
 * `DELETE /api/products/{id}` — Delete product (`Authorization: Bearer <token>`) — protected by seller ownership check (403 if unauthorized)
 
-### Password Reset Flow & Firebase Phone OTP Gateway
-* `GET /test-firebase` or `GET /firebase-otp` — Interactive Firebase Phone Auth tester UI
-* `POST /api/forgot-password` — Request 6-digit OTP via Firebase Gateway / Fast2SMS
-* `POST /api/verify-otp` — Verify OTP (supports Firebase test code `000000`, client-side Firebase `id_token`, and local OTP)
-* `POST /api/reset-password` — Set new password using reset token
+### Password Reset Flow & Firebase Email / Phone Gateway
+* `GET /test-firebase` or `GET /firebase-otp` — Interactive Firebase Email & Phone Password Reset Gateway tester UI
+* `POST /api/forgot-password` (or `/api/auth/forgot-password`) — Request password reset OTP / Firebase link using either `email` or `phone` (or single `identifier`/`email_or_phone` field) via Firebase Gateway / Fast2SMS
+* `POST /api/verify-otp` (or `/api/auth/verify-otp`) — Verify reset using `code`/`otp`, Firebase `id_token`, or Firebase email `oob_code` for either `email` or `phone` and receive `reset_token`
+* `POST /api/reset-password` (or `/api/auth/reset-password`) — Set new password using `email` or `phone` with verified `reset_token` (or Firebase `oob_code` / `id_token`)
 
 ### Orders, Multi-Vendor Routing & Invoices
 * `GET /test-buyer` or `GET /buyer` — Interactive Buyer Checkout, Quantity Increments, Order Details & Order Editing Hub
