@@ -50,14 +50,16 @@ if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
     exit;
 }
 
-// Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /images/, /products/, double-URLs)
+// Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /storage/app/public/, /public/storage/, /images/, /products/, double-URLs)
 $imgMatch = [];
-$hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp))/i', $requestUri, $imgMatch);
+$hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $requestUri, $imgMatch);
 $isImgPrefix = str_starts_with($requestUri, '/uploads/') || str_starts_with($requestUri, '/api/images/') || 
                str_starts_with($requestUri, '/api/products/images/') || str_starts_with($requestUri, '/api/uploads/') || 
                str_starts_with($requestUri, '/public/uploads/') || str_starts_with($requestUri, '/storage/') || 
+               str_starts_with($requestUri, '/public/storage/') ||
                str_starts_with($requestUri, '/images/') || str_starts_with($requestUri, '/products/') ||
-               str_contains($requestUri, '/uploads/products/') || str_contains($requestUri, '/uploads/avatars/');
+               str_contains($requestUri, '/uploads/products/') || str_contains($requestUri, '/uploads/avatars/') ||
+               str_contains($requestUri, '/storage/app/public/products/') || str_contains($requestUri, '/public/storage/products/');
 
 if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefix)) {
     header('Access-Control-Allow-Origin: *');
@@ -78,11 +80,14 @@ if (in_array($method, ['GET', 'HEAD', 'OPTIONS']) && ($hasImgFile || $isImgPrefi
         if ($filePath && file_exists($filePath) && is_file($filePath)) {
             $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
             $mimes = [
-                'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+                'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'jfif' => 'image/jpeg',
                 'png' => 'image/png', 'webp' => 'image/webp',
-                'gif' => 'image/gif', 'svg' => 'image/svg+xml'
+                'gif' => 'image/gif', 'bmp' => 'image/bmp',
+                'tif' => 'image/tiff', 'tiff' => 'image/tiff',
+                'avif' => 'image/avif', 'heic' => 'image/heic', 'heif' => 'image/heif',
+                'ico' => 'image/x-icon', 'svg' => 'image/svg+xml'
             ];
-            header('Content-Type: ' . ($mimes[$ext] ?? 'image/jpeg'));
+            header('Content-Type: ' . ($mimes[$ext] ?? 'image/webp'));
             header('Cache-Control: public, max-age=31536000, immutable');
             readfile($filePath);
             exit;
@@ -238,6 +243,7 @@ require_once __DIR__ . '/api/orders.php';
 require_once __DIR__ . '/api/invoice.php';
 require_once __DIR__ . '/api/gst.php';
 require_once __DIR__ . '/api/seller_deletion.php';
+require_once __DIR__ . '/helpers/mailer.php';
 
 // Health Check
 if ($requestUri === '/api/health') {
@@ -958,6 +964,128 @@ if (preg_match('#^/api/admin/seller-deletions/(\d+)/final-delete$#', $requestUri
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
+}
+
+// ==========================================
+// Admin Hostinger Business Email (SMTP) Routes
+// ==========================================
+
+if ($requestUri === '/api/admin/email/config' || $requestUri === '/api/admin/email/status') {
+    if (session_status() === PHP_SESSION_NONE) {
+        @session_start();
+    }
+    $adminActorId = null;
+    if (!empty($_SESSION['admin_logged_in']) && !empty($_SESSION['admin_id'])) {
+        $adminActorId = (int) $_SESSION['admin_id'];
+    } else {
+        $u = authenticateUser($pdo);
+        if (strtolower((string) ($u['role'] ?? '')) !== 'admin') {
+            errorResponse('Unauthorized. Admin access required.', [], 403);
+        }
+        $adminActorId = (int) ($u['id'] ?? 1);
+    }
+
+    if ($method === 'GET') {
+        jsonResponse([
+            'status' => 'success',
+            'email' => getPublicMailConfigSummaryPhp($pdo),
+        ]);
+    } elseif ($method === 'POST' || $method === 'PUT') {
+        $input = getJsonInput();
+        $saved = saveMailConfigPhp($pdo, $input, $adminActorId);
+        jsonResponse([
+            'status' => 'success',
+            'message' => !empty($saved['configured'])
+                ? 'Hostinger Business Email SMTP settings saved successfully.'
+                : 'Mail settings saved (enter mailbox username & password to enable SMTP delivery).',
+            'email' => $saved,
+        ]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/admin/email/test') {
+    if ($method !== 'POST') {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+    if (session_status() === PHP_SESSION_NONE) {
+        @session_start();
+    }
+    if (empty($_SESSION['admin_logged_in'])) {
+        $u = authenticateUser($pdo);
+        if (strtolower((string) ($u['role'] ?? '')) !== 'admin') {
+            errorResponse('Unauthorized. Admin access required.', [], 403);
+        }
+    }
+    $input = getJsonInput();
+    $to = trim((string) ($input['to'] ?? $input['email'] ?? ''));
+    if (!isRealDeliverableEmailPhp($to)) {
+        errorResponse('Please provide a valid recipient email address.', ['to' => ['Valid recipient email is required.']], 422);
+    }
+    $override = [];
+    foreach (['host', 'port', 'encryption', 'username', 'password', 'from_address', 'from_name', 'reply_to'] as $k) {
+        if (isset($input[$k]) && $input[$k] !== '') {
+            $override[$k] = $input[$k];
+        }
+    }
+    $res = sendTestMailPhp($pdo, $to, $override);
+    if (!empty($res['sent'])) {
+        jsonResponse([
+            'status' => 'success',
+            'message' => "Test email dispatched to {$to} via Hostinger Mail SMTP.",
+            'result' => $res,
+        ]);
+    }
+    errorResponse((string) ($res['error'] ?? $res['reason'] ?? 'Failed to send test email via Hostinger SMTP.'), ['result' => $res], !empty($res['skipped']) ? 422 : 502);
+}
+
+if ($requestUri === '/api/admin/email/send') {
+    if ($method !== 'POST') {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+    if (session_status() === PHP_SESSION_NONE) {
+        @session_start();
+    }
+    if (empty($_SESSION['admin_logged_in'])) {
+        $u = authenticateUser($pdo);
+        if (strtolower((string) ($u['role'] ?? '')) !== 'admin') {
+            errorResponse('Unauthorized. Admin access required.', [], 403);
+        }
+    }
+    $input = getJsonInput();
+    $to = trim((string) ($input['to'] ?? $input['email'] ?? ''));
+    $subject = trim((string) ($input['subject'] ?? ''));
+    $messageBody = trim((string) ($input['message'] ?? $input['text'] ?? ''));
+    $htmlBody = (string) ($input['html'] ?? '');
+    if (!isRealDeliverableEmailPhp($to)) {
+        errorResponse('Please provide a valid recipient email address.', ['to' => ['Valid recipient email is required.']], 422);
+    }
+    if ($subject === '') {
+        errorResponse('Subject is required.', ['subject' => ['Subject is required.']], 422);
+    }
+    if ($messageBody === '' && trim($htmlBody) === '') {
+        errorResponse('Email message body is required.', ['message' => ['Email body is required.']], 422);
+    }
+    $appName = mailerReadEnvPhp('APP_NAME', 'Knowlipop Vendor');
+    $finalHtml = trim($htmlBody) !== ''
+        ? $htmlBody
+        : wrapEmailLayoutPhp($appName, 'ADMIN MESSAGE', $subject, '<p style="margin:0;white-space:pre-line;">' . htmlspecialchars($messageBody, ENT_QUOTES, 'UTF-8') . '</p>');
+    $res = sendHostingerEmailPhp([
+        'pdo' => $pdo,
+        'to' => $to,
+        'subject' => $subject,
+        'html' => $finalHtml,
+        'text' => $messageBody ?: strip_tags($finalHtml),
+    ]);
+    if (!empty($res['sent'])) {
+        jsonResponse([
+            'status' => 'success',
+            'message' => "Email sent to {$to} via Hostinger Mail SMTP.",
+            'result' => $res,
+        ]);
+    }
+    errorResponse((string) ($res['error'] ?? $res['reason'] ?? 'Failed to send email via Hostinger SMTP.'), ['result' => $res], !empty($res['skipped']) ? 422 : 502);
 }
 
 // Buyer Orders & Order Items CRUD (supports /api/orders and /api/order)

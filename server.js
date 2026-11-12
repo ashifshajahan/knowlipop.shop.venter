@@ -21,6 +21,19 @@ const {
   deletionListRequestsNode
 } = require('./helpers/seller_deletion');
 const { createSellerDeletionRouter } = require('./routes/seller_deletion_routes');
+const {
+  escapeHtml: mailerEscapeHtml,
+  wrapEmailLayout: mailerWrapLayout,
+  isRealDeliverableEmailNode,
+  getEffectiveMailConfigNode,
+  getPublicMailConfigSummaryNode,
+  saveMailConfigNode,
+  sendHostingerEmailNode,
+  sendPasswordResetOtpMailNode,
+  sendWelcomeSellerMailNode,
+  sendGstStatusMailNode,
+  sendTestMailNode
+} = require('./helpers/mailer');
 
 // Attempt loading .env from candidate paths
 const candidateEnvPaths = [
@@ -181,8 +194,14 @@ function resolveUploadedMediaPath(fileName, isAvatar = false) {
     path.join(altDir, safeName),
     isAvatar ? path.join(localAvatarsDir, safeName) : path.join(localProductsDir, safeName),
     isAvatar ? path.join(localProductsDir, safeName) : path.join(localAvatarsDir, safeName),
+    path.resolve(__dirname, 'storage', 'app', 'public', primarySub, safeName),
+    path.resolve(__dirname, 'storage', 'app', 'public', altSub, safeName),
+    path.resolve(__dirname, 'public', 'storage', primarySub, safeName),
+    path.resolve(__dirname, 'public', 'storage', altSub, safeName),
     path.resolve(process.cwd(), 'uploads', primarySub, safeName),
     path.resolve(process.cwd(), 'uploads', altSub, safeName),
+    path.resolve(process.cwd(), 'storage', 'app', 'public', primarySub, safeName),
+    path.resolve(process.cwd(), 'storage', 'app', 'public', altSub, safeName),
     `/home/u999617803/domains/knowlipop.shop/venter_uploads/${primarySub}/${safeName}`,
     `/home/u999617803/domains/knowlipop.shop/venter_uploads/${altSub}/${safeName}`,
     `/home/u999617803/venter_uploads/${primarySub}/${safeName}`,
@@ -306,11 +325,14 @@ app.use((req, res, next) => {
     urlPath.startsWith('/api/products/images/') ||
     urlPath.startsWith('/api/uploads/') ||
     urlPath.startsWith('/storage/') ||
+    urlPath.startsWith('/public/storage/') ||
     urlPath.startsWith('/images/') ||
     urlPath.startsWith('/products/') ||
     urlPath.startsWith('/public/uploads/') ||
     urlPath.includes('/uploads/products/') ||
-    urlPath.includes('/uploads/avatars/')
+    urlPath.includes('/uploads/avatars/') ||
+    urlPath.includes('/storage/app/public/products/') ||
+    urlPath.includes('/public/storage/products/')
   );
 
   if (!isImageRoute || !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
@@ -393,27 +415,17 @@ const mediaStaticOpts = {
   }
 };
 app.use(
-  ['/uploads', '/public/uploads', '/storage/uploads', '/storage'],
+  ['/uploads', '/public/uploads', '/storage/uploads', '/storage', '/storage/app/public', '/public/storage'],
   mediaStaticCors,
   express.static(path.dirname(uploadDir), mediaStaticOpts),
-  express.static(path.resolve(__dirname, 'uploads'), mediaStaticOpts)
+  express.static(path.resolve(__dirname, 'uploads'), mediaStaticOpts),
+  express.static(path.resolve(__dirname, 'storage', 'app', 'public'), mediaStaticOpts),
+  express.static(path.resolve(__dirname, 'public', 'storage'), mediaStaticOpts)
 );
 
 // Product image conversion and magic-byte validation helpers are loaded from ./helpers/webp_converter
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '') || '.tmp';
-    const tempName = `tmp_upload_${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
-    cb(null, tempName);
-  }
-});
+// Use in-memory upload buffering so original non-WebP files never touch persistent product storage
+const storage = multer.memoryStorage();
 
 const imageFileFilter = (req, file, cb) => {
   const ext = path.extname(file.originalname || '').toLowerCase();
@@ -482,31 +494,41 @@ function handleMulterUpload(req, res, next) {
 
       for (let i = 0; i < fileList.length; i++) {
         const f = fileList[i];
-        if (!f || !f.path) continue;
-        const tempPath = f.path;
+        if (!f) continue;
         let rawBuf = null;
-        try {
-          rawBuf = fs.readFileSync(tempPath);
-        } finally {
-          try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+        if (Buffer.isBuffer(f.buffer)) {
+          rawBuf = f.buffer;
+        } else if (f.path) {
+          const tempPath = f.path;
+          try {
+            rawBuf = fs.readFileSync(tempPath);
+          } finally {
+            try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+          }
         }
+        if (!rawBuf) continue;
 
-        if ((!rawBuf || rawBuf.length === 0) && !String(f.originalname || '').trim()) {
+        if (rawBuf.length === 0 && !String(f.originalname || '').trim()) {
           continue;
         }
 
         const hash = crypto.createHash('sha256').update(rawBuf).digest('hex');
         if (seenHashes.has(hash)) {
           // Duplicate file in same request: skip duplicate
+          f.buffer = null;
           continue;
         }
         seenHashes.add(hash);
 
         try {
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+          }
           const webpBuf = await convertImageBufferToWebp(rawBuf, {
             originalName: f.originalname,
             mimeType: f.mimetype
           });
+          f.buffer = null;
           const webpFilename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.webp`;
           const webpPath = path.join(uploadDir, webpFilename);
           fs.writeFileSync(webpPath, webpBuf);
@@ -515,10 +537,12 @@ function handleMulterUpload(req, res, next) {
 
           f.filename = webpFilename;
           f.path = webpPath;
+          f._createdWebpPath = webpPath;
           f.mimetype = 'image/webp';
           f.size = webpBuf.length;
           uniqueFiles.push(f);
         } catch (convErr) {
+          f.buffer = null;
           cleanupRemainingTempFiles(i + 1);
           return res.status(422).json({
             message: 'Invalid or unsupported image file.',
@@ -596,6 +620,7 @@ async function saveBase64Image(dataString, req = null) {
       url: `${baseUrl}/uploads/products/${filename}`,
       file_name: filename,
       relative_path: `uploads/products/${filename}`,
+      local_path: fullPath,
       file_size: webpBuffer.length,
       mime_type: 'image/webp'
     };
@@ -627,20 +652,99 @@ function dedupeImagesByFilename(list) {
   return result;
 }
 
+function isAllowedProductImageUrl(urlStr, req = null) {
+  try {
+    const parsed = new URL(urlStr);
+    const host = (parsed.hostname || '').toLowerCase();
+    if (!host) return false;
+    const allowedHosts = new Set(['knowlipop.shop', 'www.knowlipop.shop', 'localhost', '127.0.0.1', '::1', '[::1]', '10.0.2.2']);
+    if (process.env.APP_URL) {
+      try {
+        const appHost = new URL(process.env.APP_URL).hostname.toLowerCase();
+        if (appHost) allowedHosts.add(appHost);
+      } catch (e) {}
+    }
+    if (req && typeof req.get === 'function') {
+      const reqHostHeader = req.get('host');
+      if (reqHostHeader) {
+        try {
+          const reqHostname = new URL(`http://${reqHostHeader}`).hostname.toLowerCase();
+          if (reqHostname) allowedHosts.add(reqHostname);
+        } catch (e) {}
+      }
+    }
+    if (allowedHosts.has(host) || host.endsWith('.knowlipop.shop')) {
+      return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+function cleanupCreatedUploadFiles(req, imgResult = null) {
+  const seenPaths = new Set();
+  const tryUnlink = (p) => {
+    if (!p || typeof p !== 'string') return;
+    const resolved = path.resolve(p);
+    if (seenPaths.has(resolved)) return;
+    seenPaths.add(resolved);
+    try {
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+        fs.unlinkSync(resolved);
+      }
+    } catch (e) {}
+  };
+
+  if (req && req.files) {
+    const list = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+    for (const f of list) {
+      if (f) {
+        if (f._createdWebpPath) tryUnlink(f._createdWebpPath);
+        if (f.path) tryUnlink(f.path);
+      }
+    }
+  }
+  if (req && req.file) {
+    if (req.file._createdWebpPath) tryUnlink(req.file._createdWebpPath);
+    if (req.file.path) tryUnlink(req.file.path);
+  }
+  if (imgResult && Array.isArray(imgResult.createdPaths)) {
+    for (const p of imgResult.createdPaths) {
+      tryUnlink(p);
+    }
+  }
+  if (imgResult && Array.isArray(imgResult.filesInfo)) {
+    for (const fi of imgResult.filesInfo) {
+      if (fi && fi.local_path) tryUnlink(fi.local_path);
+    }
+  }
+}
+
 async function resolveProductImages(req) {
   const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
   const collected = [];
   const filesInfo = [];
+  const createdPaths = [];
+  const uploadErrors = [];
   const seenKeys = new Set();
   const seenBase64Payloads = new Map();
 
   function addCollected(url, info = null) {
     if (!url || typeof url !== 'string') return;
     const key = getImageBasename(url);
-    if (!key || seenKeys.has(key)) return;
+    if (!key || seenKeys.has(key)) {
+      if (info && info.local_path && fs.existsSync(info.local_path)) {
+        try { fs.unlinkSync(info.local_path); } catch (e) {}
+      }
+      return;
+    }
     seenKeys.add(key);
     collected.push(url);
-    if (info) filesInfo.push(info);
+    if (info) {
+      if (info.local_path) createdPaths.push(info.local_path);
+      filesInfo.push(info);
+    }
   }
 
   // 1. Multipart uploaded files from multer (req.files array, object, or single req.file)
@@ -653,6 +757,7 @@ async function resolveProductImages(req) {
           file_name: f.filename,
           relative_path: `uploads/products/${f.filename}`,
           image_url: fullUrl,
+          local_path: f._createdWebpPath || f.path || path.join(uploadDir, f.filename),
           file_size: f.size || 0,
           mime_type: f.mimetype || 'image/webp'
         });
@@ -664,6 +769,7 @@ async function resolveProductImages(req) {
       file_name: req.file.filename,
       relative_path: `uploads/products/${req.file.filename}`,
       image_url: fullUrl,
+      local_path: req.file._createdWebpPath || req.file.path || path.join(uploadDir, req.file.filename),
       file_size: req.file.size || 0,
       mime_type: req.file.mimetype || 'image/webp'
     });
@@ -784,9 +890,12 @@ async function resolveProductImages(req) {
             file_name: saved.file_name,
             relative_path: saved.relative_path,
             image_url: saved.url,
+            local_path: saved.local_path,
             file_size: saved.file_size,
             mime_type: saved.mime_type || 'image/webp'
           });
+        } else {
+          uploadErrors.push('Invalid or unsupported base64 image payload (could not convert to .webp).');
         }
         return;
       }
@@ -796,24 +905,45 @@ async function resolveProductImages(req) {
         return;
       }
 
-      // Reject external demo/sample images (e.g. Unsplash) and placeholder images
-      if (trimmed.toLowerCase().includes('unsplash.com') || trimmed.toLowerCase().includes('placeholder')) {
+      // Reject external third-party / demo / Unsplash URLs; keep placeholder ignored for legacy safety
+      if (trimmed.toLowerCase().includes('placeholder')) {
+        return;
+      }
+      if (trimmed.toLowerCase().includes('unsplash.com')) {
+        uploadErrors.push('External third-party image URLs are not allowed. Please upload the image file or provide base64 image data.');
         return;
       }
 
-      // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or device path)
+      const isHttpUrl = trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//');
+      if (isHttpUrl) {
+        const fullUrl = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
+        if (!isAllowedProductImageUrl(fullUrl, req)) {
+          uploadErrors.push('External third-party image URLs are not allowed. Please upload the image file or provide base64 image data.');
+          return;
+        }
+      }
+
+      // Check if string contains a product image filename anywhere (e.g. mangled/double URLs or relative path)
       const fnMatch = trimmed.match(/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg))/i);
       if (fnMatch) {
         addCollected(`${baseUrl}/uploads/products/${fnMatch[1]}`);
         return;
       }
 
-      // Standard HTTP/HTTPS or relative upload URL or filename
-      if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('//')) {
+      // Own-server HTTP/HTTPS or relative upload URL or filename
+      if (isHttpUrl) {
         const fullUrl = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
         addCollected(fullUrl);
-      } else if (trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') || trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') || trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')) {
-        const cleanPath = trimmed.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
+      } else if (
+        trimmed.startsWith('/uploads/') || trimmed.startsWith('uploads/') ||
+        trimmed.startsWith('/storage/app/public/') || trimmed.startsWith('storage/app/public/') ||
+        trimmed.startsWith('/public/storage/') || trimmed.startsWith('public/storage/') ||
+        trimmed.startsWith('/storage/') || trimmed.startsWith('storage/') ||
+        trimmed.startsWith('/public/uploads/') || trimmed.startsWith('public/uploads/')
+      ) {
+        const cleanPath = trimmed
+          .replace(/^\/?(storage\/app\/public\/|public\/storage\/|storage\/|public\/uploads\/)/, 'uploads/')
+          .replace(/^\//, '');
         addCollected(`${baseUrl}/${cleanPath}`);
       } else if (/^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)$/i.test(trimmed)) {
         addCollected(`${baseUrl}/uploads/products/${trimmed}`);
@@ -829,10 +959,16 @@ async function resolveProductImages(req) {
     }
   }
 
-  // Check all other body keys for image candidates
+  // Check all other body keys for image candidates (skipping control & removal keys)
   for (const [k, v] of Object.entries(body)) {
     if (!v || explicitGalleryKeys.includes(k)) continue;
     const lowerKey = k.toLowerCase();
+    if (
+      /^(?:remove|delete|deleted|clear|old|prev|previous|retain|keep)_/i.test(lowerKey) ||
+      ['replace_images', 'replace_all', 'image_index', 'index', 'existing_images_control', 'image_action', 'mode', 'action'].includes(lowerKey)
+    ) {
+      continue;
+    }
     if (
       lowerKey.includes('image') ||
       lowerKey.includes('img') ||
@@ -859,10 +995,20 @@ async function resolveProductImages(req) {
   let uniqueImages = dedupeImagesByFilename(collected);
   const hasImages = uniqueImages.length > 0;
 
-  // Strictly enforce seller multiple URL limit of 4 images
+  // Strictly enforce seller multiple URL limit of 4 images and delete any newly created files beyond 4 so none remain orphaned
   uniqueImages = uniqueImages.slice(0, 4);
+  const keptUrlSet = new Set(uniqueImages);
+  const keptCreatedPaths = new Set();
+  const filteredFilesInfo = [];
+  for (const fi of filesInfo) {
+    if (fi && keptUrlSet.has(fi.image_url)) {
+      filteredFilesInfo.push(fi);
+      if (fi.local_path) keptCreatedPaths.add(path.resolve(fi.local_path));
+    } else if (fi && fi.local_path && fs.existsSync(fi.local_path)) {
+      try { fs.unlinkSync(fi.local_path); } catch (e) {}
+    }
+  }
   const primaryImageUrl = uniqueImages.length > 0 ? uniqueImages[0] : null;
-  const filteredFilesInfo = filesInfo.filter(fi => fi && uniqueImages.includes(fi.image_url));
 
   return {
     hasImages,
@@ -871,7 +1017,9 @@ async function resolveProductImages(req) {
     images: uniqueImages,
     image_urls: uniqueImages,
     imagesJson: uniqueImages.length > 0 ? JSON.stringify(uniqueImages) : null,
-    filesInfo: filteredFilesInfo,
+    filesInfo: filteredFilesInfo.map(({ local_path, ...pub }) => pub),
+    createdPaths: Array.from(keptCreatedPaths),
+    uploadErrors,
     limit: 4,
     count: uniqueImages.length
   };
@@ -914,8 +1062,8 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
   if (!pPool || !sellerId || !Array.isArray(images) || images.length === 0) return;
   try {
     for (const imgUrl of images) {
-      const fileName = path.basename(imgUrl.split('?')[0]);
-      const relativePath = imgUrl.includes('/uploads/products/')
+      const fileName = path.basename(imgUrl.split('?')[0].split('#')[0]);
+      const relativePath = (imgUrl.includes('/uploads/products/') || /^prod_/i.test(fileName))
         ? `uploads/products/${fileName}`
         : (imgUrl.startsWith('http') ? imgUrl : `uploads/products/${fileName}`);
 
@@ -944,14 +1092,25 @@ async function syncProductImagesRecord(pPool, sellerId, productId, images, files
         }
       }
 
-      // Check if image record already exists to avoid duplicate image records
-      const [existing] = await pPool.query(
-        'SELECT id FROM product_images WHERE seller_id = ? AND (image_url = ? OR file_name = ?) LIMIT 1',
-        [sellerId, imgUrl, fileName]
-      );
+      // Check if image record already exists for THIS product or is an unattached upload (never steal another product's row)
+      let existing = [];
+      if (productId) {
+        const [ownedRows] = await pPool.query(
+          'SELECT id FROM product_images WHERE seller_id = ? AND product_id = ? AND (image_url = ? OR file_name = ?) LIMIT 1',
+          [sellerId, productId, imgUrl, fileName]
+        );
+        existing = ownedRows;
+      }
+      if (existing.length === 0) {
+        const [unattachedRows] = await pPool.query(
+          'SELECT id FROM product_images WHERE seller_id = ? AND product_id IS NULL AND (image_url = ? OR file_name = ?) LIMIT 1',
+          [sellerId, imgUrl, fileName]
+        );
+        existing = unattachedRows;
+      }
       if (existing.length > 0) {
         if (productId) {
-          await pPool.query('UPDATE product_images SET product_id = ?, updated_at = NOW() WHERE id = ?', [productId, existing[0].id]);
+          await pPool.query('UPDATE product_images SET product_id = ?, image_url = ?, updated_at = NOW() WHERE id = ?', [productId, imgUrl, existing[0].id]);
         }
       } else {
         await pPool.query(
@@ -1033,7 +1192,9 @@ async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null
     // Safe to delete physical file
     const deleteTargets = [
       path.join(uploadDir, safeName),
-      path.join(__dirname, 'uploads', 'products', safeName)
+      path.join(__dirname, 'uploads', 'products', safeName),
+      path.join(__dirname, 'storage', 'app', 'public', 'products', safeName),
+      path.join(__dirname, 'public', 'storage', 'products', safeName)
     ];
     let deleted = false;
     for (const target of deleteTargets) {
@@ -2408,6 +2569,12 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
         { expiresIn: '30d' }
       );
 
+      if (publicEmail) {
+        setImmediate(() => {
+          sendWelcomeSellerMailNode(pool, { to: publicEmail, sellerName: seller_name, phone: dbPhone }).catch(() => {});
+        });
+      }
+
       return res.status(201).json({
         message: 'Seller registration successful.',
         user: safeSeller({
@@ -3481,13 +3648,40 @@ async function sendPasswordResetEmailNode(email, otp, options = {}) {
     };
   }
 
+  let smtpError = null;
+  const activePool = options.pool || (dbAvailable !== false ? pool : null);
+  const mailCfg = await getEffectiveMailConfigNode(activePool);
+  if (options.authMode !== 'email_link' && mailCfg.configured) {
+    const smtpRes = await sendPasswordResetOtpMailNode(activePool, {
+      to: email,
+      sellerName: options.sellerName || 'Seller',
+      otp
+    });
+    if (smtpRes && smtpRes.sent) {
+      return {
+        sent: true,
+        provider: 'hostinger_smtp',
+        channel: 'email',
+        status: 'dispatched',
+        flow: 'hostinger_smtp_otp',
+        message_id: smtpRes.message_id || null,
+        note: '6-digit verification OTP email sent via Hostinger Mail SMTP.'
+      };
+    }
+    smtpError = (smtpRes && smtpRes.error) || 'Hostinger SMTP send failed.';
+    console.warn('[Hostinger SMTP Password Reset Error]', smtpError);
+  }
+
   const firebaseApiKey = process.env.FIREBASE_API_KEY;
   if (!firebaseApiKey) {
     return {
       sent: false,
-      provider: 'mock',
+      provider: smtpError ? 'hostinger_smtp' : 'mock',
       channel: 'email',
-      reason: 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+      ...(smtpError ? { smtp_error: smtpError } : {}),
+      reason: smtpError
+        ? `Hostinger Mail SMTP could not send email (${smtpError}) and FIREBASE_API_KEY is not set. dev_otp returned in payload for testing.`
+        : 'Hostinger SMTP and Firebase credentials are not set in .env. dev_otp returned in payload for testing.'
     };
   }
 
@@ -3884,8 +4078,9 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
       });
     }
 
+    const sellerDisplayName = matchedUser.seller_name || matchedUser.name || 'Seller';
     gatewayResult = activeChannel === 'email'
-      ? await sendPasswordResetEmailNode(targetEmail, otp, { continueUrl, authMode })
+      ? await sendPasswordResetEmailNode(targetEmail, otp, { continueUrl, authMode, pool: !usingFallback ? pool : null, sellerName: sellerDisplayName })
       : await sendOtpSmsNode(targetPhone, otp, recaptchaToken);
   }
 
@@ -4409,8 +4604,14 @@ function formatProductRecord(p, options = {}) {
       return t;
     }
     if (t.startsWith('data:image/')) return t;
-    if (t.startsWith('/uploads/') || t.startsWith('uploads/') || t.startsWith('/storage/') || t.startsWith('storage/') || t.startsWith('/public/uploads/') || t.startsWith('public/uploads/')) {
-      const clean = t.replace(/^\/?(storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
+    if (
+      t.startsWith('/uploads/') || t.startsWith('uploads/') ||
+      t.startsWith('/storage/app/public/') || t.startsWith('storage/app/public/') ||
+      t.startsWith('/public/storage/') || t.startsWith('public/storage/') ||
+      t.startsWith('/storage/') || t.startsWith('storage/') ||
+      t.startsWith('/public/uploads/') || t.startsWith('public/uploads/')
+    ) {
+      const clean = t.replace(/^\/?(storage\/app\/public\/|public\/storage\/|storage\/|public\/uploads\/)/, 'uploads/').replace(/^\//, '');
       return `${baseUrl}/${clean}`;
     }
     if (/\.(jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)(\?.*)?$/i.test(t)) {
@@ -5239,6 +5440,7 @@ async function performCategoryMutationNode(p, action, body = {}, allowUnprefixed
   return { ok: false, statusCode: 422, errorBody: { message: 'Unsupported category_action. Use create, update, or delete.' } };
 }
 
+let fallbackProductImages = [];
 let fallbackProducts = [
   { id: 1, seller_id: 1, seller_name: 'Verified Seller', name: 'Smart Wireless Headset Pro', description: 'Active noise cancelling over-ear headphones with 40-hour battery life.', price: '2999.00', seller_price: '2999.00', mrp: '3999.00', discount_percent: 25, sku: 'SKU-0001', category: 'Electronics', brand: 'SoundMaster', rating: 4.8, ratings_count: 248, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 50, images: [], is_active: true },
   { id: 2, seller_id: 1, seller_name: 'Verified Seller', name: 'Ultra HD 4K Smart Watch', description: 'AMOLED display smartwatch with heart rate monitor, GPS tracking, and 7-day battery life.', price: '4499.00', seller_price: '4499.00', mrp: '5999.00', discount_percent: 25, sku: 'SKU-0002', category: 'Wearables', brand: 'Chronos', rating: 4.7, ratings_count: 182, delivery_charge: '0.00', delivery_text: 'FREE Delivery', stock: 35, images: [], is_active: true },
@@ -5533,7 +5735,15 @@ app.get([
 // Dedicated Image Upload Endpoint (Supports single or multiple images, base64, multipart)
 app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActiveSellerForMutation, upload.any(), async (req, res) => {
   const imgResult = await resolveProductImages(req);
+  if (imgResult.uploadErrors && imgResult.uploadErrors.length > 0) {
+    cleanupCreatedUploadFiles(req, imgResult);
+    return res.status(422).json({
+      message: imgResult.uploadErrors[0],
+      errors: { image: imgResult.uploadErrors }
+    });
+  }
   if (!imgResult.hasImages || imgResult.images.length === 0) {
+    cleanupCreatedUploadFiles(req, imgResult);
     return res.status(422).json({
       message: 'No image uploaded or invalid format.',
       errors: { image: ['Please upload image file(s) (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or provide image data/URLs.'] }
@@ -5552,13 +5762,15 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
         await ensureProductPriceColumns(pool);
         const [pRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [targetProductId]);
         if (pRows.length === 0) {
+          cleanupCreatedUploadFiles(req, imgResult);
           return res.status(404).json({ message: 'Target product not found.' });
         }
         if (req.user.role !== 'admin' && Number(pRows[0].seller_id) !== Number(sellerId)) {
+          cleanupCreatedUploadFiles(req, imgResult);
           return res.status(403).json({ message: 'Access denied. You do not own this product.' });
         }
 
-        const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
+        const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.replace === '1' || req.body.mode === 'replace';
         let existingImgs = [];
         try {
           existingImgs = parseImagesJson(pRows[0].images || pRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
@@ -5566,6 +5778,7 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
 
         let combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
         if (combinedImgs.length > 4) {
+          cleanupCreatedUploadFiles(req, imgResult);
           return res.status(422).json({
             message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
             current_count: existingImgs.length,
@@ -5581,6 +5794,20 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
           'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
           [primaryUrl, imagesJson, targetProductId]
         );
+
+        // Clean up replaced old images when replace=true / mode=replace
+        if (isReplace && existingImgs.length > 0) {
+          const keptBasenames = new Set(combinedImgs.map(u => getImageBasename(u)).filter(Boolean));
+          for (const oldU of existingImgs) {
+            const oldBn = getImageBasename(oldU);
+            if (oldBn && !keptBasenames.has(oldBn)) {
+              try {
+                await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [targetProductId, oldBn]);
+              } catch (e) {}
+              await safeDeleteLocalImageFile(pool, oldBn, targetProductId);
+            }
+          }
+        }
 
         // Sync permanent records in product_images table in MySQL
         await syncProductImagesRecord(pool, Number(pRows[0].seller_id || sellerId), targetProductId, combinedImgs, imgResult.filesInfo);
@@ -5603,16 +5830,19 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
     if (!handledDb) {
       const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === Number(targetProductId));
       if (fbIdx === -1) {
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(404).json({ message: 'Target product not found.' });
       }
       if (req.user.role !== 'admin' && Number(fallbackProducts[fbIdx].seller_id) !== Number(sellerId)) {
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(403).json({ message: 'Access denied. You do not own this product.' });
       }
-      const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.mode === 'replace';
+      const isReplace = req.body.replace === true || req.body.replace === 'true' || req.body.replace === '1' || req.body.mode === 'replace';
       const existingImgs = parseImagesJson(fallbackProducts[fbIdx].images || fallbackProducts[fbIdx].image_url)
         .filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
       const combinedImgs = isReplace ? dedupeImagesByFilename(imgResult.images) : dedupeImagesByFilename([...existingImgs, ...imgResult.images]);
       if (combinedImgs.length > 4) {
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({
           message: `Maximum 4 images allowed per product. Currently has ${existingImgs.length}, tried adding ${imgResult.images.length}.`,
           current_count: existingImgs.length,
@@ -5622,16 +5852,34 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
       }
       fallbackProducts[fbIdx].images = combinedImgs;
       fallbackProducts[fbIdx].image_url = combinedImgs[0] || null;
+      if (isReplace && existingImgs.length > 0) {
+        const keptBasenames = new Set(combinedImgs.map(u => getImageBasename(u)).filter(Boolean));
+        for (const oldU of existingImgs) {
+          const oldBn = getImageBasename(oldU);
+          if (oldBn && !keptBasenames.has(oldBn)) {
+            await safeDeleteLocalImageFile(pool, oldBn, targetProductId);
+          }
+        }
+      }
       attachedProduct = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
     }
-  } else if (dbActive) {
-    try {
-      const targetOwnerId = (req.user.role === 'admin' && req.body.seller_id && /^\d+$/.test(String(req.body.seller_id)))
-        ? parseInt(req.body.seller_id, 10)
-        : sellerId;
-      await syncProductImagesRecord(pool, targetOwnerId, null, imgResult.images, imgResult.filesInfo);
-    } catch (dbErr) {
-      console.error('[Upload Sync Error]:', dbErr.message);
+  } else {
+    const targetOwnerId = (req.user.role === 'admin' && req.body.seller_id && /^\d+$/.test(String(req.body.seller_id)))
+      ? parseInt(req.body.seller_id, 10)
+      : sellerId;
+    if (dbActive) {
+      try {
+        await syncProductImagesRecord(pool, targetOwnerId, null, imgResult.images, imgResult.filesInfo);
+      } catch (dbErr) {
+        console.error('[Upload Sync Error]:', dbErr.message);
+      }
+    } else {
+      for (const imgUrl of imgResult.images) {
+        const fn = path.basename(String(imgUrl).split('?')[0].split('#')[0]);
+        if (fn && !fallbackProductImages.some(pi => pi.file_name === fn)) {
+          fallbackProductImages.push({ seller_id: targetOwnerId, file_name: fn, image_url: imgUrl });
+        }
+      }
     }
   }
 
@@ -5672,64 +5920,72 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
 // Dedicated Image Retrieval Endpoint for product images
 app.get('/api/products/:id/images', async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
-    if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+  const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
+  const normalizeImgUrl = (u) => {
+    if (!u || typeof u !== 'string' || u.includes('placeholder') || u.includes('unsplash.com')) return null;
+    const fn = path.basename(u.split('?')[0].split('#')[0]);
+    if (
+      u.includes('/uploads/products/') ||
+      u.includes('/storage/products/') ||
+      u.includes('/storage/app/public/products/') ||
+      u.includes('/public/storage/products/') ||
+      /^prod_/i.test(fn)
+    ) {
+      return `${baseUrl}/uploads/products/${fn}`;
+    }
+    return u;
+  };
 
-    const p = rows[0];
-    const baseUrl = getAppBaseUrl(req).replace(/\/$/, '');
-    const normalizeImgUrl = (u) => {
-      if (!u || typeof u !== 'string' || u.includes('placeholder') || u.includes('unsplash.com')) return null;
-      const fn = path.basename(u.split('?')[0]);
-      return (u.includes('/uploads/products/') || /^prod_/i.test(fn)) ? `${baseUrl}/uploads/products/${fn}` : u;
-    };
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+      if (rows.length === 0) return res.status(404).json({ message: 'Product not found.' });
 
-    let images = parseImagesJson(p.images || p.image_url).map(normalizeImgUrl).filter(Boolean);
-    images = dedupeImagesByFilename(images);
+      const p = rows[0];
+      let images = parseImagesJson(p.images || p.image_url).map(normalizeImgUrl).filter(Boolean);
+      images = dedupeImagesByFilename(images);
 
-    const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
-    for (const r of piRows) {
-      const norm = normalizeImgUrl(r.image_url);
-      if (norm) {
-        const k = getImageBasename(norm);
-        if (images.length < 4 && !images.some(img => getImageBasename(img) === k)) {
-          images.push(norm);
+      const [piRows] = await pool.query('SELECT * FROM product_images WHERE product_id = ? ORDER BY id ASC', [prodId]);
+      for (const r of piRows) {
+        const norm = normalizeImgUrl(r.image_url);
+        if (norm) {
+          const k = getImageBasename(norm);
+          if (images.length < 4 && !images.some(img => getImageBasename(img) === k)) {
+            images.push(norm);
+          }
         }
       }
-    }
-    images = dedupeImagesByFilename(images).slice(0, 4);
+      images = dedupeImagesByFilename(images).slice(0, 4);
 
-    const galleryList = [];
-    const seenGalleryKeys = new Set();
-    for (const r of piRows) {
-      if (!r.image_url || r.image_url.includes('placeholder') || r.image_url.includes('unsplash.com')) continue;
-      const k = getImageBasename(r.image_url);
-      if (seenGalleryKeys.has(k)) continue;
-      seenGalleryKeys.add(k);
-      galleryList.push({
-        id: Number(r.id),
-        image_url: normalizeImgUrl(r.image_url) || r.image_url,
-        relative_path: r.relative_path,
-        file_name: r.file_name,
-        file_size: r.file_size ? Number(r.file_size) : null,
-        mime_type: r.mime_type
+      const primaryUrl = images[0] || null;
+      return res.json({
+        success: true,
+        status: true,
+        product_id: prodId,
+        image_url: primaryUrl,
+        image: primaryUrl,
+        images,
+        total: images.length
       });
-    }
-
-    const primaryUrl = images[0] || null;
-    res.json({
-      success: true,
-      status: true,
-      product_id: prodId,
-      image_url: primaryUrl,
-      image: primaryUrl,
-      images,
-      total: images.length
-    });
-  } catch (err) {
-    res.status(500).json({ message: 'Failed to retrieve product images.' });
+    } catch (err) {}
   }
+
+  const fbProd = fallbackProducts.find(p => Number(p.id) === prodId);
+  if (!fbProd) return res.status(404).json({ message: 'Product not found.' });
+  const formatted = formatProductRecord(fbProd, { req });
+  const images = dedupeImagesByFilename(formatted.images || []).slice(0, 4);
+  const primaryUrl = images[0] || null;
+  return res.json({
+    success: true,
+    status: true,
+    product_id: prodId,
+    image_url: primaryUrl,
+    image: primaryUrl,
+    images,
+    total: images.length
+  });
 });
 
 // Individual Image Detail Endpoint: /api/products/:id/images/:image_id
@@ -5794,13 +6050,25 @@ const handleProductImageReplacement = async (req, res) => {
     existing = fallbackProducts.filter(p => Number(p.id) === prodId);
   }
 
-  if (existing.length === 0) return res.status(404).json({ message: 'Product not found.' });
+  if (existing.length === 0) {
+    cleanupTempReqFiles(req);
+    return res.status(404).json({ message: 'Product not found.' });
+  }
   if (req.user.role !== 'admin' && Number(existing[0].seller_id) !== Number(req.user.id)) {
+    cleanupTempReqFiles(req);
     return res.status(403).json({ message: 'Access denied. You do not own this product.' });
   }
 
   const imgResult = await resolveProductImages(req);
+  if (imgResult.uploadErrors && imgResult.uploadErrors.length > 0) {
+    cleanupCreatedUploadFiles(req, imgResult);
+    return res.status(422).json({
+      message: imgResult.uploadErrors[0],
+      errors: { image: imgResult.uploadErrors }
+    });
+  }
   if (!imgResult.hasImages) {
+    cleanupCreatedUploadFiles(req, imgResult);
     return res.status(422).json({
       message: 'No replacement image provided.',
       errors: { image: ['Please upload an image file (jpg, jpeg, png, webp, gif, bmp, tiff, avif, heic, svg, ico) or image URL.'] }
@@ -5808,7 +6076,7 @@ const handleProductImageReplacement = async (req, res) => {
   }
 
   let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
-  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.body.replace_images === true || req.body.replace_images === 'true' || req.query.replace_all === 'true';
+  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.body.replace_all === '1' || req.body.replace_images === true || req.body.replace_images === 'true' || req.body.replace_images === '1' || req.query.replace_all === 'true';
   const isExplicitReplace = req.body.mode === 'replace' || req.query.mode === 'replace' || req.body.action === 'replace';
 
   let hasExplicitIndex = false;
@@ -5843,6 +6111,7 @@ const handleProductImageReplacement = async (req, res) => {
 
   if (isReplaceAll) {
     if (imgResult.images.length > 4) {
+      cleanupCreatedUploadFiles(req, imgResult);
       return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
     }
     newImages = imgResult.images.slice(0, 4);
@@ -5868,6 +6137,7 @@ const handleProductImageReplacement = async (req, res) => {
     }
     const dedupedIndexed = dedupeImagesByFilename(currentImgs);
     if (dedupedIndexed.length > 4) {
+      cleanupCreatedUploadFiles(req, imgResult);
       return res.status(422).json({
         message: `Maximum 4 images allowed per product. Currently has ${dedupedIndexed.length} images.`,
         limit: 4
@@ -5885,6 +6155,7 @@ const handleProductImageReplacement = async (req, res) => {
     }
     const dedupedExplicit = dedupeImagesByFilename(currentImgs);
     if (dedupedExplicit.length > 4) {
+      cleanupCreatedUploadFiles(req, imgResult);
       return res.status(422).json({
         message: `Maximum 4 images allowed per product. Currently has ${dedupedExplicit.length} images.`,
         limit: 4
@@ -5896,6 +6167,7 @@ const handleProductImageReplacement = async (req, res) => {
     // Appends new uploaded images to current gallery slots so seller can have multiple images (1/4, 2/4, 3/4, 4/4)
     const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
     if (combined.length > 4) {
+      cleanupCreatedUploadFiles(req, imgResult);
       return res.status(422).json({
         message: `Maximum 4 images allowed per product. Product already has ${currentImgs.length} image(s), cannot add ${imgResult.images.length} more.`,
         current_count: currentImgs.length,
@@ -5920,9 +6192,10 @@ const handleProductImageReplacement = async (req, res) => {
       await syncProductImagesRecord(pool, Number(existing[0].seller_id || req.user.id), prodId, newImages, imgResult.filesInfo);
 
       // Safe deletion of old physical file ONLY IF oldImageUrl was explicitly replaced and is not used anywhere else
+      const keptBasenames = new Set(newImages.map(u => getImageBasename(u)).filter(Boolean));
       for (const repUrl of replacedUrls) {
-        if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
-          const repFn = path.basename(repUrl.split('?')[0]);
+        const repFn = getImageBasename(repUrl);
+        if (repFn && !keptBasenames.has(repFn)) {
           await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, repFn]);
           await safeDeleteLocalImageFile(pool, repFn, prodId);
         }
@@ -5954,9 +6227,10 @@ const handleProductImageReplacement = async (req, res) => {
   if (fbIdx !== -1) {
     fallbackProducts[fbIdx].images = newImages;
     fallbackProducts[fbIdx].image_url = primaryUrl;
+    const keptBasenames = new Set(newImages.map(u => getImageBasename(u)).filter(Boolean));
     for (const repUrl of replacedUrls) {
-      if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
-        const repFn = path.basename(repUrl.split('?')[0]);
+      const repFn = getImageBasename(repUrl);
+      if (repFn && !keptBasenames.has(repFn)) {
         await safeDeleteLocalImageFile(pool, repFn, prodId);
       }
     }
@@ -5972,6 +6246,7 @@ const handleProductImageReplacement = async (req, res) => {
       data: formattedFb
     });
   }
+  cleanupCreatedUploadFiles(req, imgResult);
   return res.status(500).json({ message: 'Failed to update product image.' });
 };
 
@@ -6124,11 +6399,12 @@ app.delete('/api/images/:filename', authenticateToken, requireActiveSellerForMut
       if (Number(fp.seller_id) !== Number(req.user.id)) return false;
       const imgsStr = JSON.stringify(fp.images || '') + ' ' + String(fp.image_url || '');
       return imgsStr.includes(safeFilename);
-    });
+    }) || fallbackProductImages.some(pi => Number(pi.seller_id) === Number(req.user.id) && pi.file_name === safeFilename);
     if (!ownedBySeller) {
       return res.status(403).json({ message: 'Access denied. You do not own this image.' });
     }
   }
+  fallbackProductImages = fallbackProductImages.filter(pi => pi.file_name !== safeFilename);
   await safeDeleteLocalImageFile(pool, safeFilename);
   return res.json({ success: true, status: true, message: 'Image deleted successfully.' });
 });
@@ -6211,6 +6487,13 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
   }
 
   const imgResult = await resolveProductImages(req);
+  if (imgResult.uploadErrors && imgResult.uploadErrors.length > 0) {
+    cleanupCreatedUploadFiles(req, imgResult);
+    return res.status(422).json({
+      message: imgResult.uploadErrors[0],
+      errors: { image: imgResult.uploadErrors }
+    });
+  }
   const pricing = resolveProductPricing(body);
   const sku = (body.sku || '').toString().trim() || null;
   let category = (body.category || '').toString().trim() || 'General';
@@ -6247,7 +6530,7 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
     } else {
       const mutRes = await performCategoryMutationNode(pool, 'create_category', body, false, null);
       if (!mutRes.ok) {
-        cleanupTempReqFiles(req);
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(mutRes.statusCode).json(mutRes.errorBody);
       }
       createdCategoryObj = mutRes.payload.category;
@@ -6291,7 +6574,7 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
       await ensureProductPriceColumns(pool);
       const catRes = await resolveProductCategoryInput(pool, body, true);
       if (catRes.error) {
-        cleanupTempReqFiles(req);
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
       }
       category = catRes.category;
@@ -6345,7 +6628,7 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
     ? fallbackCategories.find(c => String(c.id) === String(body.category_id).trim())
     : fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase());
   if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '' && !fbCatMatch) {
-    cleanupTempReqFiles(req);
+    cleanupCreatedUploadFiles(req, imgResult);
     return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
   }
   const nowIso = new Date().toISOString();
@@ -6694,59 +6977,86 @@ async function handleProductUpdateRoute(req, res) {
     params.push(parseInt(body.stock, 10));
   }
 
-  const oldImgs = parseImagesJson(existing[0].images || existing[0].image_url).filter(u => u && !u.includes('placeholder') && !u.includes('unsplash.com'));
+  const oldImgs = dedupeImagesByFilename([
+    ...parseImagesJson(existing[0].images),
+    ...(existing[0].image_url ? [String(existing[0].image_url)] : [])
+  ]).filter(u => u && !u.includes('placeholder') && !u.includes('unsplash.com'));
+
   const clearImagesRequested = body.clear_images !== undefined && body.clear_images !== '' && parseBoolBitNode(body.clear_images, 0) === 1;
+  const rawRemoveCandidates = [
+    ...parseImagesJson(body.remove_images),
+    ...parseImagesJson(body.deleted_images),
+    ...parseImagesJson(body.remove_image),
+    ...parseImagesJson(body.delete_image)
+  ];
+  const removeBasenames = new Set(rawRemoveCandidates.map(u => getImageBasename(u)).filter(Boolean));
+  const explicitImagesKeyPresent = Object.prototype.hasOwnProperty.call(body, 'images');
+  const explicitEmptyImages = explicitImagesKeyPresent && (
+    (Array.isArray(body.images) && body.images.length === 0) ||
+    (typeof body.images === 'string' && body.images.trim() === '[]')
+  );
+
   const imgResult = clearImagesRequested
-    ? { hasImages: false, images: [], filesInfo: [] }
+    ? { hasImages: false, images: [], filesInfo: [], createdPaths: [], uploadErrors: [] }
     : await resolveProductImages(req);
+
+  if (imgResult.uploadErrors && imgResult.uploadErrors.length > 0) {
+    cleanupCreatedUploadFiles(req, imgResult);
+    return res.status(422).json({
+      message: imgResult.uploadErrors[0],
+      errors: { image: imgResult.uploadErrors }
+    });
+  }
+
   let newFinalImages = null;
 
   if (clearImagesRequested) {
-    cleanupTempReqFiles(req);
+    cleanupCreatedUploadFiles(req, imgResult);
     newFinalImages = [];
     updates.push('image_url = ?', 'images = ?');
     params.push(null, null);
   } else if (imgResult.hasImages && imgResult.images.length > 0) {
+    const filteredIncoming = imgResult.images.filter(u => !removeBasenames.has(getImageBasename(u)));
     const isReplaceAll = body.replace_all === true || body.replace_all === 'true' || body.replace_all === '1' || body.replace_images === true || body.replace_images === 'true' || body.replace_images === '1' || body.mode === 'replace';
-    const currentImgs = [...oldImgs];
+    const currentImgs = oldImgs.filter(u => !removeBasenames.has(getImageBasename(u)));
 
     let finalImages = [];
     if (isReplaceAll || currentImgs.length === 0) {
-      if (imgResult.images.length > 4) {
-        cleanupTempReqFiles(req);
+      if (filteredIncoming.length > 4) {
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
       }
-      finalImages = dedupeImagesByFilename(imgResult.images).slice(0, 4);
+      finalImages = dedupeImagesByFilename(filteredIncoming).slice(0, 4);
     } else if (body.image_index !== undefined || body.index !== undefined) {
       const idx = parseInt(body.image_index ?? body.index, 10);
       if (idx >= 0 && idx < currentImgs.length) {
-        currentImgs[idx] = imgResult.primaryImageUrl;
-      } else {
-        currentImgs.push(imgResult.primaryImageUrl);
+        currentImgs[idx] = filteredIncoming[0] || imgResult.primaryImageUrl;
+      } else if (filteredIncoming.length > 0) {
+        currentImgs.push(filteredIncoming[0]);
       }
       const dedupedIndexed = dedupeImagesByFilename(currentImgs);
       if (dedupedIndexed.length > 4) {
-        cleanupTempReqFiles(req);
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
       finalImages = dedupedIndexed;
     } else if (body.images && (Array.isArray(body.images) || (typeof body.images === 'string' && body.images.trim().startsWith('[')))) {
       // Client explicitly passed the full list of images to retain
-      const dedupedExplicit = dedupeImagesByFilename(imgResult.images);
+      const dedupedExplicit = dedupeImagesByFilename(filteredIncoming);
       if (dedupedExplicit.length > 4) {
-        cleanupTempReqFiles(req);
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
       finalImages = dedupedExplicit;
     } else {
-      // Files uploaded without explicit replacement array: preserve existing images and append newly uploaded files up to 4
-      const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
+      // Files uploaded without explicit replacement array: preserve remaining existing images and append newly uploaded files up to 4
+      const combined = dedupeImagesByFilename([...currentImgs, ...filteredIncoming]);
       if (combined.length > 4) {
-        cleanupTempReqFiles(req);
+        cleanupCreatedUploadFiles(req, imgResult);
         return res.status(422).json({
-          message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length}, cannot add ${imgResult.images.length} more.`,
+          message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length}, cannot add ${filteredIncoming.length} more.`,
           current_count: currentImgs.length,
-          attempted_to_add: imgResult.images.length,
+          attempted_to_add: filteredIncoming.length,
           limit: 4
         });
       }
@@ -6758,6 +7068,16 @@ async function handleProductUpdateRoute(req, res) {
     const imagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
     updates.push('image_url = ?', 'images = ?');
     params.push(primaryUrl, imagesJson);
+  } else if (explicitEmptyImages) {
+    cleanupCreatedUploadFiles(req, imgResult);
+    newFinalImages = [];
+    updates.push('image_url = ?', 'images = ?');
+    params.push(null, null);
+  } else if (removeBasenames.size > 0) {
+    const remaining = dedupeImagesByFilename(oldImgs.filter(u => !removeBasenames.has(getImageBasename(u)))).slice(0, 4);
+    newFinalImages = remaining;
+    updates.push('image_url = ?', 'images = ?');
+    params.push(remaining[0] || null, remaining.length > 0 ? JSON.stringify(remaining) : null);
   }
 
   let isActiveModified = false;
@@ -6795,7 +7115,7 @@ async function handleProductUpdateRoute(req, res) {
       if (shouldAssignCategory) {
         const catRes = await resolveProductCategoryInput(pool, buildAssignBody(), false);
         if (catRes.error) {
-          cleanupTempReqFiles(req);
+          cleanupCreatedUploadFiles(req, imgResult);
           return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
         }
         if (catRes.provided) {
@@ -6811,8 +7131,14 @@ async function handleProductUpdateRoute(req, res) {
 
         if (newFinalImages !== null) {
           const keptBasenames = new Set(newFinalImages.map(u => getImageBasename(u)).filter(Boolean));
-          for (const oldU of oldImgs) {
-            const oldBn = getImageBasename(oldU);
+          const candidateOldBasenames = new Set(oldImgs.map(u => getImageBasename(u)).filter(Boolean));
+          try {
+            const [piRows] = await pool.query('SELECT file_name FROM product_images WHERE product_id = ?', [req.params.id]);
+            for (const r of piRows) {
+              if (r && r.file_name) candidateOldBasenames.add(getImageBasename(r.file_name));
+            }
+          } catch (e) {}
+          for (const oldBn of candidateOldBasenames) {
             if (oldBn && !keptBasenames.has(oldBn)) {
               try {
                 await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [req.params.id, oldBn]);
@@ -6864,7 +7190,7 @@ async function handleProductUpdateRoute(req, res) {
       if (assignSrc.category_id !== undefined && assignSrc.category_id !== null && String(assignSrc.category_id).trim() !== '') {
         const matchedCat = fallbackCategories.find(c => String(c.id) === String(assignSrc.category_id).trim());
         if (!matchedCat) {
-          cleanupTempReqFiles(req);
+          cleanupCreatedUploadFiles(req, imgResult);
           return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
         }
         fallbackProducts[idx].category_id = Number(matchedCat.id);
@@ -6934,7 +7260,7 @@ async function handleProductUpdateRoute(req, res) {
     }
     return res.json(resp);
   }
-  cleanupTempReqFiles(req);
+  cleanupCreatedUploadFiles(req, imgResult);
   return res.status(500).json({ message: 'Update failed.' });
 }
 
@@ -6963,7 +7289,10 @@ app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutatio
   }
 
   const prodId = Number(existing[0].id);
-  const imagesToDelete = parseImagesJson(existing[0].images || existing[0].image_url);
+  const imagesToDelete = dedupeImagesByFilename([
+    ...parseImagesJson(existing[0].images),
+    ...(existing[0].image_url ? [String(existing[0].image_url)] : [])
+  ]);
 
   if (dbActive) {
     try {
@@ -6984,13 +7313,21 @@ app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutatio
         });
       }
 
+      const piBasenames = new Set(imagesToDelete.map(u => getImageBasename(u)).filter(Boolean));
+      try {
+        const [piRows] = await pool.query('SELECT file_name, image_url FROM product_images WHERE product_id = ?', [prodId]);
+        for (const r of piRows) {
+          if (r && r.file_name) piBasenames.add(getImageBasename(r.file_name));
+          if (r && r.image_url) piBasenames.add(getImageBasename(r.image_url));
+        }
+      } catch (e) {}
+
       await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
       await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
 
       // Safely delete associated physical image files ONLY IF no other product is referencing them
-      for (const imgUrl of imagesToDelete) {
-        if (imgUrl && imgUrl.includes('/uploads/products/')) {
-          const fn = path.basename(imgUrl.split('?')[0]);
+      for (const fn of piBasenames) {
+        if (fn) {
           await safeDeleteLocalImageFile(pool, fn, prodId);
         }
       }
@@ -7022,8 +7359,8 @@ app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutatio
 
   fallbackProducts = fallbackProducts.filter(p => Number(p.id) !== prodId);
   for (const imgUrl of imagesToDelete) {
-    if (imgUrl && imgUrl.includes('/uploads/products/')) {
-      const fn = path.basename(imgUrl.split('?')[0]);
+    const fn = getImageBasename(imgUrl);
+    if (fn) {
       await safeDeleteLocalImageFile(pool, fn, prodId);
     }
   }
@@ -10062,48 +10399,85 @@ app.get(['/api/orders/:id/invoice', '/api/order/:id/invoice', '/invoice/:id'], h
 
 app.get('/login', (req, res) => res.redirect('/admin/login'));
 
-app.get('/admin/login', (req, res) => {
-  res.send(`
+function renderNodeAdminLoginPage(errorMsg = null, prefillEmail = 'admin@vendor.app') {
+  const safeEmail = String(prefillEmail || 'admin@vendor.app').replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag));
+  const safeErr = errorMsg ? String(errorMsg).replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag)) : '';
+  return `
     <!doctype html>
     <html lang="en">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>Vendor Admin — Sign In</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
       <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
-        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; }
-        .brand { font-size: 21px; font-weight: 800; }
-        .wrap { max-width: 440px; margin: 60px auto; padding: 0 18px; }
-        .card { background: #fff; border-radius: 14px; padding: 30px; box-shadow: 0 8px 30px rgba(37,32,74,0.08); }
-        h1 { margin-top: 0; font-size: 24px; color: #1e1b4b; }
-        p.muted { color: #64748b; font-size: 14px; margin-bottom: 24px; }
-        label { display: block; font-size: 13px; font-weight: 600; margin: 16px 0 6px; color: #334155; }
-        input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; }
-        input:focus { border-color: #6366f1; }
-        button { width: 100%; background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 13px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 24px; }
-        button:hover { background: #4a3cb8; }
+        body { min-height: 100vh; background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%); display: flex; flex-direction: column; }
+        .login-card { max-width: 440px; width: 100%; border-radius: 1rem; }
       </style>
     </head>
     <body>
-      <header class="top"><div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div></header>
-      <main class="wrap">
-        <div class="card">
-          <h1>Admin sign in</h1>
-          <p class="muted">Sign in to manage Vendor sellers and catalog.</p>
-          <form method="POST" action="/admin/login">
-            <label>Admin email</label>
-            <input type="email" name="email" value="admin@vendor.app" required autofocus>
-            <label>Password</label>
-            <input type="password" name="password" required>
-            <button type="submit">Sign in</button>
-          </form>
+      <nav class="navbar navbar-dark bg-dark shadow-sm">
+        <div class="container">
+          <span class="navbar-brand fw-bold d-flex align-items-center gap-2">
+            <i class="bi bi-shop-window text-primary"></i>
+            Vendor <span class="badge bg-primary fw-semibold">Admin Panel</span>
+          </span>
+        </div>
+      </nav>
+      <main class="flex-grow-1 d-flex align-items-center justify-content-center p-3 p-md-4">
+        <div class="card login-card border-0 shadow-lg">
+          <div class="card-body p-4 p-sm-5">
+            <div class="d-flex align-items-center gap-2 mb-3">
+              <span class="rounded-3 bg-primary bg-opacity-10 text-primary p-2 d-inline-flex align-items-center justify-content-center">
+                <i class="bi bi-shield-lock-fill fs-4"></i>
+              </span>
+              <div>
+                <h1 class="h4 fw-bold mb-0 text-dark">Admin sign in</h1>
+                <small class="text-body-secondary">Sign in to manage Vendor sellers and catalog.</small>
+              </div>
+            </div>
+            ${safeErr ? `
+              <div class="alert alert-danger d-flex align-items-start gap-2 py-2 px-3 small" role="alert">
+                <i class="bi bi-exclamation-triangle-fill mt-1"></i>
+                <div>${safeErr}</div>
+              </div>
+            ` : ''}
+            <form method="POST" action="/admin/login" class="mt-3">
+              <div class="mb-3">
+                <label for="adminEmailInput" class="form-label fw-semibold small text-secondary">Admin email</label>
+                <div class="input-group">
+                  <span class="input-group-text bg-light"><i class="bi bi-envelope text-secondary"></i></span>
+                  <input type="email" id="adminEmailInput" name="email" class="form-control" value="${safeEmail}" required autofocus autocomplete="username">
+                </div>
+              </div>
+              <div class="mb-4">
+                <label for="adminPasswordInput" class="form-label fw-semibold small text-secondary">Password</label>
+                <div class="input-group">
+                  <span class="input-group-text bg-light"><i class="bi bi-key text-secondary"></i></span>
+                  <input type="password" id="adminPasswordInput" name="password" class="form-control" required autocomplete="current-password">
+                </div>
+              </div>
+              <button type="submit" class="btn btn-primary w-100 fw-semibold py-2">
+                <i class="bi bi-box-arrow-in-right me-1"></i> Sign in to Dashboard
+              </button>
+            </form>
+            <div class="alert alert-light border mt-4 mb-0 small text-body-secondary">
+              <div class="fw-semibold text-dark mb-1"><i class="bi bi-info-circle me-1 text-primary"></i> Default Credentials</div>
+              <div>Email: <code>admin@vendor.app</code></div>
+              <div>Password: <code>Admin123!</code></div>
+            </div>
+          </div>
         </div>
       </main>
+      <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
-  `);
+  `;
+}
+
+app.get('/admin/login', (req, res) => {
+  res.send(renderNodeAdminLoginPage(null, 'admin@vendor.app'));
 });
 
 app.post('/admin/login', async (req, res) => {
@@ -10137,7 +10511,7 @@ app.post('/admin/login', async (req, res) => {
       }
 
       if (rows.length === 0 || !(await bcrypt.compare(password, rows[0].password))) {
-        return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
+        return res.status(401).send(renderNodeAdminLoginPage('Invalid admin credentials. Please verify your email and password.', email || 'admin@vendor.app'));
       }
 
       const adminToken = jwt.sign(
@@ -10163,7 +10537,7 @@ app.post('/admin/login', async (req, res) => {
       (fbAdmin.password && (await bcrypt.compare(password, fbAdmin.password)))
     );
     if (!fbValid) {
-      return res.status(401).send(`<h3>Invalid admin credentials.</h3><p>Default credentials: admin@vendor.app / Admin123!</p><a href="/admin/login">Try again</a>`);
+      return res.status(401).send(renderNodeAdminLoginPage('Invalid admin credentials. Please verify your email and password.', email || 'admin@vendor.app'));
     }
     const adminToken = jwt.sign(
       { id: fbAdmin.id, role: 'admin', email: fbAdmin.email || 'admin@vendor.app', tv: Number(fbAdmin.token_version || 1) },
@@ -10183,29 +10557,18 @@ app.post('/admin/login', async (req, res) => {
       <html lang="en">
       <head>
         <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Database Error — Vendor Admin</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-          .card { background: #1e293b; padding: 36px; border-radius: 16px; border: 1px solid #334155; max-width: 620px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); text-align: left; }
-          h2 { color: #f87171; margin-top: 0; }
-          .err-box { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; padding: 12px 16px; border-radius: 8px; font-family: monospace; font-size: 13px; margin: 16px 0; word-break: break-all; }
-          p { color: #cbd5e1; line-height: 1.6; font-size: 14px; }
-          pre { background: #0b1120; border: 1px solid #334155; color: #38bdf8; padding: 14px; border-radius: 8px; font-size: 13px; overflow-x: auto; }
-          .btn { display: inline-block; background: #6366f1; color: white; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 14px; margin-top: 16px; }
-        </style>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
       </head>
-      <body>
-        <div class="card">
-          <h2>Database Connection Error</h2>
-          <p>The backend was unable to connect to the MySQL database (Host: <code>${dbHost}</code>, User: <code>${activeConfig.user}</code>, Database: <code>${activeConfig.database}</code>).</p>
-          <p><strong>Configured database details:</strong></p>
-          <pre>DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_DATABASE=${activeConfig.database}
-DB_USERNAME=${activeConfig.user}
-DB_PASSWORD=Xtragclub_vendor2026</pre>
-          <a href="/admin/login" class="btn">Back to Login</a>
+      <body class="bg-light d-flex align-items-center justify-content-center min-vh-100 p-3">
+        <div class="card shadow border-0 rounded-4" style="max-width: 560px; width: 100%;">
+          <div class="card-body p-4">
+            <h2 class="h5 text-danger fw-bold mb-3">Database Connection Error</h2>
+            <p class="text-body-secondary small mb-3">The backend was unable to connect to the database (Host: <code>${dbHost}</code>, User: <code>${activeConfig.user}</code>, Database: <code>${activeConfig.database}</code>).</p>
+            <div class="alert alert-danger small mb-3">${String(err && err.message ? err.message : 'Connection failed')}</div>
+            <a href="/admin/login" class="btn btn-primary btn-sm">Back to Login</a>
+          </div>
         </div>
       </body>
       </html>
@@ -10250,28 +10613,40 @@ function handleAdminDashboardUpload(req, res, next) {
 
       for (let i = 0; i < fileList.length; i++) {
         const f = fileList[i];
-        if (!f || !f.path) continue;
-        const tempPath = f.path;
+        if (!f) continue;
         let rawBuf = null;
-        try {
-          rawBuf = fs.readFileSync(tempPath);
-        } finally {
-          try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+        if (Buffer.isBuffer(f.buffer)) {
+          rawBuf = f.buffer;
+        } else if (f.path) {
+          const tempPath = f.path;
+          try {
+            rawBuf = fs.readFileSync(tempPath);
+          } finally {
+            try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+          }
         }
+        if (!rawBuf) continue;
 
-        if ((!rawBuf || rawBuf.length === 0) && !String(f.originalname || '').trim()) {
+        if (rawBuf.length === 0 && !String(f.originalname || '').trim()) {
           continue;
         }
 
         const hash = crypto.createHash('sha256').update(rawBuf).digest('hex');
-        if (seenHashes.has(hash)) continue;
+        if (seenHashes.has(hash)) {
+          f.buffer = null;
+          continue;
+        }
         seenHashes.add(hash);
 
         try {
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+          }
           const webpBuf = await convertImageBufferToWebp(rawBuf, {
             originalName: f.originalname,
             mimeType: f.mimetype
           });
+          f.buffer = null;
           const webpFilename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.webp`;
           const webpPath = path.join(uploadDir, webpFilename);
           fs.writeFileSync(webpPath, webpBuf);
@@ -10280,10 +10655,12 @@ function handleAdminDashboardUpload(req, res, next) {
 
           f.filename = webpFilename;
           f.path = webpPath;
+          f._createdWebpPath = webpPath;
           f.mimetype = 'image/webp';
           f.size = webpBuf.length;
           uniqueFiles.push(f);
         } catch (convErr) {
+          f.buffer = null;
           cleanupRemainingTempFiles(i + 1);
           req.files = [];
           req.uploadError = convErr.message || 'Could not process uploaded image into WebP format.';
@@ -10340,6 +10717,20 @@ app.post(['/admin', '/admin/dashboard'], requireAdminDashboardAuth, handleAdminD
             performed_by: adminActorId,
             performer_role: 'admin'
           });
+          setImmediate(async () => {
+            try {
+              const [uRows] = await pool.query('SELECT email, seller_name, name FROM users WHERE id = ? LIMIT 1', [sellerId]);
+              if (uRows[0] && uRows[0].email) {
+                await sendGstStatusMailNode(pool, {
+                  to: uRows[0].email,
+                  sellerName: uRows[0].seller_name || uRows[0].name || 'Seller',
+                  status: 'Approved',
+                  gstin: gstRows[0].gstin || '',
+                  notes
+                });
+              }
+            } catch (ignore) {}
+          });
           feedbackMsg = `Seller #${sellerId} document verification approved.`;
         } else {
           feedbackErr = `No GST record found for Seller #${sellerId}.`;
@@ -10395,6 +10786,20 @@ app.post(['/admin', '/admin/dashboard'], requireAdminDashboardAuth, handleAdminD
             notes: reason,
             performed_by: adminActorId,
             performer_role: 'admin'
+          });
+          setImmediate(async () => {
+            try {
+              const [uRows] = await pool.query('SELECT email, seller_name, name FROM users WHERE id = ? LIMIT 1', [sellerId]);
+              if (uRows[0] && uRows[0].email) {
+                await sendGstStatusMailNode(pool, {
+                  to: uRows[0].email,
+                  sellerName: uRows[0].seller_name || uRows[0].name || 'Seller',
+                  status: 'Rejected',
+                  gstin: gstRows[0].gstin || '',
+                  notes: reason
+                });
+              }
+            } catch (ignore) {}
           });
           feedbackMsg = `Seller #${sellerId} verification rejected.`;
         } else {
@@ -11169,13 +11574,21 @@ app.post(['/admin', '/admin/dashboard'], requireAdminDashboardAuth, handleAdminD
               ...parseImagesJson(prodRow.images),
               ...(prodRow.image_url ? [String(prodRow.image_url)] : [])
             ];
+            const piBasenames = new Set(imgsToDel.map(u => getImageBasename(u)).filter(Boolean));
+            try {
+              const [piRows] = await pool.query('SELECT file_name, image_url FROM product_images WHERE product_id = ?', [prodId]);
+              for (const r of piRows) {
+                if (r && r.file_name) piBasenames.add(getImageBasename(r.file_name));
+                if (r && r.image_url) piBasenames.add(getImageBasename(r.image_url));
+              }
+            } catch (e) {}
             await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
             try {
               await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
             } catch (e) {}
-            for (const imgU of imgsToDel) {
-              if (typeof imgU === 'string' && imgU.includes('/uploads/products/')) {
-                await safeDeleteLocalImageFile(pool, getImageBasename(imgU), prodId);
+            for (const fn of piBasenames) {
+              if (fn) {
+                await safeDeleteLocalImageFile(pool, fn, prodId);
               }
             }
             feedbackMsg = `Product #${prodId} ("${prodRow.name}") deleted permanently.`;
@@ -11204,8 +11617,9 @@ app.post(['/admin', '/admin/dashboard'], requireAdminDashboardAuth, handleAdminD
             ];
             fallbackProducts.splice(fbIdx, 1);
             for (const imgU of imgsToDel) {
-              if (typeof imgU === 'string' && imgU.includes('/uploads/products/')) {
-                await safeDeleteLocalImageFile(null, getImageBasename(imgU), prodId);
+              const fn = getImageBasename(imgU);
+              if (fn) {
+                await safeDeleteLocalImageFile(null, fn, prodId);
               }
             }
             feedbackMsg = `Product #${prodId} ("${prodRow.name}") deleted permanently.`;
@@ -11848,151 +12262,197 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>${escapeHtml(curMeta.title)} — Vendor Admin Portal</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
       <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; min-height: 100vh; display: flex; flex-direction: column; }
-        .top { background: #25204a; color: white; padding: 14px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; position: sticky; top: 0; z-index: 200; box-shadow: 0 4px 16px rgba(20, 16, 48, 0.16); }
-        .brand { font-size: 20px; font-weight: 800; color: #fff; text-decoration: none; }
-        .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; white-space: nowrap; }
-        .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
-        .wrap { flex: 1; width: 100%; max-width: 1220px; margin: 24px auto; padding: 0 18px; }
-        .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
-        .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
-        h1, h2 { margin-top: 0; color: #1e1b4b; }
-        p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
+        body {
+          background-color: #f8f9fa;
+          color: #212529;
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+        }
+        .admin-navbar {
+          background-color: #1e293b;
+        }
+        #adminTopNav .nav-pill {
+          color: rgba(255, 255, 255, 0.85);
+          border-radius: 0.5rem;
+          padding: 0.42rem 0.72rem;
+          font-size: 0.8125rem;
+          font-weight: 600;
+          white-space: nowrap;
+          transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        #adminTopNav .nav-pill:hover {
+          color: #fff;
+          background-color: rgba(255, 255, 255, 0.12);
+        }
+        #adminTopNav .nav-pill.active {
+          color: #fff;
+          background-color: #0d6efd;
+        }
         .admin-view-panel { display: none; }
         .admin-view-panel.is-visible { display: block; }
-        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 20px; }
-        .cat-pager { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; box-shadow: 0 4px 16px rgba(37,32,74,0.04); }
-        .cat-pager-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-        .cat-page-pill { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; border-radius: 8px; background: #f1f5f9; color: #475569; text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid #e2e8f0; transition: all .15s; white-space: nowrap; }
-        .cat-page-pill:hover { background: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
-        .cat-page-pill.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .cat-pager-nav { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .cat-step-btn { background: #f8fafc; color: #1e1b4b; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
-        .cat-step-btn:hover:not(:disabled) { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .cat-step-indicator { font-size: 12px; font-weight: 700; color: #475569; padding: 0 4px; white-space: nowrap; }
-        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #475569; }
-        .pg-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-        .pg-btn { background: #f8fafc; color: #334155; border: 1px solid #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; min-width: 32px; text-align: center; }
-        .pg-btn:hover:not(:disabled) { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
-        .pg-btn.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-        .pg-select { width: auto !important; min-width: 105px; padding: 5px 8px !important; font-size: 12px !important; border-radius: 6px !important; border: 1px solid #cbd5e1 !important; background: #fff; }
-        .reject-presets { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
-        .reject-chip { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 9999px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer; }
-        .reject-chip:hover { background: #fecaca; }
-        .modal-err-banner { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; border-left: 4px solid #dc2626; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
-        .kpi-card-link { cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; border: 1px solid #eef2ff; }
-        .kpi-card-link:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(37,32,74,0.1); border-color: #c7d2fe; }
-        .dir-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 8px; }
-        .dir-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; gap: 14px; box-shadow: 0 6px 20px rgba(37,32,74,0.04); transition: transform .15s ease, border-color .15s ease; }
-        .dir-card:hover { transform: translateY(-2px); border-color: #a5b4fc; }
-        .dir-card h3 { margin: 0 0 6px; font-size: 16px; color: #1e1b4b; }
-        .dir-card p { margin: 0; font-size: 13px; color: #64748b; line-height: 1.5; }
-        .dir-card-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 10px; border-top: 1px solid #f1f5f9; }
-        .sub-kpi-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
-        .admin-footer { background: #1e1b4b; color: #cbd5e1; padding: 22px 5%; margin-top: 32px; border-top: 1px solid #312e81; }
-        .footer-inner { max-width: 1220px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; font-size: 13px; }
-        .footer-links { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
-        .footer-links a { color: #cbd5e1; text-decoration: none; font-weight: 600; transition: color .15s; }
-        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
-        label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
-        input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
-        input:focus, textarea:focus, select:focus { border-color: #6366f1; }
-        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
-        button:hover, .btn:hover { background: #4a3cb8; }
-        button:disabled { opacity: 0.45; cursor: not-allowed; }
-        table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
-        th { color: #64748b; font-weight: 600; font-size: 13px; }
-        .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
-        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }
-        .btn-sm:hover { background: #4f46e5; }
-        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
-        .btn-approve-sm:hover { background: #15803d; }
-        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
-        .btn-reject-sm:hover { background: #b91c1c; }
-        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
-        .btn-hold-sm:hover { background: #c2410c; }
-        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
-        .btn-del-req:hover { background: #fee2e2; }
-        .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
-        .prod-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid #e2e8f0; background: #f8fafc; flex-shrink: 0; }
-        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 8px; border: 1px dashed #cbd5e1; background: #f8fafc; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #94a3b8; flex-shrink: 0; }
-        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 10px; margin-top: 6px; }
-        .existing-img-item { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; background: #f8fafc; text-align: center; font-size: 11px; }
-        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 6px; display: block; margin-bottom: 4px; }
-        .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .filter-bar select { width: auto; min-width: 145px; padding: 7px 10px; font-size: 13px; }
-        .badge-pending { background: #fef3c7; color: #b45309; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .badge-approved { background: #dcfce7; color: #15803d; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .badge-rejected { background: #fee2e2; color: #b91c1c; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .del-badge { font-weight: 700; font-size: 11px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
-        .del-yellow { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
-        .del-blue { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
-        .del-green { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
-        .del-red { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
-        .del-orange { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
-        .badge-pdf { background: #fee2e2; color: #dc2626; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #fca5a5; }
-        .badge-img { background: #e0f2fe; color: #0284c7; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #bae6fd; }
-        .tabs-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; flex-wrap: wrap; }
-        .tab-btn { background: #f1f5f9; color: #475569; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; transition: all .2s; }
-        .tab-btn.active { background: #4f46e5; color: #fff; }
-        .btn-view { background: #0284c7; color: white; padding: 5px 11px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px; }
-        .btn-view:hover { background: #0369a1; }
-        .btn-dl { background: #475569; color: white; padding: 5px 9px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
-        .btn-dl:hover { background: #334155; }
-        .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
-        .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
-        .search-box input:focus { border-color: #6366f1; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 1.25rem; }
+
+        #adminCategoryPager .cat-page-pill {
+          font-size: 0.78rem;
+          font-weight: 600;
+          white-space: nowrap;
+        }
+        #adminCategoryPager .cat-page-pill.active {
+          background-color: #0d6efd;
+          color: #fff;
+          border-color: #0d6efd;
+        }
+
+        .kpi-card-link {
+          cursor: pointer;
+          transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+        .kpi-card-link:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 0.5rem 1rem rgba(15, 23, 42, 0.08) !important;
+        }
+        .dir-card {
+          transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+        .dir-card:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 0.5rem 1.25rem rgba(15, 23, 42, 0.08) !important;
+        }
+
+        /* Preserved Domain Status Badges (Bootstrap Pill Aesthetic + Test Class Hooks) */
+        .del-badge {
+          font-weight: 700;
+          font-size: 0.6875rem;
+          padding: 0.3rem 0.65rem;
+          border-radius: 50rem;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.25rem;
+          text-transform: uppercase;
+          letter-spacing: 0.3px;
+        }
+        .del-yellow { background: #fff3cd; color: #997404; border: 1px solid #ffe69c; }
+        .del-blue { background: #cfe2ff; color: #084298; border: 1px solid #9ec5fe; }
+        .del-green { background: #d1e7dd; color: #0f5132; border: 1px solid #a3cfbb; }
+        .del-red { background: #f8d7da; color: #842029; border: 1px solid #f1aeb5; }
+        .del-orange { background: #ffe5d0; color: #984c0c; border: 1px solid #fecba1; }
+
+        .badge-pending { background: #fff3cd; color: #997404; border: 1px solid #ffe69c; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-approved { background: #d1e7dd; color: #0f5132; border: 1px solid #a3cfbb; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-rejected { background: #f8d7da; color: #842029; border: 1px solid #f1aeb5; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-prod { background: #e7f1ff; color: #0a58ca; border: 1px solid #cfe2ff; font-weight: 600; font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 50rem; display: inline-block; }
+        .badge-pdf { background: #f8d7da; color: #b02a37; font-weight: 800; font-size: 0.6875rem; padding: 0.15rem 0.45rem; border-radius: 0.25rem; border: 1px solid #f1aeb5; }
+        .badge-img { background: #cff4fc; color: #055160; font-weight: 800; font-size: 0.6875rem; padding: 0.15rem 0.45rem; border-radius: 0.25rem; border: 1px solid #9eeaf9; }
+
+        .tabs-bar .tab-btn.active {
+          background-color: #0d6efd !important;
+          color: #fff !important;
+          border-color: #0d6efd !important;
+        }
+        .prod-thumb { width: 44px; height: 44px; border-radius: 0.5rem; object-fit: cover; border: 1px solid #dee2e6; background: #f8f9fa; flex-shrink: 0; }
+        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 0.5rem; border: 1px dashed #ced4da; background: #f8f9fa; display: flex; align-items: center; justify-content: center; font-size: 1rem; color: #6c757d; flex-shrink: 0; }
+        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 0.625rem; margin-top: 0.375rem; }
+        .existing-img-item { border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 0.4rem; background: #f8f9fa; text-align: center; font-size: 0.75rem; }
+        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 0.375rem; display: block; margin-bottom: 0.25rem; }
+
+        /* Bootstrap 5 Modal Overlay Compatibility Wrapper */
+        .modal-overlay {
+          display: none;
+          position: fixed;
+          inset: 0;
+          background: rgba(15, 23, 42, 0.65);
+          backdrop-filter: blur(3px);
+          z-index: 1055;
+          align-items: center;
+          justify-content: center;
+          padding: 1rem;
+          overflow-y: auto;
+        }
         .modal-overlay.active { display: flex; }
-        .modal-box { background: #fff; width: 94%; max-width: 780px; max-height: 92vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
-        .modal-box.wide { max-width: 1040px; }
-        .modal-header { padding: 18px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
-        .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
-        .modal-close { background: transparent; border: none; font-size: 22px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
-        .modal-body { padding: 24px; }
-        .doc-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .log-row { padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; display: flex; justify-content: space-between; gap: 12px; }
-        .metric-mini { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
-        .metric-mini .k { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
-        .metric-mini .v { font-size: 17px; font-weight: 800; color: #1e1b4b; margin-top: 3px; }
-        .ws-section { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #fff; }
-        .ws-section h4 { margin: 0 0 10px; color: #1e1b4b; font-size: 15px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-        .status-legend { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 6px; }
+        .modal-overlay .modal-dialog {
+          width: 100%;
+          max-width: 780px;
+          max-height: 92vh;
+          margin: auto;
+        }
+        .modal-overlay .modal-dialog.modal-xl { max-width: 1060px; }
+        .modal-overlay .modal-dialog.modal-sm-custom { max-width: 460px; }
+        .modal-overlay .modal-content {
+          max-height: 92vh;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+        }
+        .modal-overlay .modal-header {
+          background: #fff;
+          z-index: 5;
+        }
+        .modal-overlay .modal-body {
+          overflow-y: auto;
+        }
+
+        .metric-mini { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 0.65rem 0.75rem; }
+        .metric-mini .k { font-size: 0.6875rem; font-weight: 700; color: #6c757d; text-transform: uppercase; }
+        .metric-mini .v { font-size: 1.05rem; font-weight: 700; color: #212529; margin-top: 0.15rem; }
+        .ws-section { border: 1px solid #dee2e6; border-radius: 0.75rem; padding: 1rem; margin-bottom: 1rem; background: #fff; }
+        .ws-section h4 { margin: 0 0 0.75rem; color: #212529; font-size: 0.95rem; font-weight: 700; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+        .doc-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 0.625rem; padding: 0.875rem; margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; }
+        .log-row { padding: 0.6rem 0; border-bottom: 1px solid #edf2f7; font-size: 0.8125rem; display: flex; justify-content: space-between; gap: 0.75rem; }
+        .reject-presets { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.5rem 0; }
+        .admin-footer { background-color: #1e293b; color: #cbd5e1; margin-top: auto; }
+        .footer-links a { color: #cbd5e1; text-decoration: none; font-size: 0.8125rem; font-weight: 600; }
+        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
+        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; padding-top: 0.875rem; border-top: 1px solid #dee2e6; font-size: 0.8125rem; color: #495057; }
       </style>
     </head>
     <body>
-      <header class="top">
-        <a href="/admin" class="brand" onclick="return switchAdminTab('overview', event);">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></a>
-        <nav class="top-nav" id="adminTopNav">
-          <a href="/admin" data-tab="overview" class="nav-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">Overview</a>
-          <a href="/admin/gst-verifications" data-tab="gst" class="nav-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">PDF Verifications${pendingGstCount > 0 ? ' (' + pendingGstCount + ')' : ''}</a>
-          <a href="/admin/sellers" data-tab="sellers" class="nav-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">Seller Accounts (${count})</a>
-          <a href="/admin/create-seller" data-tab="create-seller" class="nav-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
-          <a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount">${Number(delKpis.total || 0)}</span>)</a>
-          <a href="/admin/products" data-tab="products" class="nav-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">Manage Products (${totalListedProducts})</a>
-          <a href="/admin/categories" data-tab="categories" class="nav-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">Categories (${categoriesList.length})</a>
-          <a href="/admin?tab=all" data-tab="all" class="nav-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Lists</a>
-        </nav>
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <button type="button" class="btn-approve-sm" style="padding:7px 11px;" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
-          <span style="font-size:13px; opacity:.9;">${escapeHtml((req.adminUser && req.adminUser.email) || 'admin@vendor.app')}</span>
-          <a href="/admin/logout" class="logout-btn">Sign out</a>
-        </div>
-      </header>
-
-      <main class="wrap">
-        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
-          <div>
-            <h1 id="adminPageTitle" style="margin-bottom:6px;">${escapeHtml(curMeta.title)}</h1>
-            <p id="adminPageSubtitle" class="muted" style="margin:0;">${escapeHtml(curMeta.sub)}</p>
+      <nav class="navbar navbar-expand-xl navbar-dark admin-navbar sticky-top shadow-sm">
+        <div class="container-fluid px-3 px-lg-4">
+          <a href="/admin" class="navbar-brand fw-bold d-flex align-items-center gap-2" onclick="return switchAdminTab('overview', event);">
+            <i class="bi bi-shop-window text-primary"></i>
+            Vendor <span class="badge bg-primary-subtle text-primary-emphasis fw-semibold">Admin</span>
+          </a>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#adminNavbarContent" aria-controls="adminNavbarContent" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+          </button>
+          <div class="collapse navbar-collapse" id="adminNavbarContent">
+            <ul class="navbar-nav me-auto mb-2 mb-xl-0 gap-1" id="adminTopNav">
+              <li class="nav-item"><a href="/admin" data-tab="overview" class="nav-link nav-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">Overview</a></li>
+              <li class="nav-item"><a href="/admin/gst-verifications" data-tab="gst" class="nav-link nav-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">PDF Verifications${pendingGstCount > 0 ? ' (' + pendingGstCount + ')' : ''}</a></li>
+              <li class="nav-item"><a href="/admin/sellers" data-tab="sellers" class="nav-link nav-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">Seller Accounts (${count})</a></li>
+              <li class="nav-item"><a href="/admin/create-seller" data-tab="create-seller" class="nav-link nav-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a></li>
+              <li class="nav-item"><a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-link nav-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount">${Number(delKpis.total || 0)}</span>)</a></li>
+              <li class="nav-item"><a href="/admin/products" data-tab="products" class="nav-link nav-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">Manage Products (${totalListedProducts})</a></li>
+              <li class="nav-item"><a href="/admin/categories" data-tab="categories" class="nav-link nav-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">Categories (${categoriesList.length})</a></li>
+              <li class="nav-item"><a href="/admin?tab=all" data-tab="all" class="nav-link nav-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Lists</a></li>
+            </ul>
+            <div class="d-flex align-items-center gap-2 flex-wrap">
+              <button type="button" class="btn btn-outline-info btn-sm fw-semibold" onclick="openHostingerMailModal()">
+                <i class="bi bi-envelope-at"></i> Hostinger Mail
+              </button>
+              <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="switchAdminTab('products'); openProductModal(null);">
+                <i class="bi bi-plus-lg"></i> Add Product
+              </button>
+              <span class="badge text-bg-secondary py-2 px-2">
+                <i class="bi bi-person-circle me-1"></i>${escapeHtml((req.adminUser && req.adminUser.email) || 'admin@vendor.app')}
+              </span>
+              <a href="/admin/logout" class="btn btn-outline-light btn-sm">Sign out</a>
+            </div>
           </div>
-          <div class="status-legend">
+        </div>
+      </nav>
+
+      <main class="container-xl py-4 flex-grow-1">
+        <div class="d-flex flex-column flex-lg-row justify-content-between align-items-lg-end gap-3 mb-3">
+          <div>
+            <h1 id="adminPageTitle" class="h3 fw-bold mb-1">${escapeHtml(curMeta.title)}</h1>
+            <p id="adminPageSubtitle" class="text-body-secondary mb-0 small">${escapeHtml(curMeta.sub)}</p>
+          </div>
+          <div class="d-flex gap-2 flex-wrap align-items-center">
             <span class="del-badge del-yellow">PENDING</span>
             <span class="del-badge del-blue">PROCESSING</span>
             <span class="del-badge del-green">SUCCESS</span>
@@ -12001,747 +12461,829 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
           </div>
         </div>
 
-        ${flashMsg ? `<div style="background:#ecfdf5; color:#047857; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashMsg)}</div>` : ''}
-        ${flashErr ? `<div style="background:#fef2f2; color:#b91c1c; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashErr)}</div>` : ''}
+        ${flashMsg ? `<div class="alert alert-success alert-dismissible fade show d-flex align-items-center gap-2" role="alert"><i class="bi bi-check-circle-fill"></i><div>${escapeHtml(flashMsg)}</div><button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>` : ''}
+        ${flashErr ? `<div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2" role="alert"><i class="bi bi-exclamation-triangle-fill"></i><div>${escapeHtml(flashErr)}</div><button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>` : ''}
 
         <!-- Page-Wise Admin Category Stepper Bar -->
-        <nav class="cat-pager" id="adminCategoryPager" aria-label="Admin Category Pages">
-          <div class="cat-pager-pills">
-            <a href="/admin" data-tab="overview" class="cat-page-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">🏠 Overview</a>
-            <a href="/admin/gst-verifications" data-tab="gst" class="cat-page-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (${totalGstCount})</a>
-            <a href="/admin/sellers" data-tab="sellers" class="cat-page-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (${count})</a>
-            <a href="/admin/create-seller" data-tab="create-seller" class="cat-page-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
-            <a href="/admin/seller-deletions" data-tab="seller-deletions" class="cat-page-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (${Number(delKpis.total || 0)})</a>
-            <a href="/admin/products" data-tab="products" class="cat-page-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">5. Manage Products (${totalListedProducts})</a>
-            <a href="/admin/categories" data-tab="categories" class="cat-page-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">6. Categories (${categoriesList.length})</a>
-            <a href="/admin?tab=all" data-tab="all" class="cat-page-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Pages</a>
-          </div>
-          <div class="cat-pager-nav">
-            <button type="button" id="catPrevBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(-1)">← Previous</button>
-            <span id="categoryPageIndicator" class="cat-step-indicator">Overview</span>
-            <button type="button" id="catNextBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(1)">Next →</button>
+        <nav class="card border-0 shadow-sm mb-4" id="adminCategoryPager" aria-label="Admin Category Pages">
+          <div class="card-body py-2 px-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div class="d-flex gap-1 flex-wrap align-items-center">
+              <a href="/admin" data-tab="overview" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);"><i class="bi bi-house-door me-1"></i>Overview</a>
+              <a href="/admin/gst-verifications" data-tab="gst" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (${totalGstCount})</a>
+              <a href="/admin/sellers" data-tab="sellers" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (${count})</a>
+              <a href="/admin/create-seller" data-tab="create-seller" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
+              <a href="/admin/seller-deletions" data-tab="seller-deletions" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (${Number(delKpis.total || 0)})</a>
+              <a href="/admin/products" data-tab="products" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">5. Manage Products (${totalListedProducts})</a>
+              <a href="/admin/categories" data-tab="categories" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">6. Categories (${categoriesList.length})</a>
+              <a href="/admin?tab=all" data-tab="all" class="btn btn-sm btn-outline-secondary cat-page-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Pages</a>
+            </div>
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+              <button type="button" id="catPrevBtn" class="btn btn-outline-primary btn-sm" onclick="stepAdminCategoryPage(-1)"><i class="bi bi-arrow-left"></i> Previous</button>
+              <span id="categoryPageIndicator" class="badge text-bg-light border text-dark fw-semibold px-2 py-2">Overview</span>
+              <button type="button" id="catNextBtn" class="btn btn-outline-primary btn-sm" onclick="stepAdminCategoryPage(1)">Next <i class="bi bi-arrow-right"></i></button>
+            </div>
           </div>
         </nav>
 
         <!-- KPI Metrics Grid (shown cleanly on Overview & All Lists; clickable to jump directly to any module list) -->
         <div class="admin-view-panel ${(activeTab === 'overview' || activeTab === 'all') ? 'is-visible' : ''}" data-admin-panel="overview,all">
-          <div class="grid" style="margin-bottom: 24px;">
-            <section class="card kpi-card-link" onclick="switchAdminTab('sellers')">
-              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
-              <div class="stat">${count}</div>
-            </section>
-            <section class="card kpi-card-link" onclick="switchAdminTab('products')">
-              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
-              <div class="stat" style="color:#2563eb;">${productCount}</div>
-            </section>
-            <section class="card kpi-card-link" onclick="switchAdminTab('categories')">
-              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
-              <div class="stat" style="color:#7c3aed;">${categoryCount}</div>
-            </section>
-            <section class="card">
-              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
-              <div class="stat" style="color:#0891b2;">${orderCount}</div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #f59e0b; background:${pendingGstCount > 0 ? '#fffbeb' : '#fff'};" onclick="switchAdminTab('gst')">
-              <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
-                Pending PDF Reviews
-                ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>' : ''}
+          <div class="row row-cols-2 row-cols-md-4 row-cols-xl-4 g-3 mb-4">
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-primary kpi-card-link" onclick="switchAdminTab('sellers')">
+                <div class="card-body">
+                  <div class="text-body-secondary small fw-bold text-uppercase">Registered Sellers</div>
+                  <div class="fs-2 fw-bold text-primary mt-1">${count}</div>
+                </div>
               </div>
-              <div class="stat" style="color:#b45309;">${pendingGstCount}</div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #10b981;" onclick="switchAdminTab('gst')">
-              <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
-              <div class="stat" style="color:#10b981;">${approvedGstCount}</div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #ef4444;" onclick="switchAdminTab('seller-deletions')">
-              <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Deletion Requests</div>
-              <div class="stat" style="color:#dc2626;">${Number(delKpis.total || 0)}</div>
-            </section>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-info kpi-card-link" onclick="switchAdminTab('products')">
+                <div class="card-body">
+                  <div class="text-body-secondary small fw-bold text-uppercase">Active Products</div>
+                  <div class="fs-2 fw-bold text-info-emphasis mt-1">${productCount}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-secondary kpi-card-link" onclick="switchAdminTab('categories')">
+                <div class="card-body">
+                  <div class="text-body-secondary small fw-bold text-uppercase">Product Categories</div>
+                  <div class="fs-2 fw-bold text-secondary-emphasis mt-1">${categoryCount}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-dark">
+                <div class="card-body">
+                  <div class="text-body-secondary small fw-bold text-uppercase">Marketplace Orders</div>
+                  <div class="fs-2 fw-bold text-dark mt-1">${orderCount}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-warning kpi-card-link ${pendingGstCount > 0 ? 'bg-warning-subtle' : ''}" onclick="switchAdminTab('gst')">
+                <div class="card-body">
+                  <div class="text-warning-emphasis small fw-bold text-uppercase d-flex align-items-center justify-content-between gap-1">
+                    <span>Pending PDF Reviews</span>
+                    ${pendingGstCount > 0 ? '<span class="badge text-bg-warning">Action</span>' : ''}
+                  </div>
+                  <div class="fs-2 fw-bold text-warning-emphasis mt-1">${pendingGstCount}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-success kpi-card-link" onclick="switchAdminTab('gst')">
+                <div class="card-body">
+                  <div class="text-success small fw-bold text-uppercase">Approved Sellers</div>
+                  <div class="fs-2 fw-bold text-success mt-1">${approvedGstCount}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="card h-100 border-0 shadow-sm border-start border-4 border-danger kpi-card-link" onclick="switchAdminTab('seller-deletions')">
+                <div class="card-body">
+                  <div class="text-danger small fw-bold text-uppercase">Deletion Requests</div>
+                  <div class="fs-2 fw-bold text-danger mt-1">${Number(delKpis.total || 0)}</div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
         <!-- Overview Directory Grid (clean page-wise category cards into each Admin page/list) -->
         <div class="admin-view-panel ${activeTab === 'overview' ? 'is-visible' : ''}" data-admin-panel="overview" id="overviewSection">
-          <section class="card">
-            <h2>Admin Categories — Page-Wise Navigation</h2>
-            <p class="muted">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
-            <div class="dir-grid">
-              <div class="dir-card" style="border-left: 4px solid #f59e0b;">
-                <div>
-                  <h3>📄 Page 1: Seller PDF Document Verification</h3>
-                  <p>Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+          <div class="card border-0 shadow-sm">
+            <div class="card-body p-4">
+              <h2 class="h5 fw-bold mb-1">Admin Categories — Page-Wise Navigation</h2>
+              <p class="text-body-secondary small mb-4">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
+              <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-warning dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-file-earmark-pdf text-warning me-1"></i> Page 1: Seller PDF Document Verification</h3>
+                      <p class="text-body-secondary small mb-0">Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                      <span class="badge-pending">${pendingGstCount} pending &bull; ${rejectedGstCount} rejected</span>
+                      <a href="/admin/gst-verifications" class="btn btn-warning btn-sm fw-semibold" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                    </div>
+                  </div>
                 </div>
-                <div class="dir-card-actions">
-                  <span class="badge-pending">${pendingGstCount} pending &bull; ${rejectedGstCount} rejected</span>
-                  <a href="/admin/gst-verifications" class="btn-sm" style="background:#d97706;" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-primary dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-shop text-primary me-1"></i> Page 2: Seller Accounts</h3>
+                      <p class="text-body-secondary small mb-0">Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                      <span class="badge-prod">${count} sellers</span>
+                      <a href="/admin/sellers" class="btn btn-primary btn-sm fw-semibold" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div class="dir-card">
-                <div>
-                  <h3>🏪 Page 2: Seller Accounts</h3>
-                  <p>Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-info dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-person-plus text-info me-1"></i> Page 3: Create Seller Account</h3>
+                      <p class="text-body-secondary small mb-0">Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-end align-items-center">
+                      <a href="/admin/create-seller" class="btn btn-info btn-sm fw-semibold text-white" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                    </div>
+                  </div>
                 </div>
-                <div class="dir-card-actions">
-                  <span class="badge-prod">${count} sellers</span>
-                  <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-danger dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-trash3 text-danger me-1"></i> Page 4: Seller Deletion &amp; Refunds</h3>
+                      <p class="text-body-secondary small mb-0">Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                      <span class="badge-pending">${Number(delKpis.pending || 0) + Number(delKpis.processing || 0)} active &bull; ${Number(delKpis.total || 0)} total</span>
+                      <a href="/admin/seller-deletions" class="btn btn-danger btn-sm fw-semibold" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div class="dir-card">
-                <div>
-                  <h3>➕ Page 3: Create Seller Account</h3>
-                  <p>Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-success dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-box-seam text-success me-1"></i> Page 5: Manage Products</h3>
+                      <p class="text-body-secondary small mb-0">Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                      <span class="badge-prod">${totalListedProducts} total &bull; ${activeListedProducts} active</span>
+                      <div class="d-flex gap-1 flex-wrap">
+                        <a href="/admin/products" class="btn btn-primary btn-sm fw-semibold" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
+                        <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="switchAdminTab('products'); openProductModal(null);">+ Add</button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-                <div class="dir-card-actions">
-                  <a href="/admin/create-seller" class="btn-sm" style="background:#4f46e5;" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-secondary dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-tags text-secondary me-1"></i> Page 6: Product Categories</h3>
+                      <p class="text-body-secondary small mb-0">Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                      <span class="badge-prod">${categoriesList.length} categories</span>
+                      <a href="/admin/categories" class="btn btn-secondary btn-sm fw-semibold" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div class="dir-card" style="border-left: 4px solid #dc2626;">
-                <div>
-                  <h3>🗑 Page 4: Seller Deletion &amp; Refunds</h3>
-                  <p>Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
-                </div>
-                <div class="dir-card-actions">
-                  <span class="badge-pending">${Number(delKpis.pending || 0) + Number(delKpis.processing || 0)} active &bull; ${Number(delKpis.total || 0)} total</span>
-                  <a href="/admin/seller-deletions" class="btn-sm" style="background:#dc2626;" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
-                </div>
-              </div>
-              <div class="dir-card">
-                <div>
-                  <h3>📦 Page 5: Manage Products</h3>
-                  <p>Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
-                </div>
-                <div class="dir-card-actions">
-                  <span class="badge-prod">${totalListedProducts} total &bull; ${activeListedProducts} active</span>
-                  <a href="/admin/products" class="btn-sm" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
-                  <button type="button" class="btn-approve-sm" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
-                </div>
-              </div>
-              <div class="dir-card">
-                <div>
-                  <h3>🏷 Page 6: Product Categories</h3>
-                  <p>Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
-                </div>
-                <div class="dir-card-actions">
-                  <span class="badge-prod">${categoriesList.length} categories</span>
-                  <a href="/admin/categories" class="btn-sm" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
-                </div>
-              </div>
-              <div class="dir-card">
-                <div>
-                  <h3>📋 Combined All-Lists Mode</h3>
-                  <p>View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
-                </div>
-                <div class="dir-card-actions">
-                  <a href="/admin?tab=all" class="btn-sm" style="background:#475569;" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                <div class="col">
+                  <div class="card h-100 border shadow-sm border-start border-4 border-dark dir-card">
+                    <div class="card-body">
+                      <h3 class="h6 fw-bold mb-2"><i class="bi bi-collection text-dark me-1"></i> Combined All-Lists Mode</h3>
+                      <p class="text-body-secondary small mb-0">View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
+                    </div>
+                    <div class="card-footer bg-transparent border-top d-flex justify-content-end align-items-center">
+                      <a href="/admin?tab=all" class="btn btn-dark btn-sm fw-semibold" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
-          </section>
+          </div>
         </div>
 
         <!-- Section 1: Seller PDF Document Verification Hub -->
         <div class="admin-view-panel ${panelVisible('gst') ? 'is-visible' : ''}" data-admin-panel="gst">
-        <section class="card" id="gstSection" style="margin-top:0;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-primary" id="gstSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
             <div>
-              <h2>Seller PDF Document Verification</h2>
-              <p class="muted">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-file-earmark-pdf text-primary me-2"></i>Seller PDF Document Verification</h2>
+              <p class="text-body-secondary small mb-0">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
             </div>
-            <div class="search-box">
-              <input type="text" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
+            <div class="input-group input-group-sm" style="max-width: 310px;">
+              <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+              <input type="text" class="form-control" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
             </div>
           </div>
+          <div class="card-body">
+            <div class="tabs-bar nav nav-pills gap-2 pb-3 mb-3 border-bottom flex-wrap">
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn active" onclick="filterGstRows('all', this)">All Documents (${totalGstCount})</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('pending', this)">
+                Pending Review (${pendingGstCount})
+                ${pendingGstCount > 0 ? '<span class="badge text-bg-warning ms-1">●</span>' : ''}
+              </button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('approved', this)">Approved (${approvedGstCount})</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('rejected', this)">Rejected (${rejectedGstCount})</button>
+            </div>
 
-          <div class="tabs-bar">
-            <button type="button" class="tab-btn active" onclick="filterGstRows('all', this)">All Documents (${totalGstCount})</button>
-            <button type="button" class="tab-btn" onclick="filterGstRows('pending', this)">
-              Pending Review (${pendingGstCount})
-              ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:#fff; border-radius:999px; padding:1px 6px; font-size:11px; margin-left:4px;">●</span>' : ''}
-            </button>
-            <button type="button" class="tab-btn" onclick="filterGstRows('approved', this)">Approved (${approvedGstCount})</button>
-            <button type="button" class="tab-btn" onclick="filterGstRows('rejected', this)">Rejected (${rejectedGstCount})</button>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th style="width:24%;">Seller</th>
-                <th style="width:28%;">Uploaded PDF Document</th>
-                <th style="width:16%;">Verification Status</th>
-                <th style="width:14%;">Submitted</th>
-                <th style="width:18%;">Admin Actions</th>
-              </tr>
-            </thead>
-            <tbody id="gstTableBody">
-              ${gstSellers.length === 0 ? `
-                <tr><td colspan="5" style="color:#94a3b8; text-align:center; padding:32px;">No sellers have uploaded verification documents yet.</td></tr>
-              ` : gstSellers.map(g => {
-                let st = (g.status || 'Pending').toLowerCase();
-                if (st === 'resubmitted') st = 'pending';
-                const badgeClass = (st === 'approved') ? 'badge-approved' : ((st === 'rejected') ? 'badge-rejected' : 'badge-pending');
-                const sellerLabel = g.seller_name || g.user_name || 'Seller #' + g.seller_id;
-                const displayGstEmail = getPublicSellerEmail(g.email);
-                const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (displayGstEmail || '')).toLowerCase();
-                const latestDocId = g.latest_doc_id;
-                const subDate = formatDateStr(g.submitted_at || g.updated_at);
-
-                return `
-                  <tr class="gst-row" data-status="${st}" data-search="${escapeHtml(searchString)}">
-                    <td>
-                      <strong style="font-size:15px; color:#1e1b4b;">${escapeHtml(sellerLabel)}</strong>
-                      <div style="font-size:12px; color:#64748b; margin-top:2px;">
-                        <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #${g.seller_id}</span>
-                        ${escapeHtml(g.phone || '')}
-                      </div>
-                      ${displayGstEmail ? `<div style="font-size:12px; color:#94a3b8;">${escapeHtml(displayGstEmail)}</div>` : ''}
-                    </td>
-                    <td>
-                      ${latestDocId ? `
-                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                          <span class="badge-pdf">PDF</span>
-                          <strong style="color:#334155; font-size:13px;">${escapeHtml(g.latest_doc_name || 'Certificate.pdf')}</strong>
-                          <span style="color:#94a3b8; font-size:11px;">(${formatBytes(g.latest_doc_size)})</span>
-                          ${!g.latest_doc_exists ? `<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>` : ''}
-                        </div>
-                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                          <button type="button" class="btn-view" style="border:none; cursor:pointer;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false, ${Number(latestDocId)})">
-                            📄 Preview PDF
-                          </button>
-                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn-view" style="background:#475569;" title="Open PDF in New Tab">
-                            ↗ New Tab
-                          </a>
-                          <a href="/admin/view_gst_doc?id=${latestDocId}&mode=download" class="btn-dl" title="Download PDF">
-                            ⬇
-                          </a>
-                          ${g.doc_count > 1 ? `<span style="font-size:11px; color:#64748b; font-weight:600;">+${g.doc_count - 1} more</span>` : ''}
-                        </div>
-                      ` : `
-                        <span style="color:#94a3b8; font-style:italic; font-size:13px;">No document attached</span>
-                      `}
-                    </td>
-                    <td>
-                      <span class="${badgeClass}">
-                        ${st === 'pending' ? '⏳ ' : (st === 'approved' ? '✓ ' : '✕ ')}
-                        ${escapeHtml(g.status || 'Pending')}
-                      </span>
-                      ${st === 'rejected' && g.rejection_reason ? `
-                        <div style="font-size:11px; color:#b91c1c; margin-top:4px; max-width:220px; line-height:1.3;" title="${escapeHtml(g.rejection_reason)}">
-                          <strong>Reason:</strong> ${escapeHtml(g.rejection_reason.length > 55 ? g.rejection_reason.slice(0, 52) + '...' : g.rejection_reason)}
-                        </div>
-                      ` : ''}
-                    </td>
-                    <td>
-                      <div style="font-size:13px; color:#334155;">${subDate.date}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${subDate.time}</div>
-                    </td>
-                    <td>
-                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                        ${st !== 'approved' ? `
-                          <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Approve Verification" data-confirm-msg="${escapeHtml('Approve verification for ' + sellerLabel + '?')}" onsubmit="return openFormConfirmModal(this);">
-                            <input type="hidden" name="action" value="approve_gst">
-                            <input type="hidden" name="seller_id" value="${g.seller_id}">
-                            <input type="hidden" name="notes" value="Approved by administrator">
-                            <button type="submit" class="btn-approve-sm" title="Instant Approve">✓ Approve</button>
-                          </form>
-                        ` : ''}
-
-                        ${st !== 'rejected' ? `
-                          <button type="button" class="btn-reject-sm" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModalWithReject(${g.seller_id}, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
-                        ` : ''}
-
-                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
-                      </div>
-                    </td>
+            <div class="table-responsive">
+              <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th style="width:24%;">Seller</th>
+                    <th style="width:28%;">Uploaded PDF Document</th>
+                    <th style="width:16%;">Verification Status</th>
+                    <th style="width:14%;">Submitted</th>
+                    <th style="width:18%;">Admin Actions</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-          <div id="gstPaginationBar" class="pagination-bar"></div>
+                </thead>
+                <tbody id="gstTableBody">
+                  ${gstSellers.length === 0 ? `
+                    <tr><td colspan="5" class="text-body-secondary text-center py-4">No sellers have uploaded verification documents yet.</td></tr>
+                  ` : gstSellers.map(g => {
+                    let st = (g.status || 'Pending').toLowerCase();
+                    if (st === 'resubmitted') st = 'pending';
+                    const badgeClass = (st === 'approved') ? 'badge-approved' : ((st === 'rejected') ? 'badge-rejected' : 'badge-pending');
+                    const sellerLabel = g.seller_name || g.user_name || 'Seller #' + g.seller_id;
+                    const displayGstEmail = getPublicSellerEmail(g.email);
+                    const searchString = (sellerLabel + ' ' + (g.phone || '') + ' ' + (displayGstEmail || '')).toLowerCase();
+                    const latestDocId = g.latest_doc_id;
+                    const subDate = formatDateStr(g.submitted_at || g.updated_at);
+
+                    return `
+                      <tr class="gst-row" data-status="${st}" data-search="${escapeHtml(searchString)}">
+                        <td>
+                          <div class="fw-bold text-dark">${escapeHtml(sellerLabel)}</div>
+                          <div class="small text-body-secondary mt-1">
+                            <span class="badge-prod me-1">ID #${g.seller_id}</span>
+                            ${escapeHtml(g.phone || '')}
+                          </div>
+                          ${displayGstEmail ? `<div class="small text-muted">${escapeHtml(displayGstEmail)}</div>` : ''}
+                        </td>
+                        <td>
+                          ${latestDocId ? `
+                            <div class="d-flex align-items-center gap-2 flex-wrap">
+                              <span class="badge-pdf">PDF</span>
+                              <span class="fw-semibold small text-dark">${escapeHtml(g.latest_doc_name || 'Certificate.pdf')}</span>
+                              <span class="text-body-secondary small">(${formatBytes(g.latest_doc_size)})</span>
+                              ${!g.latest_doc_exists ? `<span class="badge text-bg-warning" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>` : ''}
+                            </div>
+                            <div class="mt-2 d-flex gap-1 align-items-center flex-wrap">
+                              <button type="button" class="btn btn-info btn-sm text-white py-1 px-2" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false, ${Number(latestDocId)})">
+                                <i class="bi bi-file-earmark-text me-1"></i>Preview PDF
+                              </button>
+                              <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn btn-outline-secondary btn-sm py-1 px-2" title="Open PDF in New Tab">
+                                <i class="bi bi-box-arrow-up-right"></i> New Tab
+                              </a>
+                              <a href="/admin/view_gst_doc?id=${latestDocId}&mode=download" class="btn btn-outline-dark btn-sm py-1 px-2" title="Download PDF">
+                                <i class="bi bi-download"></i>
+                              </a>
+                              ${g.doc_count > 1 ? `<span class="small text-body-secondary fw-semibold ms-1">+${g.doc_count - 1} more</span>` : ''}
+                            </div>
+                          ` : `
+                            <span class="text-body-secondary fst-italic small">No document attached</span>
+                          `}
+                        </td>
+                        <td>
+                          <span class="${badgeClass}">
+                            ${st === 'pending' ? '⏳ ' : (st === 'approved' ? '✓ ' : '✕ ')}
+                            ${escapeHtml(g.status || 'Pending')}
+                          </span>
+                          ${st === 'rejected' && g.rejection_reason ? `
+                            <div class="small text-danger mt-1" style="max-width:220px;" title="${escapeHtml(g.rejection_reason)}">
+                              <strong>Reason:</strong> ${escapeHtml(g.rejection_reason.length > 55 ? g.rejection_reason.slice(0, 52) + '...' : g.rejection_reason)}
+                            </div>
+                          ` : ''}
+                        </td>
+                        <td>
+                          <div class="small text-dark">${subDate.date}</div>
+                          <div class="small text-muted">${subDate.time}</div>
+                        </td>
+                        <td>
+                          <div class="d-flex gap-1 flex-wrap align-items-center">
+                            ${st !== 'approved' ? `
+                              <form method="POST" action="/admin" class="d-inline" data-confirm-title="Approve Verification" data-confirm-msg="${escapeHtml('Approve verification for ' + sellerLabel + '?')}" onsubmit="return openFormConfirmModal(this);">
+                                <input type="hidden" name="action" value="approve_gst">
+                                <input type="hidden" name="seller_id" value="${g.seller_id}">
+                                <input type="hidden" name="notes" value="Approved by administrator">
+                                <button type="submit" class="btn btn-success btn-sm fw-semibold" title="Instant Approve">✓ Approve</button>
+                              </form>
+                            ` : ''}
+
+                            ${st !== 'rejected' ? `
+                              <button type="button" class="btn btn-danger btn-sm fw-semibold" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModalWithReject(${g.seller_id}, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
+                            ` : ''}
+
+                            <button type="button" class="btn btn-primary btn-sm fw-semibold" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
+                          </div>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div id="gstPaginationBar" class="pagination-bar"></div>
+          </div>
         </section>
         </div>
 
         <!-- Section 2: Seller Accounts Overview with Search, Status Filter, Pagination & Deletion Controls -->
         <div class="admin-view-panel ${panelVisible('sellers') ? 'is-visible' : ''}" data-admin-panel="sellers">
-        <section class="card" id="sellersSection" style="margin-top:0;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-primary" id="sellersSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
             <div>
-              <h2>Seller Accounts</h2>
-              <p class="muted">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-shop text-primary me-2"></i>Seller Accounts</h2>
+              <p class="text-body-secondary small mb-0">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
             </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-              <a href="/admin/create-seller" class="btn-sm" style="background:#16a34a; padding:8px 13px; font-size:12px;" onclick="return switchAdminTab('create-seller', event);">+ Add New Seller</a>
-            </div>
+            <a href="/admin/create-seller" class="btn btn-success btn-sm fw-semibold" onclick="return switchAdminTab('create-seller', event);"><i class="bi bi-plus-lg me-1"></i>Add New Seller</a>
           </div>
-          <div class="filter-bar" style="margin-bottom:12px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
-            <div class="search-box" style="max-width:280px; flex:1; min-width:190px;">
-              <input type="text" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+          <div class="card-body">
+            <div class="row g-2 align-items-center bg-light p-3 rounded-3 border mb-3">
+              <div class="col-md-5">
+                <div class="input-group input-group-sm">
+                  <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
+                  <input type="text" class="form-control" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+                </div>
+              </div>
+              <div class="col-md-4 col-lg-3">
+                <select class="form-select form-select-sm" id="sellersStatusFilter" onchange="applySellerFilters()">
+                  <option value="all">All Account Statuses</option>
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="DELETION_PENDING">DELETION_PENDING</option>
+                  <option value="LOCKED">LOCKED</option>
+                  <option value="DELETED">DELETED</option>
+                </select>
+              </div>
             </div>
-            <select id="sellersStatusFilter" onchange="applySellerFilters()">
-              <option value="all">All Account Statuses</option>
-              <option value="ACTIVE">ACTIVE</option>
-              <option value="DELETION_PENDING">DELETION_PENDING</option>
-              <option value="LOCKED">LOCKED</option>
-              <option value="DELETED">DELETED</option>
-            </select>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Seller Name</th>
-                <th>Contact</th>
-                <th>Location</th>
-                <th>Products</th>
-                <th>Document Status</th>
-                <th>Account Status</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="sellersTableBody">
-              ${sellers.length === 0 ? `
-                <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
-              ` : sellers.map(s => {
-                let dSt = (s.doc_status || '').toLowerCase();
-                if (dSt === 'resubmitted') dSt = 'pending';
-                const docBadgeClass = (dSt === 'approved') ? 'badge-approved' : ((dSt === 'rejected') ? 'badge-rejected' : ((dSt === 'pending') ? 'badge-pending' : ''));
-                const accStatus = String(s.account_status || 'ACTIVE').toUpperCase();
-                const accBadgeCls = accStatus === 'ACTIVE' ? 'del-badge del-green' : (accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : (accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
-                const pubSellerEmail = getPublicSellerEmail(s.email) || '';
-                const sellerSearchStr = ((s.seller_name || s.name || '') + ' ' + (s.phone || '') + ' ' + pubSellerEmail + ' ' + (s.state || '') + ' #' + Number(s.id)).toLowerCase();
-
-                return `
-                  <tr id="seller-row-${Number(s.id)}" class="seller-account-row" data-status="${escapeHtml(accStatus)}" data-search="${escapeHtml(sellerSearchStr)}">
-                    <td>#${s.id}</td>
-                    <td>
-                      <strong>${escapeHtml(s.seller_name || s.name)}</strong>
-                    </td>
-                    <td>
-                      <div>${escapeHtml(s.phone || '—')}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(pubSellerEmail)}</div>
-                    </td>
-                    <td>${escapeHtml(s.state || '—')}</td>
-                    <td><span class="badge-prod">${s.products_count || 0} products</span></td>
-                    <td>
-                      ${docBadgeClass ? `
-                        <span class="${docBadgeClass}">${escapeHtml(s.doc_status)}</span>
-                        ${s.latest_doc_id ? `<a href="/admin/view_gst_doc?id=${s.latest_doc_id}&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>` : ''}
-                      ` : `
-                        <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
-                      `}
-                    </td>
-                    <td class="seller-acc-cell"><span class="${accBadgeCls}">${escapeHtml(accStatus)}</span></td>
-                    <td>${String(s.created_at || '').slice(0, 10)}</td>
-                    <td>
-                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;" data-seller-id="${Number(s.id)}">
-                        <button type="button" class="btn-sm" data-seller="${escapeHtml(JSON.stringify(s))}" onclick="openSellerModal(this)">View / Edit</button>
-                        <span class="seller-del-btn-slot">
-                          ${s.active_deletion_request_id ? `
-                            <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(${Number(s.active_deletion_request_id)})">Manage Deletion #${Number(s.active_deletion_request_id)}</button>
-                          ` : (accStatus !== 'DELETED' ? `
-                            <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(${Number(s.id)})">Request Seller Deletion</button>
-                          ` : '')}
-                        </span>
-                      </div>
-                    </td>
+            <div class="table-responsive">
+              <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th>ID</th>
+                    <th>Seller Name</th>
+                    <th>Contact</th>
+                    <th>Location</th>
+                    <th>Products</th>
+                    <th>Document Status</th>
+                    <th>Account Status</th>
+                    <th>Created</th>
+                    <th>Actions</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-          <div id="sellersPaginationBar" class="pagination-bar"></div>
+                </thead>
+                <tbody id="sellersTableBody">
+                  ${sellers.length === 0 ? `
+                    <tr><td colspan="9" class="text-body-secondary text-center py-4">No sellers registered yet.</td></tr>
+                  ` : sellers.map(s => {
+                    let dSt = (s.doc_status || '').toLowerCase();
+                    if (dSt === 'resubmitted') dSt = 'pending';
+                    const docBadgeClass = (dSt === 'approved') ? 'badge-approved' : ((dSt === 'rejected') ? 'badge-rejected' : ((dSt === 'pending') ? 'badge-pending' : ''));
+                    const accStatus = String(s.account_status || 'ACTIVE').toUpperCase();
+                    const accBadgeCls = accStatus === 'ACTIVE' ? 'del-badge del-green' : (accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : (accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
+                    const pubSellerEmail = getPublicSellerEmail(s.email) || '';
+                    const sellerSearchStr = ((s.seller_name || s.name || '') + ' ' + (s.phone || '') + ' ' + pubSellerEmail + ' ' + (s.state || '') + ' #' + Number(s.id)).toLowerCase();
+
+                    return `
+                      <tr id="seller-row-${Number(s.id)}" class="seller-account-row" data-status="${escapeHtml(accStatus)}" data-search="${escapeHtml(sellerSearchStr)}">
+                        <td class="fw-semibold">#${s.id}</td>
+                        <td>
+                          <span class="fw-bold text-dark">${escapeHtml(s.seller_name || s.name)}</span>
+                        </td>
+                        <td>
+                          <div class="small fw-medium">${escapeHtml(s.phone || '—')}</div>
+                          <div class="small text-muted">${escapeHtml(pubSellerEmail)}</div>
+                        </td>
+                        <td class="small">${escapeHtml(s.state || '—')}</td>
+                        <td><span class="badge-prod">${s.products_count || 0} products</span></td>
+                        <td>
+                          ${docBadgeClass ? `
+                            <span class="${docBadgeClass}">${escapeHtml(s.doc_status)}</span>
+                            ${s.latest_doc_id ? `<a href="/admin/view_gst_doc?id=${s.latest_doc_id}&mode=preview" target="_blank" class="btn btn-link btn-sm text-decoration-none p-0 ms-1 fw-semibold">📄 View</a>` : ''}
+                          ` : `
+                            <span class="text-body-secondary small">Not Uploaded</span>
+                          `}
+                        </td>
+                        <td class="seller-acc-cell"><span class="${accBadgeCls}">${escapeHtml(accStatus)}</span></td>
+                        <td class="small text-body-secondary">${String(s.created_at || '').slice(0, 10)}</td>
+                        <td>
+                          <div class="d-flex gap-1 flex-wrap align-items-center" data-seller-id="${Number(s.id)}">
+                            <button type="button" class="btn btn-primary btn-sm fw-semibold" data-seller="${escapeHtml(JSON.stringify(s))}" onclick="openSellerModal(this)">View / Edit</button>
+                            <span class="seller-del-btn-slot">
+                              ${s.active_deletion_request_id ? `
+                                <button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(${Number(s.active_deletion_request_id)})">Manage Deletion #${Number(s.active_deletion_request_id)}</button>
+                              ` : (accStatus !== 'DELETED' ? `
+                                <button type="button" class="btn btn-outline-danger btn-sm fw-semibold" onclick="openDeletionPreflightModal(${Number(s.id)})">Request Seller Deletion</button>
+                              ` : '')}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div id="sellersPaginationBar" class="pagination-bar"></div>
+          </div>
         </section>
         </div>
 
         <!-- Section 2B: Seller Management → Seller Deletion Requests -->
         <div class="admin-view-panel ${panelVisible('seller-deletions') ? 'is-visible' : ''}" data-admin-panel="seller-deletions">
-        <section class="card" id="deletionRequestsSection" style="margin-top:0; border-top: 4px solid #dc2626;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-danger" id="deletionRequestsSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
             <div>
-              <h2>Seller Management → Seller Deletion Requests</h2>
-              <p class="muted">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-trash3 text-danger me-2"></i>Seller Management → Seller Deletion Requests</h2>
+              <p class="text-body-secondary small mb-0">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
             </div>
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <div class="search-box" style="max-width:260px;">
-                <input type="text" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+              <div class="input-group input-group-sm" style="max-width: 260px;">
+                <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+                <input type="text" class="form-control" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
               </div>
-              <button type="button" class="btn-sm" onclick="reloadDeletionRequestsList()">↻ Refresh</button>
+              <button type="button" class="btn btn-outline-primary btn-sm fw-semibold" onclick="reloadDeletionRequestsList()"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
             </div>
           </div>
+          <div class="card-body">
+            <div class="row row-cols-2 row-cols-md-3 row-cols-xl-6 g-2 mb-3">
+              <div class="col"><div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal">${Number(delKpis.total || 0)}</div></div></div>
+              <div class="col"><div class="metric-mini bg-warning-subtle border-warning-subtle"><div class="k text-warning-emphasis">Pending (Yellow)</div><div class="v text-warning-emphasis" id="delKpiPending">${Number(delKpis.pending || 0)}</div></div></div>
+              <div class="col"><div class="metric-mini bg-primary-subtle border-primary-subtle"><div class="k text-primary-emphasis">Processing (Blue)</div><div class="v text-primary-emphasis" id="delKpiProcessing">${Number(delKpis.processing || 0)}</div></div></div>
+              <div class="col"><div class="metric-mini bg-danger-subtle border-danger-subtle"><div class="k text-danger-emphasis">Failed (Red)</div><div class="v text-danger-emphasis" id="delKpiFailed">${Number(delKpis.failed || 0)}</div></div></div>
+              <div class="col"><div class="metric-mini" style="background:#ffe5d0; border-color:#fecba1;"><div class="k" style="color:#984c0c;">On Hold (Orange)</div><div class="v" style="color:#984c0c;" id="delKpiHold">${Number(delKpis.on_hold || 0)}</div></div></div>
+              <div class="col"><div class="metric-mini bg-success-subtle border-success-subtle"><div class="k text-success-emphasis">Approved / Deleted</div><div class="v text-success-emphasis" id="delKpiApprovedDeleted">${Number(delKpis.approved || 0) + Number(delKpis.deleted || 0)}</div></div></div>
+            </div>
 
-          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap:10px; margin-bottom:14px;">
-            <div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal">${Number(delKpis.total || 0)}</div></div>
-            <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Pending (Yellow)</div><div class="v" style="color:#b45309;" id="delKpiPending">${Number(delKpis.pending || 0)}</div></div>
-            <div class="metric-mini" style="background:#eff6ff;"><div class="k" style="color:#1d4ed8;">Processing (Blue)</div><div class="v" style="color:#1d4ed8;" id="delKpiProcessing">${Number(delKpis.processing || 0)}</div></div>
-            <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Failed (Red)</div><div class="v" style="color:#b91c1c;" id="delKpiFailed">${Number(delKpis.failed || 0)}</div></div>
-            <div class="metric-mini" style="background:#fff7ed;"><div class="k" style="color:#c2410c;">On Hold (Orange)</div><div class="v" style="color:#c2410c;" id="delKpiHold">${Number(delKpis.on_hold || 0)}</div></div>
-            <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Approved / Deleted</div><div class="v" style="color:#15803d;" id="delKpiApprovedDeleted">${Number(delKpis.approved || 0) + Number(delKpis.deleted || 0)}</div></div>
-          </div>
+            <div class="tabs-bar nav nav-pills gap-2 pb-3 mb-3 border-bottom flex-wrap" id="delFilterTabs">
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
+            </div>
 
-          <div class="tabs-bar" id="delFilterTabs">
-            <button type="button" class="tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
-            <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th>Req ID</th>
-                <th>Seller &amp; ID</th>
-                <th>Requested Date</th>
-                <th>Deletion Stage</th>
-                <th>Status</th>
-                <th>Metrics / Balance Snapshot</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="deletionRequestsTbody">
-              ${delRequests.length === 0 ? `
-                <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
-              ` : delRequests.map(dr => {
-                const reqDate = formatDateStr(dr.created_at);
-                const snapMetrics = dr.metrics || {};
-                const finSum = dr.financial_summary || {};
-                const badgeCls = delBadgeClass(dr.badge_color || dr.status);
-                const searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
-                return `
-                  <tr class="del-req-row" data-status="${escapeHtml(dr.status)}" data-search="${escapeHtml(searchTxt)}">
-                    <td><strong>#${dr.id}</strong></td>
-                    <td>
-                      <strong style="color:#1e1b4b;">${escapeHtml(dr.seller_name)}</strong>
-                      ${dr.initiated_by_role === 'seller' ? '<span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : ''}
-                      <div style="font-size:12px; color:#64748b;">Seller ID #${dr.seller_id} ${dr.seller_phone ? '&bull; ' + escapeHtml(dr.seller_phone) : ''}</div>
-                      ${dr.seller_email ? `<div style="font-size:11px; color:#94a3b8;">${escapeHtml(dr.seller_email)}</div>` : ''}
-                    </td>
-                    <td>
-                      <div style="font-size:13px;">${reqDate.date}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${reqDate.time}</div>
-                    </td>
-                    <td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">${escapeHtml(dr.stage)}</code></td>
-                    <td><span class="${badgeCls}">${escapeHtml(dr.status)}</span></td>
-                    <td style="font-size:12px; color:#475569;">
-                      Orders: <strong>${Number(snapMetrics.total_orders || 0)}</strong> &bull;
-                      Balance: <strong>₹${Number(finSum.available_seller_balance || snapMetrics.seller_wallet_balance || 0).toFixed(2)}</strong>
-                    </td>
-                    <td>
-                      <button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(${dr.id})">Manage Deletion</button>
-                    </td>
+            <div class="table-responsive">
+              <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th>Req ID</th>
+                    <th>Seller &amp; ID</th>
+                    <th>Requested Date</th>
+                    <th>Deletion Stage</th>
+                    <th>Status</th>
+                    <th>Metrics / Balance Snapshot</th>
+                    <th>Actions</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-          <div id="delPaginationBar" class="pagination-bar"></div>
+                </thead>
+                <tbody id="deletionRequestsTbody">
+                  ${delRequests.length === 0 ? `
+                    <tr><td colspan="7" class="text-body-secondary text-center py-4">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
+                  ` : delRequests.map(dr => {
+                    const reqDate = formatDateStr(dr.created_at);
+                    const snapMetrics = dr.metrics || {};
+                    const finSum = dr.financial_summary || {};
+                    const badgeCls = delBadgeClass(dr.badge_color || dr.status);
+                    const searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
+                    return `
+                      <tr class="del-req-row" data-status="${escapeHtml(dr.status)}" data-search="${escapeHtml(searchTxt)}">
+                        <td class="fw-bold">#${dr.id}</td>
+                        <td>
+                          <span class="fw-bold text-dark">${escapeHtml(dr.seller_name)}</span>
+                          ${dr.initiated_by_role === 'seller' ? '<span class="del-badge del-yellow ms-1" style="font-size:10px; padding:2px 6px;">Seller Request</span>' : ''}
+                          <div class="small text-body-secondary">Seller ID #${dr.seller_id} ${dr.seller_phone ? '&bull; ' + escapeHtml(dr.seller_phone) : ''}</div>
+                          ${dr.seller_email ? `<div class="small text-muted">${escapeHtml(dr.seller_email)}</div>` : ''}
+                        </td>
+                        <td>
+                          <div class="small">${reqDate.date}</div>
+                          <div class="small text-muted">${reqDate.time}</div>
+                        </td>
+                        <td><code class="bg-light px-2 py-1 rounded border small">${escapeHtml(dr.stage)}</code></td>
+                        <td><span class="${badgeCls}">${escapeHtml(dr.status)}</span></td>
+                        <td class="small text-body-secondary">
+                          Orders: <strong>${Number(snapMetrics.total_orders || 0)}</strong> &bull;
+                          Balance: <strong>₹${Number(finSum.available_seller_balance || snapMetrics.seller_wallet_balance || 0).toFixed(2)}</strong>
+                        </td>
+                        <td>
+                          <button type="button" class="btn btn-primary btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(${dr.id})">Manage Deletion</button>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div id="delPaginationBar" class="pagination-bar"></div>
+          </div>
         </section>
         </div>
 
         <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
         <div class="admin-view-panel ${panelVisible('categories') ? 'is-visible' : ''}" data-admin-panel="categories">
-        <section class="card" id="categoriesSection" style="margin-top:0;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-secondary" id="categoriesSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
             <div>
-              <h2>Product Categories (Editable)</h2>
-              <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-tags text-secondary me-2"></i>Product Categories (Editable)</h2>
+              <p class="text-body-secondary small mb-0">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
             </div>
-            <div class="search-box">
-              <input type="text" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
+            <div class="input-group input-group-sm" style="max-width: 280px;">
+              <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+              <input type="text" class="form-control" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
             </div>
           </div>
+          <div class="card-body">
+            <div class="table-responsive">
+              <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th>ID</th>
+                    <th>Category Name</th>
+                    <th>Slug</th>
+                    <th>Description</th>
+                    <th>Products</th>
+                    <th>Order</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="categoriesTableBody">
+                  ${categoriesList.length === 0 ? `
+                    <tr><td colspan="8" class="text-body-secondary text-center py-4">No categories found.</td></tr>
+                  ` : categoriesList.map(cat => `
+                    <tr class="cat-list-row" data-search="${escapeHtml(((cat.name || '') + ' ' + (cat.slug || '') + ' ' + (cat.description || '') + ' #' + cat.id).toLowerCase())}">
+                      <td class="fw-semibold">#${cat.id}</td>
+                      <td>
+                        <span class="fs-6 me-1">${escapeHtml(cat.icon || '🏷️')}</span>
+                        <span class="fw-bold">${escapeHtml(cat.name)}</span>
+                      </td>
+                      <td><code class="bg-light px-2 py-1 rounded border small">${escapeHtml(cat.slug)}</code></td>
+                      <td class="text-body-secondary small" style="max-width:260px;">${escapeHtml(cat.description || '—')}</td>
+                      <td><span class="badge-prod">${Number(cat.products_count || 0)} products</span></td>
+                      <td>${Number(cat.sort_order || 0)}</td>
+                      <td>
+                        ${Number(cat.is_active) ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
+                      </td>
+                      <td>
+                        <div class="d-flex gap-1 align-items-center">
+                          <button type="button" class="btn btn-primary btn-sm fw-semibold" data-cat="${escapeHtml(JSON.stringify(cat))}" onclick="openCategoryModal(this)">Edit</button>
+                          <form method="POST" action="/admin" class="d-inline" data-confirm-title="Delete Category" data-confirm-msg="${escapeHtml('Delete category "' + cat.name + '"? Linked products will fall back to General.')}" onsubmit="return openFormConfirmModal(this);">
+                            <input type="hidden" name="action" value="delete_category">
+                            <input type="hidden" name="category_id" value="${cat.id}">
+                            <button type="submit" class="btn btn-danger btn-sm fw-semibold">Delete</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div id="categoriesPaginationBar" class="pagination-bar"></div>
 
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Category Name</th>
-                <th>Slug</th>
-                <th>Description</th>
-                <th>Products</th>
-                <th>Order</th>
-                <th>Status</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="categoriesTableBody">
-              ${categoriesList.length === 0 ? `
-                <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
-              ` : categoriesList.map(cat => `
-                <tr class="cat-list-row" data-search="${escapeHtml(((cat.name || '') + ' ' + (cat.slug || '') + ' ' + (cat.description || '') + ' #' + cat.id).toLowerCase())}">
-                  <td>#${cat.id}</td>
-                  <td>
-                    <span style="font-size:16px; margin-right:4px;">${escapeHtml(cat.icon || '🏷️')}</span>
-                    <strong>${escapeHtml(cat.name)}</strong>
-                  </td>
-                  <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:12px;">${escapeHtml(cat.slug)}</code></td>
-                  <td style="color:#64748b; font-size:13px; max-width:260px;">${escapeHtml(cat.description || '—')}</td>
-                  <td><span class="badge-prod">${Number(cat.products_count || 0)} products</span></td>
-                  <td>${Number(cat.sort_order || 0)}</td>
-                  <td>
-                    ${Number(cat.is_active) ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
-                  </td>
-                  <td>
-                    <div style="display:flex; gap:6px; align-items:center;">
-                      <button type="button" class="btn-sm" data-cat="${escapeHtml(JSON.stringify(cat))}" onclick="openCategoryModal(this)">Edit</button>
-                      <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete Category" data-confirm-msg="${escapeHtml('Delete category "' + cat.name + '"? Linked products will fall back to General.')}" onsubmit="return openFormConfirmModal(this);">
-                        <input type="hidden" name="action" value="delete_category">
-                        <input type="hidden" name="category_id" value="${cat.id}">
-                        <button type="submit" class="btn-reject-sm">Delete</button>
-                      </form>
-                    </div>
-                  </td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-          <div id="categoriesPaginationBar" class="pagination-bar"></div>
-
-          <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
-            <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
-            <form method="POST" action="/admin">
-              <input type="hidden" name="action" value="add_category">
-              <div class="grid">
-                <div>
-                  <label>Category Name *</label>
-                  <input name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+            <div class="mt-4 pt-3 border-top">
+              <h3 class="h6 fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-1"></i>Add New Category</h3>
+              <form method="POST" action="/admin">
+                <input type="hidden" name="action" value="add_category">
+                <div class="row g-3">
+                  <div class="col-md-3">
+                    <label class="form-label small fw-semibold">Category Name *</label>
+                    <input class="form-control" name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label small fw-semibold">Icon (Emoji)</label>
+                    <input class="form-control" name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                  </div>
+                  <div class="col-md-5">
+                    <label class="form-label small fw-semibold">Description</label>
+                    <input class="form-control" name="description" maxlength="255" placeholder="Short description">
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label small fw-semibold">Sort Order</label>
+                    <input class="form-control" type="number" name="sort_order" value="${categoriesList.length + 1}">
+                  </div>
                 </div>
-                <div>
-                  <label>Icon (Emoji)</label>
-                  <input name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                <div class="mt-3 d-flex align-items-center gap-3 flex-wrap">
+                  <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" name="is_active" id="addCatActiveChk" value="1" checked>
+                    <label class="form-check-label small fw-semibold" for="addCatActiveChk">Active</label>
+                  </div>
+                  <button type="submit" class="btn btn-primary fw-semibold">+ Add Category</button>
                 </div>
-                <div>
-                  <label>Description</label>
-                  <input name="description" maxlength="255" placeholder="Short description">
-                </div>
-                <div>
-                  <label>Sort Order</label>
-                  <input type="number" name="sort_order" value="${categoriesList.length + 1}">
-                </div>
-              </div>
-              <div style="margin-top:10px; display:flex; align-items:center; gap:14px;">
-                <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer;">
-                  <input type="checkbox" name="is_active" value="1" checked style="width:auto;"> Active
-                </label>
-                <button type="submit" style="background:#4f46e5;">+ Add Category</button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
         </section>
         </div>
 
         <!-- Section 4: Dedicated Admin Manage Products Page -->
         <div class="admin-view-panel ${panelVisible('products') ? 'is-visible' : ''}" data-admin-panel="products">
-          <div class="sub-kpi-bar">
-            <div class="metric-mini"><div class="k">Total Catalog Products</div><div class="v">${totalListedProducts}</div></div>
-            <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Active on Storefront</div><div class="v" style="color:#15803d;">${activeListedProducts}</div></div>
-            <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Inactive / Archived</div><div class="v" style="color:#b91c1c;">${inactiveListedProducts}</div></div>
-            <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Out of Stock</div><div class="v" style="color:#b45309;">${outOfStockProducts}</div></div>
+          <div class="row row-cols-2 row-cols-md-4 g-3 mb-3">
+            <div class="col"><div class="metric-mini shadow-sm"><div class="k">Total Catalog Products</div><div class="v">${totalListedProducts}</div></div></div>
+            <div class="col"><div class="metric-mini bg-success-subtle border-success-subtle shadow-sm"><div class="k text-success-emphasis">Active on Storefront</div><div class="v text-success-emphasis">${activeListedProducts}</div></div></div>
+            <div class="col"><div class="metric-mini bg-danger-subtle border-danger-subtle shadow-sm"><div class="k text-danger-emphasis">Inactive / Archived</div><div class="v text-danger-emphasis">${inactiveListedProducts}</div></div></div>
+            <div class="col"><div class="metric-mini bg-warning-subtle border-warning-subtle shadow-sm"><div class="k text-warning-emphasis">Out of Stock</div><div class="v text-warning-emphasis">${outOfStockProducts}</div></div></div>
           </div>
-        <section class="card" id="productCategoriesSection" style="margin-top:0;">
-          <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-success" id="productCategoriesSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-start flex-wrap gap-3">
             <div>
-              <h2>Products — Catalog &amp; Category Management</h2>
-              <p class="muted">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-box-seam text-success me-2"></i>Products — Catalog &amp; Category Management</h2>
+              <p class="text-body-secondary small mb-0">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
             </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-              <button type="button" class="btn-sm" style="background:#16a34a; padding:9px 14px; font-size:13px;" onclick="openProductModal(null)">+ Add New Product</button>
-            </div>
+            <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="openProductModal(null)"><i class="bi bi-plus-lg me-1"></i>Add New Product</button>
           </div>
-          <div class="filter-bar" style="margin-bottom:14px; padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
-            <div class="search-box" style="max-width:260px; flex:1; min-width:190px;">
-              <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+          <div class="card-body">
+            <div class="row g-2 align-items-center bg-light p-3 rounded-3 border mb-3">
+              <div class="col-md-4">
+                <div class="input-group input-group-sm">
+                  <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
+                  <input type="text" class="form-control" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+                </div>
+              </div>
+              <div class="col-md-3">
+                <select class="form-select form-select-sm" id="prodSellerFilter" onchange="applyAdminProductFilters()">
+                  <option value="">All Sellers</option>
+                  ${eligibleSellersForProducts.map(sfOpt => `<option value="${Number(sfOpt.id)}">${escapeHtml(sfOpt.display_name + ' (#' + Number(sfOpt.id) + ')')}</option>`).join('')}
+                </select>
+              </div>
+              <div class="col-md-3">
+                <select class="form-select form-select-sm" id="prodCategoryFilter" onchange="applyAdminProductFilters()">
+                  <option value="">All Categories</option>
+                  ${categoriesList.map(cfOpt => `<option value="${escapeHtml(String(cfOpt.name || '').toLowerCase())}">${escapeHtml(cfOpt.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="col-md-2">
+                <select class="form-select form-select-sm" id="prodStatusFilter" onchange="applyAdminProductFilters()">
+                  <option value="all">All Statuses</option>
+                  <option value="1">Active Only</option>
+                  <option value="0">Inactive Only</option>
+                </select>
+              </div>
             </div>
-            <select id="prodSellerFilter" onchange="applyAdminProductFilters()">
-              <option value="">All Sellers</option>
-              ${eligibleSellersForProducts.map(sfOpt => `<option value="${Number(sfOpt.id)}">${escapeHtml(sfOpt.display_name + ' (#' + Number(sfOpt.id) + ')')}</option>`).join('')}
-            </select>
-            <select id="prodCategoryFilter" onchange="applyAdminProductFilters()">
-              <option value="">All Categories</option>
-              ${categoriesList.map(cfOpt => `<option value="${escapeHtml(String(cfOpt.name || '').toLowerCase())}">${escapeHtml(cfOpt.name)}</option>`).join('')}
-            </select>
-            <select id="prodStatusFilter" onchange="applyAdminProductFilters()">
-              <option value="all">All Statuses</option>
-              <option value="1">Active Only</option>
-              <option value="0">Inactive Only</option>
-            </select>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Product</th>
-                <th>Seller</th>
-                <th>Pricing &amp; Stock</th>
-                <th>Status</th>
-                <th>Category &amp; Reassign</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="productsTableBody">
-              ${adminProducts.length === 0 ? `
-                <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
-              ` : adminProducts.map(ap => {
-                const sAccProd = String(ap.seller_account_status || 'ACTIVE').toUpperCase();
-                const isProdActive = parseBoolBitNode(ap.is_active, 1) === 1;
-                const formattedAp = {
-                  ...formatProductRecord(ap, { req, isSellerView: true }),
-                  is_active: isProdActive,
-                  seller_account_status: sAccProd
-                };
-                const thumbRaw = formattedAp.image_url || '';
-                const thumbSrc = (thumbRaw && thumbRaw.includes('/uploads/products/'))
-                  ? '/uploads/products/' + path.basename(thumbRaw.split('?')[0])
-                  : thumbRaw;
-                const pSearch = (
-                  (formattedAp.name || '') + ' ' +
-                  (formattedAp.sku || '') + ' ' +
-                  (formattedAp.brand || '') + ' ' +
-                  (formattedAp.category || '') + ' ' +
-                  (formattedAp.seller_name || '') + ' #' + formattedAp.id
-                ).toLowerCase();
-                let hasMatch = false;
-                const optionsHtml = categoriesList.map(catOpt => {
-                  const matched = (ap.category_id && Number(ap.category_id) === Number(catOpt.id)) || (String(ap.category || '').toLowerCase() === String(catOpt.name || '').toLowerCase());
-                  if (matched) hasMatch = true;
-                  return `<option value="${catOpt.id}" ${matched ? 'selected' : ''}>${escapeHtml(catOpt.name)}</option>`;
-                }).join('');
-
-                return `
-                  <tr class="prod-cat-row"
-                      data-search="${escapeHtml(pSearch)}"
-                      data-seller-id="${Number(ap.seller_id)}"
-                      data-category="${escapeHtml(String(formattedAp.category || 'General').toLowerCase())}"
-                      data-active="${isProdActive ? '1' : '0'}">
-                    <td><strong>#${Number(ap.id)}</strong></td>
-                    <td>
-                      <div style="display:flex; gap:10px; align-items:center;">
-                        ${thumbSrc ? `<img src="${escapeHtml(thumbSrc)}" alt="" class="prod-thumb" loading="lazy">` : `<div class="prod-thumb-empty" title="No Image">📦</div>`}
-                        <div>
-                          <strong style="color:#1e1b4b;">${escapeHtml(formattedAp.name)}</strong>
-                          <div style="font-size:11px; color:#64748b; margin-top:2px;">
-                            SKU: <code>${escapeHtml(formattedAp.sku)}</code> &bull; Brand: ${escapeHtml(formattedAp.brand)}
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-                    <td>
-                      <div>${escapeHtml(formattedAp.seller_name)}</div>
-                      <div style="font-size:11px; color:#64748b;">
-                        Seller #${Number(ap.seller_id)}
-                        ${sAccProd !== 'ACTIVE' ? `&bull; <span class="${delBadgeClass(sAccProd)}" style="font-size:9px; padding:1px 5px;">${escapeHtml(sAccProd)}</span>` : ''}
-                      </div>
-                    </td>
-                    <td>
-                      <div><strong>₹${Number(formattedAp.price || 0).toFixed(2)}</strong></div>
-                      ${Number(formattedAp.mrp || 0) > Number(formattedAp.price || 0) ? `<div style="font-size:11px; color:#94a3b8; text-decoration:line-through;">MRP ₹${Number(formattedAp.mrp).toFixed(2)}</div>` : ''}
-                      <div style="font-size:11px; color:#475569;">Stock: <strong>${Number(formattedAp.stock || 0)}</strong></div>
-                    </td>
-                    <td>
-                      ${isProdActive ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
-                    </td>
-                    <td>
-                      <div style="margin-bottom:5px;"><span class="badge-prod">${escapeHtml(formattedAp.category || 'General')}</span></div>
-                      <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
-                        <input type="hidden" name="action" value="update_product_category">
-                        <input type="hidden" name="product_id" value="${Number(ap.id)}">
-                        <select name="category_id" required style="padding:5px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; max-width:155px;">
-                          ${!hasMatch ? '<option value="" disabled selected>-- Select Category --</option>' : ''}
-                          ${optionsHtml}
-                        </select>
-                        <button type="submit" class="btn-sm">Save</button>
-                      </form>
-                    </td>
-                    <td>
-                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                        <button type="button" class="btn-sm" data-product="${escapeHtml(JSON.stringify(formattedAp))}" onclick="openProductModal(this)">Edit</button>
-                        <form method="POST" action="/admin" style="display:inline;">
-                          <input type="hidden" name="action" value="toggle_product_status">
-                          <input type="hidden" name="product_id" value="${Number(ap.id)}">
-                          <button type="submit" class="${isProdActive ? 'btn-hold-sm' : 'btn-approve-sm'}" title="${isProdActive ? 'Hide from storefront' : 'Make visible on storefront'}">
-                            ${isProdActive ? 'Deactivate' : 'Activate'}
-                          </button>
-                        </form>
-                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete / Archive Product" data-confirm-msg="${escapeHtml('Delete product #' + Number(ap.id) + ' ("' + formattedAp.name + '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.')}" onsubmit="return openFormConfirmModal(this);">
-                          <input type="hidden" name="action" value="delete_product">
-                          <input type="hidden" name="product_id" value="${Number(ap.id)}">
-                          <button type="submit" class="btn-reject-sm">Delete</button>
-                        </form>
-                      </div>
-                    </td>
+            <div class="table-responsive">
+              <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                  <tr>
+                    <th>ID</th>
+                    <th>Product</th>
+                    <th>Seller</th>
+                    <th>Pricing &amp; Stock</th>
+                    <th>Status</th>
+                    <th>Category &amp; Reassign</th>
+                    <th>Actions</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-          <div id="productsPaginationBar" class="pagination-bar"></div>
+                </thead>
+                <tbody id="productsTableBody">
+                  ${adminProducts.length === 0 ? `
+                    <tr><td colspan="7" class="text-body-secondary text-center py-4">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
+                  ` : adminProducts.map(ap => {
+                    const sAccProd = String(ap.seller_account_status || 'ACTIVE').toUpperCase();
+                    const isProdActive = parseBoolBitNode(ap.is_active, 1) === 1;
+                    const formattedAp = {
+                      ...formatProductRecord(ap, { req, isSellerView: true }),
+                      is_active: isProdActive,
+                      seller_account_status: sAccProd
+                    };
+                    const thumbRaw = formattedAp.image_url || '';
+                    const thumbSrc = (thumbRaw && thumbRaw.includes('/uploads/products/'))
+                      ? '/uploads/products/' + path.basename(thumbRaw.split('?')[0])
+                      : thumbRaw;
+                    const pSearch = (
+                      (formattedAp.name || '') + ' ' +
+                      (formattedAp.sku || '') + ' ' +
+                      (formattedAp.brand || '') + ' ' +
+                      (formattedAp.category || '') + ' ' +
+                      (formattedAp.seller_name || '') + ' #' + formattedAp.id
+                    ).toLowerCase();
+                    let hasMatch = false;
+                    const optionsHtml = categoriesList.map(catOpt => {
+                      const matched = (ap.category_id && Number(ap.category_id) === Number(catOpt.id)) || (String(ap.category || '').toLowerCase() === String(catOpt.name || '').toLowerCase());
+                      if (matched) hasMatch = true;
+                      return `<option value="${catOpt.id}" ${matched ? 'selected' : ''}>${escapeHtml(catOpt.name)}</option>`;
+                    }).join('');
+
+                    return `
+                      <tr class="prod-cat-row"
+                          data-search="${escapeHtml(pSearch)}"
+                          data-seller-id="${Number(ap.seller_id)}"
+                          data-category="${escapeHtml(String(formattedAp.category || 'General').toLowerCase())}"
+                          data-active="${isProdActive ? '1' : '0'}">
+                        <td class="fw-bold">#${Number(ap.id)}</td>
+                        <td>
+                          <div class="d-flex gap-2 align-items-center">
+                            ${thumbSrc ? `<img src="${escapeHtml(thumbSrc)}" alt="" class="prod-thumb" loading="lazy">` : `<div class="prod-thumb-empty" title="No Image">📦</div>`}
+                            <div>
+                              <div class="fw-bold text-dark">${escapeHtml(formattedAp.name)}</div>
+                              <div class="small text-body-secondary">
+                                SKU: <code>${escapeHtml(formattedAp.sku)}</code> &bull; Brand: ${escapeHtml(formattedAp.brand)}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="fw-medium small">${escapeHtml(formattedAp.seller_name)}</div>
+                          <div class="small text-body-secondary">
+                            Seller #${Number(ap.seller_id)}
+                            ${sAccProd !== 'ACTIVE' ? `&bull; <span class="${delBadgeClass(sAccProd)}" style="font-size:9px; padding:1px 5px;">${escapeHtml(sAccProd)}</span>` : ''}
+                          </div>
+                        </td>
+                        <td>
+                          <div class="fw-bold">₹${Number(formattedAp.price || 0).toFixed(2)}</div>
+                          ${Number(formattedAp.mrp || 0) > Number(formattedAp.price || 0) ? `<div class="small text-muted text-decoration-line-through">MRP ₹${Number(formattedAp.mrp).toFixed(2)}</div>` : ''}
+                          <div class="small text-body-secondary">Stock: <strong>${Number(formattedAp.stock || 0)}</strong></div>
+                        </td>
+                        <td>
+                          ${isProdActive ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
+                        </td>
+                        <td>
+                          <div class="mb-1"><span class="badge-prod">${escapeHtml(formattedAp.category || 'General')}</span></div>
+                          <form method="POST" action="/admin" class="d-flex gap-1 align-items-center">
+                            <input type="hidden" name="action" value="update_product_category">
+                            <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                            <select class="form-select form-select-sm" name="category_id" required style="max-width:155px;">
+                              ${!hasMatch ? '<option value="" disabled selected>-- Select Category --</option>' : ''}
+                              ${optionsHtml}
+                            </select>
+                            <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                          </form>
+                        </td>
+                        <td>
+                          <div class="d-flex gap-1 flex-wrap align-items-center">
+                            <button type="button" class="btn btn-primary btn-sm fw-semibold" data-product="${escapeHtml(JSON.stringify(formattedAp))}" onclick="openProductModal(this)">Edit</button>
+                            <form method="POST" action="/admin" class="d-inline">
+                              <input type="hidden" name="action" value="toggle_product_status">
+                              <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                              <button type="submit" class="btn btn-sm fw-semibold ${isProdActive ? 'btn-warning' : 'btn-success'}" title="${isProdActive ? 'Hide from storefront' : 'Make visible on storefront'}">
+                                ${isProdActive ? 'Deactivate' : 'Activate'}
+                              </button>
+                            </form>
+                            <form method="POST" action="/admin" class="d-inline" data-confirm-title="Delete / Archive Product" data-confirm-msg="${escapeHtml('Delete product #' + Number(ap.id) + ' ("' + formattedAp.name + '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.')}" onsubmit="return openFormConfirmModal(this);">
+                              <input type="hidden" name="action" value="delete_product">
+                              <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                              <button type="submit" class="btn btn-danger btn-sm fw-semibold">Delete</button>
+                            </form>
+                          </div>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div id="productsPaginationBar" class="pagination-bar"></div>
+          </div>
         </section>
         </div>
 
         <!-- Section 5: Create Seller Account (Dedicated Page 3 or visible in All Lists) -->
         <div class="admin-view-panel ${panelVisible('create-seller') ? 'is-visible' : ''}" data-admin-panel="create-seller">
-        <section class="card" id="createSellerSection" style="margin-top:0;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-info" id="createSellerSection">
+          <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
             <div>
-              <h2>Create New Seller Account</h2>
-              <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with country code, e.g. +919876543210).</p>
+              <h2 class="h5 fw-bold mb-1"><i class="bi bi-person-plus text-info me-2"></i>Create New Seller Account</h2>
+              <p class="text-body-secondary small mb-0">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with country code, e.g. +919876543210).</p>
             </div>
-            <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
+            <a href="/admin/sellers" class="btn btn-outline-primary btn-sm fw-semibold" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
           </div>
-          <form method="POST" action="/admin" data-default-tab="sellers">
-            <input type="hidden" name="action" value="create_seller">
-            <div class="grid">
-              <div>
-                <label>Seller / Shop Name</label>
-                <input name="seller_name" required maxlength="120" placeholder="e.g. Apex Electronics">
+          <div class="card-body">
+            <form method="POST" action="/admin" data-default-tab="sellers">
+              <input type="hidden" name="action" value="create_seller">
+              <div class="row g-3">
+                <div class="col-md-6 col-lg-3">
+                  <label class="form-label small fw-semibold">Seller / Shop Name *</label>
+                  <input class="form-control" name="seller_name" required maxlength="120" placeholder="e.g. Apex Electronics">
+                </div>
+                <div class="col-md-6 col-lg-3">
+                  <label class="form-label small fw-semibold">Phone (+country code)</label>
+                  <input class="form-control" name="phone" placeholder="+919876543210">
+                </div>
+                <div class="col-md-6 col-lg-3">
+                  <label class="form-label small fw-semibold">Email Address</label>
+                  <input class="form-control" type="email" name="email" placeholder="seller@example.com">
+                </div>
+                <div class="col-md-6 col-lg-3">
+                  <label class="form-label small fw-semibold">State *</label>
+                  <input class="form-control" name="state" required placeholder="e.g. Karnataka">
+                </div>
+                <div class="col-md-6 col-lg-6">
+                  <label class="form-label small fw-semibold">Address *</label>
+                  <input class="form-control" name="address" required placeholder="Shop address">
+                </div>
+                <div class="col-md-6 col-lg-6">
+                  <label class="form-label small fw-semibold">Landmark</label>
+                  <input class="form-control" name="landmark" placeholder="Nearest landmark">
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label small fw-semibold">Password (min 8 characters) *</label>
+                  <input class="form-control" type="password" name="password" required minlength="8" autocomplete="new-password">
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label small fw-semibold">Confirm Password *</label>
+                  <input class="form-control" type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
+                </div>
               </div>
-              <div>
-                <label>Phone (+country code)</label>
-                <input name="phone" placeholder="+919876543210">
+              <div class="mt-4">
+                <button type="submit" class="btn btn-primary fw-semibold px-4">+ Create Seller Account</button>
               </div>
-              <div>
-                <label>Email Address</label>
-                <input type="email" name="email" placeholder="seller@example.com">
-              </div>
-              <div>
-                <label>State</label>
-                <input name="state" required placeholder="e.g. Karnataka">
-              </div>
-              <div>
-                <label>Address</label>
-                <input name="address" required placeholder="Shop address">
-              </div>
-              <div>
-                <label>Landmark</label>
-                <input name="landmark" placeholder="Nearest landmark">
-              </div>
-              <div>
-                <label>Password (min 8 characters)</label>
-                <input type="password" name="password" required minlength="8" autocomplete="new-password">
-              </div>
-              <div>
-                <label>Confirm Password</label>
-                <input type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
-              </div>
-            </div>
-            <br>
-            <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
-          </form>
+            </form>
+          </div>
         </section>
         </div>
       </main>
 
-      <footer class="admin-footer">
-        <div class="footer-inner">
+      <footer class="admin-footer py-4 border-top border-secondary-subtle">
+        <div class="container-xl d-flex flex-column flex-lg-row justify-content-between align-items-lg-center gap-3">
           <div>
-            <strong>Vendor Admin Portal</strong> &bull; Venter App Marketplace Operations
-            <div style="font-size:11px; color:#94a3b8; margin-top:3px;">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
+            <div class="fw-bold text-white"><i class="bi bi-shop-window text-primary me-1"></i>Vendor Admin Portal &bull; Venter App Marketplace Operations</div>
+            <div class="small text-secondary mt-1">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
           </div>
-          <nav class="footer-links" id="adminFooterNav">
+          <nav class="footer-links d-flex gap-3 flex-wrap align-items-center" id="adminFooterNav">
             <a href="/admin" data-tab="overview" class="${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">Overview</a>
             <a href="/admin/gst-verifications" data-tab="gst" class="${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">PDF Verifications</a>
             <a href="/admin/sellers" data-tab="sellers" class="${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">Seller Accounts</a>
@@ -12751,102 +13293,107 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
             <a href="/admin/categories" data-tab="categories" class="${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">Categories</a>
             <a href="/admin?tab=all" data-tab="all" class="${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Lists</a>
           </nav>
-          <div style="font-size:12px; color:#94a3b8;">
-            <a href="/admin/logout" style="color:#f8fafc; font-weight:700; text-decoration:none;">Sign out</a>
+          <div>
+            <a href="/admin/logout" class="btn btn-outline-light btn-sm">Sign out</a>
           </div>
         </div>
       </footer>
 
       <!-- GST Review & Verification Modal -->
       <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
-        <div class="modal-box">
-          <div class="modal-header">
-            <h3 id="gstModalTitle">Document Verification Review</h3>
-            <button type="button" class="modal-close" onclick="closeGstModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <div id="gstModalLoading" style="text-align:center; padding:32px; color:#64748b;">
-              Loading details &amp; documents...
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="gstModalTitle">Document Verification Review</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeGstModal()"></button>
             </div>
-
-            <div id="gstModalContent" style="display:none;">
-              <div id="gstFetchErrorBox" class="modal-err-banner" style="display:none;"></div>
-              <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:18px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:6px;">
-                  <strong style="font-size:16px; color:#1e1b4b;" id="modalSellerName">—</strong>
-                  <div id="modalGstStatus">—</div>
-                </div>
-                <div id="modalSellerMeta" style="font-size:12px; color:#475569; margin-bottom:8px;">—</div>
-                <div id="modalGstinRow" style="display:none; font-size:13px; color:#334155; margin-bottom:6px;">
-                  <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
-                  <div style="font-size:12px; color:#475569; margin-top:4px;"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
-                </div>
-                <div style="font-size:13px; color:#64748b;">
-                  <div><strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span></div>
-                </div>
-
-                <div id="rejectionAlertBox" style="display:none; background:#fee2e2; border-left:4px solid #ef4444; padding:12px; border-radius:6px; margin-top:12px;">
-                  <strong style="color:#b91c1c; font-size:13px;">Rejection Reason:</strong>
-                  <div id="modalRejectionReason" style="color:#7f1d1d; font-size:13px; margin-top:4px;">—</div>
-                </div>
+            <div class="modal-body p-4">
+              <div id="gstModalLoading" class="text-center py-4 text-body-secondary">
+                <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                Loading details &amp; documents...
               </div>
 
-              <h4 style="margin: 18px 0 10px; color:#1e1b4b;">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
-              <div id="modalDocumentsList" style="margin-bottom: 16px;"></div>
+              <div id="gstModalContent" style="display:none;">
+                <div id="gstFetchErrorBox" class="alert alert-danger py-2 px-3 small mb-3" style="display:none;"></div>
+                <div class="card bg-light border mb-3">
+                  <div class="card-body p-3">
+                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+                      <strong class="fs-6 text-dark" id="modalSellerName">—</strong>
+                      <div id="modalGstStatus">—</div>
+                    </div>
+                    <div id="modalSellerMeta" class="small text-body-secondary mb-2">—</div>
+                    <div id="modalGstinRow" class="small text-dark mb-1" style="display:none;">
+                      <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
+                      <div class="small text-body-secondary mt-1"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
+                    </div>
+                    <div class="small text-body-secondary">
+                      <strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span>
+                    </div>
 
-              <!-- Embedded Live PDF / Document Viewer -->
-              <div id="modalInlinePreviewBox" style="display:none; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; margin-bottom:20px; background:#f8fafc;">
-                <div style="background:#f1f5f9; padding:8px 14px; border-bottom:1px solid #cbd5e1; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                  <strong style="font-size:13px; color:#334155;" id="modalPreviewLabel">Live Document Preview</strong>
-                  <div style="display:flex; gap:8px; align-items:center;">
-                    <a id="modalPreviewNewTab" href="#" target="_blank" style="font-size:12px; font-weight:700; color:#0284c7; text-decoration:none;">↗ Open Full Screen</a>
-                    <a id="modalPreviewDownload" href="#" style="font-size:12px; font-weight:700; color:#475569; text-decoration:none;">⬇ Download</a>
-                    <button type="button" class="btn-dl" style="font-size:11px; padding:4px 8px;" onclick="closeInlineDocPreview()">Close Preview</button>
+                    <div id="rejectionAlertBox" class="alert alert-danger mt-2 mb-0 py-2 px-3" style="display:none;">
+                      <strong class="small">Rejection Reason:</strong>
+                      <div id="modalRejectionReason" class="small mt-1">—</div>
+                    </div>
                   </div>
                 </div>
-                <div id="modalPreviewFrameWrap" style="width:100%; height:440px; background:#e2e8f0; display:flex; align-items:center; justify-content:center;"></div>
-                <div id="modalPreviewHint" style="font-size:12px; color:#64748b; padding:6px 14px; background:#f8fafc; border-top:1px solid #e2e8f0;">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
-              </div>
 
-              <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
-                <h4 style="margin: 0 0 12px; color:#1e1b4b;">Admin Verification Actions</h4>
-                
-                <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
-                  <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
-                    <input type="hidden" name="action" value="approve_gst">
-                    <input type="hidden" name="seller_id" id="approveSellerId">
-                    <input type="hidden" name="notes" value="Approved by administrator">
-                    <button type="submit" class="btn-approve-sm" style="padding:10px 18px; font-size:14px;">Approve Document</button>
-                  </form>
+                <h4 class="h6 fw-bold mt-3 mb-2">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
+                <div id="modalDocumentsList" class="mb-3"></div>
 
-                  <button type="button" class="btn-reject-sm" style="padding:10px 18px; font-size:14px;" onclick="toggleRejectBox()">Reject Document...</button>
+                <!-- Embedded Live PDF / Document Viewer -->
+                <div id="modalInlinePreviewBox" class="card border mb-3 overflow-hidden" style="display:none;">
+                  <div class="card-header bg-light py-2 px-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <strong class="small text-dark" id="modalPreviewLabel">Live Document Preview</strong>
+                    <div class="d-flex gap-2 align-items-center">
+                      <a id="modalPreviewNewTab" href="#" target="_blank" class="btn btn-outline-primary btn-sm py-0 px-2">↗ Open Full Screen</a>
+                      <a id="modalPreviewDownload" href="#" class="btn btn-outline-secondary btn-sm py-0 px-2">⬇ Download</a>
+                      <button type="button" class="btn btn-secondary btn-sm py-0 px-2" onclick="closeInlineDocPreview()">Close Preview</button>
+                    </div>
+                  </div>
+                  <div id="modalPreviewFrameWrap" class="bg-body-secondary d-flex align-items-center justify-content-center" style="width:100%; height:440px;"></div>
+                  <div id="modalPreviewHint" class="small text-body-secondary px-3 py-2 bg-light border-top">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
                 </div>
 
-                <!-- Reject Box -->
-                <div id="rejectBox" style="display:none; background:#fef2f2; border:1px solid #fecaca; border-radius:10px; padding:16px; margin-top:14px;">
-                  <form method="POST" action="/admin">
-                    <input type="hidden" name="action" value="reject_gst">
-                    <input type="hidden" name="seller_id" id="rejectSellerId">
-                    <label style="margin-top:0; color:#991b1b; font-weight:700;">Mandatory Rejection Reason <span style="color:#ef4444;">*</span></label>
-                    <div class="reject-presets">
-                      <button type="button" class="reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
-                      <button type="button" class="reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
-                      <button type="button" class="reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
-                      <button type="button" class="reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
-                    </div>
-                    <textarea name="rejection_reason" id="rejectReasonInput" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry text, expired certificate)..."></textarea>
-                    <div style="display:flex; gap:10px; margin-top:10px;">
-                      <button type="submit" class="btn-reject-sm" style="padding:8px 16px;">Confirm Rejection</button>
-                      <button type="button" onclick="toggleRejectBox()" style="background:#e2e8f0; color:#334155;" class="btn">Cancel</button>
-                    </div>
-                  </form>
-                </div>
-              </div>
+                <div class="border-top pt-3 mt-3">
+                  <h4 class="h6 fw-bold mb-2">Admin Verification Actions</h4>
 
-              <!-- Verification Audit Logs -->
-              <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:24px;">
-                <h4 style="margin: 0 0 10px; color:#1e1b4b;">Verification Audit Trail</h4>
-                <div id="modalLogsList" style="max-height:160px; overflow-y:auto; border:1px solid #f1f5f9; border-radius:8px; padding:0 12px; background:#fafafa;"></div>
+                  <div class="d-flex gap-2 flex-wrap align-items-start">
+                    <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
+                      <input type="hidden" name="action" value="approve_gst">
+                      <input type="hidden" name="seller_id" id="approveSellerId">
+                      <input type="hidden" name="notes" value="Approved by administrator">
+                      <button type="submit" class="btn btn-success fw-semibold">✓ Approve Document</button>
+                    </form>
+
+                    <button type="button" class="btn btn-danger fw-semibold" onclick="toggleRejectBox()">✕ Reject Document...</button>
+                  </div>
+
+                  <!-- Reject Box -->
+                  <div id="rejectBox" class="alert alert-danger mt-3 mb-0 p-3" style="display:none;">
+                    <form method="POST" action="/admin">
+                      <input type="hidden" name="action" value="reject_gst">
+                      <input type="hidden" name="seller_id" id="rejectSellerId">
+                      <label class="form-label small fw-bold text-danger-emphasis">Mandatory Rejection Reason <span class="text-danger">*</span></label>
+                      <div class="reject-presets mb-2">
+                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
+                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
+                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
+                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
+                      </div>
+                      <textarea class="form-control border-danger-subtle" name="rejection_reason" id="rejectReasonInput" required rows="3" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry text, expired certificate)..."></textarea>
+                      <div class="d-flex gap-2 mt-2">
+                        <button type="submit" class="btn btn-danger btn-sm fw-semibold">Confirm Rejection</button>
+                        <button type="button" onclick="toggleRejectBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+
+                <!-- Verification Audit Logs -->
+                <div class="border-top pt-3 mt-4">
+                  <h4 class="h6 fw-bold mb-2">Verification Audit Trail</h4>
+                  <div id="modalLogsList" class="border rounded-3 px-3 bg-light" style="max-height:160px; overflow-y:auto;"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -12855,253 +13402,344 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
 
       <!-- Edit Category Modal -->
       <div id="editCategoryModal" class="modal-overlay" onclick="if(event.target.id==='editCategoryModal') closeCategoryModal();">
-        <div class="modal-box">
-          <div class="modal-header">
-            <h3 id="catModalTitle">Edit Category</h3>
-            <button type="button" class="modal-close" onclick="closeCategoryModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <form method="POST" action="/admin">
-              <input type="hidden" name="action" value="edit_category">
-              <input type="hidden" name="category_id" id="editCatId">
-              <div class="grid">
-                <div>
-                  <label>Category Name *</label>
-                  <input name="name" id="editCatName" required maxlength="100">
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="catModalTitle">Edit Category</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeCategoryModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <form method="POST" action="/admin">
+                <input type="hidden" name="action" value="edit_category">
+                <input type="hidden" name="category_id" id="editCatId">
+                <div class="row g-3">
+                  <div class="col-md-8">
+                    <label class="form-label small fw-semibold">Category Name *</label>
+                    <input class="form-control" name="name" id="editCatName" required maxlength="100">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">Icon (Emoji)</label>
+                    <input class="form-control" name="icon" id="editCatIcon" maxlength="20">
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Description</label>
+                    <input class="form-control" name="description" id="editCatDesc" maxlength="255">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Sort Order</label>
+                    <input class="form-control" type="number" name="sort_order" id="editCatSort">
+                  </div>
+                  <div class="col-md-6 d-flex align-items-end pb-1">
+                    <div class="form-check">
+                      <input class="form-check-input" type="checkbox" name="is_active" id="editCatActive" value="1">
+                      <label class="form-check-label small fw-semibold" for="editCatActive">Category Active</label>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <label>Icon (Emoji)</label>
-                  <input name="icon" id="editCatIcon" maxlength="20">
+                <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                  <button type="button" onclick="closeCategoryModal()" class="btn btn-outline-secondary">Cancel</button>
+                  <button type="submit" class="btn btn-primary fw-semibold">Save Category Changes</button>
                 </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Description</label>
-                  <input name="description" id="editCatDesc" maxlength="255">
-                </div>
-                <div>
-                  <label>Sort Order</label>
-                  <input type="number" name="sort_order" id="editCatSort">
-                </div>
-                <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
-                  <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
-                    <input type="checkbox" name="is_active" id="editCatActive" value="1" style="width:auto;"> Category Active
-                  </label>
-                </div>
-              </div>
-              <br>
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <button type="submit">Save Category Changes</button>
-                <button type="button" onclick="closeCategoryModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Seller Profile & Edit Modal -->
       <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
-        <div class="modal-box">
-          <div class="modal-header">
-            <h3 id="modalTitle">Seller Profile</h3>
-            <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <div style="background:#f8fafc; border:1px solid #e2e8f0; padding:12px; border-radius:8px; margin-bottom:18px; display:grid; grid-template-columns:repeat(2, 1fr); gap:12px;">
-              <div style="font-size:12px; color:#64748b;">Seller ID<strong style="display:block; font-size:14px; color:#1e293b; margin-top:2px;" id="viewSellerId">—</strong></div>
-              <div style="font-size:12px; color:#64748b;">Registered On<strong style="display:block; font-size:14px; color:#1e293b; margin-top:2px;" id="viewCreatedAt">—</strong></div>
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="modalTitle">Seller Profile</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeSellerModal()"></button>
             </div>
+            <div class="modal-body p-4">
+              <div class="row g-2 mb-3">
+                <div class="col-6">
+                  <div class="p-2 bg-light border rounded-3">
+                    <div class="small text-body-secondary">Seller ID</div>
+                    <strong class="text-dark" id="viewSellerId">—</strong>
+                  </div>
+                </div>
+                <div class="col-6">
+                  <div class="p-2 bg-light border rounded-3">
+                    <div class="small text-body-secondary">Registered On</div>
+                    <strong class="text-dark" id="viewCreatedAt">—</strong>
+                  </div>
+                </div>
+              </div>
 
-            <form method="POST" action="/admin">
-              <input type="hidden" name="action" value="edit_seller">
-              <input type="hidden" name="seller_id" id="formSellerId">
-              <div class="grid">
-                <div>
-                  <label>Seller / Shop Name</label>
-                  <input name="seller_name" id="formSellerName" required maxlength="120">
+              <form method="POST" action="/admin">
+                <input type="hidden" name="action" value="edit_seller">
+                <input type="hidden" name="seller_id" id="formSellerId">
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Seller / Shop Name *</label>
+                    <input class="form-control" name="seller_name" id="formSellerName" required maxlength="120">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Phone (+country code)</label>
+                    <input class="form-control" name="phone" id="formPhone" placeholder="+919876543210">
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Email Address</label>
+                    <input class="form-control" type="email" name="email" id="formEmail" placeholder="seller@example.com">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">State *</label>
+                    <input class="form-control" name="state" id="formState" required>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Country *</label>
+                    <input class="form-control" name="country" id="formCountry" required>
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Address *</label>
+                    <input class="form-control" name="address" id="formAddress" required>
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Landmark</label>
+                    <input class="form-control" name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
+                  </div>
+                  <div class="col-12 mt-3 pt-2 border-top">
+                    <strong class="small text-dark">Change Password</strong>
+                    <span class="small text-body-secondary ms-1">(leave blank if not changing)</span>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Current Password</label>
+                    <input class="form-control" type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">New Password</label>
+                    <input class="form-control" type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Confirm Password</label>
+                    <input class="form-control" type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
+                  </div>
                 </div>
-                <div>
-                  <label>Phone (+country code)</label>
-                  <input name="phone" id="formPhone" placeholder="+919876543210">
+                <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                  <button type="button" onclick="closeSellerModal()" class="btn btn-outline-secondary">Cancel</button>
+                  <button type="submit" class="btn btn-primary fw-semibold">Save Changes</button>
                 </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Email Address</label>
-                  <input type="email" name="email" id="formEmail" placeholder="seller@example.com">
-                </div>
-                <div>
-                  <label>State</label>
-                  <input name="state" id="formState" required>
-                </div>
-                <div>
-                  <label>Country</label>
-                  <input name="country" id="formCountry" required>
-                </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Address</label>
-                  <input name="address" id="formAddress" required>
-                </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Landmark</label>
-                  <input name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
-                </div>
-                <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
-                  <strong style="color: #334155; font-size: 13px;">Change Password</strong>
-                  <span style="font-size: 12px; color: #64748b; margin-left: 6px;">(leave blank if not changing)</span>
-                </div>
-                <div>
-                  <label>Current Password</label>
-                  <input type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
-                </div>
-                <div>
-                  <label>New Password</label>
-                  <input type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
-                </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Confirm Password</label>
-                  <input type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
-                </div>
-              </div>
-              <br>
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <button type="submit">Save Changes</button>
-                <button type="button" onclick="closeSellerModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Seller Deletion Preflight Modal -->
       <div id="deletionPreflightModal" class="modal-overlay" onclick="if(event.target.id==='deletionPreflightModal') closeDeletionPreflightModal();">
-        <div class="modal-box wide">
-          <div class="modal-header">
-            <h3 id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
-            <button type="button" class="modal-close" onclick="closeDeletionPreflightModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <div id="delPreflightLoading" style="text-align:center; padding:32px; color:#64748b;">Computing orders, refunds, payouts &amp; settlement snapshot...</div>
-            <div id="delPreflightBody" style="display:none;"></div>
+        <div class="modal-dialog modal-dialog-centered modal-xl">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeDeletionPreflightModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <div id="delPreflightLoading" class="text-center py-4 text-body-secondary">
+                <div class="spinner-border spinner-border-sm text-danger me-2" role="status"></div>
+                Computing orders, refunds, payouts &amp; settlement snapshot...
+              </div>
+              <div id="delPreflightBody" style="display:none;"></div>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Seller Deletion Review Workspace Modal -->
       <div id="deletionWorkspaceModal" class="modal-overlay" onclick="if(event.target.id==='deletionWorkspaceModal') closeDeletionWorkspaceModal();">
-        <div class="modal-box wide">
-          <div class="modal-header">
-            <h3 id="delWsTitle">Seller Deletion Review Workspace</h3>
-            <button type="button" class="modal-close" onclick="closeDeletionWorkspaceModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <div id="delWsLoading" style="text-align:center; padding:32px; color:#64748b;">Loading seller deletion workspace...</div>
-            <div id="delWsBody" style="display:none;"></div>
+        <div class="modal-dialog modal-dialog-centered modal-xl">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="delWsTitle">Seller Deletion Review Workspace</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeDeletionWorkspaceModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <div id="delWsLoading" class="text-center py-4 text-body-secondary">
+                <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                Loading seller deletion workspace...
+              </div>
+              <div id="delWsBody" style="display:none;"></div>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Admin Product Add / Edit Modal -->
       <div id="productModal" class="modal-overlay" onclick="if(event.target.id==='productModal') closeProductModal();">
-        <div class="modal-box" style="max-width:760px;">
-          <div class="modal-header">
-            <h3 id="prodModalTitle">Add New Product</h3>
-            <button type="button" class="modal-close" onclick="closeProductModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <form method="POST" action="/admin" enctype="multipart/form-data">
-              <input type="hidden" name="action" id="prodFormAction" value="create_product">
-              <input type="hidden" name="product_id" id="prodFormId" value="">
-              <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
-              <div class="grid">
-                <div style="grid-column: 1 / -1;">
-                  <label>Product Name *</label>
-                  <input name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="prodModalTitle">Add New Product</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeProductModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <form method="POST" action="/admin" enctype="multipart/form-data">
+                <input type="hidden" name="action" id="prodFormAction" value="create_product">
+                <input type="hidden" name="product_id" id="prodFormId" value="">
+                <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
+                <div class="row g-3">
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Product Name *</label>
+                    <input class="form-control" name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Seller Account *</label>
+                    <select class="form-select" name="seller_id" id="prodFormSeller" required>
+                      <option value="">-- Select Seller --</option>
+                      ${eligibleSellersForProducts.map(spOpt => {
+                        const spAcc = String(spOpt.account_status || 'ACTIVE').toUpperCase();
+                        return `<option value="${Number(spOpt.id)}" data-acc-status="${escapeHtml(spAcc)}">${escapeHtml(spOpt.display_name + ' (#' + Number(spOpt.id) + ')' + (spAcc !== 'ACTIVE' ? ' [' + spAcc + ']' : ''))}</option>`;
+                      }).join('')}
+                    </select>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Category *</label>
+                    <select class="form-select" name="category_id" id="prodFormCategory" required>
+                      ${categoriesList.map(catOpt => `<option value="${Number(catOpt.id)}">${escapeHtml(catOpt.name)}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">Selling Price (₹) *</label>
+                    <input class="form-control" type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">MRP (₹)</label>
+                    <input class="form-control" type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (+30%)">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">Stock Quantity *</label>
+                    <input class="form-control" type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">SKU</label>
+                    <input class="form-control" name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if blank">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-semibold">Brand</label>
+                    <input class="form-control" name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
+                  </div>
+                  <div class="col-md-4 d-flex align-items-end pb-1">
+                    <div class="form-check">
+                      <input class="form-check-input" type="checkbox" name="is_active" id="prodFormActive" value="1" checked>
+                      <label class="form-check-label small fw-semibold" for="prodFormActive">Active (Storefront)</label>
+                    </div>
+                  </div>
+                  <div class="col-12">
+                    <label class="form-label small fw-semibold">Description</label>
+                    <textarea class="form-control" name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
+                  </div>
+                  <div id="prodExistingImagesWrap" class="col-12" style="display:none;">
+                    <label class="form-label small fw-semibold mb-1">Current Product Images (uncheck to remove)</label>
+                    <div id="prodModalExistingImgs" class="existing-img-grid"></div>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Upload Product Images (up to 4, auto-WebP)</label>
+                    <input class="form-control" type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Add Image URLs (optional)</label>
+                    <textarea class="form-control" name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
+                  </div>
+                  <div id="prodEditImageOptions" class="col-12 bg-light border rounded-3 p-2 gap-3 flex-wrap align-items-center" style="display:none;">
+                    <div class="form-check mb-0">
+                      <input class="form-check-input" type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1">
+                      <label class="form-check-label small" for="prodFormReplaceImgs">Replace all existing images with new uploads/URLs</label>
+                    </div>
+                    <div class="form-check mb-0">
+                      <input class="form-check-input" type="checkbox" name="clear_images" id="prodFormClearImgs" value="1">
+                      <label class="form-check-label small text-danger" for="prodFormClearImgs">Remove all images</label>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <label>Seller Account *</label>
-                  <select name="seller_id" id="prodFormSeller" required>
-                    <option value="">-- Select Seller --</option>
-                    ${eligibleSellersForProducts.map(spOpt => {
-                      const spAcc = String(spOpt.account_status || 'ACTIVE').toUpperCase();
-                      return `<option value="${Number(spOpt.id)}" data-acc-status="${escapeHtml(spAcc)}">${escapeHtml(spOpt.display_name + ' (#' + Number(spOpt.id) + ')' + (spAcc !== 'ACTIVE' ? ' [' + spAcc + ']' : ''))}</option>`;
-                    }).join('')}
-                  </select>
+                <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                  <button type="button" onclick="closeProductModal()" class="btn btn-outline-secondary">Cancel</button>
+                  <button type="submit" id="prodFormSubmitBtn" class="btn btn-primary fw-semibold">Save Product</button>
                 </div>
-                <div>
-                  <label>Category *</label>
-                  <select name="category_id" id="prodFormCategory" required>
-                    ${categoriesList.map(catOpt => `<option value="${Number(catOpt.id)}">${escapeHtml(catOpt.name)}</option>`).join('')}
-                  </select>
-                </div>
-                <div>
-                  <label>Selling Price (₹) *</label>
-                  <input type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
-                </div>
-                <div>
-                  <label>MRP (₹)</label>
-                  <input type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (defaults +30%)">
-                </div>
-                <div>
-                  <label>Stock Quantity *</label>
-                  <input type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
-                </div>
-                <div>
-                  <label>SKU</label>
-                  <input name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if left blank">
-                </div>
-                <div>
-                  <label>Brand</label>
-                  <input name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
-                </div>
-                <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
-                  <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
-                    <input type="checkbox" name="is_active" id="prodFormActive" value="1" checked style="width:auto;"> Active (Visible on Storefront)
-                  </label>
-                </div>
-                <div style="grid-column: 1 / -1;">
-                  <label>Description</label>
-                  <textarea name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
-                </div>
-                <div id="prodExistingImagesWrap" style="grid-column: 1 / -1; display:none;">
-                  <label style="margin-bottom:4px;">Current Product Images (uncheck to remove)</label>
-                  <div id="prodModalExistingImgs" class="existing-img-grid"></div>
-                </div>
-                <div>
-                  <label>Upload Product Images (up to 4, auto-WebP)</label>
-                  <input type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
-                </div>
-                <div>
-                  <label>Add Image URLs (optional, comma/newline separated)</label>
-                  <textarea name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
-                </div>
-                <div id="prodEditImageOptions" style="grid-column: 1 / -1; display:none; gap:16px; flex-wrap:wrap; align-items:center; padding:8px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
-                  <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px;">
-                    <input type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1" style="width:auto;"> Replace all existing images with new uploads/URLs
-                  </label>
-                  <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px; color:#b91c1c;">
-                    <input type="checkbox" name="clear_images" id="prodFormClearImgs" value="1" style="width:auto;"> Remove all images
-                  </label>
-                </div>
-              </div>
-              <br>
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <button type="submit" id="prodFormSubmitBtn">Save Product</button>
-                <button type="button" onclick="closeProductModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Shared In-Page Form Confirmation Modal (replaces native confirm()) -->
       <div id="confirmActionModal" class="modal-overlay" style="z-index: 1100;" onclick="if(event.target.id==='confirmActionModal') closeConfirmModal();">
-        <div class="modal-box" style="max-width:460px;">
-          <div class="modal-header">
-            <h3 id="confirmModalTitle">Confirm Action</h3>
-            <button type="button" class="modal-close" onclick="closeConfirmModal()">&times;</button>
+        <div class="modal-dialog modal-dialog-centered modal-sm-custom">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0" id="confirmModalTitle">Confirm Action</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeConfirmModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <p id="confirmModalMessage" class="text-body-secondary mb-4">Are you sure?</p>
+              <div class="d-flex justify-content-end gap-2">
+                <button type="button" onclick="closeConfirmModal()" class="btn btn-outline-secondary">Cancel</button>
+                <button type="button" onclick="confirmPendingForm()" class="btn btn-danger fw-semibold">Confirm</button>
+              </div>
+            </div>
           </div>
-          <div class="modal-body">
-            <p id="confirmModalMessage" style="margin:0 0 18px; color:#334155; font-size:14px; line-height:1.5;">Are you sure?</p>
-            <div style="display:flex; justify-content:flex-end; gap:10px;">
-              <button type="button" onclick="closeConfirmModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-              <button type="button" onclick="confirmPendingForm()" style="background:#dc2626;">Confirm</button>
+        </div>
+      </div>
+
+      <!-- Hostinger Business Email (SMTP) Settings & Test Modal -->
+      <div id="hostingerMailModal" class="modal-overlay" onclick="if(event.target.id==='hostingerMailModal') closeHostingerMailModal();">
+        <div class="modal-dialog modal-dialog-centered">
+          <div class="modal-content border-0 shadow-lg rounded-4">
+            <div class="modal-header border-bottom py-3 px-4">
+              <h3 class="modal-title h5 fw-bold mb-0"><i class="bi bi-envelope-at text-primary me-2"></i>Hostinger Mail SMTP Integration</h3>
+              <button type="button" class="btn-close" aria-label="Close" onclick="closeHostingerMailModal()"></button>
+            </div>
+            <div class="modal-body p-4">
+              <div id="hmStatusBanner" class="alert alert-secondary small py-2 mb-3">Loading Hostinger Mail status...</div>
+              <form onsubmit="saveHostingerMailSettings(event)">
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">SMTP Host</label>
+                    <input class="form-control form-control-sm" id="hmHost" value="smtp.hostinger.com" required>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label small fw-semibold">Port</label>
+                    <select class="form-select form-select-sm" id="hmPort" onchange="onHostingerPortChange()">
+                      <option value="465" selected>465 (SSL/TLS)</option>
+                      <option value="587">587 (STARTTLS)</option>
+                    </select>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label small fw-semibold">Encryption</label>
+                    <input class="form-control form-control-sm" id="hmEncryption" value="ssl" readonly>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Hostinger Email (Username) *</label>
+                    <input class="form-control form-control-sm" type="email" id="hmUsername" placeholder="contact@knowlipop.shop" required>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">Mailbox Password</label>
+                    <input class="form-control form-control-sm" type="password" id="hmPassword" placeholder="Enter Hostinger email password">
+                    <div class="form-text small" id="hmPassHint">Leave blank to keep existing saved password.</div>
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">From Address</label>
+                    <input class="form-control form-control-sm" type="email" id="hmFromAddress" placeholder="Defaults to Hostinger Email">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-semibold">From Name</label>
+                    <input class="form-control form-control-sm" id="hmFromName" value="Knowlipop Vendor">
+                  </div>
+                </div>
+                <div class="d-flex justify-content-end gap-2 mt-3">
+                  <button type="submit" id="hmSaveBtn" class="btn btn-primary btn-sm fw-semibold"><i class="bi bi-save me-1"></i>Save Hostinger Mail Settings</button>
+                </div>
+              </form>
+              <hr class="my-3">
+              <div class="bg-light border rounded-3 p-3">
+                <label class="form-label small fw-bold mb-1">Send Live Test Email via Hostinger Mail</label>
+                <div class="input-group input-group-sm">
+                  <input type="email" class="form-control" id="hmTestRecipient" placeholder="recipient@example.com">
+                  <button type="button" id="hmTestBtn" class="btn btn-success fw-semibold" onclick="sendHostingerTestEmail()"><i class="bi bi-send me-1"></i>Send Test Email</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -13275,23 +13913,26 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
           var winStart = Math.max(1, st.page - 2);
           var winEnd = Math.min(totalPages, st.page + 2);
           if (winStart > 1) {
-            pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button>';
-            if (winStart > 2) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+            pagesHtml += '<li class="page-item"><button type="button" class="page-link pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button></li>';
+            if (winStart > 2) pagesHtml += '<li class="page-item disabled"><span class="page-link">...</span></li>';
           }
           for (var pNum = winStart; pNum <= winEnd; pNum++) {
-            pagesHtml += '<button type="button" class="pg-btn' + (pNum === st.page ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button>';
+            var isCurPg = (pNum === st.page);
+            pagesHtml += '<li class="page-item' + (isCurPg ? ' active' : '') + '"><button type="button" class="page-link pg-btn' + (isCurPg ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button></li>';
           }
           if (winEnd < totalPages) {
-            if (winEnd < totalPages - 1) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
-            pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button>';
+            if (winEnd < totalPages - 1) pagesHtml += '<li class="page-item disabled"><span class="page-link">...</span></li>';
+            pagesHtml += '<li class="page-item"><button type="button" class="page-link pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button></li>';
           }
 
-          barEl.innerHTML = '<div><strong>' + escapeHtml(summaryText) + '</strong></div>' +
-            '<div class="pg-controls">' +
-            '<select class="pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
-            '<button type="button" class="pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button>' +
+          barEl.innerHTML = '<div class="small fw-semibold text-body-secondary">' + escapeHtml(summaryText) + '</div>' +
+            '<div class="d-flex align-items-center gap-2 flex-wrap">' +
+            '<select class="form-select form-select-sm w-auto pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
+            '<nav aria-label="Table pagination"><ul class="pagination pagination-sm mb-0">' +
+            '<li class="page-item' + (st.page <= 1 ? ' disabled' : '') + '"><button type="button" class="page-link pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button></li>' +
             pagesHtml +
-            '<button type="button" class="pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button>' +
+            '<li class="page-item' + (st.page >= totalPages ? ' disabled' : '') + '"><button type="button" class="page-link pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button></li>' +
+            '</ul></nav>' +
             '</div>';
         }
 
@@ -13808,10 +14449,10 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
 
           if (!fileExists) {
             if (hintEl) hintEl.style.display = 'none';
-            frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;">' +
+            frameWrap.innerHTML = '<div class="p-4 text-center bg-warning-subtle text-warning-emphasis w-100 h-100 d-flex flex-column align-items-center justify-content-center gap-2">' +
               '<strong>File Not Found on Server Disk</strong>' +
-              '<p style="font-size:13px;max-width:440px;margin:0;line-height:1.5;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
-              '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
+              '<p class="small mb-1" style="max-width:440px;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
+              '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
               '</div>';
             return;
           }
@@ -13909,31 +14550,31 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
               document.getElementById('modalDocCount').innerText = docs.length;
               var docsContainer = document.getElementById('modalDocumentsList');
               if (docs.length === 0) {
-                docsContainer.innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">No documents uploaded by this seller yet.</div>';
+                docsContainer.innerHTML = '<div class="text-body-secondary small p-3 bg-light rounded-3 border">No documents uploaded by this seller yet.</div>';
               } else {
                 var docsHtml = '';
                 docs.forEach(function(d) {
                   var dName = String(d.original_name || ('Document #' + d.id));
                   var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (dName.toLowerCase().slice(-4) === '.pdf'));
                   var typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
-                  var primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
-                  var missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Re-upload Needed)</span>' : '';
+                  var primaryTag = d.is_primary ? '<span class="badge text-bg-primary ms-1">Main Document</span>' : '';
+                  var missingTag = (d.file_exists === false) ? '<span class="badge text-bg-warning ms-1">File Missing (Re-upload Needed)</span>' : '';
                   var previewHref = d.admin_preview_url || ('/admin/view_gst_doc?id=' + Number(d.id) + '&mode=preview');
                   var dlHref = d.admin_download_url || ('/admin/view_gst_doc?id=' + Number(d.id) + '&mode=download');
 
                   docsHtml += '<div class="doc-card">' +
                     '<div>' +
-                    '<div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                    '<div class="fw-bold small text-dark d-flex align-items-center gap-2 flex-wrap">' +
                     typeBadge + ' ' + escapeHtml(dName) + ' ' + primaryTag + ' ' + missingTag +
                     '</div>' +
-                    '<div style="font-size:12px; color:#64748b; margin-top:4px;">' +
+                    '<div class="small text-body-secondary mt-1">' +
                     escapeHtml(d.file_size_formatted || '') + ' &bull; Uploaded ' + escapeHtml(d.created_at ? String(d.created_at).slice(0, 10) : '') +
                     '</div>' +
                     '</div>' +
-                    '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-                    '<button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
-                    '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn-view" style="background:#475569;">New Tab</a>' +
-                    '<a href="' + escapeHtml(dlHref) + '" class="btn-dl">Download</a>' +
+                    '<div class="d-flex gap-2 flex-wrap">' +
+                    '<button type="button" class="btn btn-info btn-sm text-white fw-semibold" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
+                    '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn btn-outline-secondary btn-sm fw-semibold">New Tab</a>' +
+                    '<a href="' + escapeHtml(dlHref) + '" class="btn btn-outline-dark btn-sm fw-semibold">Download</a>' +
                     '</div>' +
                     '</div>';
                 });
@@ -13947,18 +14588,18 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
 
               var logsContainer = document.getElementById('modalLogsList');
               if (logs.length === 0) {
-                logsContainer.innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">No history logs recorded yet.</div>';
+                logsContainer.innerHTML = '<div class="text-body-secondary small py-2">No history logs recorded yet.</div>';
               } else {
                 var logsHtml = '';
                 logs.forEach(function(l) {
                   logsHtml += '<div class="log-row">' +
-                    '<div style="color:#64748b; font-size:12px; min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
-                    '<div style="flex:1;">' +
+                    '<div class="text-body-secondary small" style="min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
+                    '<div class="flex-grow-1">' +
                     '<strong>' + escapeHtml(String(l.action || '').toUpperCase()) + '</strong> ' +
-                    '<span style="color:#64748b;">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
+                    '<span class="text-body-secondary">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
                     escapeHtml(l.notes || '') +
                     '</div>' +
-                    '<div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">' + escapeHtml(l.new_status) + '</span></div>' +
+                    '<div><span class="badge text-bg-secondary">' + escapeHtml(l.new_status) + '</span></div>' +
                     '</div>';
                 });
                 logsContainer.innerHTML = logsHtml;
@@ -13983,8 +14624,8 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
               if (msMeta) msMeta.innerText = 'Seller ID #' + sellerId;
               document.getElementById('modalGstStatus').innerHTML = '<span class="badge-pending">Offline / Partial</span>';
               document.getElementById('modalDocCount').innerText = '0';
-              document.getElementById('modalDocumentsList').innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">Document metadata unavailable while fetch failed.</div>';
-              document.getElementById('modalLogsList').innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">Logs unavailable while fetch failed.</div>';
+              document.getElementById('modalDocumentsList').innerHTML = '<div class="text-body-secondary small p-3 bg-light rounded-3 border">Document metadata unavailable while fetch failed.</div>';
+              document.getElementById('modalLogsList').innerHTML = '<div class="text-body-secondary small py-2">Logs unavailable while fetch failed.</div>';
               if (autoShowReject) {
                 focusRejectBoxInModal();
               }
@@ -14040,9 +14681,9 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
           var slot = row.querySelector('.seller-del-btn-slot');
           if (slot) {
             if (activeReqId && accUpper !== 'DELETED') {
-              slot.innerHTML = '<button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
+              slot.innerHTML = '<button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
             } else if (accUpper !== 'DELETED') {
-              slot.innerHTML = '<button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
+              slot.innerHTML = '<button type="button" class="btn btn-outline-danger btn-sm fw-semibold" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
             } else {
               slot.innerHTML = '';
             }
@@ -14093,7 +14734,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
               var tbody = document.getElementById('deletionRequestsTbody');
               if (!tbody) return;
               if (data.requests.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-body-secondary text-center py-4">No seller deletion requests submitted yet.</td></tr>';
                 refreshTablePagination('del', true);
                 return;
               }
@@ -14103,17 +14744,17 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
                 var finS = dr.financial_summary || {};
                 var searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
                 html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
-                  '<td><strong>#' + Number(dr.id) + '</strong></td>' +
-                  '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
-                  (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : '') +
-                  '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
-                  (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
+                  '<td class="fw-bold">#' + Number(dr.id) + '</td>' +
+                  '<td><span class="fw-bold text-dark">' + escapeHtml(dr.seller_name) + '</span>' +
+                  (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow ms-1" style="font-size:10px; padding:2px 6px;">Seller Request</span>' : '') +
+                  '<div class="small text-body-secondary">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
+                  (dr.seller_email ? '<div class="small text-muted">' + escapeHtml(dr.seller_email) + '</div>' : '') +
                   '</td>' +
-                  '<td><div style="font-size:13px;">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div style="font-size:11px; color:#94a3b8;">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
-                  '<td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">' + escapeHtml(dr.stage) + '</code></td>' +
+                  '<td><div class="small">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div class="small text-muted">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
+                  '<td><code class="bg-light px-2 py-1 rounded border small">' + escapeHtml(dr.stage) + '</code></td>' +
                   '<td>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</td>' +
-                  '<td style="font-size:12px; color:#475569;">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
-                  '<td><button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
+                  '<td class="small text-body-secondary">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
+                  '<td><button type="button" class="btn btn-primary btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
                   '</tr>';
               });
               tbody.innerHTML = html;
@@ -14139,7 +14780,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
               var bodyEl = document.getElementById('delPreflightBody');
               bodyEl.style.display = 'block';
               if (!resObj.ok || !resObj.d || !resObj.d.seller) {
-                bodyEl.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:14px;border-radius:8px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
+                bodyEl.innerHTML = '<div class="alert alert-danger mb-0">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
                 return;
               }
               var s = resObj.d.seller;
@@ -14159,33 +14800,33 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
                 ['Outstanding Commissions', fmtCur(m.outstanding_commissions || 0)],
                 ['Open Disputes', Number(m.open_disputes_count || 0)]
               ];
-              var html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
-                '<div><strong style="font-size:16px;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
-                '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '\u2014') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
-                '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div>' +
-                '<div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(175px, 1fr));gap:10px;margin-bottom:16px;">';
+              var html = '<div class="card bg-light border mb-3"><div class="card-body p-3 d-flex justify-content-between align-items-center flex-wrap gap-2">' +
+                '<div><strong class="fs-6 text-dark">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
+                '<div class="small text-body-secondary mt-1">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '\u2014') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
+                '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div></div>' +
+                '<div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-2 mb-3">';
               cards.forEach(function(c) {
-                html += '<div class="metric-mini"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div>';
+                html += '<div class="col"><div class="metric-mini h-100"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div></div>';
               });
               html += '</div>' +
-                '<div style="background:#fffbeb;border:1px solid #fcd34d;padding:12px;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:14px;">' +
+                '<div class="alert alert-warning small mb-3">' +
                 'Submitting this request sets the seller account immediately to <strong>DELETION_PENDING</strong>, notifies the seller, and blocks new buyer orders without deleting any historical data.' +
                 '</div>' +
-                '<label>Deletion Request Reason *</label>' +
-                '<input type="text" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255">' +
-                '<label>Admin Remarks</label>' +
-                '<textarea id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea>' +
-                '<div id="preflightErrBox" style="color:#b91c1c;font-size:13px;margin-top:8px;"></div>' +
-                '<div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end;">' +
-                '<button type="button" onclick="closeDeletionPreflightModal()" style="background:#e2e8f0;color:#334155;">Cancel</button>' +
-                '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" style="background:#dc2626;">Confirm Deletion Request (DELETION_PENDING)</button>' +
+                '<div class="mb-3"><label class="form-label small fw-semibold">Deletion Request Reason *</label>' +
+                '<input type="text" class="form-control" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255"></div>' +
+                '<div class="mb-2"><label class="form-label small fw-semibold">Admin Remarks</label>' +
+                '<textarea class="form-control" id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea></div>' +
+                '<div id="preflightErrBox" class="text-danger small mt-2"></div>' +
+                '<div class="d-flex gap-2 mt-3 justify-content-end pt-2 border-top">' +
+                '<button type="button" onclick="closeDeletionPreflightModal()" class="btn btn-outline-secondary">Cancel</button>' +
+                '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" class="btn btn-danger fw-semibold">Confirm Deletion Request (DELETION_PENDING)</button>' +
                 '</div>';
               bodyEl.innerHTML = html;
             })
             .catch(function(err) {
               document.getElementById('delPreflightLoading').style.display = 'none';
               document.getElementById('delPreflightBody').style.display = 'block';
-              document.getElementById('delPreflightBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+              document.getElementById('delPreflightBody').innerHTML = '<div class="alert alert-danger mb-0">Error: ' + escapeHtml(err.message) + '</div>';
             });
         }
 
@@ -14235,7 +14876,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
               var bodyEl = document.getElementById('delWsBody');
               bodyEl.style.display = 'block';
               if (!resObj.ok || !resObj.d || !resObj.d.deletion_request) {
-                bodyEl.innerHTML = '<div style="color:#b91c1c;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load deletion request.') + '</div>';
+                bodyEl.innerHTML = '<div class="alert alert-danger mb-0">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load deletion request.') + '</div>';
                 return;
               }
               renderDeletionWorkspace(resObj.d);
@@ -14243,7 +14884,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
             .catch(function(err) {
               document.getElementById('delWsLoading').style.display = 'none';
               document.getElementById('delWsBody').style.display = 'block';
-              document.getElementById('delWsBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+              document.getElementById('delWsBody').innerHTML = '<div class="alert alert-danger mb-0">Error: ' + escapeHtml(err.message) + '</div>';
             });
         }
 
@@ -14254,7 +14895,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
             payload.remarks = remarksInput.value.trim();
           }
           var msgBox = document.getElementById('wsFeedbackBox');
-          if (msgBox) msgBox.innerHTML = '<span style="color:#1d4ed8;">Processing action...</span>';
+          if (msgBox) msgBox.innerHTML = '<div class="alert alert-info py-2 px-3 small mb-3">Processing action...</div>';
 
           fetch('/api/admin/seller-deletions/' + Number(reqId) + '/' + subPath, {
             method: 'POST',
@@ -14265,7 +14906,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
           .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
           .then(function(resObj) {
             if (!resObj.ok) {
-              if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
+              if (msgBox) msgBox.innerHTML = '<div class="alert alert-danger py-2 px-3 small mb-3">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
               return;
             }
             if (resObj.d && resObj.d.deletion_request) {
@@ -14278,7 +14919,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
             reloadDeletionRequestsList();
           })
           .catch(function(err) {
-            if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
+            if (msgBox) msgBox.innerHTML = '<div class="alert alert-danger py-2 px-3 small mb-3">' + escapeHtml(err.message) + '</div>';
           });
         }
 
@@ -14386,141 +15027,141 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
           var isTerminal = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED');
 
           var html = '<div id="wsFeedbackBox">' +
-            (successBanner ? '<div style="background:#dcfce7;color:#15803d;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;">' + escapeHtml(successBanner) + '</div>' : '') +
+            (successBanner ? '<div class="alert alert-success py-2 px-3 small fw-semibold mb-3">' + escapeHtml(successBanner) + '</div>' : '') +
             '</div>';
 
-          html += '<div class="ws-section" style="background:#f8fafc;">' +
-            '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">' +
+          html += '<div class="ws-section bg-light">' +
+            '<div class="d-flex justify-content-between align-items-start flex-wrap gap-2">' +
             '<div>' +
-            '<div style="font-size:17px;font-weight:800;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span style="font-size:13px;color:#64748b;">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
-            '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '\u2014') + ' &bull; Email: ' + escapeHtml(s.email || '\u2014') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
-            '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '\u2014') + '</div>' +
+            '<div class="fs-6 fw-bold text-dark">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span class="small text-body-secondary">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
+            '<div class="small text-body-secondary mt-1">Phone: ' + escapeHtml(s.phone || '\u2014') + ' &bull; Email: ' + escapeHtml(s.email || '\u2014') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
+            '<div class="small text-muted mt-1">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '\u2014') + '</div>' +
             '</div>' +
-            '<div style="text-align:right;">' +
-            '<div style="margin-bottom:6px;">Stage: <code style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-weight:700;">' + escapeHtml(dr.stage) + '</code></div>' +
+            '<div class="text-md-end">' +
+            '<div class="mb-1 small">Stage: <code class="bg-primary-subtle text-primary-emphasis px-2 py-1 rounded fw-bold">' + escapeHtml(dr.stage) + '</code></div>' +
             '<div>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</div>' +
             '</div></div></div>';
 
           html += '<div class="ws-section"><h4><span>6-Gate Verification Checklist</span><span>' +
             (data.all_checks_passed ? delStatusBadgeHtml('GREEN', 'ALL CHECKS PASSED') : delStatusBadgeHtml('YELLOW', 'VERIFICATION INCOMPLETE')) +
-            '</span></h4><table><thead><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
+            '</span></h4><div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
           checks.forEach(function(ck) {
             html += '<tr><td><strong>' + escapeHtml(ck.label) + '</strong></td><td>' + delStatusBadgeHtml(ck.status, ck.status) + '</td></tr>';
           });
-          html += '</tbody></table></div>';
+          html += '</tbody></table></div></div>';
 
           html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
-            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
-            '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
+            '<div class="d-flex gap-2 align-items-center flex-wrap">' +
+            '<label class="form-check-label small fw-semibold d-inline-flex align-items-center gap-1 m-0" style="cursor:pointer;"><input type="checkbox" class="form-check-input mt-0" id="wsApproveRuleB"> Approve Accepted Order Cancellations (Rule B)</label>' +
+            '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
+            '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
             '</div></h4>' +
-            '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
-            '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div>' +
+            '<div class="row row-cols-2 row-cols-sm-5 g-2 mb-2">' +
+            '<div class="col"><div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div></div>' +
             '</div>';
           if (orders.length > 0) {
-            html += '<table><thead><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
+            html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
             orders.forEach(function(o) {
               html += '<tr><td>#' + Number(o.id) + ' (' + escapeHtml(o.order_number || '') + ')</td>' +
                 '<td><strong>' + escapeHtml(o.effective_status) + '</strong></td>' +
                 '<td>' + escapeHtml(o.payment_method || '') + ' / ' + escapeHtml(o.payment_status || '') + '</td>' +
                 '<td>' + fmtCur(o.seller_gross || 0) + '</td>' +
-                '<td style="font-size:12px;">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
+                '<td class="small">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
             });
-            html += '</tbody></table>';
+            html += '</tbody></table></div>';
           }
           html += '</div>';
 
           html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
-            '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
+            '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
+            '<div class="small text-body-secondary mb-2">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
           if (refunds.length === 0) {
-            html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
+            html += '<div class="small text-muted">No refund records queued for this seller.</div>';
           } else {
-            html += '<table><thead><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
+            html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
             refunds.forEach(function(rf) {
               html += '<tr><td>#' + Number(rf.id) + '</td><td>#' + Number(rf.order_id) + '</td><td>' + fmtCur(rf.eligible_refund_amount) + ' / ' + fmtCur(rf.refunded_amount) + '</td>' +
                 '<td><code>' + escapeHtml(rf.gateway_refund_id || '\u2014') + '</code></td>' +
                 '<td>' + delStatusBadgeHtml(rf.badge_color || rf.status, rf.status) + '</td>' +
-                '<td style="font-size:11px;color:#b91c1c;">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
+                '<td class="small text-danger">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
             });
-            html += '</tbody></table>';
+            html += '</tbody></table></div>';
           }
           html += '</div>';
 
           html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
-            '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
-            '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
-            '<div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v" style="font-size:14px;">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div>' +
-            '<div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div>' +
+            '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
+            '<div class="row row-cols-2 row-cols-md-3 g-2 mb-3">' +
+            '<div class="col"><div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v small fw-bold">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div></div>' +
+            '<div class="col"><div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div></div>' +
             '</div>' +
-            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:10px;">' +
-            '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;"><input type="checkbox" id="wsConfirmGatewaySettled" style="width:auto;" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
-            '<input type="text" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;padding:6px 10px;font-size:12px;">' +
-            '<button type="button" class="btn-approve-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
+            '<div class="d-flex gap-2 align-items-center flex-wrap p-2 bg-light border rounded-3 mb-2">' +
+            '<label class="form-check-label small d-inline-flex align-items-center gap-1 m-0" style="cursor:pointer;"><input type="checkbox" class="form-check-input mt-0" id="wsConfirmGatewaySettled" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
+            '<input type="text" class="form-control form-control-sm" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;">' +
+            '<button type="button" class="btn btn-success btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
             '</div>';
           if (disputes.length > 0) {
-            html += '<table><thead><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+            html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
             disputes.forEach(function(dp) {
               var isOpen = ['OPEN', 'UNDER_REVIEW', 'ESCALATED'].indexOf(String(dp.status || '').toUpperCase()) !== -1;
               html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
                 '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
                 '<td>' + (isOpen && !isTerminal
-                  ? '<button type="button" class="btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
+                  ? '<button type="button" class="btn btn-primary btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
                   : 'Resolved') + '</td></tr>';
             });
-            html += '</tbody></table>';
+            html += '</tbody></table></div>';
           }
           html += '</div>';
 
           html += '<div class="ws-section"><h4>Admin Decision &amp; Final Confirmation</h4>' +
-            '<label style="margin-top:0;">Admin Remarks</label>' +
-            '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
-            '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
-            '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">\u2713 Approve Deletion</button>' +
-            '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">\u23F8 Put On Hold</button>' +
-            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">\u2715 Reject Request</button>' +
-            '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">\uD83D\uDDD1 Final Delete Seller</button>' +
+            '<label class="form-label small fw-semibold">Admin Remarks</label>' +
+            '<textarea class="form-control" id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
+            '<div class="d-flex gap-2 flex-wrap mt-3 align-items-center">' +
+            '<button type="button" class="btn btn-success fw-semibold" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">\u2713 Approve Deletion</button>' +
+            '<button type="button" class="btn btn-warning fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">\u23F8 Put On Hold</button>' +
+            '<button type="button" class="btn btn-danger fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">\u2715 Reject Request</button>' +
+            '<button type="button" id="wsFinalDeleteBtn" class="btn btn-dark border-danger fw-semibold" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">\uD83D\uDDD1 Final Delete Seller</button>' +
             '</div>' +
-            '<div id="wsHoldBox" style="display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:14px;margin-top:12px;">' +
-            '<strong style="color:#9a3412;font-size:13px;">Put Deletion Request On Hold</strong>' +
-            '<input type="text" id="wsHoldReasonInput" value="Awaiting manual verification / return period" style="margin-top:6px;">' +
-            '<div style="display:flex;gap:8px;margin-top:10px;">' +
-            '<button type="button" class="btn-hold-sm" style="padding:8px 14px;" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
-            '<button type="button" onclick="toggleWsHoldBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+            '<div id="wsHoldBox" class="alert alert-warning mt-3 mb-0 p-3" style="display:none;">' +
+            '<strong class="small d-block mb-2">Put Deletion Request On Hold</strong>' +
+            '<input type="text" class="form-control form-control-sm" id="wsHoldReasonInput" value="Awaiting manual verification / return period">' +
+            '<div class="d-flex gap-2 mt-2">' +
+            '<button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
+            '<button type="button" onclick="toggleWsHoldBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>' +
             '</div></div>' +
-            '<div id="wsRejectBox" style="display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px;margin-top:12px;">' +
-            '<strong style="color:#991b1b;font-size:13px;">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
-            '<textarea id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..." style="margin-top:6px;border-color:#fca5a5;"></textarea>' +
-            '<div id="wsRejectErr" style="color:#b91c1c;font-size:12px;margin-top:4px;"></div>' +
-            '<div style="display:flex;gap:8px;margin-top:10px;">' +
-            '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
-            '<button type="button" onclick="toggleWsRejectBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+            '<div id="wsRejectBox" class="alert alert-danger mt-3 mb-0 p-3" style="display:none;">' +
+            '<strong class="small d-block mb-2">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
+            '<textarea class="form-control form-control-sm border-danger-subtle" id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..."></textarea>' +
+            '<div id="wsRejectErr" class="text-danger small mt-1"></div>' +
+            '<div class="d-flex gap-2 mt-2">' +
+            '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
+            '<button type="button" onclick="toggleWsRejectBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>' +
             '</div></div>' +
-            (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
-            '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
-            '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
-            '<p style="font-size:13px;color:#7f1d1d;margin:6px 0;">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
-            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
-            '<input type="text" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
-            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
+            (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div class="small text-body-secondary mt-2">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
+            '<div id="wsFinalConfirmBox" class="alert alert-danger border-2 border-danger mt-3 mb-0 p-3" style="display:none;">' +
+            '<strong class="small d-block">Second Explicit Confirmation Required</strong>' +
+            '<p class="small my-2">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
+            '<div class="d-flex gap-2 align-items-center flex-wrap">' +
+            '<input type="text" class="form-control form-control-sm" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
+            '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
             '</div></div></div>';
 
-          html += '<div class="ws-section"><h4>Admin Activity History (' + logs.length + ')</h4>';
+          html += '<div class="ws-section mb-0"><h4>Admin Activity History (' + logs.length + ')</h4>';
           if (logs.length === 0) {
-            html += '<div style="font-size:12px;color:#94a3b8;">No admin activity recorded yet.</div>';
+            html += '<div class="small text-muted">No admin activity recorded yet.</div>';
           } else {
             logs.forEach(function(lg) {
-              html += '<div class="log-row"><div style="color:#64748b;font-size:12px;min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
-                '<div style="flex:1;"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div style="color:#475569;font-size:12px;">' + escapeHtml(lg.remarks || '') + '</div></div>' +
+              html += '<div class="log-row"><div class="text-body-secondary small" style="min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
+                '<div class="flex-grow-1"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div class="text-body-secondary small">' + escapeHtml(lg.remarks || '') + '</div></div>' +
                 '<div>' + delStatusBadgeHtml(lg.new_status || lg.new_stage || 'INFO', lg.new_status || lg.new_stage || '') + '</div></div>';
             });
           }
@@ -14528,13 +15169,146 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
 
           document.getElementById('delWsBody').innerHTML = html;
         }
+
+        function onHostingerPortChange() {
+          var port = document.getElementById('hmPort').value;
+          document.getElementById('hmEncryption').value = (String(port) === '587') ? 'tls' : 'ssl';
+        }
+
+        function openHostingerMailModal() {
+          document.getElementById('hostingerMailModal').classList.add('active');
+          loadHostingerMailConfig();
+        }
+
+        function closeHostingerMailModal() {
+          document.getElementById('hostingerMailModal').classList.remove('active');
+        }
+
+        function loadHostingerMailConfig() {
+          var banner = document.getElementById('hmStatusBanner');
+          banner.className = 'alert alert-secondary small py-2 mb-3';
+          banner.innerText = 'Loading Hostinger Mail configuration...';
+          fetch('/api/admin/email/config', { credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              var cfg = (data && data.email) || {};
+              if (cfg.host) document.getElementById('hmHost').value = cfg.host;
+              if (cfg.port) document.getElementById('hmPort').value = String(cfg.port);
+              document.getElementById('hmEncryption').value = cfg.encryption || (String(cfg.port) === '587' ? 'tls' : 'ssl');
+              document.getElementById('hmUsername').value = cfg.username || '';
+              document.getElementById('hmPassword').value = '';
+              document.getElementById('hmFromAddress').value = cfg.from_address || cfg.username || '';
+              document.getElementById('hmFromName').value = cfg.from_name || 'Knowlipop Vendor';
+              document.getElementById('hmPassHint').innerText = cfg.has_password
+                ? 'A Hostinger mailbox password is currently saved. Leave blank to keep it.'
+                : 'Enter your Hostinger Business Email mailbox password.';
+              if (cfg.configured) {
+                banner.className = 'alert alert-success small py-2 mb-3';
+                banner.innerText = 'Hostinger Mail SMTP is ACTIVE (' + (cfg.username || '') + ' via ' + (cfg.host || 'smtp.hostinger.com') + ':' + (cfg.port || 465) + ', source: ' + (cfg.source || 'env') + ').';
+              } else {
+                banner.className = 'alert alert-warning small py-2 mb-3';
+                banner.innerText = 'Hostinger Mail SMTP is not configured yet. Enter your Hostinger email address and password below to enable OTP & notification emails.';
+              }
+            })
+            .catch(function() {
+              banner.className = 'alert alert-danger small py-2 mb-3';
+              banner.innerText = 'Could not load email settings.';
+            });
+        }
+
+        function saveHostingerMailSettings(ev) {
+          if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+          var btn = document.getElementById('hmSaveBtn');
+          var banner = document.getElementById('hmStatusBanner');
+          btn.disabled = true;
+          var payload = {
+            host: document.getElementById('hmHost').value.trim(),
+            port: parseInt(document.getElementById('hmPort').value, 10) || 465,
+            encryption: document.getElementById('hmEncryption').value.trim() || 'ssl',
+            username: document.getElementById('hmUsername').value.trim(),
+            password: document.getElementById('hmPassword').value,
+            from_address: document.getElementById('hmFromAddress').value.trim() || document.getElementById('hmUsername').value.trim(),
+            from_name: document.getElementById('hmFromName').value.trim() || 'Knowlipop Vendor'
+          };
+          fetch('/api/admin/email/config', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+          .then(function(res) {
+            btn.disabled = false;
+            if (res.ok && res.d && res.d.status === 'success') {
+              banner.className = 'alert alert-success small py-2 mb-3';
+              banner.innerText = res.d.message || 'Saved Hostinger Mail settings.';
+              document.getElementById('hmPassword').value = '';
+              loadHostingerMailConfig();
+            } else {
+              banner.className = 'alert alert-danger small py-2 mb-3';
+              banner.innerText = (res.d && res.d.message) || 'Failed to save settings.';
+            }
+          })
+          .catch(function() {
+            btn.disabled = false;
+            banner.className = 'alert alert-danger small py-2 mb-3';
+            banner.innerText = 'Network error saving mail settings.';
+          });
+        }
+
+        function sendHostingerTestEmail() {
+          var to = document.getElementById('hmTestRecipient').value.trim();
+          var banner = document.getElementById('hmStatusBanner');
+          if (!to || to.indexOf('@') === -1) {
+            banner.className = 'alert alert-danger small py-2 mb-3';
+            banner.innerText = 'Enter a valid recipient email address to send a test email.';
+            return;
+          }
+          var btn = document.getElementById('hmTestBtn');
+          btn.disabled = true;
+          banner.className = 'alert alert-info small py-2 mb-3';
+          banner.innerText = 'Connecting to Hostinger Mail SMTP and sending test email...';
+          var payload = {
+            to: to,
+            host: document.getElementById('hmHost').value.trim(),
+            port: parseInt(document.getElementById('hmPort').value, 10) || 465,
+            encryption: document.getElementById('hmEncryption').value.trim() || 'ssl',
+            username: document.getElementById('hmUsername').value.trim(),
+            password: document.getElementById('hmPassword').value,
+            from_address: document.getElementById('hmFromAddress').value.trim() || document.getElementById('hmUsername').value.trim(),
+            from_name: document.getElementById('hmFromName').value.trim() || 'Knowlipop Vendor'
+          };
+          fetch('/api/admin/email/test', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+          .then(function(res) {
+            btn.disabled = false;
+            if (res.ok && res.d && res.d.status === 'success') {
+              banner.className = 'alert alert-success small py-2 mb-3';
+              banner.innerText = res.d.message || 'Test email sent successfully!';
+            } else {
+              banner.className = 'alert alert-danger small py-2 mb-3';
+              banner.innerText = (res.d && res.d.message) || 'Test email failed.';
+            }
+          })
+          .catch(function() {
+            btn.disabled = false;
+            banner.className = 'alert alert-danger small py-2 mb-3';
+            banner.innerText = 'Network error sending test email.';
+          });
+        }
       </script>
+      <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
   `);
   } catch (err) {
     console.error('Admin Dashboard Error:', err);
-    res.status(500).send(`<h3>Database Error: ${err.message}</h3><p>Could not load sellers. Ensure database connection is active and schema is imported.</p><a href="/admin/login">Back to Login</a>`);
+    res.status(500).send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Database Error — Vendor Admin</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light d-flex align-items-center min-vh-100"><div class="container" style="max-width:560px;"><div class="card border-0 shadow-sm"><div class="card-body p-4"><div class="alert alert-danger mb-3"><h3 class="h5 fw-bold mb-1">Database Error: ${escapeHtml(err.message)}</h3><p class="small mb-0">Could not load sellers. Ensure database connection is active and schema is imported.</p></div><a href="/admin/login" class="btn btn-primary btn-sm fw-semibold">Back to Login</a></div></div></div></body></html>`);
   }
 });
 
@@ -15287,6 +16061,21 @@ app.post('/api/admin/sellers/gst/:sellerId/approve', authenticateToken, requireA
       performer_role: 'admin'
     });
 
+    setImmediate(async () => {
+      try {
+        const [uRows] = await pool.query('SELECT email, seller_name, name FROM users WHERE id = ? LIMIT 1', [targetSellerId]);
+        if (uRows[0] && uRows[0].email) {
+          await sendGstStatusMailNode(pool, {
+            to: uRows[0].email,
+            sellerName: uRows[0].seller_name || uRows[0].name || 'Seller',
+            status: 'Approved',
+            gstin: gst.gstin || '',
+            notes
+          });
+        }
+      } catch (ignore) {}
+    });
+
     res.json({
       status: 'success',
       message: 'Seller GST has been approved successfully.',
@@ -15344,6 +16133,21 @@ app.post('/api/admin/sellers/gst/:sellerId/reject', authenticateToken, requireAd
       performer_role: 'admin'
     });
 
+    setImmediate(async () => {
+      try {
+        const [uRows] = await pool.query('SELECT email, seller_name, name FROM users WHERE id = ? LIMIT 1', [targetSellerId]);
+        if (uRows[0] && uRows[0].email) {
+          await sendGstStatusMailNode(pool, {
+            to: uRows[0].email,
+            sellerName: uRows[0].seller_name || uRows[0].name || 'Seller',
+            status: 'Rejected',
+            gstin: gst.gstin || '',
+            notes: reason
+          });
+        }
+      } catch (ignore) {}
+    });
+
     res.json({
       status: 'success',
       message: 'Seller GST has been rejected.',
@@ -15375,6 +16179,119 @@ app.get(['/api/admin/sellers/gst/documents/:id/preview', '/api/admin/sellers/gst
   } catch (err) {
     console.error('Admin view GST doc error:', err);
     res.status(500).json({ error: 'Server error retrieving document.' });
+  }
+});
+
+// ==========================================
+// Admin Hostinger Business Email (SMTP) Routes
+// ==========================================
+
+app.get(['/api/admin/email/config', '/api/admin/email/status'], authenticateToken, requireAdminRole, async (req, res) => {
+  try {
+    const activePool = (await checkDbReachable(pool, deletionCtx)) ? pool : null;
+    const summary = await getPublicMailConfigSummaryNode(activePool);
+    res.json({ status: 'success', email: summary });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: 'Could not read Hostinger mail config: ' + err.message });
+  }
+});
+
+app.post(['/api/admin/email/config', '/api/admin/email/status'], authenticateToken, requireAdminRole, async (req, res) => {
+  try {
+    const activePool = (await checkDbReachable(pool, deletionCtx)) ? pool : null;
+    const saved = await saveMailConfigNode(activePool, req.body || {}, Number(req.user && req.user.id) || null);
+    res.json({
+      status: 'success',
+      message: saved.configured
+        ? 'Hostinger Business Email SMTP settings saved successfully.'
+        : 'Mail settings saved (enter mailbox username & password to enable SMTP delivery).',
+      email: saved
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: 'Failed to save Hostinger mail config: ' + err.message });
+  }
+});
+
+app.post('/api/admin/email/test', authenticateToken, requireAdminRole, async (req, res) => {
+  const body = req.body || {};
+  const to = String(body.to || body.email || '').trim();
+  if (!isRealDeliverableEmailNode(to)) {
+    return res.status(422).json({
+      status: 'error',
+      message: 'Please provide a valid recipient email address.',
+      errors: { to: ['Valid recipient email is required.'] }
+    });
+  }
+  try {
+    const activePool = (await checkDbReachable(pool, deletionCtx)) ? pool : null;
+    const override = {};
+    ['host', 'port', 'encryption', 'username', 'password', 'from_address', 'from_name', 'reply_to'].forEach((k) => {
+      if (body[k] !== undefined && body[k] !== '') override[k] = body[k];
+    });
+    const result = await sendTestMailNode(activePool, {
+      to,
+      configOverride: Object.keys(override).length > 0 ? override : null
+    });
+    if (result.sent) {
+      return res.json({
+        status: 'success',
+        message: `Test email dispatched to ${to} via Hostinger Mail SMTP.`,
+        result
+      });
+    }
+    return res.status(result.skipped ? 422 : 502).json({
+      status: 'error',
+      message: result.error || result.reason || 'Failed to send test email via Hostinger SMTP.',
+      result
+    });
+  } catch (err) {
+    return res.status(500).json({ status: 'error', message: 'Test email failed: ' + err.message });
+  }
+});
+
+app.post('/api/admin/email/send', authenticateToken, requireAdminRole, async (req, res) => {
+  const body = req.body || {};
+  const to = String(body.to || body.email || '').trim();
+  const subject = String(body.subject || '').trim();
+  const messageBody = String(body.message || body.text || '').trim();
+  const htmlBody = String(body.html || '');
+  if (!isRealDeliverableEmailNode(to)) {
+    return res.status(422).json({ status: 'error', message: 'Please provide a valid recipient email address.' });
+  }
+  if (!subject) {
+    return res.status(422).json({ status: 'error', message: 'Subject is required.' });
+  }
+  if (!messageBody && !htmlBody.trim()) {
+    return res.status(422).json({ status: 'error', message: 'Email message body is required.' });
+  }
+  try {
+    const activePool = (await checkDbReachable(pool, deletionCtx)) ? pool : null;
+    const appName = process.env.APP_NAME || 'Knowlipop Vendor';
+    const finalHtml = htmlBody.trim()
+      ? htmlBody
+      : mailerWrapLayout({
+          appName,
+          badge: 'ADMIN MESSAGE',
+          title: subject,
+          bodyHtml: `<p style="margin:0;white-space:pre-line;">${mailerEscapeHtml(messageBody)}</p>`
+        });
+    const result = await sendHostingerEmailNode({
+      pool: activePool,
+      to,
+      subject,
+      html: finalHtml,
+      text: messageBody || finalHtml.replace(/<[^>]+>/g, ' ')
+    });
+    if (result.sent) {
+      return res.json({ status: 'success', message: `Email sent to ${to} via Hostinger Mail SMTP.`, result });
+    }
+    return res.status(result.skipped ? 422 : 502).json({
+      status: 'error',
+      message: result.error || result.reason || 'Failed to send email via Hostinger SMTP.',
+      result
+    });
+  } catch (err) {
+    return res.status(500).json({ status: 'error', message: 'Email send failed: ' + err.message });
   }
 });
 

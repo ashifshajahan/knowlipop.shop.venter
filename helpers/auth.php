@@ -6,6 +6,7 @@
  */
 
 require_once __DIR__ . '/response.php';
+require_once __DIR__ . '/mailer.php';
 
 function getJwtSecret(): string
 {
@@ -988,7 +989,7 @@ function sendOtpSms(string $phone, string $otp, string $recaptchaToken = ''): ar
     ];
 }
 
-function sendPasswordResetEmail(string $email, string $otp, string $continueUrl = '', string $authMode = 'password_reset'): array
+function sendPasswordResetEmail(string $email, string $otp, string $continueUrl = '', string $authMode = 'password_reset', ?PDO $pdo = null, string $sellerName = 'Seller'): array
 {
     if (isFirebaseTestEmail($email)) {
         return [
@@ -1002,13 +1003,34 @@ function sendPasswordResetEmail(string $email, string $otp, string $continueUrl 
         ];
     }
 
+    $smtpError = null;
+    $mailCfg = function_exists('getEffectiveMailConfigPhp') ? getEffectiveMailConfigPhp($pdo) : ['configured' => false];
+    if (strtolower($authMode) !== 'email_link' && !empty($mailCfg['configured']) && function_exists('sendPasswordResetOtpMailPhp')) {
+        $smtpRes = sendPasswordResetOtpMailPhp($pdo, $email, $sellerName, $otp);
+        if (!empty($smtpRes['sent'])) {
+            return [
+                'sent' => true,
+                'provider' => 'hostinger_smtp',
+                'channel' => 'email',
+                'status' => 'dispatched',
+                'flow' => 'hostinger_smtp_otp',
+                'message_id' => $smtpRes['message_id'] ?? null,
+                'note' => '6-digit verification OTP email sent via Hostinger Mail SMTP.'
+            ];
+        }
+        $smtpError = (string) ($smtpRes['error'] ?? 'Hostinger SMTP send failed.');
+    }
+
     $firebaseApiKey = getEnvVar('FIREBASE_API_KEY');
     if (empty($firebaseApiKey)) {
         return [
             'sent' => false,
-            'provider' => 'mock',
+            'provider' => $smtpError ? 'hostinger_smtp' : 'mock',
             'channel' => 'email',
-            'reason' => 'Firebase credentials (FIREBASE_API_KEY) are not set in .env. dev_otp returned in payload for testing.'
+            ...($smtpError ? ['smtp_error' => $smtpError] : []),
+            'reason' => $smtpError
+                ? "Hostinger Mail SMTP could not send email ({$smtpError}) and FIREBASE_API_KEY is not set. dev_otp returned in payload for testing."
+                : 'Hostinger SMTP and Firebase Email credentials are not set yet. dev_otp returned in payload for testing.'
         ];
     }
 

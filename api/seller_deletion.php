@@ -7,6 +7,36 @@
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
 require_once __DIR__ . '/../helpers/seller_deletion.php';
+require_once __DIR__ . '/../helpers/mailer.php';
+
+function notifySellerDeletionEmailPhp(PDO $pdo, array $data, string $event, string $reason = ''): void
+{
+    if (!function_exists('sendSellerDeletionLifecycleMailPhp')) {
+        return;
+    }
+    try {
+        $seller = is_array($data['seller'] ?? null) ? $data['seller'] : [];
+        $reqRow = is_array($data['deletion_request'] ?? null) ? $data['deletion_request'] : [];
+        $toEmail = (string) ($seller['email'] ?? '');
+        $sellerName = (string) ($seller['seller_name'] ?? $seller['name'] ?? 'Seller');
+        $reqId = (int) ($reqRow['id'] ?? $data['request_id'] ?? 0);
+        if ($toEmail === '' && !empty($seller['id'])) {
+            $sStmt = $pdo->prepare("SELECT email, seller_name, name FROM users WHERE id = :id LIMIT 1");
+            $sStmt->execute([':id' => (int) $seller['id']]);
+            $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+            if ($sRow) {
+                $toEmail = (string) ($sRow['email'] ?? '');
+                if ($sellerName === 'Seller') {
+                    $sellerName = (string) ($sRow['seller_name'] ?? $sRow['name'] ?? 'Seller');
+                }
+            }
+        }
+        if ($toEmail !== '') {
+            sendSellerDeletionLifecycleMailPhp($pdo, $toEmail, $sellerName, $event, $reqId, $reason);
+        }
+    } catch (Throwable $ignoreMail) {
+    }
+}
 
 function authenticateAdminForDeletionPhp(PDO $pdo): array
 {
@@ -62,6 +92,7 @@ function apiAdminCreateSellerDeletion(PDO $pdo): void
         $extra = !empty($res['existing_request_id']) ? ['existing_request_id' => $res['existing_request_id']] : [];
         errorResponse($res['error'], $extra, (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'REQUESTED', $reason);
     jsonResponse(array_merge([
         'status' => 'success',
         'message' => 'Seller deletion request created. Account entered DELETION_PENDING status and new orders are blocked.',
@@ -108,6 +139,7 @@ function apiSellerRequestDeletion(PDO $pdo, ?int $urlSellerId = null, bool $requ
         $extra = !empty($res['existing_request_id']) ? ['existing_request_id' => $res['existing_request_id']] : [];
         errorResponse($res['error'], $extra, (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'REQUESTED', $reason);
 
     $payload = $res['data'];
     if (!$isAdmin) {
@@ -212,6 +244,7 @@ function apiSellerWithdrawDeletion(PDO $pdo, ?int $urlSellerId = null, ?int $url
     if (!empty($res['error'])) {
         errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'WITHDRAWN', $reason);
 
     jsonResponse(array_merge([
         'status' => 'success',
@@ -323,6 +356,7 @@ function apiAdminApproveSellerDeletion(PDO $pdo, int $delReqId): void
         $extra = !empty($res['failing_checks']) ? ['failing_checks' => $res['failing_checks']] : [];
         errorResponse($res['error'], $extra, (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'APPROVED', $remarks);
     jsonResponse(array_merge(['status' => 'success', 'message' => 'Seller deletion approved. Explicit second confirmation required to finalize.'], $res['data']), $res['statusCode']);
 }
 
@@ -336,6 +370,7 @@ function apiAdminRejectSellerDeletion(PDO $pdo, int $delReqId): void
     if (!empty($res['error'])) {
         errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'REJECTED', $reason ?: $remarks);
     jsonResponse(array_merge(['status' => 'success', 'message' => 'Seller deletion request rejected. Seller account restored to ACTIVE.'], $res['data']), $res['statusCode']);
 }
 
@@ -349,6 +384,7 @@ function apiAdminHoldSellerDeletion(PDO $pdo, int $delReqId): void
     if (!empty($res['error'])) {
         errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'ON_HOLD', $reason ?: $remarks);
     jsonResponse(array_merge(['status' => 'success', 'message' => 'Seller deletion request placed ON HOLD.'], $res['data']), $res['statusCode']);
 }
 
@@ -360,6 +396,7 @@ function apiAdminFinalDeleteSeller(PDO $pdo, int $delReqId): void
     if (!empty($res['error'])) {
         errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
     }
+    notifySellerDeletionEmailPhp($pdo, $res['data'] ?? [], 'DELETED', '');
     jsonResponse(array_merge(['status' => 'success', 'message' => 'Seller account permanently soft-deleted. Financial and order records preserved.'], $res['data']), $res['statusCode']);
 }
 

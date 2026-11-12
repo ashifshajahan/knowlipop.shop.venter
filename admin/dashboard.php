@@ -13,6 +13,7 @@ require_once __DIR__ . '/../helpers/auth.php';
 require_once __DIR__ . '/../helpers/gst.php';
 require_once __DIR__ . '/../api/products.php';
 require_once __DIR__ . '/../helpers/seller_deletion.php';
+require_once __DIR__ . '/../helpers/mailer.php';
 
 $pdo = getDatabaseConnection();
 ensureGstTables($pdo);
@@ -211,6 +212,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         ");
         $up->execute([':admin' => $adminId, ':id' => $gst['id']]);
         logGstVerification($pdo, $sellerId, (int)$gst['id'], 'approved', $prevStatus, 'Approved', $notes, $adminId, 'admin');
+        if (function_exists('sendGstStatusMailPhp')) {
+            try {
+                $uStmt = $pdo->prepare("SELECT email, seller_name, name FROM users WHERE id = :id LIMIT 1");
+                $uStmt->execute([':id' => $sellerId]);
+                $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+                if ($uRow && !empty($uRow['email'])) {
+                    sendGstStatusMailPhp($pdo, (string) $uRow['email'], (string) ($uRow['seller_name'] ?? $uRow['name'] ?? 'Seller'), 'Approved', (string) ($gst['gstin'] ?? ''), $notes);
+                }
+            } catch (Throwable $ignoreMail) {}
+        }
         $success = "Seller #{$sellerId} GST verification has been APPROVED successfully!";
     } else {
         $error = "No GST record found for Seller #{$sellerId}.";
@@ -239,6 +250,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             ");
             $up->execute([':reason' => $reason, ':admin' => $adminId, ':id' => $gst['id']]);
             logGstVerification($pdo, $sellerId, (int)$gst['id'], 'rejected', $prevStatus, 'Rejected', $reason, $adminId, 'admin');
+            if (function_exists('sendGstStatusMailPhp')) {
+                try {
+                    $uStmt = $pdo->prepare("SELECT email, seller_name, name FROM users WHERE id = :id LIMIT 1");
+                    $uStmt->execute([':id' => $sellerId]);
+                    $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+                    if ($uRow && !empty($uRow['email'])) {
+                        sendGstStatusMailPhp($pdo, (string) $uRow['email'], (string) ($uRow['seller_name'] ?? $uRow['name'] ?? 'Seller'), 'Rejected', (string) ($gst['gstin'] ?? ''), $reason);
+                    }
+                } catch (Throwable $ignoreMail) {}
+            }
             $success = "Seller #{$sellerId} GST has been REJECTED. Rejection reason has been recorded.";
         } else {
             $error = "No GST record found for Seller #{$sellerId}.";
@@ -824,17 +845,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $imgsToDel = [];
             if (!empty($prodRow['images'])) {
                 $dec = json_decode((string) $prodRow['images'], true);
-                if (is_array($dec)) $imgsToDel = $dec;
-            } elseif (!empty($prodRow['image_url'])) {
-                $imgsToDel = [(string) $prodRow['image_url']];
+                if (is_array($dec)) {
+                    foreach ($dec as $u) {
+                        if (is_string($u) && $u !== '') $imgsToDel[] = $u;
+                    }
+                }
             }
+            if (!empty($prodRow['image_url'])) {
+                $imgsToDel[] = (string) $prodRow['image_url'];
+            }
+            try {
+                $piStmt = $pdo->prepare("SELECT file_name, image_url FROM product_images WHERE product_id = :id");
+                $piStmt->execute([':id' => $prodId]);
+                while ($piR = $piStmt->fetch(PDO::FETCH_ASSOC)) {
+                    if (!empty($piR['file_name'])) $imgsToDel[] = (string) $piR['file_name'];
+                    if (!empty($piR['image_url'])) $imgsToDel[] = (string) $piR['image_url'];
+                }
+            } catch (Throwable $e) {}
             $pdo->prepare("DELETE FROM products WHERE id = :id")->execute([':id' => $prodId]);
             try {
                 $pdo->prepare("DELETE FROM product_images WHERE product_id = :id")->execute([':id' => $prodId]);
             } catch (Throwable $e) {}
+            $deletedNames = [];
             foreach ($imgsToDel as $imgU) {
-                if (is_string($imgU) && str_contains($imgU, '/uploads/products/')) {
-                    safeDeleteLocalImageFilePHP($pdo, basename(explode('?', $imgU)[0]), $prodId);
+                $bn = is_string($imgU) ? getImageBasename($imgU) : '';
+                if ($bn !== '' && !in_array($bn, $deletedNames, true)) {
+                    $deletedNames[] = $bn;
+                    safeDeleteLocalImageFilePHP($pdo, $bn, $prodId);
                 }
             }
             $success = "Product #{$prodId} (\"{$prodRow['name']}\") deleted permanently.";
@@ -1042,167 +1079,197 @@ function delBadgeClassPhp(?string $statusOrColor): string {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title><?= htmlspecialchars($curMetaPhp['title']) ?> — Vendor Admin Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; min-height: 100vh; display: flex; flex-direction: column; }
-        .top { background: #25204a; color: white; padding: 14px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; position: sticky; top: 0; z-index: 200; box-shadow: 0 4px 16px rgba(20, 16, 48, 0.16); }
-        .brand { font-size: 20px; font-weight: 800; color: #fff; text-decoration: none; }
-        .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; white-space: nowrap; }
-        .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
-        .wrap { flex: 1; width: 100%; max-width: 1220px; margin: 24px auto; padding: 0 18px; }
-        .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
-        .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
-        h1, h2 { margin-top: 0; color: #1e1b4b; }
-        p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
+        body {
+            background-color: #f8f9fa;
+            color: #212529;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .admin-navbar {
+            background-color: #1e293b;
+        }
+        #adminTopNav .nav-pill {
+            color: rgba(255, 255, 255, 0.85);
+            border-radius: 0.5rem;
+            padding: 0.42rem 0.72rem;
+            font-size: 0.8125rem;
+            font-weight: 600;
+            white-space: nowrap;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        #adminTopNav .nav-pill:hover {
+            color: #fff;
+            background-color: rgba(255, 255, 255, 0.12);
+        }
+        #adminTopNav .nav-pill.active {
+            color: #fff;
+            background-color: #0d6efd;
+        }
         .admin-view-panel { display: none; }
         .admin-view-panel.is-visible { display: block; }
-        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 20px; }
-        .cat-pager { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; box-shadow: 0 4px 16px rgba(37,32,74,0.04); }
-        .cat-pager-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-        .cat-page-pill { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; border-radius: 8px; background: #f1f5f9; color: #475569; text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid #e2e8f0; transition: all .15s; white-space: nowrap; }
-        .cat-page-pill:hover { background: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
-        .cat-page-pill.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .cat-pager-nav { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .cat-step-btn { background: #f8fafc; color: #1e1b4b; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
-        .cat-step-btn:hover:not(:disabled) { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .cat-step-indicator { font-size: 12px; font-weight: 700; color: #475569; padding: 0 4px; white-space: nowrap; }
-        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #475569; }
-        .pg-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-        .pg-btn { background: #f8fafc; color: #334155; border: 1px solid #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; min-width: 32px; text-align: center; }
-        .pg-btn:hover:not(:disabled) { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
-        .pg-btn.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-        .pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-        .pg-select { width: auto !important; min-width: 105px; padding: 5px 8px !important; font-size: 12px !important; border-radius: 6px !important; border: 1px solid #cbd5e1 !important; background: #fff; }
-        .reject-presets { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
-        .reject-chip { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 9999px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer; }
-        .reject-chip:hover { background: #fecaca; }
-        .modal-err-banner { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; border-left: 4px solid #dc2626; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
-        .kpi-card-link { cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; border: 1px solid #eef2ff; }
-        .kpi-card-link:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(37,32,74,0.1); border-color: #c7d2fe; }
-        .dir-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 8px; }
-        .dir-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; gap: 14px; box-shadow: 0 6px 20px rgba(37,32,74,0.04); transition: transform .15s ease, border-color .15s ease; }
-        .dir-card:hover { transform: translateY(-2px); border-color: #a5b4fc; }
-        .dir-card h3 { margin: 0 0 6px; font-size: 16px; color: #1e1b4b; }
-        .dir-card p { margin: 0; font-size: 13px; color: #64748b; line-height: 1.5; }
-        .dir-card-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 10px; border-top: 1px solid #f1f5f9; }
-        .sub-kpi-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
-        .admin-footer { background: #1e1b4b; color: #cbd5e1; padding: 22px 5%; margin-top: 32px; border-top: 1px solid #312e81; }
-        .footer-inner { max-width: 1220px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; font-size: 13px; }
-        .footer-links { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
-        .footer-links a { color: #cbd5e1; text-decoration: none; font-weight: 600; transition: color .15s; }
-        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
-        label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
-        input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
-        input:focus, textarea:focus, select:focus { border-color: #6366f1; }
-        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
-        button:hover, .btn:hover { background: #4a3cb8; }
-        button:disabled { opacity: 0.45; cursor: not-allowed; }
-        table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
-        th { color: #64748b; font-weight: 600; font-size: 13px; }
-        .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
-        .success { background: #ecfdf5; color: #047857; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
-        .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
-        .logout-btn:hover { background: rgba(255,255,255,0.25); }
-        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }
-        .btn-sm:hover { background: #4f46e5; }
-        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
-        .btn-hold-sm:hover { background: #c2410c; }
-        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
-        .btn-del-req:hover { background: #fee2e2; }
-        .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
-        .prod-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid #e2e8f0; background: #f8fafc; flex-shrink: 0; }
-        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 8px; border: 1px dashed #cbd5e1; background: #f8fafc; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #94a3b8; flex-shrink: 0; }
-        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 10px; margin-top: 6px; }
-        .existing-img-item { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; background: #f8fafc; text-align: center; font-size: 11px; }
-        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 6px; display: block; margin-bottom: 4px; }
-        .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .filter-bar select { width: auto; min-width: 145px; padding: 7px 10px; font-size: 13px; }
-        .del-badge { font-weight: 700; font-size: 11px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
-        .del-yellow { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
-        .del-blue { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
-        .del-green { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
-        .del-red { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
-        .del-orange { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
-        /* Modal Styles */
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 1.25rem; }
+
+        #adminCategoryPager .cat-page-pill {
+            font-size: 0.78rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        #adminCategoryPager .cat-page-pill.active {
+            background-color: #0d6efd;
+            color: #fff;
+            border-color: #0d6efd;
+        }
+
+        .kpi-card-link {
+            cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+        .kpi-card-link:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0.5rem 1rem rgba(15, 23, 42, 0.08) !important;
+        }
+        .dir-card {
+            transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+        .dir-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0.5rem 1.25rem rgba(15, 23, 42, 0.08) !important;
+        }
+
+        /* Preserved Domain Status Badges (Bootstrap Pill Aesthetic + Test Class Hooks) */
+        .del-badge {
+            font-weight: 700;
+            font-size: 0.6875rem;
+            padding: 0.3rem 0.65rem;
+            border-radius: 50rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .del-yellow { background: #fff3cd; color: #997404; border: 1px solid #ffe69c; }
+        .del-blue { background: #cfe2ff; color: #084298; border: 1px solid #9ec5fe; }
+        .del-green { background: #d1e7dd; color: #0f5132; border: 1px solid #a3cfbb; }
+        .del-red { background: #f8d7da; color: #842029; border: 1px solid #f1aeb5; }
+        .del-orange { background: #ffe5d0; color: #984c0c; border: 1px solid #fecba1; }
+
+        .badge-pending { background: #fff3cd; color: #997404; border: 1px solid #ffe69c; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-approved { background: #d1e7dd; color: #0f5132; border: 1px solid #a3cfbb; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-rejected { background: #f8d7da; color: #842029; border: 1px solid #f1aeb5; font-weight: 700; font-size: 0.75rem; padding: 0.28rem 0.65rem; border-radius: 50rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+        .badge-prod { background: #e7f1ff; color: #0a58ca; border: 1px solid #cfe2ff; font-weight: 600; font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 50rem; display: inline-block; }
+        .badge-pdf { background: #f8d7da; color: #b02a37; font-weight: 800; font-size: 0.6875rem; padding: 0.15rem 0.45rem; border-radius: 0.25rem; border: 1px solid #f1aeb5; }
+        .badge-img { background: #cff4fc; color: #055160; font-weight: 800; font-size: 0.6875rem; padding: 0.15rem 0.45rem; border-radius: 0.25rem; border: 1px solid #9eeaf9; }
+
+        .tabs-bar .tab-btn.active {
+            background-color: #0d6efd !important;
+            color: #fff !important;
+            border-color: #0d6efd !important;
+        }
+        .prod-thumb { width: 44px; height: 44px; border-radius: 0.5rem; object-fit: cover; border: 1px solid #dee2e6; background: #f8f9fa; flex-shrink: 0; }
+        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 0.5rem; border: 1px dashed #ced4da; background: #f8f9fa; display: flex; align-items: center; justify-content: center; font-size: 1rem; color: #6c757d; flex-shrink: 0; }
+        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 0.625rem; margin-top: 0.375rem; }
+        .existing-img-item { border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 0.4rem; background: #f8f9fa; text-align: center; font-size: 0.75rem; }
+        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 0.375rem; display: block; margin-bottom: 0.25rem; }
+
+        /* Bootstrap 5 Modal Overlay Compatibility Wrapper */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.65);
+            backdrop-filter: blur(3px);
+            z-index: 1055;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            overflow-y: auto;
+        }
         .modal-overlay.active { display: flex; }
-        .modal-box { background: #fff; width: 94%; max-width: 780px; max-height: 92vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
-        .modal-box.wide { max-width: 1040px; }
-        .modal-header { padding: 18px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
-        .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
-        .modal-close { background: transparent; border: none; font-size: 22px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
-        .modal-close:hover { color: #0f172a; }
-        .modal-body { padding: 24px; }
-        .metric-mini { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
-        .metric-mini .k { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; }
-        .metric-mini .v { font-size: 17px; font-weight: 800; color: #1e1b4b; margin-top: 3px; }
-        .ws-section { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #fff; }
-        .ws-section h4 { margin: 0 0 10px; color: #1e1b4b; font-size: 15px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-        .status-legend { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 6px; }
-        .info-pill { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
-        .info-pill-item { font-size: 12px; color: #64748b; }
-        .info-pill-item strong { display: block; font-size: 14px; color: #1e293b; margin-top: 2px; }
-        /* GST Badges & Components */
-        .badge-pending { background: #fef3c7; color: #b45309; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .badge-approved { background: #dcfce7; color: #15803d; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .badge-rejected { background: #fee2e2; color: #b91c1c; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
-        .badge-pdf { background: #fee2e2; color: #dc2626; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #fca5a5; }
-        .badge-img { background: #e0f2fe; color: #0284c7; font-weight: 800; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #bae6fd; }
-        .gstin-pill { font-family: monospace; font-size: 13px; font-weight: 800; background: #eef2ff; color: #3730a3; padding: 3px 8px; border-radius: 6px; border: 1px solid #c7d2fe; letter-spacing: 0.5px; }
-        .tabs-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; flex-wrap: wrap; }
-        .tab-btn { background: #f1f5f9; color: #475569; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; transition: all .2s; }
-        .tab-btn.active { background: #4f46e5; color: #fff; }
-        .doc-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .doc-title { font-weight: 700; font-size: 14px; color: #1e293b; display: flex; align-items: center; gap: 8px; }
-        .doc-meta { font-size: 12px; color: #64748b; margin-top: 4px; }
-        .btn-view { background: #0284c7; color: white; padding: 5px 11px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px; }
-        .btn-view:hover { background: #0369a1; }
-        .btn-dl { background: #475569; color: white; padding: 5px 9px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
-        .btn-dl:hover { background: #334155; }
-        .btn-approve { background: #16a34a; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
-        .btn-approve:hover { background: #15803d; }
-        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
-        .btn-approve-sm:hover { background: #15803d; }
-        .btn-reject { background: #dc2626; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
-        .btn-reject:hover { background: #b91c1c; }
-        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
-        .btn-reject-sm:hover { background: #b91c1c; }
-        .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
-        .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
-        .search-box input:focus { border-color: #6366f1; }
-        .log-row { padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; display: flex; justify-content: space-between; gap: 12px; }
-        .log-time { color: #64748b; font-size: 12px; min-width: 130px; }
+        .modal-overlay .modal-dialog {
+            width: 100%;
+            max-width: 780px;
+            max-height: 92vh;
+            margin: auto;
+        }
+        .modal-overlay .modal-dialog.modal-xl { max-width: 1060px; }
+        .modal-overlay .modal-dialog.modal-sm-custom { max-width: 460px; }
+        .modal-overlay .modal-content {
+            max-height: 92vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .modal-overlay .modal-header {
+            background: #fff;
+            z-index: 5;
+        }
+        .modal-overlay .modal-body {
+            overflow-y: auto;
+        }
+
+        .metric-mini { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 0.65rem 0.75rem; }
+        .metric-mini .k { font-size: 0.6875rem; font-weight: 700; color: #6c757d; text-transform: uppercase; }
+        .metric-mini .v { font-size: 1.05rem; font-weight: 700; color: #212529; margin-top: 0.15rem; }
+        .ws-section { border: 1px solid #dee2e6; border-radius: 0.75rem; padding: 1rem; margin-bottom: 1rem; background: #fff; }
+        .ws-section h4 { margin: 0 0 0.75rem; color: #212529; font-size: 0.95rem; font-weight: 700; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+        .doc-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 0.625rem; padding: 0.875rem; margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; }
+        .log-row { padding: 0.6rem 0; border-bottom: 1px solid #edf2f7; font-size: 0.8125rem; display: flex; justify-content: space-between; gap: 0.75rem; }
+        .reject-presets { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.5rem 0; }
+        .admin-footer { background-color: #1e293b; color: #cbd5e1; margin-top: auto; }
+        .footer-links a { color: #cbd5e1; text-decoration: none; font-size: 0.8125rem; font-weight: 600; }
+        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
+        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; padding-top: 0.875rem; border-top: 1px solid #dee2e6; font-size: 0.8125rem; color: #495057; }
     </style>
 </head>
 <body>
-    <header class="top">
-        <a href="/admin" class="brand" onclick="return switchAdminTab('overview', event);">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></a>
-        <nav class="top-nav" id="adminTopNav">
-            <a href="/admin" data-tab="overview" class="nav-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">Overview</a>
-            <a href="/admin/gst-verifications" data-tab="gst" class="nav-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">PDF Verifications<?= $pendingGstCount > 0 ? ' (' . (int) $pendingGstCount . ')' : '' ?></a>
-            <a href="/admin/sellers" data-tab="sellers" class="nav-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">Seller Accounts (<?= (int) $sellerCount ?>)</a>
-            <a href="/admin/create-seller" data-tab="create-seller" class="nav-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
-            <a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount"><?= (int) ($delKpis['total'] ?? 0) ?></span>)</a>
-            <a href="/admin/products" data-tab="products" class="nav-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products (<?= (int) $totalListedProducts ?>)</a>
-            <a href="/admin/categories" data-tab="categories" class="nav-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories (<?= count($categoriesList) ?>)</a>
-            <a href="/admin?tab=all" data-tab="all" class="nav-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a>
-        </nav>
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <button type="button" class="btn-approve-sm" style="padding:7px 11px;" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
-            <span style="font-size:13px; opacity:.9;">Welcome, <?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?></span>
-            <a href="/admin/logout" class="logout-btn">Sign out</a>
-        </div>
-    </header>
-    <main class="wrap">
-        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
-            <div>
-                <h1 id="adminPageTitle" style="margin-bottom:6px;"><?= htmlspecialchars($curMetaPhp['title']) ?></h1>
-                <p id="adminPageSubtitle" class="muted" style="margin:0;"><?= htmlspecialchars($curMetaPhp['sub']) ?></p>
+    <nav class="navbar navbar-expand-xl navbar-dark admin-navbar sticky-top shadow-sm">
+        <div class="container-fluid px-3 px-lg-4">
+            <a href="/admin" class="navbar-brand fw-bold d-flex align-items-center gap-2" onclick="return switchAdminTab('overview', event);">
+                <i class="bi bi-shop-window text-primary"></i>
+                Vendor <span class="badge bg-primary-subtle text-primary-emphasis fw-semibold">Admin</span>
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#adminNavbarContent" aria-controls="adminNavbarContent" aria-expanded="false" aria-label="Toggle navigation">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="adminNavbarContent">
+                <ul class="navbar-nav me-auto mb-2 mb-xl-0 gap-1" id="adminTopNav">
+                    <li class="nav-item"><a href="/admin" data-tab="overview" class="nav-link nav-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">Overview</a></li>
+                    <li class="nav-item"><a href="/admin/gst-verifications" data-tab="gst" class="nav-link nav-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">PDF Verifications<?= $pendingGstCount > 0 ? ' (' . (int) $pendingGstCount . ')' : '' ?></a></li>
+                    <li class="nav-item"><a href="/admin/sellers" data-tab="sellers" class="nav-link nav-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">Seller Accounts (<?= (int) $sellerCount ?>)</a></li>
+                    <li class="nav-item"><a href="/admin/create-seller" data-tab="create-seller" class="nav-link nav-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a></li>
+                    <li class="nav-item"><a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-link nav-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount"><?= (int) ($delKpis['total'] ?? 0) ?></span>)</a></li>
+                    <li class="nav-item"><a href="/admin/products" data-tab="products" class="nav-link nav-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products (<?= (int) $totalListedProducts ?>)</a></li>
+                    <li class="nav-item"><a href="/admin/categories" data-tab="categories" class="nav-link nav-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories (<?= count($categoriesList) ?>)</a></li>
+                    <li class="nav-item"><a href="/admin?tab=all" data-tab="all" class="nav-link nav-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a></li>
+                </ul>
+                <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-info btn-sm fw-semibold" onclick="openHostingerMailModal()">
+                        <i class="bi bi-envelope-at"></i> Hostinger Mail
+                    </button>
+                    <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="switchAdminTab('products'); openProductModal(null);">
+                        <i class="bi bi-plus-lg"></i> Add Product
+                    </button>
+                    <span class="badge text-bg-secondary py-2 px-2">
+                        <i class="bi bi-person-circle me-1"></i><?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?>
+                    </span>
+                    <a href="/admin/logout" class="btn btn-outline-light btn-sm">Sign out</a>
+                </div>
             </div>
-            <div class="status-legend">
+        </div>
+    </nav>
+
+    <main class="container-xl py-4 flex-grow-1">
+        <div class="d-flex flex-column flex-lg-row justify-content-between align-items-lg-end gap-3 mb-3">
+            <div>
+                <h1 id="adminPageTitle" class="h3 fw-bold mb-1"><?= htmlspecialchars($curMetaPhp['title']) ?></h1>
+                <p id="adminPageSubtitle" class="text-body-secondary mb-0 small"><?= htmlspecialchars($curMetaPhp['sub']) ?></p>
+            </div>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
                 <span class="del-badge del-yellow">PENDING</span>
                 <span class="del-badge del-blue">PROCESSING</span>
                 <span class="del-badge del-green">SUCCESS</span>
@@ -1211,795 +1278,889 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             </div>
         </div>
 
-        <?php if ($success): ?><div class="success"><?= htmlspecialchars($success) ?></div><?php endif; ?>
-        <?php if ($error): ?><div class="error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
+        <?php if ($success): ?>
+            <div class="alert alert-success alert-dismissible fade show d-flex align-items-center gap-2" role="alert">
+                <i class="bi bi-check-circle-fill"></i>
+                <div><?= htmlspecialchars($success) ?></div>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        <?php endif; ?>
+        <?php if ($error): ?>
+            <div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2" role="alert">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <div><?= htmlspecialchars($error) ?></div>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        <?php endif; ?>
 
         <!-- Page-Wise Admin Category Stepper Bar -->
-        <nav class="cat-pager" id="adminCategoryPager" aria-label="Admin Category Pages">
-            <div class="cat-pager-pills">
-                <a href="/admin" data-tab="overview" class="cat-page-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">🏠 Overview</a>
-                <a href="/admin/gst-verifications" data-tab="gst" class="cat-page-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (<?= (int) $totalGstCount ?>)</a>
-                <a href="/admin/sellers" data-tab="sellers" class="cat-page-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (<?= (int) $sellerCount ?>)</a>
-                <a href="/admin/create-seller" data-tab="create-seller" class="cat-page-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
-                <a href="/admin/seller-deletions" data-tab="seller-deletions" class="cat-page-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
-                <a href="/admin/products" data-tab="products" class="cat-page-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">5. Manage Products (<?= (int) $totalListedProducts ?>)</a>
-                <a href="/admin/categories" data-tab="categories" class="cat-page-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">6. Categories (<?= count($categoriesList) ?>)</a>
-                <a href="/admin?tab=all" data-tab="all" class="cat-page-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Pages</a>
-            </div>
-            <div class="cat-pager-nav">
-                <button type="button" id="catPrevBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(-1)">← Previous</button>
-                <span id="categoryPageIndicator" class="cat-step-indicator">Overview</span>
-                <button type="button" id="catNextBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(1)">Next →</button>
+        <nav class="card border-0 shadow-sm mb-4" id="adminCategoryPager" aria-label="Admin Category Pages">
+            <div class="card-body py-2 px-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div class="d-flex gap-1 flex-wrap align-items-center">
+                    <a href="/admin" data-tab="overview" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);"><i class="bi bi-house-door me-1"></i>Overview</a>
+                    <a href="/admin/gst-verifications" data-tab="gst" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (<?= (int) $totalGstCount ?>)</a>
+                    <a href="/admin/sellers" data-tab="sellers" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (<?= (int) $sellerCount ?>)</a>
+                    <a href="/admin/create-seller" data-tab="create-seller" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
+                    <a href="/admin/seller-deletions" data-tab="seller-deletions" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
+                    <a href="/admin/products" data-tab="products" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">5. Manage Products (<?= (int) $totalListedProducts ?>)</a>
+                    <a href="/admin/categories" data-tab="categories" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">6. Categories (<?= count($categoriesList) ?>)</a>
+                    <a href="/admin?tab=all" data-tab="all" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Pages</a>
+                </div>
+                <div class="d-flex gap-2 align-items-center flex-wrap">
+                    <button type="button" id="catPrevBtn" class="btn btn-outline-primary btn-sm" onclick="stepAdminCategoryPage(-1)"><i class="bi bi-arrow-left"></i> Previous</button>
+                    <span id="categoryPageIndicator" class="badge text-bg-light border text-dark fw-semibold px-2 py-2">Overview</span>
+                    <button type="button" id="catNextBtn" class="btn btn-outline-primary btn-sm" onclick="stepAdminCategoryPage(1)">Next <i class="bi bi-arrow-right"></i></button>
+                </div>
             </div>
         </nav>
 
-        <!-- KPI Metrics Grid (shown cleanly on Overview & All Lists; clickable to jump directly to any module list) -->
+        <!-- KPI Metrics Grid (shown cleanly on Overview & All Lists) -->
         <div class="admin-view-panel <?= ($activeTab === 'overview' || $activeTab === 'all') ? 'is-visible' : '' ?>" data-admin-panel="overview,all">
-        <div class="grid" style="margin-bottom: 24px;">
-            <section class="card kpi-card-link" onclick="switchAdminTab('sellers')">
-                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
-                <div class="stat"><?= $sellerCount ?></div>
-            </section>
-            <section class="card kpi-card-link" onclick="switchAdminTab('products')">
-                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
-                <div class="stat" style="color:#2563eb;"><?= $productCount ?></div>
-            </section>
-            <section class="card kpi-card-link" onclick="switchAdminTab('categories')">
-                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
-                <div class="stat" style="color:#7c3aed;"><?= $categoryCount ?></div>
-            </section>
-            <section class="card">
-                <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
-                <div class="stat" style="color:#0891b2;"><?= $orderCount ?></div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #f59e0b; background: <?= $pendingGstCount > 0 ? '#fffbeb' : '#fff' ?>;" onclick="switchAdminTab('gst')">
-                <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
-                    Pending PDF Reviews
-                    <?php if ($pendingGstCount > 0): ?>
-                        <span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>
-                    <?php endif; ?>
+            <div class="row row-cols-2 row-cols-md-4 row-cols-xl-4 g-3 mb-4">
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-primary kpi-card-link" onclick="switchAdminTab('sellers')">
+                        <div class="card-body">
+                            <div class="text-body-secondary small fw-bold text-uppercase">Registered Sellers</div>
+                            <div class="fs-2 fw-bold text-primary mt-1"><?= $sellerCount ?></div>
+                        </div>
+                    </div>
                 </div>
-                <div class="stat" style="color:#b45309;"><?= $pendingGstCount ?></div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #10b981;" onclick="switchAdminTab('gst')">
-                <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
-                <div class="stat" style="color:#10b981;"><?= $approvedGstCount ?></div>
-            </section>
-            <section class="card kpi-card-link" style="border-left: 4px solid #ef4444;" onclick="switchAdminTab('seller-deletions')">
-                <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Deletion Requests</div>
-                <div class="stat" style="color:#dc2626;"><?= (int) ($delKpis['total'] ?? 0) ?></div>
-            </section>
-        </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-info kpi-card-link" onclick="switchAdminTab('products')">
+                        <div class="card-body">
+                            <div class="text-body-secondary small fw-bold text-uppercase">Active Products</div>
+                            <div class="fs-2 fw-bold text-info-emphasis mt-1"><?= $productCount ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-secondary kpi-card-link" onclick="switchAdminTab('categories')">
+                        <div class="card-body">
+                            <div class="text-body-secondary small fw-bold text-uppercase">Product Categories</div>
+                            <div class="fs-2 fw-bold text-secondary-emphasis mt-1"><?= $categoryCount ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-dark">
+                        <div class="card-body">
+                            <div class="text-body-secondary small fw-bold text-uppercase">Marketplace Orders</div>
+                            <div class="fs-2 fw-bold text-dark mt-1"><?= $orderCount ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-warning kpi-card-link <?= $pendingGstCount > 0 ? 'bg-warning-subtle' : '' ?>" onclick="switchAdminTab('gst')">
+                        <div class="card-body">
+                            <div class="text-warning-emphasis small fw-bold text-uppercase d-flex align-items-center justify-content-between gap-1">
+                                <span>Pending PDF Reviews</span>
+                                <?php if ($pendingGstCount > 0): ?>
+                                    <span class="badge text-bg-warning">Action</span>
+                                <?php endif; ?>
+                            </div>
+                            <div class="fs-2 fw-bold text-warning-emphasis mt-1"><?= $pendingGstCount ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-success kpi-card-link" onclick="switchAdminTab('gst')">
+                        <div class="card-body">
+                            <div class="text-success small fw-bold text-uppercase">Approved Sellers</div>
+                            <div class="fs-2 fw-bold text-success mt-1"><?= $approvedGstCount ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-danger kpi-card-link" onclick="switchAdminTab('seller-deletions')">
+                        <div class="card-body">
+                            <div class="text-danger small fw-bold text-uppercase">Deletion Requests</div>
+                            <div class="fs-2 fw-bold text-danger mt-1"><?= (int) ($delKpis['total'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- Overview Directory Grid (clean page-wise category cards into each Admin page/list) -->
         <div class="admin-view-panel <?= $activeTab === 'overview' ? 'is-visible' : '' ?>" data-admin-panel="overview" id="overviewSection">
-            <section class="card">
-                <h2>Admin Categories — Page-Wise Navigation</h2>
-                <p class="muted">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
-                <div class="dir-grid">
-                    <div class="dir-card" style="border-left: 4px solid #f59e0b;">
-                        <div>
-                            <h3>📄 Page 1: Seller PDF Document Verification</h3>
-                            <p>Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+            <div class="card border-0 shadow-sm">
+                <div class="card-body p-4">
+                    <h2 class="h5 fw-bold mb-1">Admin Categories — Page-Wise Navigation</h2>
+                    <p class="text-body-secondary small mb-4">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
+                    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-warning dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-file-earmark-pdf text-warning me-1"></i> Page 1: Seller PDF Document Verification</h3>
+                                    <p class="text-body-secondary small mb-0">Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-pending"><?= (int) $pendingGstCount ?> pending &bull; <?= (int) $rejectedGstCount ?> rejected</span>
+                                    <a href="/admin/gst-verifications" class="btn btn-warning btn-sm fw-semibold" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                                </div>
+                            </div>
                         </div>
-                        <div class="dir-card-actions">
-                            <span class="badge-pending"><?= (int) $pendingGstCount ?> pending &bull; <?= (int) $rejectedGstCount ?> rejected</span>
-                            <a href="/admin/gst-verifications" class="btn-sm" style="background:#d97706;" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-primary dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-shop text-primary me-1"></i> Page 2: Seller Accounts</h3>
+                                    <p class="text-body-secondary small mb-0">Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-prod"><?= (int) $sellerCount ?> sellers</span>
+                                    <a href="/admin/sellers" class="btn btn-primary btn-sm fw-semibold" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                                </div>
+                            </div>
                         </div>
-                    </div>
-                    <div class="dir-card">
-                        <div>
-                            <h3>🏪 Page 2: Seller Accounts</h3>
-                            <p>Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-info dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-person-plus text-info me-1"></i> Page 3: Create Seller Account</h3>
+                                    <p class="text-body-secondary small mb-0">Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-end align-items-center">
+                                    <a href="/admin/create-seller" class="btn btn-info btn-sm fw-semibold text-white" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                                </div>
+                            </div>
                         </div>
-                        <div class="dir-card-actions">
-                            <span class="badge-prod"><?= (int) $sellerCount ?> sellers</span>
-                            <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-danger dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-trash3 text-danger me-1"></i> Page 4: Seller Deletion &amp; Refunds</h3>
+                                    <p class="text-body-secondary small mb-0">Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-pending"><?= (int) (($delKpis['pending'] ?? 0) + ($delKpis['processing'] ?? 0)) ?> active &bull; <?= (int) ($delKpis['total'] ?? 0) ?> total</span>
+                                    <a href="/admin/seller-deletions" class="btn btn-danger btn-sm fw-semibold" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
+                                </div>
+                            </div>
                         </div>
-                    </div>
-                    <div class="dir-card">
-                        <div>
-                            <h3>➕ Page 3: Create Seller Account</h3>
-                            <p>Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-success dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-box-seam text-success me-1"></i> Page 5: Manage Products</h3>
+                                    <p class="text-body-secondary small mb-0">Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-prod"><?= (int) $totalListedProducts ?> total &bull; <?= (int) $activeListedProducts ?> active</span>
+                                    <div class="d-flex gap-1 flex-wrap">
+                                        <a href="/admin/products" class="btn btn-primary btn-sm fw-semibold" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
+                                        <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="switchAdminTab('products'); openProductModal(null);">+ Add</button>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                        <div class="dir-card-actions">
-                            <a href="/admin/create-seller" class="btn-sm" style="background:#4f46e5;" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-secondary dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-tags text-secondary me-1"></i> Page 6: Product Categories</h3>
+                                    <p class="text-body-secondary small mb-0">Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-prod"><?= count($categoriesList) ?> categories</span>
+                                    <a href="/admin/categories" class="btn btn-secondary btn-sm fw-semibold" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
+                                </div>
+                            </div>
                         </div>
-                    </div>
-                    <div class="dir-card" style="border-left: 4px solid #dc2626;">
-                        <div>
-                            <h3>🗑 Page 4: Seller Deletion &amp; Refunds</h3>
-                            <p>Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
-                        </div>
-                        <div class="dir-card-actions">
-                            <span class="badge-pending"><?= (int) (($delKpis['pending'] ?? 0) + ($delKpis['processing'] ?? 0)) ?> active &bull; <?= (int) ($delKpis['total'] ?? 0) ?> total</span>
-                            <a href="/admin/seller-deletions" class="btn-sm" style="background:#dc2626;" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
-                        </div>
-                    </div>
-                    <div class="dir-card">
-                        <div>
-                            <h3>📦 Page 5: Manage Products</h3>
-                            <p>Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
-                        </div>
-                        <div class="dir-card-actions">
-                            <span class="badge-prod"><?= (int) $totalListedProducts ?> total &bull; <?= (int) $activeListedProducts ?> active</span>
-                            <a href="/admin/products" class="btn-sm" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
-                            <button type="button" class="btn-approve-sm" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
-                        </div>
-                    </div>
-                    <div class="dir-card">
-                        <div>
-                            <h3>🏷 Page 6: Product Categories</h3>
-                            <p>Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
-                        </div>
-                        <div class="dir-card-actions">
-                            <span class="badge-prod"><?= count($categoriesList) ?> categories</span>
-                            <a href="/admin/categories" class="btn-sm" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
-                        </div>
-                    </div>
-                    <div class="dir-card">
-                        <div>
-                            <h3>📋 Combined All-Lists Mode</h3>
-                            <p>View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
-                        </div>
-                        <div class="dir-card-actions">
-                            <a href="/admin?tab=all" class="btn-sm" style="background:#475569;" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-dark dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-collection text-dark me-1"></i> Combined All-Lists Mode</h3>
+                                    <p class="text-body-secondary small mb-0">View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-end align-items-center">
+                                    <a href="/admin?tab=all" class="btn btn-dark btn-sm fw-semibold" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </section>
+            </div>
         </div>
 
         <!-- Section 1: Seller PDF Document Verification Hub (Primary Function) -->
         <div class="admin-view-panel <?= $panelVisiblePhp('gst') ? 'is-visible' : '' ?>" data-admin-panel="gst">
-        <section class="card" id="gstSection" style="margin-top:0;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-primary" id="gstSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
                 <div>
-                    <h2>Seller PDF Document Verification</h2>
-                    <p class="muted">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-file-earmark-pdf text-primary me-2"></i>Seller PDF Document Verification</h2>
+                    <p class="text-body-secondary small mb-0">Inspect seller-uploaded PDF certificates with 1-click preview, approve for marketplace compliance, or reject with feedback.</p>
                 </div>
-                <div class="search-box">
-                    <input type="text" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
+                <div class="input-group input-group-sm" style="max-width: 310px;">
+                    <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+                    <input type="text" class="form-control" id="gstSearchInput" onkeyup="filterGstSearch(this.value)" placeholder="Search seller, phone, or email...">
                 </div>
             </div>
+            <div class="card-body">
+                <div class="tabs-bar nav nav-pills gap-2 pb-3 mb-3 border-bottom flex-wrap">
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn active" onclick="filterGstRows('all', this)">All Documents (<?= $totalGstCount ?>)</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('pending', this)">
+                        Pending Review (<?= $pendingGstCount ?>)
+                        <?php if ($pendingGstCount > 0): ?><span class="badge text-bg-warning ms-1">●</span><?php endif; ?>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('approved', this)">Approved (<?= $approvedGstCount ?>)</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterGstRows('rejected', this)">Rejected (<?= $rejectedGstCount ?>)</button>
+                </div>
 
-            <div class="tabs-bar">
-                <button type="button" class="tab-btn active" onclick="filterGstRows('all', this)">All Documents (<?= $totalGstCount ?>)</button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('pending', this)">
-                    Pending Review (<?= $pendingGstCount ?>)
-                    <?php if ($pendingGstCount > 0): ?><span style="background:#f59e0b; color:#fff; border-radius:999px; padding:1px 6px; font-size:11px; margin-left:4px;">●</span><?php endif; ?>
-                </button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('approved', this)">Approved (<?= $approvedGstCount ?>)</button>
-                <button type="button" class="tab-btn" onclick="filterGstRows('rejected', this)">Rejected (<?= $rejectedGstCount ?>)</button>
-            </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width:24%;">Seller</th>
-                        <th style="width:28%;">Uploaded PDF Document</th>
-                        <th style="width:16%;">Verification Status</th>
-                        <th style="width:14%;">Submitted</th>
-                        <th style="width:18%;">Admin Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="gstTableBody">
-                    <?php if (empty($gstSellers)): ?>
-                        <tr><td colspan="5" style="color:#94a3b8; text-align:center; padding:32px;">No sellers have uploaded verification documents yet.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($gstSellers as $g): ?>
-                            <?php
-                                $st = strtolower($g['status']);
-                                if ($st === 'resubmitted') $st = 'pending';
-                                $badgeClass = ($st === 'approved') ? 'badge-approved' : (($st === 'rejected') ? 'badge-rejected' : 'badge-pending');
-                                $sellerLabel = $g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id'];
-                                $displayGstEmail = getPublicSellerEmailPhp($g['email'] ?? null);
-                                $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($displayGstEmail ?? ''));
-                                $docExistsPhp = !empty($g['latest_doc_id']) && (resolveGstFilePathPhp([
-                                    'file_name' => $g['latest_doc_file_name'] ?? null,
-                                    'file_path' => $g['latest_doc_file_path'] ?? null,
-                                ]) !== null);
-                            ?>
-                            <tr class="gst-row" data-status="<?= $st ?>" data-search="<?= htmlspecialchars($searchString) ?>">
-                                <td>
-                                    <strong style="font-size:15px; color:#1e1b4b;"><?= htmlspecialchars($sellerLabel) ?></strong>
-                                    <div style="font-size:12px; color:#64748b; margin-top:2px;">
-                                        <span class="badge-prod" style="font-size:10px; padding:1px 6px;">ID #<?= (int)$g['seller_id'] ?></span>
-                                        <?= htmlspecialchars($g['phone'] ?? '') ?>
-                                    </div>
-                                    <?php if (!empty($displayGstEmail)): ?>
-                                        <div style="font-size:12px; color:#94a3b8;"><?= htmlspecialchars($displayGstEmail) ?></div>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <?php if (!empty($g['latest_doc_id'])): ?>
-                                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-                                            <span class="badge-pdf">PDF</span>
-                                            <strong style="color:#334155; font-size:13px;"><?= htmlspecialchars($g['latest_doc_name'] ?: 'Certificate.pdf') ?></strong>
-                                            <span style="color:#94a3b8; font-size:11px;">(<?= formatBytesPhp($g['latest_doc_size']) ?>)</span>
-                                            <?php if (!$docExistsPhp): ?>
-                                                <span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>
-                                            <?php endif; ?>
-                                        </div>
-                                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                                            <button type="button" class="btn-view" style="border:none; cursor:pointer; font-size:11px; padding:4px 10px;" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false, <?= (int)$g['latest_doc_id'] ?>)">
-                                                📄 Preview PDF
-                                            </button>
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Open in New Tab">
-                                                ↗ New Tab
-                                            </a>
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=download" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Download PDF">
-                                                ⬇
-                                            </a>
-                                            <?php if ((int)$g['doc_count'] > 1): ?>
-                                                <span style="font-size:11px; color:#64748b; font-weight:600;">+<?= (int)$g['doc_count'] - 1 ?> more</span>
-                                            <?php endif; ?>
-                                        </div>
-                                    <?php else: ?>
-                                        <span style="color:#94a3b8; font-style:italic; font-size:13px;">No document attached</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <span class="<?= $badgeClass ?>">
-                                        <?= ($st === 'pending') ? '⏳ ' : (($st === 'approved') ? '✓ ' : '✕ ') ?>
-                                        <?= htmlspecialchars($g['status']) ?>
-                                    </span>
-                                    <?php if ($st === 'rejected' && !empty($g['rejection_reason'])): ?>
-                                        <div style="font-size:11px; color:#b91c1c; margin-top:4px; max-width:220px; line-height:1.3;" title="<?= htmlspecialchars($g['rejection_reason']) ?>">
-                                            <strong>Reason:</strong> <?= htmlspecialchars(strlen($g['rejection_reason']) > 55 ? substr($g['rejection_reason'], 0, 52) . '...' : $g['rejection_reason']) ?>
-                                        </div>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <div style="font-size:13px; color:#334155;"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 0, 10)) ?></div>
-                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 11, 5)) ?></div>
-                                </td>
-                                <td>
-                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                                        <?php if ($st !== 'approved'): ?>
-                                            <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Approve GST Verification" data-confirm-msg="<?= htmlspecialchars('Approve GST verification for ' . $sellerLabel . '?', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
-                                                <input type="hidden" name="action" value="approve_gst">
-                                                <input type="hidden" name="seller_id" value="<?= (int)$g['seller_id'] ?>">
-                                                <input type="hidden" name="notes" value="Approved by administrator">
-                                                <button type="submit" class="btn-approve-sm" title="Instant Approve">✓ Approve</button>
-                                            </form>
-                                        <?php endif; ?>
-
-                                        <?php if ($st !== 'rejected'): ?>
-                                            <button type="button" class="btn-reject-sm" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModalWithReject(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
-                                        <?php endif; ?>
-
-                                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
-                                    </div>
-                                </td>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th style="width:24%;">Seller</th>
+                                <th style="width:28%;">Uploaded PDF Document</th>
+                                <th style="width:16%;">Verification Status</th>
+                                <th style="width:14%;">Submitted</th>
+                                <th style="width:18%;">Admin Actions</th>
                             </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-            <div id="gstPaginationBar" class="pagination-bar"></div>
+                        </thead>
+                        <tbody id="gstTableBody">
+                            <?php if (empty($gstSellers)): ?>
+                                <tr><td colspan="5" class="text-body-secondary text-center py-4">No sellers have uploaded verification documents yet.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($gstSellers as $g): ?>
+                                    <?php
+                                        $st = strtolower($g['status']);
+                                        if ($st === 'resubmitted') $st = 'pending';
+                                        $badgeClass = ($st === 'approved') ? 'badge-approved' : (($st === 'rejected') ? 'badge-rejected' : 'badge-pending');
+                                        $sellerLabel = $g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id'];
+                                        $displayGstEmail = getPublicSellerEmailPhp($g['email'] ?? null);
+                                        $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($displayGstEmail ?? ''));
+                                        $docExistsPhp = !empty($g['latest_doc_id']) && (resolveGstFilePathPhp([
+                                            'file_name' => $g['latest_doc_file_name'] ?? null,
+                                            'file_path' => $g['latest_doc_file_path'] ?? null,
+                                        ]) !== null);
+                                    ?>
+                                    <tr class="gst-row" data-status="<?= $st ?>" data-search="<?= htmlspecialchars($searchString) ?>">
+                                        <td>
+                                            <div class="fw-bold text-dark"><?= htmlspecialchars($sellerLabel) ?></div>
+                                            <div class="small text-body-secondary mt-1">
+                                                <span class="badge-prod me-1">ID #<?= (int)$g['seller_id'] ?></span>
+                                                <?= htmlspecialchars($g['phone'] ?? '') ?>
+                                            </div>
+                                            <?php if (!empty($displayGstEmail)): ?>
+                                                <div class="small text-muted"><?= htmlspecialchars($displayGstEmail) ?></div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <?php if (!empty($g['latest_doc_id'])): ?>
+                                                <div class="d-flex align-items-center gap-2 flex-wrap">
+                                                    <span class="badge-pdf">PDF</span>
+                                                    <span class="fw-semibold small text-dark"><?= htmlspecialchars($g['latest_doc_name'] ?: 'Certificate.pdf') ?></span>
+                                                    <span class="text-body-secondary small">(<?= formatBytesPhp($g['latest_doc_size']) ?>)</span>
+                                                    <?php if (!$docExistsPhp): ?>
+                                                        <span class="badge text-bg-warning" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>
+                                                    <?php endif; ?>
+                                                </div>
+                                                <div class="mt-2 d-flex gap-1 align-items-center flex-wrap">
+                                                    <button type="button" class="btn btn-info btn-sm text-white py-1 px-2" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false, <?= (int)$g['latest_doc_id'] ?>)">
+                                                        <i class="bi bi-file-earmark-text me-1"></i>Preview PDF
+                                                    </button>
+                                                    <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn btn-outline-secondary btn-sm py-1 px-2" title="Open in New Tab">
+                                                        <i class="bi bi-box-arrow-up-right"></i> New Tab
+                                                    </a>
+                                                    <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=download" class="btn btn-outline-dark btn-sm py-1 px-2" title="Download PDF">
+                                                        <i class="bi bi-download"></i>
+                                                    </a>
+                                                    <?php if ((int)$g['doc_count'] > 1): ?>
+                                                        <span class="small text-body-secondary fw-semibold ms-1">+<?= (int)$g['doc_count'] - 1 ?> more</span>
+                                                    <?php endif; ?>
+                                                </div>
+                                            <?php else: ?>
+                                                <span class="text-body-secondary fst-italic small">No document attached</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span class="<?= $badgeClass ?>">
+                                                <?= ($st === 'pending') ? '⏳ ' : (($st === 'approved') ? '✓ ' : '✕ ') ?>
+                                                <?= htmlspecialchars($g['status']) ?>
+                                            </span>
+                                            <?php if ($st === 'rejected' && !empty($g['rejection_reason'])): ?>
+                                                <div class="small text-danger mt-1" style="max-width:220px;" title="<?= htmlspecialchars($g['rejection_reason']) ?>">
+                                                    <strong>Reason:</strong> <?= htmlspecialchars(strlen($g['rejection_reason']) > 55 ? substr($g['rejection_reason'], 0, 52) . '...' : $g['rejection_reason']) ?>
+                                                </div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <div class="small text-dark"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 0, 10)) ?></div>
+                                            <div class="small text-muted"><?= htmlspecialchars(substr($g['submitted_at'] ?? $g['updated_at'] ?? '', 11, 5)) ?></div>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-1 flex-wrap align-items-center">
+                                                <?php if ($st !== 'approved'): ?>
+                                                    <form method="POST" action="/admin" class="d-inline" data-confirm-title="Approve GST Verification" data-confirm-msg="<?= htmlspecialchars('Approve GST verification for ' . $sellerLabel . '?', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
+                                                        <input type="hidden" name="action" value="approve_gst">
+                                                        <input type="hidden" name="seller_id" value="<?= (int)$g['seller_id'] ?>">
+                                                        <input type="hidden" name="notes" value="Approved by administrator">
+                                                        <button type="submit" class="btn btn-success btn-sm fw-semibold" title="Instant Approve">✓ Approve</button>
+                                                    </form>
+                                                <?php endif; ?>
+
+                                                <?php if ($st !== 'rejected'): ?>
+                                                    <button type="button" class="btn btn-danger btn-sm fw-semibold" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModalWithReject(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
+                                                <?php endif; ?>
+
+                                                <button type="button" class="btn btn-primary btn-sm fw-semibold" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="gstPaginationBar" class="pagination-bar"></div>
+            </div>
         </section>
         </div>
 
         <!-- Section 2: Seller Accounts Overview with Search, Status Filter, Pagination & Deletion Controls -->
         <div class="admin-view-panel <?= $panelVisiblePhp('sellers') ? 'is-visible' : '' ?>" data-admin-panel="sellers">
-        <section class="card" id="sellersSection" style="margin-top:0;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-primary" id="sellersSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <div>
-                    <h2>Seller Accounts</h2>
-                    <p class="muted">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-shop text-primary me-2"></i>Seller Accounts</h2>
+                    <p class="text-body-secondary small mb-0">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
                 </div>
-                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-                    <a href="/admin/create-seller" class="btn-sm" style="background:#16a34a; padding:8px 13px; font-size:12px;" onclick="return switchAdminTab('create-seller', event);">+ Add New Seller</a>
-                </div>
+                <a href="/admin/create-seller" class="btn btn-success btn-sm fw-semibold" onclick="return switchAdminTab('create-seller', event);"><i class="bi bi-plus-lg me-1"></i>Add New Seller</a>
             </div>
-            <div class="filter-bar" style="margin-bottom:12px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
-                <div class="search-box" style="max-width:280px; flex:1; min-width:190px;">
-                    <input type="text" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+            <div class="card-body">
+                <div class="row g-2 align-items-center bg-light p-3 rounded-3 border mb-3">
+                    <div class="col-md-5">
+                        <div class="input-group input-group-sm">
+                            <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
+                            <input type="text" class="form-control" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+                        </div>
+                    </div>
+                    <div class="col-md-4 col-lg-3">
+                        <select class="form-select form-select-sm" id="sellersStatusFilter" onchange="applySellerFilters()">
+                            <option value="all">All Account Statuses</option>
+                            <option value="ACTIVE">ACTIVE</option>
+                            <option value="DELETION_PENDING">DELETION_PENDING</option>
+                            <option value="LOCKED">LOCKED</option>
+                            <option value="DELETED">DELETED</option>
+                        </select>
+                    </div>
                 </div>
-                <select id="sellersStatusFilter" onchange="applySellerFilters()">
-                    <option value="all">All Account Statuses</option>
-                    <option value="ACTIVE">ACTIVE</option>
-                    <option value="DELETION_PENDING">DELETION_PENDING</option>
-                    <option value="LOCKED">LOCKED</option>
-                    <option value="DELETED">DELETED</option>
-                </select>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Seller Name</th>
-                        <th>Contact</th>
-                        <th>Location</th>
-                        <th>Products</th>
-                        <th>Document Status</th>
-                        <th>Account Status</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="sellersTableBody">
-                    <?php if (empty($sellers)): ?>
-                        <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($sellers as $s): ?>
-                            <?php
-                                $dSt = strtolower($s['doc_status'] ?? '');
-                                if ($dSt === 'resubmitted') $dSt = 'pending';
-                                $docBadgeClass = ($dSt === 'approved') ? 'badge-approved' : (($dSt === 'rejected') ? 'badge-rejected' : (($dSt === 'pending') ? 'badge-pending' : ''));
-                                $accStatus = strtoupper((string) ($s['account_status'] ?? 'ACTIVE'));
-                                $accBadgeCls = $accStatus === 'ACTIVE' ? 'del-badge del-green' : ($accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : ($accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
-                                $pubSellerEmail = getPublicSellerEmailPhp($s['email'] ?? null) ?? '';
-                                $sellerSearchStr = strtolower(($s['seller_name'] ?? $s['name'] ?? '') . ' ' . ($s['phone'] ?? '') . ' ' . $pubSellerEmail . ' ' . ($s['state'] ?? '') . ' #' . (int) $s['id']);
-                            ?>
-                            <tr id="seller-row-<?= (int) $s['id'] ?>" class="seller-account-row" data-status="<?= htmlspecialchars($accStatus, ENT_QUOTES, 'UTF-8') ?>" data-search="<?= htmlspecialchars($sellerSearchStr, ENT_QUOTES, 'UTF-8') ?>">
-                                <td>#<?= (int) $s['id'] ?></td>
-                                <td>
-                                    <strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong>
-                                </td>
-                                <td>
-                                    <div><?= htmlspecialchars($s['phone'] ?? '—') ?></div>
-                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($pubSellerEmail) ?></div>
-                                </td>
-                                <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
-                                <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
-                                <td>
-                                    <?php if (!empty($docBadgeClass)): ?>
-                                        <span class="<?= $docBadgeClass ?>"><?= htmlspecialchars($s['doc_status']) ?></span>
-                                        <?php if (!empty($s['latest_doc_id'])): ?>
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int) $s['latest_doc_id'] ?>&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>
-                                        <?php endif; ?>
-                                    <?php else: ?>
-                                        <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="seller-acc-cell"><span class="<?= $accBadgeCls ?>"><?= htmlspecialchars($accStatus) ?></span></td>
-                                <td><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
-                                <td>
-                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;" data-seller-id="<?= (int) $s['id'] ?>">
-                                        <button type="button" class="btn-sm" data-seller="<?= htmlspecialchars(json_encode($s, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openSellerModal(this)">View / Edit</button>
-                                        <span class="seller-del-btn-slot">
-                                            <?php if (!empty($s['active_deletion_request_id'])): ?>
-                                                <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(<?= (int) $s['active_deletion_request_id'] ?>)">Manage Deletion #<?= (int) $s['active_deletion_request_id'] ?></button>
-                                            <?php elseif ($accStatus !== 'DELETED'): ?>
-                                                <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(<?= (int) $s['id'] ?>)">Request Seller Deletion</button>
-                                            <?php endif; ?>
-                                        </span>
-                                    </div>
-                                </td>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>ID</th>
+                                <th>Seller Name</th>
+                                <th>Contact</th>
+                                <th>Location</th>
+                                <th>Products</th>
+                                <th>Document Status</th>
+                                <th>Account Status</th>
+                                <th>Created</th>
+                                <th>Actions</th>
                             </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-            <div id="sellersPaginationBar" class="pagination-bar"></div>
+                        </thead>
+                        <tbody id="sellersTableBody">
+                            <?php if (empty($sellers)): ?>
+                                <tr><td colspan="9" class="text-body-secondary text-center py-4">No sellers registered yet.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($sellers as $s): ?>
+                                    <?php
+                                        $dSt = strtolower($s['doc_status'] ?? '');
+                                        if ($dSt === 'resubmitted') $dSt = 'pending';
+                                        $docBadgeClass = ($dSt === 'approved') ? 'badge-approved' : (($dSt === 'rejected') ? 'badge-rejected' : (($dSt === 'pending') ? 'badge-pending' : ''));
+                                        $accStatus = strtoupper((string) ($s['account_status'] ?? 'ACTIVE'));
+                                        $accBadgeCls = $accStatus === 'ACTIVE' ? 'del-badge del-green' : ($accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : ($accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
+                                        $pubSellerEmail = getPublicSellerEmailPhp($s['email'] ?? null) ?? '';
+                                        $sellerSearchStr = strtolower(($s['seller_name'] ?? $s['name'] ?? '') . ' ' . ($s['phone'] ?? '') . ' ' . $pubSellerEmail . ' ' . ($s['state'] ?? '') . ' #' . (int) $s['id']);
+                                    ?>
+                                    <tr id="seller-row-<?= (int) $s['id'] ?>" class="seller-account-row" data-status="<?= htmlspecialchars($accStatus, ENT_QUOTES, 'UTF-8') ?>" data-search="<?= htmlspecialchars($sellerSearchStr, ENT_QUOTES, 'UTF-8') ?>">
+                                        <td class="fw-semibold">#<?= (int) $s['id'] ?></td>
+                                        <td>
+                                            <span class="fw-bold text-dark"><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></span>
+                                        </td>
+                                        <td>
+                                            <div class="small fw-medium"><?= htmlspecialchars($s['phone'] ?? '—') ?></div>
+                                            <div class="small text-muted"><?= htmlspecialchars($pubSellerEmail) ?></div>
+                                        </td>
+                                        <td class="small"><?= htmlspecialchars($s['state'] ?? '—') ?></td>
+                                        <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
+                                        <td>
+                                            <?php if (!empty($docBadgeClass)): ?>
+                                                <span class="<?= $docBadgeClass ?>"><?= htmlspecialchars($s['doc_status']) ?></span>
+                                                <?php if (!empty($s['latest_doc_id'])): ?>
+                                                    <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int) $s['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn btn-link btn-sm text-decoration-none p-0 ms-1 fw-semibold">📄 View</a>
+                                                <?php endif; ?>
+                                            <?php else: ?>
+                                                <span class="text-body-secondary small">Not Uploaded</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td class="seller-acc-cell"><span class="<?= $accBadgeCls ?>"><?= htmlspecialchars($accStatus) ?></span></td>
+                                        <td class="small text-body-secondary"><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
+                                        <td>
+                                            <div class="d-flex gap-1 flex-wrap align-items-center" data-seller-id="<?= (int) $s['id'] ?>">
+                                                <button type="button" class="btn btn-primary btn-sm fw-semibold" data-seller="<?= htmlspecialchars(json_encode($s, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openSellerModal(this)">View / Edit</button>
+                                                <span class="seller-del-btn-slot">
+                                                    <?php if (!empty($s['active_deletion_request_id'])): ?>
+                                                        <button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(<?= (int) $s['active_deletion_request_id'] ?>)">Manage Deletion #<?= (int) $s['active_deletion_request_id'] ?></button>
+                                                    <?php elseif ($accStatus !== 'DELETED'): ?>
+                                                        <button type="button" class="btn btn-outline-danger btn-sm fw-semibold" onclick="openDeletionPreflightModal(<?= (int) $s['id'] ?>)">Request Seller Deletion</button>
+                                                    <?php endif; ?>
+                                                </span>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="sellersPaginationBar" class="pagination-bar"></div>
+            </div>
         </section>
         </div>
 
         <!-- Section 2B: Seller Management → Seller Deletion Requests -->
         <div class="admin-view-panel <?= $panelVisiblePhp('seller-deletions') ? 'is-visible' : '' ?>" data-admin-panel="seller-deletions">
-        <section class="card" id="deletionRequestsSection" style="margin-top:0; border-top: 4px solid #dc2626;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-danger" id="deletionRequestsSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
                 <div>
-                    <h2>Seller Management → Seller Deletion Requests</h2>
-                    <p class="muted">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-trash3 text-danger me-2"></i>Seller Management → Seller Deletion Requests</h2>
+                    <p class="text-body-secondary small mb-0">Track order verification (Rules A–E), automated Razorpay refunds, settlement checks, multi-stage Admin approvals, and audit logs.</p>
                 </div>
-                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                    <div class="search-box" style="max-width:260px;">
-                        <input type="text" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
+                <div class="d-flex gap-2 align-items-center flex-wrap">
+                    <div class="input-group input-group-sm" style="max-width: 260px;">
+                        <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+                        <input type="text" class="form-control" id="deletionSearchInput" onkeyup="filterDeletionTableSearch(this.value)" placeholder="Search seller name, email, ID...">
                     </div>
-                    <button type="button" class="btn-sm" onclick="reloadDeletionRequestsList()">↻ Refresh</button>
+                    <button type="button" class="btn btn-outline-primary btn-sm fw-semibold" onclick="reloadDeletionRequestsList()"><i class="bi bi-arrow-clockwise me-1"></i>Refresh</button>
                 </div>
             </div>
+            <div class="card-body">
+                <div class="row row-cols-2 row-cols-md-3 row-cols-xl-6 g-2 mb-3">
+                    <div class="col"><div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal"><?= (int) ($delKpis['total'] ?? 0) ?></div></div></div>
+                    <div class="col"><div class="metric-mini bg-warning-subtle border-warning-subtle"><div class="k text-warning-emphasis">Pending (Yellow)</div><div class="v text-warning-emphasis" id="delKpiPending"><?= (int) ($delKpis['pending'] ?? 0) ?></div></div></div>
+                    <div class="col"><div class="metric-mini bg-primary-subtle border-primary-subtle"><div class="k text-primary-emphasis">Processing (Blue)</div><div class="v text-primary-emphasis" id="delKpiProcessing"><?= (int) ($delKpis['processing'] ?? 0) ?></div></div></div>
+                    <div class="col"><div class="metric-mini bg-danger-subtle border-danger-subtle"><div class="k text-danger-emphasis">Failed (Red)</div><div class="v text-danger-emphasis" id="delKpiFailed"><?= (int) ($delKpis['failed'] ?? 0) ?></div></div></div>
+                    <div class="col"><div class="metric-mini" style="background:#ffe5d0; border-color:#fecba1;"><div class="k" style="color:#984c0c;">On Hold (Orange)</div><div class="v" style="color:#984c0c;" id="delKpiHold"><?= (int) ($delKpis['on_hold'] ?? 0) ?></div></div></div>
+                    <div class="col"><div class="metric-mini bg-success-subtle border-success-subtle"><div class="k text-success-emphasis">Approved / Deleted</div><div class="v text-success-emphasis" id="delKpiApprovedDeleted"><?= (int) ($delKpis['approved'] ?? 0) + (int) ($delKpis['deleted'] ?? 0) ?></div></div></div>
+                </div>
 
-            <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap:10px; margin-bottom:14px;">
-                <div class="metric-mini"><div class="k">Total Requests</div><div class="v" id="delKpiTotal"><?= (int) ($delKpis['total'] ?? 0) ?></div></div>
-                <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Pending (Yellow)</div><div class="v" style="color:#b45309;" id="delKpiPending"><?= (int) ($delKpis['pending'] ?? 0) ?></div></div>
-                <div class="metric-mini" style="background:#eff6ff;"><div class="k" style="color:#1d4ed8;">Processing (Blue)</div><div class="v" style="color:#1d4ed8;" id="delKpiProcessing"><?= (int) ($delKpis['processing'] ?? 0) ?></div></div>
-                <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Failed (Red)</div><div class="v" style="color:#b91c1c;" id="delKpiFailed"><?= (int) ($delKpis['failed'] ?? 0) ?></div></div>
-                <div class="metric-mini" style="background:#fff7ed;"><div class="k" style="color:#c2410c;">On Hold (Orange)</div><div class="v" style="color:#c2410c;" id="delKpiHold"><?= (int) ($delKpis['on_hold'] ?? 0) ?></div></div>
-                <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Approved / Deleted</div><div class="v" style="color:#15803d;" id="delKpiApprovedDeleted"><?= (int) ($delKpis['approved'] ?? 0) + (int) ($delKpis['deleted'] ?? 0) ?></div></div>
-            </div>
+                <div class="tabs-bar nav nav-pills gap-2 pb-3 mb-3 border-bottom flex-wrap" id="delFilterTabs">
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
+                </div>
 
-            <div class="tabs-bar" id="delFilterTabs">
-                <button type="button" class="tab-btn active" onclick="filterDeletionStatus('all', this)">All</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REQUESTED', this)">Requested</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('REFUND_FAILED', this)">Refund Failed</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('SETTLEMENT_PENDING', this)">Settlement Pending</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_ON_HOLD', this)">On Hold</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('APPROVED_FOR_DELETION', this)">Approved</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETED', this)">Deleted</button>
-                <button type="button" class="tab-btn" onclick="filterDeletionStatus('DELETION_REJECTED', this)">Rejected</button>
-            </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>Req ID</th>
-                        <th>Seller &amp; ID</th>
-                        <th>Requested Date</th>
-                        <th>Deletion Stage</th>
-                        <th>Status</th>
-                        <th>Metrics / Balance Snapshot</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="deletionRequestsTbody">
-                    <?php if (empty($delRequests)): ?>
-                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($delRequests as $dr): ?>
-                            <?php
-                                $snapMetrics = is_array($dr['metrics'] ?? null) ? $dr['metrics'] : [];
-                                $finSum = is_array($dr['financial_summary'] ?? null) ? $dr['financial_summary'] : [];
-                                $badgeCls = delBadgeClassPhp($dr['badge_color'] ?? $dr['status'] ?? 'PENDING');
-                                $searchTxt = strtolower(($dr['seller_name'] ?? '') . ' ' . ($dr['seller_email'] ?? '') . ' ' . ($dr['seller_phone'] ?? '') . ' ' . $dr['seller_id'] . ' ' . $dr['status'] . ' ' . $dr['stage']);
-                            ?>
-                            <tr class="del-req-row" data-status="<?= htmlspecialchars($dr['status']) ?>" data-search="<?= htmlspecialchars($searchTxt) ?>">
-                                <td><strong>#<?= (int) $dr['id'] ?></strong></td>
-                                <td>
-                                    <strong style="color:#1e1b4b;"><?= htmlspecialchars($dr['seller_name']) ?></strong>
-                                    <?php if (($dr['initiated_by_role'] ?? 'admin') === 'seller'): ?>
-                                        <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>
-                                    <?php endif; ?>
-                                    <div style="font-size:12px; color:#64748b;">Seller ID #<?= (int) $dr['seller_id'] ?><?= !empty($dr['seller_phone']) ? ' &bull; ' . htmlspecialchars($dr['seller_phone']) : '' ?></div>
-                                    <?php if (!empty($dr['seller_email'])): ?>
-                                        <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($dr['seller_email']) ?></div>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <div style="font-size:13px;"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 0, 10)) ?></div>
-                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 11, 8)) ?></div>
-                                </td>
-                                <td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;"><?= htmlspecialchars($dr['stage']) ?></code></td>
-                                <td><span class="<?= $badgeCls ?>"><?= htmlspecialchars($dr['status']) ?></span></td>
-                                <td style="font-size:12px; color:#475569;">
-                                    Orders: <strong><?= (int) ($snapMetrics['total_orders'] ?? 0) ?></strong> &bull;
-                                    Balance: <strong>₹<?= number_format((float) ($finSum['available_seller_balance'] ?? $snapMetrics['seller_wallet_balance'] ?? 0), 2) ?></strong>
-                                </td>
-                                <td>
-                                    <button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(<?= (int) $dr['id'] ?>)">Manage Deletion</button>
-                                </td>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Req ID</th>
+                                <th>Seller &amp; ID</th>
+                                <th>Requested Date</th>
+                                <th>Deletion Stage</th>
+                                <th>Status</th>
+                                <th>Metrics / Balance Snapshot</th>
+                                <th>Actions</th>
                             </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-            <div id="delPaginationBar" class="pagination-bar"></div>
+                        </thead>
+                        <tbody id="deletionRequestsTbody">
+                            <?php if (empty($delRequests)): ?>
+                                <tr><td colspan="7" class="text-body-secondary text-center py-4">No seller deletion requests submitted yet. Use "Request Seller Deletion" in Seller Accounts above.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($delRequests as $dr): ?>
+                                    <?php
+                                        $snapMetrics = is_array($dr['metrics'] ?? null) ? $dr['metrics'] : [];
+                                        $finSum = is_array($dr['financial_summary'] ?? null) ? $dr['financial_summary'] : [];
+                                        $badgeCls = delBadgeClassPhp($dr['badge_color'] ?? $dr['status'] ?? 'PENDING');
+                                        $searchTxt = strtolower(($dr['seller_name'] ?? '') . ' ' . ($dr['seller_email'] ?? '') . ' ' . ($dr['seller_phone'] ?? '') . ' ' . $dr['seller_id'] . ' ' . $dr['status'] . ' ' . $dr['stage']);
+                                    ?>
+                                    <tr class="del-req-row" data-status="<?= htmlspecialchars($dr['status']) ?>" data-search="<?= htmlspecialchars($searchTxt) ?>">
+                                        <td class="fw-bold">#<?= (int) $dr['id'] ?></td>
+                                        <td>
+                                            <span class="fw-bold text-dark"><?= htmlspecialchars($dr['seller_name']) ?></span>
+                                            <?php if (($dr['initiated_by_role'] ?? 'admin') === 'seller'): ?>
+                                                <span class="del-badge del-yellow ms-1" style="font-size:10px; padding:2px 6px;">Seller Request</span>
+                                            <?php endif; ?>
+                                            <div class="small text-body-secondary">Seller ID #<?= (int) $dr['seller_id'] ?><?= !empty($dr['seller_phone']) ? ' &bull; ' . htmlspecialchars($dr['seller_phone']) : '' ?></div>
+                                            <?php if (!empty($dr['seller_email'])): ?>
+                                                <div class="small text-muted"><?= htmlspecialchars($dr['seller_email']) ?></div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <div class="small"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 0, 10)) ?></div>
+                                            <div class="small text-muted"><?= htmlspecialchars(substr((string) ($dr['created_at'] ?? ''), 11, 8)) ?></div>
+                                        </td>
+                                        <td><code class="bg-light px-2 py-1 rounded border small"><?= htmlspecialchars($dr['stage']) ?></code></td>
+                                        <td><span class="<?= $badgeCls ?>"><?= htmlspecialchars($dr['status']) ?></span></td>
+                                        <td class="small text-body-secondary">
+                                            Orders: <strong><?= (int) ($snapMetrics['total_orders'] ?? 0) ?></strong> &bull;
+                                            Balance: <strong>₹<?= number_format((float) ($finSum['available_seller_balance'] ?? $snapMetrics['seller_wallet_balance'] ?? 0), 2) ?></strong>
+                                        </td>
+                                        <td>
+                                            <button type="button" class="btn btn-primary btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(<?= (int) $dr['id'] ?>)">Manage Deletion</button>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="delPaginationBar" class="pagination-bar"></div>
+            </div>
         </section>
         </div>
 
         <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
         <div class="admin-view-panel <?= $panelVisiblePhp('categories') ? 'is-visible' : '' ?>" data-admin-panel="categories">
-        <section class="card" id="categoriesSection" style="margin-top:0;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-secondary" id="categoriesSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-3">
                 <div>
-                    <h2>Product Categories (Editable)</h2>
-                    <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-tags text-secondary me-2"></i>Product Categories (Editable)</h2>
+                    <p class="text-body-secondary small mb-0">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
                 </div>
-                <div class="search-box">
-                    <input type="text" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
+                <div class="input-group input-group-sm" style="max-width: 280px;">
+                    <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+                    <input type="text" class="form-control" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
                 </div>
             </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Category Name</th>
-                        <th>Slug</th>
-                        <th>Description</th>
-                        <th>Products</th>
-                        <th>Order</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="categoriesTableBody">
-                    <?php if (empty($categoriesList)): ?>
-                        <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($categoriesList as $cat): ?>
-                            <?php $catSearchStr = strtolower(($cat['name'] ?? '') . ' ' . ($cat['slug'] ?? '') . ' ' . ($cat['description'] ?? '') . ' #' . (int) $cat['id']); ?>
-                            <tr class="cat-list-row" data-search="<?= htmlspecialchars($catSearchStr, ENT_QUOTES, 'UTF-8') ?>">
-                                <td>#<?= (int)$cat['id'] ?></td>
-                                <td>
-                                    <span style="font-size:16px; margin-right:4px;"><?= htmlspecialchars($cat['icon'] ?? '🏷️') ?></span>
-                                    <strong><?= htmlspecialchars($cat['name']) ?></strong>
-                                </td>
-                                <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:12px;"><?= htmlspecialchars($cat['slug']) ?></code></td>
-                                <td style="color:#64748b; font-size:13px; max-width:260px;"><?= htmlspecialchars($cat['description'] ?? '—') ?></td>
-                                <td><span class="badge-prod"><?= (int)($cat['products_count'] ?? 0) ?> products</span></td>
-                                <td><?= (int)($cat['sort_order'] ?? 0) ?></td>
-                                <td>
-                                    <?php if (!empty($cat['is_active'])): ?>
-                                        <span class="badge-approved">Active</span>
-                                    <?php else: ?>
-                                        <span class="badge-rejected">Inactive</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <div style="display:flex; gap:6px; align-items:center;">
-                                        <button type="button" class="btn-sm" data-cat="<?= htmlspecialchars(json_encode($cat, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openCategoryModal(this)">Edit</button>
-                                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete Category" data-confirm-msg="<?= htmlspecialchars('Delete category "' . $cat['name'] . '"? Products will be moved to General.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
-                                            <input type="hidden" name="action" value="delete_category">
-                                            <input type="hidden" name="category_id" value="<?= (int)$cat['id'] ?>">
-                                            <button type="submit" class="btn-reject-sm">Delete</button>
-                                        </form>
-                                    </div>
-                                </td>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>ID</th>
+                                <th>Category Name</th>
+                                <th>Slug</th>
+                                <th>Description</th>
+                                <th>Products</th>
+                                <th>Order</th>
+                                <th>Status</th>
+                                <th>Actions</th>
                             </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-            <div id="categoriesPaginationBar" class="pagination-bar"></div>
+                        </thead>
+                        <tbody id="categoriesTableBody">
+                            <?php if (empty($categoriesList)): ?>
+                                <tr><td colspan="8" class="text-body-secondary text-center py-4">No categories found.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($categoriesList as $cat): ?>
+                                    <?php $catSearchStr = strtolower(($cat['name'] ?? '') . ' ' . ($cat['slug'] ?? '') . ' ' . ($cat['description'] ?? '') . ' #' . (int) $cat['id']); ?>
+                                    <tr class="cat-list-row" data-search="<?= htmlspecialchars($catSearchStr, ENT_QUOTES, 'UTF-8') ?>">
+                                        <td class="fw-semibold">#<?= (int)$cat['id'] ?></td>
+                                        <td>
+                                            <span class="fs-6 me-1"><?= htmlspecialchars($cat['icon'] ?? '🏷️') ?></span>
+                                            <span class="fw-bold"><?= htmlspecialchars($cat['name']) ?></span>
+                                        </td>
+                                        <td><code class="bg-light px-2 py-1 rounded border small"><?= htmlspecialchars($cat['slug']) ?></code></td>
+                                        <td class="text-body-secondary small" style="max-width:260px;"><?= htmlspecialchars($cat['description'] ?? '—') ?></td>
+                                        <td><span class="badge-prod"><?= (int)($cat['products_count'] ?? 0) ?> products</span></td>
+                                        <td><?= (int)($cat['sort_order'] ?? 0) ?></td>
+                                        <td>
+                                            <?php if (!empty($cat['is_active'])): ?>
+                                                <span class="badge-approved">Active</span>
+                                            <?php else: ?>
+                                                <span class="badge-rejected">Inactive</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-1 align-items-center">
+                                                <button type="button" class="btn btn-primary btn-sm fw-semibold" data-cat="<?= htmlspecialchars(json_encode($cat, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openCategoryModal(this)">Edit</button>
+                                                <form method="POST" action="/admin" class="d-inline" data-confirm-title="Delete Category" data-confirm-msg="<?= htmlspecialchars('Delete category "' . $cat['name'] . '"? Products will be moved to General.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
+                                                    <input type="hidden" name="action" value="delete_category">
+                                                    <input type="hidden" name="category_id" value="<?= (int)$cat['id'] ?>">
+                                                    <button type="submit" class="btn btn-danger btn-sm fw-semibold">Delete</button>
+                                                </form>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="categoriesPaginationBar" class="pagination-bar"></div>
 
-            <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
-                <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
-                <form method="POST" action="/admin">
-                    <input type="hidden" name="action" value="add_category">
-                    <div class="grid">
-                        <div>
-                            <label>Category Name *</label>
-                            <input name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+                <div class="mt-4 pt-3 border-top">
+                    <h3 class="h6 fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-1"></i>Add New Category</h3>
+                    <form method="POST" action="/admin">
+                        <input type="hidden" name="action" value="add_category">
+                        <div class="row g-3">
+                            <div class="col-md-3">
+                                <label class="form-label small fw-semibold">Category Name *</label>
+                                <input class="form-control" name="name" required maxlength="100" placeholder="e.g. Sports & Fitness">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label small fw-semibold">Icon (Emoji)</label>
+                                <input class="form-control" name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                            </div>
+                            <div class="col-md-5">
+                                <label class="form-label small fw-semibold">Description</label>
+                                <input class="form-control" name="description" maxlength="255" placeholder="Short description">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label small fw-semibold">Sort Order</label>
+                                <input class="form-control" type="number" name="sort_order" value="<?= count($categoriesList) + 1 ?>">
+                            </div>
                         </div>
-                        <div>
-                            <label>Icon (Emoji)</label>
-                            <input name="icon" maxlength="20" value="🏷️" placeholder="e.g. ⚽">
+                        <div class="mt-3 d-flex align-items-center gap-3 flex-wrap">
+                            <div class="form-check mb-0">
+                                <input class="form-check-input" type="checkbox" name="is_active" id="addCatActiveChk" value="1" checked>
+                                <label class="form-check-label small fw-semibold" for="addCatActiveChk">Active</label>
+                            </div>
+                            <button type="submit" class="btn btn-primary fw-semibold">+ Add Category</button>
                         </div>
-                        <div>
-                            <label>Description</label>
-                            <input name="description" maxlength="255" placeholder="Short description">
-                        </div>
-                        <div>
-                            <label>Sort Order</label>
-                            <input type="number" name="sort_order" value="<?= count($categoriesList) + 1 ?>">
-                        </div>
-                    </div>
-                    <div style="margin-top:10px; display:flex; align-items:center; gap:14px;">
-                        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer;">
-                            <input type="checkbox" name="is_active" value="1" checked style="width:auto;"> Active
-                        </label>
-                        <button type="submit" style="background:#4f46e5;">+ Add Category</button>
-                    </div>
-                </form>
+                    </form>
+                </div>
             </div>
         </section>
         </div>
 
         <!-- Section 4: Dedicated Admin Manage Products Page -->
         <div class="admin-view-panel <?= $panelVisiblePhp('products') ? 'is-visible' : '' ?>" data-admin-panel="products">
-            <div class="sub-kpi-bar">
-                <div class="metric-mini"><div class="k">Total Catalog Products</div><div class="v"><?= (int) $totalListedProducts ?></div></div>
-                <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Active on Storefront</div><div class="v" style="color:#15803d;"><?= (int) $activeListedProducts ?></div></div>
-                <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Inactive / Archived</div><div class="v" style="color:#b91c1c;"><?= (int) $inactiveListedProducts ?></div></div>
-                <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Out of Stock</div><div class="v" style="color:#b45309;"><?= (int) $outOfStockProducts ?></div></div>
+            <div class="row row-cols-2 row-cols-md-4 g-3 mb-3">
+                <div class="col"><div class="metric-mini shadow-sm"><div class="k">Total Catalog Products</div><div class="v"><?= (int) $totalListedProducts ?></div></div></div>
+                <div class="col"><div class="metric-mini bg-success-subtle border-success-subtle shadow-sm"><div class="k text-success-emphasis">Active on Storefront</div><div class="v text-success-emphasis"><?= (int) $activeListedProducts ?></div></div></div>
+                <div class="col"><div class="metric-mini bg-danger-subtle border-danger-subtle shadow-sm"><div class="k text-danger-emphasis">Inactive / Archived</div><div class="v text-danger-emphasis"><?= (int) $inactiveListedProducts ?></div></div></div>
+                <div class="col"><div class="metric-mini bg-warning-subtle border-warning-subtle shadow-sm"><div class="k text-warning-emphasis">Out of Stock</div><div class="v text-warning-emphasis"><?= (int) $outOfStockProducts ?></div></div></div>
             </div>
-        <section class="card" id="productCategoriesSection" style="margin-top:0;">
-            <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-success" id="productCategoriesSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-start flex-wrap gap-3">
                 <div>
-                    <h2>Products — Catalog &amp; Category Management</h2>
-                    <p class="muted">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-box-seam text-success me-2"></i>Products — Catalog &amp; Category Management</h2>
+                    <p class="text-body-secondary small mb-0">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
                 </div>
-                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-                    <button type="button" class="btn-sm" style="background:#16a34a; padding:9px 14px; font-size:13px;" onclick="openProductModal(null)">+ Add New Product</button>
-                </div>
+                <button type="button" class="btn btn-success btn-sm fw-semibold" onclick="openProductModal(null)"><i class="bi bi-plus-lg me-1"></i>Add New Product</button>
             </div>
-            <div class="filter-bar" style="margin-bottom:14px; padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
-                <div class="search-box" style="max-width:260px; flex:1; min-width:190px;">
-                    <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+            <div class="card-body">
+                <div class="row g-2 align-items-center bg-light p-3 rounded-3 border mb-3">
+                    <div class="col-md-4">
+                        <div class="input-group input-group-sm">
+                            <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
+                            <input type="text" class="form-control" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <select class="form-select form-select-sm" id="prodSellerFilter" onchange="applyAdminProductFilters()">
+                            <option value="">All Sellers</option>
+                            <?php foreach ($eligibleSellersForProducts as $sfOpt): ?>
+                                <option value="<?= (int) $sfOpt['id'] ?>"><?= htmlspecialchars($sfOpt['display_name'] . ' (#' . (int) $sfOpt['id'] . ')') ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <select class="form-select form-select-sm" id="prodCategoryFilter" onchange="applyAdminProductFilters()">
+                            <option value="">All Categories</option>
+                            <?php foreach ($categoriesList as $cfOpt): ?>
+                                <option value="<?= htmlspecialchars(strtolower((string) $cfOpt['name']), ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($cfOpt['name']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <select class="form-select form-select-sm" id="prodStatusFilter" onchange="applyAdminProductFilters()">
+                            <option value="all">All Statuses</option>
+                            <option value="1">Active Only</option>
+                            <option value="0">Inactive Only</option>
+                        </select>
+                    </div>
                 </div>
-                <select id="prodSellerFilter" onchange="applyAdminProductFilters()">
-                    <option value="">All Sellers</option>
-                    <?php foreach ($eligibleSellersForProducts as $sfOpt): ?>
-                        <option value="<?= (int) $sfOpt['id'] ?>"><?= htmlspecialchars($sfOpt['display_name'] . ' (#' . (int) $sfOpt['id'] . ')') ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <select id="prodCategoryFilter" onchange="applyAdminProductFilters()">
-                    <option value="">All Categories</option>
-                    <?php foreach ($categoriesList as $cfOpt): ?>
-                        <option value="<?= htmlspecialchars(strtolower((string) $cfOpt['name']), ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($cfOpt['name']) ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <select id="prodStatusFilter" onchange="applyAdminProductFilters()">
-                    <option value="all">All Statuses</option>
-                    <option value="1">Active Only</option>
-                    <option value="0">Inactive Only</option>
-                </select>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Product</th>
-                        <th>Seller</th>
-                        <th>Pricing &amp; Stock</th>
-                        <th>Status</th>
-                        <th>Category &amp; Reassign</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="productsTableBody">
-                    <?php if (empty($adminProducts)): ?>
-                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
-                    <?php else: ?>
-                        <?php foreach ($adminProducts as $ap): ?>
-                            <?php
-                                $formattedAp = formatProductRecord($ap, true);
-                                $sAccProd = strtoupper((string) ($ap['seller_account_status'] ?? 'ACTIVE'));
-                                $formattedAp['seller_account_status'] = $sAccProd;
-                                $isProdActive = !empty($formattedAp['is_active']);
-                                $thumbRaw = $formattedAp['image_url'] ?? '';
-                                $thumbSrc = ($thumbRaw !== '' && str_contains($thumbRaw, '/uploads/products/'))
-                                    ? '/uploads/products/' . basename(explode('?', $thumbRaw)[0])
-                                    : $thumbRaw;
-                                $pSearch = strtolower(
-                                    ($formattedAp['name'] ?? '') . ' ' .
-                                    ($formattedAp['sku'] ?? '') . ' ' .
-                                    ($formattedAp['brand'] ?? '') . ' ' .
-                                    ($formattedAp['category'] ?? '') . ' ' .
-                                    ($formattedAp['seller_name'] ?? '') . ' #' . $formattedAp['id']
-                                );
-                            ?>
-                            <tr class="prod-cat-row"
-                                data-search="<?= htmlspecialchars($pSearch, ENT_QUOTES, 'UTF-8') ?>"
-                                data-seller-id="<?= (int) $ap['seller_id'] ?>"
-                                data-category="<?= htmlspecialchars(strtolower((string) ($formattedAp['category'] ?? 'General')), ENT_QUOTES, 'UTF-8') ?>"
-                                data-active="<?= $isProdActive ? '1' : '0' ?>">
-                                <td><strong>#<?= (int) $ap['id'] ?></strong></td>
-                                <td>
-                                    <div style="display:flex; gap:10px; align-items:center;">
-                                        <?php if (!empty($thumbSrc)): ?>
-                                            <img src="<?= htmlspecialchars($thumbSrc, ENT_QUOTES, 'UTF-8') ?>" alt="" class="prod-thumb" loading="lazy">
-                                        <?php else: ?>
-                                            <div class="prod-thumb-empty" title="No Image">📦</div>
-                                        <?php endif; ?>
-                                        <div>
-                                            <strong style="color:#1e1b4b;"><?= htmlspecialchars($formattedAp['name']) ?></strong>
-                                            <div style="font-size:11px; color:#64748b; margin-top:2px;">
-                                                SKU: <code><?= htmlspecialchars($formattedAp['sku']) ?></code> &bull; Brand: <?= htmlspecialchars($formattedAp['brand']) ?>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </td>
-                                <td>
-                                    <div><?= htmlspecialchars($formattedAp['seller_name']) ?></div>
-                                    <div style="font-size:11px; color:#64748b;">
-                                        Seller #<?= (int) $ap['seller_id'] ?>
-                                        <?php if ($sAccProd !== 'ACTIVE'): ?>
-                                            &bull; <span class="<?= delBadgeClassPhp($sAccProd) ?>" style="font-size:9px; padding:1px 5px;"><?= htmlspecialchars($sAccProd) ?></span>
-                                        <?php endif; ?>
-                                    </div>
-                                </td>
-                                <td>
-                                    <div><strong>₹<?= number_format((float) $formattedAp['price'], 2) ?></strong></div>
-                                    <?php if ((float) $formattedAp['mrp'] > (float) $formattedAp['price']): ?>
-                                        <div style="font-size:11px; color:#94a3b8; text-decoration:line-through;">MRP ₹<?= number_format((float) $formattedAp['mrp'], 2) ?></div>
-                                    <?php endif; ?>
-                                    <div style="font-size:11px; color:#475569;">Stock: <strong><?= (int) $formattedAp['stock'] ?></strong></div>
-                                </td>
-                                <td>
-                                    <?php if ($isProdActive): ?>
-                                        <span class="badge-approved">Active</span>
-                                    <?php else: ?>
-                                        <span class="badge-rejected">Inactive</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <div style="margin-bottom:5px;"><span class="badge-prod"><?= htmlspecialchars($formattedAp['category'] ?: 'General') ?></span></div>
-                                    <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
-                                        <input type="hidden" name="action" value="update_product_category">
-                                        <input type="hidden" name="product_id" value="<?= (int)$ap['id'] ?>">
-                                        <select name="category_id" required style="padding:5px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; max-width:155px;">
-                                            <?php
-                                                $hasSelectedCat = false;
-                                                foreach ($categoriesList as $catOptCheck) {
-                                                    if ((int)($ap['category_id'] ?? 0) === (int)$catOptCheck['id'] || strcasecmp((string)$ap['category'], (string)$catOptCheck['name']) === 0) {
-                                                        $hasSelectedCat = true;
-                                                        break;
-                                                    }
-                                                }
-                                            ?>
-                                            <?php if (!$hasSelectedCat): ?>
-                                                <option value="" disabled selected>-- Select Category --</option>
-                                            <?php endif; ?>
-                                            <?php foreach ($categoriesList as $catOpt): ?>
-                                                <?php $selected = ((int)($ap['category_id'] ?? 0) === (int)$catOpt['id'] || strcasecmp((string)$ap['category'], (string)$catOpt['name']) === 0) ? 'selected' : ''; ?>
-                                                <option value="<?= (int)$catOpt['id'] ?>" <?= $selected ?>><?= htmlspecialchars($catOpt['name']) ?></option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                        <button type="submit" class="btn-sm">Save</button>
-                                    </form>
-                                </td>
-                                <td>
-                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                                        <button type="button" class="btn-sm" data-product="<?= htmlspecialchars(json_encode($formattedAp, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openProductModal(this)">Edit</button>
-                                        <form method="POST" action="/admin" style="display:inline;">
-                                            <input type="hidden" name="action" value="toggle_product_status">
-                                            <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
-                                            <button type="submit" class="<?= $isProdActive ? 'btn-hold-sm' : 'btn-approve-sm' ?>" title="<?= $isProdActive ? 'Hide from storefront' : 'Make visible on storefront' ?>">
-                                                <?= $isProdActive ? 'Deactivate' : 'Activate' ?>
-                                            </button>
-                                        </form>
-                                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete / Archive Product" data-confirm-msg="<?= htmlspecialchars('Delete product #' . (int)$ap['id'] . ' ("' . $formattedAp['name'] . '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
-                                            <input type="hidden" name="action" value="delete_product">
-                                            <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
-                                            <button type="submit" class="btn-reject-sm">Delete</button>
-                                        </form>
-                                    </div>
-                                </td>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>ID</th>
+                                <th>Product</th>
+                                <th>Seller</th>
+                                <th>Pricing &amp; Stock</th>
+                                <th>Status</th>
+                                <th>Category &amp; Reassign</th>
+                                <th>Actions</th>
                             </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-            <div id="productsPaginationBar" class="pagination-bar"></div>
+                        </thead>
+                        <tbody id="productsTableBody">
+                            <?php if (empty($adminProducts)): ?>
+                                <tr><td colspan="7" class="text-body-secondary text-center py-4">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
+                            <?php else: ?>
+                                <?php foreach ($adminProducts as $ap): ?>
+                                    <?php
+                                        $formattedAp = formatProductRecord($ap, true);
+                                        $sAccProd = strtoupper((string) ($ap['seller_account_status'] ?? 'ACTIVE'));
+                                        $formattedAp['seller_account_status'] = $sAccProd;
+                                        $isProdActive = !empty($formattedAp['is_active']);
+                                        $thumbRaw = $formattedAp['image_url'] ?? '';
+                                        $thumbSrc = ($thumbRaw !== '' && str_contains($thumbRaw, '/uploads/products/'))
+                                            ? '/uploads/products/' . basename(explode('?', $thumbRaw)[0])
+                                            : $thumbRaw;
+                                        $pSearch = strtolower(
+                                            ($formattedAp['name'] ?? '') . ' ' .
+                                            ($formattedAp['sku'] ?? '') . ' ' .
+                                            ($formattedAp['brand'] ?? '') . ' ' .
+                                            ($formattedAp['category'] ?? '') . ' ' .
+                                            ($formattedAp['seller_name'] ?? '') . ' #' . $formattedAp['id']
+                                        );
+                                    ?>
+                                    <tr class="prod-cat-row"
+                                        data-search="<?= htmlspecialchars($pSearch, ENT_QUOTES, 'UTF-8') ?>"
+                                        data-seller-id="<?= (int) $ap['seller_id'] ?>"
+                                        data-category="<?= htmlspecialchars(strtolower((string) ($formattedAp['category'] ?? 'General')), ENT_QUOTES, 'UTF-8') ?>"
+                                        data-active="<?= $isProdActive ? '1' : '0' ?>">
+                                        <td class="fw-bold">#<?= (int) $ap['id'] ?></td>
+                                        <td>
+                                            <div class="d-flex gap-2 align-items-center">
+                                                <?php if (!empty($thumbSrc)): ?>
+                                                    <img src="<?= htmlspecialchars($thumbSrc, ENT_QUOTES, 'UTF-8') ?>" alt="" class="prod-thumb" loading="lazy">
+                                                <?php else: ?>
+                                                    <div class="prod-thumb-empty" title="No Image">📦</div>
+                                                <?php endif; ?>
+                                                <div>
+                                                    <div class="fw-bold text-dark"><?= htmlspecialchars($formattedAp['name']) ?></div>
+                                                    <div class="small text-body-secondary">
+                                                        SKU: <code><?= htmlspecialchars($formattedAp['sku']) ?></code> &bull; Brand: <?= htmlspecialchars($formattedAp['brand']) ?>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <div class="fw-medium small"><?= htmlspecialchars($formattedAp['seller_name']) ?></div>
+                                            <div class="small text-body-secondary">
+                                                Seller #<?= (int) $ap['seller_id'] ?>
+                                                <?php if ($sAccProd !== 'ACTIVE'): ?>
+                                                    &bull; <span class="<?= delBadgeClassPhp($sAccProd) ?>" style="font-size:9px; padding:1px 5px;"><?= htmlspecialchars($sAccProd) ?></span>
+                                                <?php endif; ?>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <div class="fw-bold">₹<?= number_format((float) $formattedAp['price'], 2) ?></div>
+                                            <?php if ((float) $formattedAp['mrp'] > (float) $formattedAp['price']): ?>
+                                                <div class="small text-muted text-decoration-line-through">MRP ₹<?= number_format((float) $formattedAp['mrp'], 2) ?></div>
+                                            <?php endif; ?>
+                                            <div class="small text-body-secondary">Stock: <strong><?= (int) $formattedAp['stock'] ?></strong></div>
+                                        </td>
+                                        <td>
+                                            <?php if ($isProdActive): ?>
+                                                <span class="badge-approved">Active</span>
+                                            <?php else: ?>
+                                                <span class="badge-rejected">Inactive</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <div class="mb-1"><span class="badge-prod"><?= htmlspecialchars($formattedAp['category'] ?: 'General') ?></span></div>
+                                            <form method="POST" action="/admin" class="d-flex gap-1 align-items-center">
+                                                <input type="hidden" name="action" value="update_product_category">
+                                                <input type="hidden" name="product_id" value="<?= (int)$ap['id'] ?>">
+                                                <select class="form-select form-select-sm" name="category_id" required style="max-width:155px;">
+                                                    <?php
+                                                        $hasSelectedCat = false;
+                                                        foreach ($categoriesList as $catOptCheck) {
+                                                            if ((int)($ap['category_id'] ?? 0) === (int)$catOptCheck['id'] || strcasecmp((string)$ap['category'], (string)$catOptCheck['name']) === 0) {
+                                                                $hasSelectedCat = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    ?>
+                                                    <?php if (!$hasSelectedCat): ?>
+                                                        <option value="" disabled selected>-- Select Category --</option>
+                                                    <?php endif; ?>
+                                                    <?php foreach ($categoriesList as $catOpt): ?>
+                                                        <?php $selected = ((int)($ap['category_id'] ?? 0) === (int)$catOpt['id'] || strcasecmp((string)$ap['category'], (string)$catOpt['name']) === 0) ? 'selected' : ''; ?>
+                                                        <option value="<?= (int)$catOpt['id'] ?>" <?= $selected ?>><?= htmlspecialchars($catOpt['name']) ?></option>
+                                                    <?php endforeach; ?>
+                                                </select>
+                                                <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                                            </form>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-1 flex-wrap align-items-center">
+                                                <button type="button" class="btn btn-primary btn-sm fw-semibold" data-product="<?= htmlspecialchars(json_encode($formattedAp, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openProductModal(this)">Edit</button>
+                                                <form method="POST" action="/admin" class="d-inline">
+                                                    <input type="hidden" name="action" value="toggle_product_status">
+                                                    <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
+                                                    <button type="submit" class="btn btn-sm fw-semibold <?= $isProdActive ? 'btn-warning' : 'btn-success' ?>" title="<?= $isProdActive ? 'Hide from storefront' : 'Make visible on storefront' ?>">
+                                                        <?= $isProdActive ? 'Deactivate' : 'Activate' ?>
+                                                    </button>
+                                                </form>
+                                                <form method="POST" action="/admin" class="d-inline" data-confirm-title="Delete / Archive Product" data-confirm-msg="<?= htmlspecialchars('Delete product #' . (int)$ap['id'] . ' ("' . $formattedAp['name'] . '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
+                                                    <input type="hidden" name="action" value="delete_product">
+                                                    <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
+                                                    <button type="submit" class="btn btn-danger btn-sm fw-semibold">Delete</button>
+                                                </form>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="productsPaginationBar" class="pagination-bar"></div>
+            </div>
         </section>
         </div>
 
         <!-- Section 5: Create Seller Account (Dedicated Page 3 or visible in All Lists) -->
         <div class="admin-view-panel <?= $panelVisiblePhp('create-seller') ? 'is-visible' : '' ?>" data-admin-panel="create-seller">
-        <section class="card" id="createSellerSection" style="margin-top:0;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+        <section class="card border-0 shadow-sm border-top border-4 border-info" id="createSellerSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <div>
-                    <h2>Create New Seller Account</h2>
-                    <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with international country code, e.g. +919876543210).</p>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-person-plus text-info me-2"></i>Create New Seller Account</h2>
+                    <p class="text-body-secondary small mb-0">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with international country code, e.g. +919876543210).</p>
                 </div>
-                <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
+                <a href="/admin/sellers" class="btn btn-outline-primary btn-sm fw-semibold" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
             </div>
-            <form method="POST" action="/admin" data-default-tab="sellers">
-                <input type="hidden" name="action" value="create_seller">
-                <div class="grid">
-                    <div>
-                        <label>Seller / Shop Name</label>
-                        <input name="seller_name" value="<?= htmlspecialchars($_POST['seller_name'] ?? '') ?>" required maxlength="120" placeholder="e.g. Apex Electronics">
+            <div class="card-body">
+                <form method="POST" action="/admin" data-default-tab="sellers">
+                    <input type="hidden" name="action" value="create_seller">
+                    <div class="row g-3">
+                        <div class="col-md-6 col-lg-3">
+                            <label class="form-label small fw-semibold">Seller / Shop Name *</label>
+                            <input class="form-control" name="seller_name" value="<?= htmlspecialchars($_POST['seller_name'] ?? '') ?>" required maxlength="120" placeholder="e.g. Apex Electronics">
+                        </div>
+                        <div class="col-md-6 col-lg-3">
+                            <label class="form-label small fw-semibold">Phone (+country code)</label>
+                            <input class="form-control" name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" placeholder="+919876543210">
+                        </div>
+                        <div class="col-md-6 col-lg-3">
+                            <label class="form-label small fw-semibold">Email Address</label>
+                            <input class="form-control" type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" placeholder="seller@example.com">
+                        </div>
+                        <div class="col-md-6 col-lg-3">
+                            <label class="form-label small fw-semibold">State *</label>
+                            <input class="form-control" name="state" value="<?= htmlspecialchars($_POST['state'] ?? '') ?>" required placeholder="e.g. Karnataka">
+                        </div>
+                        <div class="col-md-6 col-lg-6">
+                            <label class="form-label small fw-semibold">Address *</label>
+                            <input class="form-control" name="address" value="<?= htmlspecialchars($_POST['address'] ?? '') ?>" required placeholder="Shop address">
+                        </div>
+                        <div class="col-md-6 col-lg-6">
+                            <label class="form-label small fw-semibold">Landmark</label>
+                            <input class="form-control" name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" placeholder="Nearest landmark">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small fw-semibold">Password (min 8 characters) *</label>
+                            <input class="form-control" type="password" name="password" required minlength="8" autocomplete="new-password">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small fw-semibold">Confirm Password *</label>
+                            <input class="form-control" type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
+                        </div>
                     </div>
-                    <div>
-                        <label>Phone (+country code)</label>
-                        <input name="phone" value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>" placeholder="+919876543210">
+                    <div class="mt-4">
+                        <button type="submit" class="btn btn-primary fw-semibold px-4">+ Create Seller Account</button>
                     </div>
-                    <div>
-                        <label>Email Address</label>
-                        <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" placeholder="seller@example.com">
-                    </div>
-                    <div>
-                        <label>State</label>
-                        <input name="state" value="<?= htmlspecialchars($_POST['state'] ?? '') ?>" required placeholder="e.g. Karnataka">
-                    </div>
-                    <div>
-                        <label>Address</label>
-                        <input name="address" value="<?= htmlspecialchars($_POST['address'] ?? '') ?>" required placeholder="Shop address">
-                    </div>
-                    <div>
-                        <label>Landmark</label>
-                        <input name="landmark" value="<?= htmlspecialchars($_POST['landmark'] ?? '') ?>" placeholder="Nearest landmark">
-                    </div>
-                    <div>
-                        <label>Password (min 8 characters)</label>
-                        <input type="password" name="password" required minlength="8" autocomplete="new-password">
-                    </div>
-                    <div>
-                        <label>Confirm Password</label>
-                        <input type="password" name="password_confirmation" required minlength="8" autocomplete="new-password">
-                    </div>
-                </div>
-                <br>
-                <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
-            </form>
+                </form>
+            </div>
         </section>
         </div>
     </main>
 
-    <footer class="admin-footer">
-        <div class="footer-inner">
+    <footer class="admin-footer py-4 border-top border-secondary-subtle">
+        <div class="container-xl d-flex flex-column flex-lg-row justify-content-between align-items-lg-center gap-3">
             <div>
-                <strong>Vendor Admin Portal</strong> &bull; Venter App Marketplace Operations
-                <div style="font-size:11px; color:#94a3b8; margin-top:3px;">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
+                <div class="fw-bold text-white"><i class="bi bi-shop-window text-primary me-1"></i>Vendor Admin Portal &bull; Venter App Marketplace Operations</div>
+                <div class="small text-secondary mt-1">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
             </div>
-            <nav class="footer-links" id="adminFooterNav">
+            <nav class="footer-links d-flex gap-3 flex-wrap align-items-center" id="adminFooterNav">
                 <a href="/admin" data-tab="overview" class="<?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">Overview</a>
                 <a href="/admin/gst-verifications" data-tab="gst" class="<?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">PDF Verifications</a>
                 <a href="/admin/sellers" data-tab="sellers" class="<?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">Seller Accounts</a>
@@ -2009,107 +2170,109 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 <a href="/admin/categories" data-tab="categories" class="<?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories</a>
                 <a href="/admin?tab=all" data-tab="all" class="<?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a>
             </nav>
-            <div style="font-size:12px; color:#94a3b8;">
-                <a href="/admin/logout" style="color:#f8fafc; font-weight:700; text-decoration:none;">Sign out</a>
+            <div>
+                <a href="/admin/logout" class="btn btn-outline-light btn-sm">Sign out</a>
             </div>
         </div>
     </footer>
 
     <!-- GST Review & Verification Modal -->
     <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
-        <div class="modal-box" style="max-width: 780px;">
-            <div class="modal-header">
-                <h3 id="gstModalTitle">Document Verification Review</h3>
-                <button type="button" class="modal-close" onclick="closeGstModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="gstModalLoading" style="text-align:center; padding:32px; color:#64748b;">
-                    Loading details &amp; documents...
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="gstModalTitle">Document Verification Review</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeGstModal()"></button>
                 </div>
-
-                <div id="gstModalContent" style="display:none;">
-                    <div id="gstFetchErrorBox" class="modal-err-banner" style="display:none;"></div>
-                    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:18px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:6px;">
-                            <strong style="font-size:16px; color:#1e1b4b;" id="modalSellerName">—</strong>
-                            <div id="modalGstStatus">—</div>
-                        </div>
-                        <div id="modalSellerMeta" style="font-size:12px; color:#475569; margin-bottom:8px;">—</div>
-                        <div id="modalGstinRow" style="display:none; font-size:13px; color:#334155; margin-bottom:6px;">
-                            <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
-                            <div style="font-size:12px; color:#475569; margin-top:4px;"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
-                        </div>
-                        <div style="font-size:13px; color:#64748b;">
-                            <div><strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span></div>
-                        </div>
-
-                        <div id="rejectionAlertBox" style="display:none; background:#fee2e2; border-left:4px solid #ef4444; padding:12px; border-radius:6px; margin-top:12px;">
-                            <strong style="color:#b91c1c; font-size:13px;">Rejection Reason:</strong>
-                            <div id="modalRejectionReason" style="color:#7f1d1d; font-size:13px; margin-top:4px;">—</div>
-                        </div>
+                <div class="modal-body p-4">
+                    <div id="gstModalLoading" class="text-center py-4 text-body-secondary">
+                        <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                        Loading details &amp; documents...
                     </div>
 
-                    <h4 style="margin: 18px 0 10px; color:#1e1b4b;">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
-                    <div id="modalDocumentsList" style="margin-bottom: 16px;">
-                        <!-- Documents rendered via JS -->
-                    </div>
+                    <div id="gstModalContent" style="display:none;">
+                        <div id="gstFetchErrorBox" class="alert alert-danger py-2 px-3 small mb-3" style="display:none;"></div>
+                        <div class="card bg-light border mb-3">
+                            <div class="card-body p-3">
+                                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+                                    <strong class="fs-6 text-dark" id="modalSellerName">—</strong>
+                                    <div id="modalGstStatus">—</div>
+                                </div>
+                                <div id="modalSellerMeta" class="small text-body-secondary mb-2">—</div>
+                                <div id="modalGstinRow" class="small text-dark mb-1" style="display:none;">
+                                    <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
+                                    <div class="small text-body-secondary mt-1"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
+                                </div>
+                                <div class="small text-body-secondary">
+                                    <strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span>
+                                </div>
 
-                    <!-- Embedded Live PDF / Document Viewer -->
-                    <div id="modalInlinePreviewBox" style="display:none; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; margin-bottom:20px; background:#f8fafc;">
-                        <div style="background:#f1f5f9; padding:8px 14px; border-bottom:1px solid #cbd5e1; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                            <strong style="font-size:13px; color:#334155;" id="modalPreviewLabel">Live Document Preview</strong>
-                            <div style="display:flex; gap:8px; align-items:center;">
-                                <a id="modalPreviewNewTab" href="#" target="_blank" style="font-size:12px; font-weight:700; color:#0284c7; text-decoration:none;">↗ Open Full Screen</a>
-                                <a id="modalPreviewDownload" href="#" style="font-size:12px; font-weight:700; color:#475569; text-decoration:none;">⬇ Download</a>
-                                <button type="button" class="btn-dl" style="font-size:11px; padding:4px 8px;" onclick="closeInlineDocPreview()">Close Preview</button>
+                                <div id="rejectionAlertBox" class="alert alert-danger mt-2 mb-0 py-2 px-3" style="display:none;">
+                                    <strong class="small">Rejection Reason:</strong>
+                                    <div id="modalRejectionReason" class="small mt-1">—</div>
+                                </div>
                             </div>
                         </div>
-                        <div id="modalPreviewFrameWrap" style="width:100%; height:440px; background:#e2e8f0; display:flex; align-items:center; justify-content:center;"></div>
-                        <div id="modalPreviewHint" style="font-size:12px; color:#64748b; padding:6px 14px; background:#f8fafc; border-top:1px solid #e2e8f0;">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
-                    </div>
 
-                    <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
-                        <h4 style="margin: 0 0 12px; color:#1e1b4b;">Admin Verification Actions</h4>
-                        
-                        <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
-                            <!-- Approve Form -->
-                            <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
-                                <input type="hidden" name="action" value="approve_gst">
-                                <input type="hidden" name="seller_id" id="approveSellerId">
-                                <input type="hidden" name="notes" value="Approved by administrator">
-                                <button type="submit" class="btn-approve">Approve Document</button>
-                            </form>
-
-                            <!-- Reject Toggle Button -->
-                            <button type="button" class="btn-reject" onclick="toggleRejectBox()">Reject Document...</button>
+                        <h4 class="h6 fw-bold mt-3 mb-2">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
+                        <div id="modalDocumentsList" class="mb-3">
+                            <!-- Documents rendered via JS -->
                         </div>
 
-                        <!-- Reject Reason Form Box -->
-                        <div id="rejectBox" style="display:none; background:#fef2f2; border:1px solid #fecaca; border-radius:10px; padding:16px; margin-top:14px;">
-                            <form method="POST" action="/admin">
-                                <input type="hidden" name="action" value="reject_gst">
-                                <input type="hidden" name="seller_id" id="rejectSellerId">
-                                <label style="margin-top:0; color:#991b1b; font-weight:700;">Mandatory Rejection Reason <span style="color:#ef4444;">*</span></label>
-                                <div class="reject-presets">
-                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
-                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
-                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
-                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
+                        <!-- Embedded Live PDF / Document Viewer -->
+                        <div id="modalInlinePreviewBox" class="card border mb-3 overflow-hidden" style="display:none;">
+                            <div class="card-header bg-light py-2 px-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                                <strong class="small text-dark" id="modalPreviewLabel">Live Document Preview</strong>
+                                <div class="d-flex gap-2 align-items-center">
+                                    <a id="modalPreviewNewTab" href="#" target="_blank" class="btn btn-outline-primary btn-sm py-0 px-2">↗ Open Full Screen</a>
+                                    <a id="modalPreviewDownload" href="#" class="btn btn-outline-secondary btn-sm py-0 px-2">⬇ Download</a>
+                                    <button type="button" class="btn btn-secondary btn-sm py-0 px-2" onclick="closeInlineDocPreview()">Close Preview</button>
                                 </div>
-                                <textarea name="rejection_reason" id="rejectReasonInput" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry certificate, name mismatch)..."></textarea>
-                                <div style="display:flex; gap:10px; margin-top:10px;">
-                                    <button type="submit" class="btn-reject">Confirm Rejection</button>
-                                    <button type="button" onclick="toggleRejectBox()" style="background:#e2e8f0; color:#334155;" class="btn">Cancel</button>
-                                </div>
-                            </form>
+                            </div>
+                            <div id="modalPreviewFrameWrap" class="bg-body-secondary d-flex align-items-center justify-content-center" style="width:100%; height:440px;"></div>
+                            <div id="modalPreviewHint" class="small text-body-secondary px-3 py-2 bg-light border-top">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
                         </div>
-                    </div>
 
-                    <!-- Verification Audit Logs -->
-                    <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:24px;">
-                        <h4 style="margin: 0 0 10px; color:#1e1b4b;">Verification Audit Trail</h4>
-                        <div id="modalLogsList" style="max-height:160px; overflow-y:auto; border:1px solid #f1f5f9; border-radius:8px; padding:0 12px; background:#fafafa;">
-                            <!-- Logs rendered via JS -->
+                        <div class="border-top pt-3 mt-3">
+                            <h4 class="h6 fw-bold mb-2">Admin Verification Actions</h4>
+                            <div class="d-flex gap-2 flex-wrap align-items-start">
+                                <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
+                                    <input type="hidden" name="action" value="approve_gst">
+                                    <input type="hidden" name="seller_id" id="approveSellerId">
+                                    <input type="hidden" name="notes" value="Approved by administrator">
+                                    <button type="submit" class="btn btn-success fw-semibold">✓ Approve Document</button>
+                                </form>
+
+                                <button type="button" class="btn btn-danger fw-semibold" onclick="toggleRejectBox()">✕ Reject Document...</button>
+                            </div>
+
+                            <!-- Reject Reason Form Box -->
+                            <div id="rejectBox" class="alert alert-danger mt-3 mb-0 p-3" style="display:none;">
+                                <form method="POST" action="/admin">
+                                    <input type="hidden" name="action" value="reject_gst">
+                                    <input type="hidden" name="seller_id" id="rejectSellerId">
+                                    <label class="form-label small fw-bold text-danger-emphasis">Mandatory Rejection Reason <span class="text-danger">*</span></label>
+                                    <div class="reject-presets mb-2">
+                                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
+                                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
+                                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
+                                        <button type="button" class="btn btn-outline-danger btn-sm rounded-pill reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
+                                    </div>
+                                    <textarea class="form-control border-danger-subtle" name="rejection_reason" id="rejectReasonInput" required rows="3" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry certificate, name mismatch)..."></textarea>
+                                    <div class="d-flex gap-2 mt-2">
+                                        <button type="submit" class="btn btn-danger btn-sm fw-semibold">Confirm Rejection</button>
+                                        <button type="button" onclick="toggleRejectBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+
+                        <!-- Verification Audit Logs -->
+                        <div class="border-top pt-3 mt-4">
+                            <h4 class="h6 fw-bold mb-2">Verification Audit Trail</h4>
+                            <div id="modalLogsList" class="border rounded-3 px-3 bg-light" style="max-height:160px; overflow-y:auto;">
+                                <!-- Logs rendered via JS -->
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -2119,258 +2282,349 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 
     <!-- Edit Category Modal -->
     <div id="editCategoryModal" class="modal-overlay" onclick="if(event.target.id==='editCategoryModal') closeCategoryModal();">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h3 id="catModalTitle">Edit Category</h3>
-                <button type="button" class="modal-close" onclick="closeCategoryModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <form method="POST" action="/admin">
-                    <input type="hidden" name="action" value="edit_category">
-                    <input type="hidden" name="category_id" id="editCatId">
-                    <div class="grid">
-                        <div>
-                            <label>Category Name *</label>
-                            <input name="name" id="editCatName" required maxlength="100">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="catModalTitle">Edit Category</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeCategoryModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <form method="POST" action="/admin">
+                        <input type="hidden" name="action" value="edit_category">
+                        <input type="hidden" name="category_id" id="editCatId">
+                        <div class="row g-3">
+                            <div class="col-md-8">
+                                <label class="form-label small fw-semibold">Category Name *</label>
+                                <input class="form-control" name="name" id="editCatName" required maxlength="100">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">Icon (Emoji)</label>
+                                <input class="form-control" name="icon" id="editCatIcon" maxlength="20">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Description</label>
+                                <input class="form-control" name="description" id="editCatDesc" maxlength="255">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Sort Order</label>
+                                <input class="form-control" type="number" name="sort_order" id="editCatSort">
+                            </div>
+                            <div class="col-md-6 d-flex align-items-end pb-1">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="is_active" id="editCatActive" value="1">
+                                    <label class="form-check-label small fw-semibold" for="editCatActive">Category Active</label>
+                                </div>
+                            </div>
                         </div>
-                        <div>
-                            <label>Icon (Emoji)</label>
-                            <input name="icon" id="editCatIcon" maxlength="20">
+                        <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                            <button type="button" onclick="closeCategoryModal()" class="btn btn-outline-secondary">Cancel</button>
+                            <button type="submit" class="btn btn-primary fw-semibold">Save Category Changes</button>
                         </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Description</label>
-                            <input name="description" id="editCatDesc" maxlength="255">
-                        </div>
-                        <div>
-                            <label>Sort Order</label>
-                            <input type="number" name="sort_order" id="editCatSort">
-                        </div>
-                        <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
-                            <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
-                                <input type="checkbox" name="is_active" id="editCatActive" value="1" style="width:auto;"> Category Active
-                            </label>
-                        </div>
-                    </div>
-                    <br>
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <button type="submit">Save Category Changes</button>
-                        <button type="button" onclick="closeCategoryModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-                    </div>
-                </form>
+                    </form>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Seller Profile & Edit Modal -->
     <div id="sellerModal" class="modal-overlay" onclick="handleOverlayClick(event)">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h3 id="modalTitle">Seller Profile</h3>
-                <button type="button" class="modal-close" onclick="closeSellerModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="info-pill" style="grid-template-columns: repeat(2, 1fr);">
-                    <div class="info-pill-item">Seller ID<strong id="viewSellerId">—</strong></div>
-                    <div class="info-pill-item">Registered On<strong id="viewCreatedAt">—</strong></div>
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="modalTitle">Seller Profile</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeSellerModal()"></button>
                 </div>
+                <div class="modal-body p-4">
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <div class="p-2 bg-light border rounded-3">
+                                <div class="small text-body-secondary">Seller ID</div>
+                                <strong class="text-dark" id="viewSellerId">—</strong>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <div class="p-2 bg-light border rounded-3">
+                                <div class="small text-body-secondary">Registered On</div>
+                                <strong class="text-dark" id="viewCreatedAt">—</strong>
+                            </div>
+                        </div>
+                    </div>
 
-                <form method="POST" action="/admin">
-                    <input type="hidden" name="action" value="edit_seller">
-                    <input type="hidden" name="seller_id" id="formSellerId">
-                    
-                    <div class="grid">
-                        <div>
-                            <label>Seller / Shop Name</label>
-                            <input name="seller_name" id="formSellerName" required maxlength="120">
+                    <form method="POST" action="/admin">
+                        <input type="hidden" name="action" value="edit_seller">
+                        <input type="hidden" name="seller_id" id="formSellerId">
+
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Seller / Shop Name *</label>
+                                <input class="form-control" name="seller_name" id="formSellerName" required maxlength="120">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Phone (+country code)</label>
+                                <input class="form-control" name="phone" id="formPhone" placeholder="+919876543210">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Email Address</label>
+                                <input class="form-control" type="email" name="email" id="formEmail" placeholder="seller@example.com">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">State *</label>
+                                <input class="form-control" name="state" id="formState" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Country *</label>
+                                <input class="form-control" name="country" id="formCountry" required>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Address *</label>
+                                <input class="form-control" name="address" id="formAddress" required>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Landmark</label>
+                                <input class="form-control" name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
+                            </div>
+                            <div class="col-12 mt-3 pt-2 border-top">
+                                <strong class="small text-dark">Change Password</strong>
+                                <span class="small text-body-secondary ms-1">(leave blank if not changing)</span>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Current Password</label>
+                                <input class="form-control" type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">New Password</label>
+                                <input class="form-control" type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Confirm Password</label>
+                                <input class="form-control" type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
+                            </div>
                         </div>
-                        <div>
-                            <label>Phone (+country code)</label>
-                            <input name="phone" id="formPhone" placeholder="+919876543210">
+                        <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                            <button type="button" onclick="closeSellerModal()" class="btn btn-outline-secondary">Cancel</button>
+                            <button type="submit" class="btn btn-primary fw-semibold">Save Changes</button>
                         </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Email Address</label>
-                            <input type="email" name="email" id="formEmail" placeholder="seller@example.com">
-                        </div>
-                        <div>
-                            <label>State</label>
-                            <input name="state" id="formState" required>
-                        </div>
-                        <div>
-                            <label>Country</label>
-                            <input name="country" id="formCountry" required>
-                        </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Address</label>
-                            <input name="address" id="formAddress" required>
-                        </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Landmark</label>
-                            <input name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
-                        </div>
-                        <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
-                            <strong style="color: #334155; font-size: 13px;">Change Password</strong>
-                            <span style="font-size: 12px; color: #64748b; margin-left: 6px;">(leave blank if not changing)</span>
-                        </div>
-                        <div>
-                            <label>Current Password</label>
-                            <input type="password" name="current_password" id="formCurrentPassword" placeholder="Current password" autocomplete="current-password">
-                        </div>
-                        <div>
-                            <label>New Password</label>
-                            <input type="password" name="new_password" id="formNewPassword" minlength="8" placeholder="At least 8 characters" autocomplete="new-password">
-                        </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Confirm Password</label>
-                            <input type="password" name="confirm_password" id="formConfirmPassword" minlength="8" placeholder="Confirm new password" autocomplete="new-password">
-                        </div>
-                    </div>
-                    <br>
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <button type="submit">Save Changes</button>
-                        <button type="button" onclick="closeSellerModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-                    </div>
-                </form>
+                    </form>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Seller Deletion Preflight Modal -->
     <div id="deletionPreflightModal" class="modal-overlay" onclick="if(event.target.id==='deletionPreflightModal') closeDeletionPreflightModal();">
-        <div class="modal-box wide">
-            <div class="modal-header">
-                <h3 id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
-                <button type="button" class="modal-close" onclick="closeDeletionPreflightModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="delPreflightLoading" style="text-align:center; padding:32px; color:#64748b;">Computing orders, refunds, payouts &amp; settlement snapshot...</div>
-                <div id="delPreflightBody" style="display:none;"></div>
+        <div class="modal-dialog modal-dialog-centered modal-xl">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="delPreflightTitle">Request Seller Deletion — Preflight Audit</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeDeletionPreflightModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="delPreflightLoading" class="text-center py-4 text-body-secondary">
+                        <div class="spinner-border spinner-border-sm text-danger me-2" role="status"></div>
+                        Computing orders, refunds, payouts &amp; settlement snapshot...
+                    </div>
+                    <div id="delPreflightBody" style="display:none;"></div>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Seller Deletion Review Workspace Modal -->
     <div id="deletionWorkspaceModal" class="modal-overlay" onclick="if(event.target.id==='deletionWorkspaceModal') closeDeletionWorkspaceModal();">
-        <div class="modal-box wide">
-            <div class="modal-header">
-                <h3 id="delWsTitle">Seller Deletion Review Workspace</h3>
-                <button type="button" class="modal-close" onclick="closeDeletionWorkspaceModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="delWsLoading" style="text-align:center; padding:32px; color:#64748b;">Loading seller deletion workspace...</div>
-                <div id="delWsBody" style="display:none;"></div>
+        <div class="modal-dialog modal-dialog-centered modal-xl">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="delWsTitle">Seller Deletion Review Workspace</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeDeletionWorkspaceModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="delWsLoading" class="text-center py-4 text-body-secondary">
+                        <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                        Loading seller deletion workspace...
+                    </div>
+                    <div id="delWsBody" style="display:none;"></div>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Admin Product Add / Edit Modal -->
     <div id="productModal" class="modal-overlay" onclick="if(event.target.id==='productModal') closeProductModal();">
-        <div class="modal-box" style="max-width:760px;">
-            <div class="modal-header">
-                <h3 id="prodModalTitle">Add New Product</h3>
-                <button type="button" class="modal-close" onclick="closeProductModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <form method="POST" action="/admin" enctype="multipart/form-data">
-                    <input type="hidden" name="action" id="prodFormAction" value="create_product">
-                    <input type="hidden" name="product_id" id="prodFormId" value="">
-                    <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
-                    <div class="grid">
-                        <div style="grid-column: 1 / -1;">
-                            <label>Product Name *</label>
-                            <input name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="prodModalTitle">Add New Product</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeProductModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <form method="POST" action="/admin" enctype="multipart/form-data">
+                        <input type="hidden" name="action" id="prodFormAction" value="create_product">
+                        <input type="hidden" name="product_id" id="prodFormId" value="">
+                        <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
+                        <div class="row g-3">
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Product Name *</label>
+                                <input class="form-control" name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Seller Account *</label>
+                                <select class="form-select" name="seller_id" id="prodFormSeller" required>
+                                    <option value="">-- Select Seller --</option>
+                                    <?php foreach ($eligibleSellersForProducts as $spOpt): ?>
+                                        <?php $spAcc = strtoupper((string) ($spOpt['account_status'] ?? 'ACTIVE')); ?>
+                                        <option value="<?= (int) $spOpt['id'] ?>" data-acc-status="<?= htmlspecialchars($spAcc, ENT_QUOTES, 'UTF-8') ?>">
+                                            <?= htmlspecialchars($spOpt['display_name'] . ' (#' . (int) $spOpt['id'] . ')' . ($spAcc !== 'ACTIVE' ? ' [' . $spAcc . ']' : '')) ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Category *</label>
+                                <select class="form-select" name="category_id" id="prodFormCategory" required>
+                                    <?php foreach ($categoriesList as $catOpt): ?>
+                                        <option value="<?= (int) $catOpt['id'] ?>"><?= htmlspecialchars($catOpt['name']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">Selling Price (₹) *</label>
+                                <input class="form-control" type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">MRP (₹)</label>
+                                <input class="form-control" type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (+30%)">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">Stock Quantity *</label>
+                                <input class="form-control" type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">SKU</label>
+                                <input class="form-control" name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if blank">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold">Brand</label>
+                                <input class="form-control" name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
+                            </div>
+                            <div class="col-md-4 d-flex align-items-end pb-1">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="is_active" id="prodFormActive" value="1" checked>
+                                    <label class="form-check-label small fw-semibold" for="prodFormActive">Active (Storefront)</label>
+                                </div>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Description</label>
+                                <textarea class="form-control" name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
+                            </div>
+                            <div id="prodExistingImagesWrap" class="col-12" style="display:none;">
+                                <label class="form-label small fw-semibold mb-1">Current Product Images (uncheck to remove)</label>
+                                <div id="prodModalExistingImgs" class="existing-img-grid"></div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Upload Product Images (up to 4, auto-WebP)</label>
+                                <input class="form-control" type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Add Image URLs (optional)</label>
+                                <textarea class="form-control" name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
+                            </div>
+                            <div id="prodEditImageOptions" class="col-12 bg-light border rounded-3 p-2 gap-3 flex-wrap align-items-center" style="display:none;">
+                                <div class="form-check mb-0">
+                                    <input class="form-check-input" type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1">
+                                    <label class="form-check-label small" for="prodFormReplaceImgs">Replace all existing images with new uploads/URLs</label>
+                                </div>
+                                <div class="form-check mb-0">
+                                    <input class="form-check-input" type="checkbox" name="clear_images" id="prodFormClearImgs" value="1">
+                                    <label class="form-check-label small text-danger" for="prodFormClearImgs">Remove all images</label>
+                                </div>
+                            </div>
                         </div>
-                        <div>
-                            <label>Seller Account *</label>
-                            <select name="seller_id" id="prodFormSeller" required>
-                                <option value="">-- Select Seller --</option>
-                                <?php foreach ($eligibleSellersForProducts as $spOpt): ?>
-                                    <?php $spAcc = strtoupper((string) ($spOpt['account_status'] ?? 'ACTIVE')); ?>
-                                    <option value="<?= (int) $spOpt['id'] ?>" data-acc-status="<?= htmlspecialchars($spAcc, ENT_QUOTES, 'UTF-8') ?>">
-                                        <?= htmlspecialchars($spOpt['display_name'] . ' (#' . (int) $spOpt['id'] . ')' . ($spAcc !== 'ACTIVE' ? ' [' . $spAcc . ']' : '')) ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
+                        <div class="d-flex justify-content-between align-items-center mt-4 pt-2 border-top">
+                            <button type="button" onclick="closeProductModal()" class="btn btn-outline-secondary">Cancel</button>
+                            <button type="submit" id="prodFormSubmitBtn" class="btn btn-primary fw-semibold">Save Product</button>
                         </div>
-                        <div>
-                            <label>Category *</label>
-                            <select name="category_id" id="prodFormCategory" required>
-                                <?php foreach ($categoriesList as $catOpt): ?>
-                                    <option value="<?= (int) $catOpt['id'] ?>"><?= htmlspecialchars($catOpt['name']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div>
-                            <label>Selling Price (₹) *</label>
-                            <input type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
-                        </div>
-                        <div>
-                            <label>MRP (₹)</label>
-                            <input type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (defaults +30%)">
-                        </div>
-                        <div>
-                            <label>Stock Quantity *</label>
-                            <input type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
-                        </div>
-                        <div>
-                            <label>SKU</label>
-                            <input name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if left blank">
-                        </div>
-                        <div>
-                            <label>Brand</label>
-                            <input name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
-                        </div>
-                        <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
-                            <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
-                                <input type="checkbox" name="is_active" id="prodFormActive" value="1" checked style="width:auto;"> Active (Visible on Storefront)
-                            </label>
-                        </div>
-                        <div style="grid-column: 1 / -1;">
-                            <label>Description</label>
-                            <textarea name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
-                        </div>
-                        <div id="prodExistingImagesWrap" style="grid-column: 1 / -1; display:none;">
-                            <label style="margin-bottom:4px;">Current Product Images (uncheck to remove)</label>
-                            <div id="prodModalExistingImgs" class="existing-img-grid"></div>
-                        </div>
-                        <div>
-                            <label>Upload Product Images (up to 4, auto-WebP)</label>
-                            <input type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
-                        </div>
-                        <div>
-                            <label>Add Image URLs (optional, comma/newline separated)</label>
-                            <textarea name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
-                        </div>
-                        <div id="prodEditImageOptions" style="grid-column: 1 / -1; display:none; gap:16px; flex-wrap:wrap; align-items:center; padding:8px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
-                            <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px;">
-                                <input type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1" style="width:auto;"> Replace all existing images with new uploads/URLs
-                            </label>
-                            <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px; color:#b91c1c;">
-                                <input type="checkbox" name="clear_images" id="prodFormClearImgs" value="1" style="width:auto;"> Remove all images
-                            </label>
-                        </div>
-                    </div>
-                    <br>
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <button type="submit" id="prodFormSubmitBtn">Save Product</button>
-                        <button type="button" onclick="closeProductModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-                    </div>
-                </form>
+                    </form>
+                </div>
             </div>
         </div>
     </div>
 
     <!-- Shared In-Page Form Confirmation Modal (replaces native confirm()) -->
     <div id="confirmActionModal" class="modal-overlay" style="z-index: 1100;" onclick="if(event.target.id==='confirmActionModal') closeConfirmModal();">
-        <div class="modal-box" style="max-width:460px;">
-            <div class="modal-header">
-                <h3 id="confirmModalTitle">Confirm Action</h3>
-                <button type="button" class="modal-close" onclick="closeConfirmModal()">&times;</button>
+        <div class="modal-dialog modal-dialog-centered modal-sm-custom">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0" id="confirmModalTitle">Confirm Action</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeConfirmModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <p id="confirmModalMessage" class="text-body-secondary mb-4">Are you sure?</p>
+                    <div class="d-flex justify-content-end gap-2">
+                        <button type="button" onclick="closeConfirmModal()" class="btn btn-outline-secondary">Cancel</button>
+                        <button type="button" onclick="confirmPendingForm()" class="btn btn-danger fw-semibold">Confirm</button>
+                    </div>
+                </div>
             </div>
-            <div class="modal-body">
-                <p id="confirmModalMessage" style="margin:0 0 18px; color:#334155; font-size:14px; line-height:1.5;">Are you sure?</p>
-                <div style="display:flex; justify-content:flex-end; gap:10px;">
-                    <button type="button" onclick="closeConfirmModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
-                    <button type="button" onclick="confirmPendingForm()" style="background:#dc2626;">Confirm</button>
+        </div>
+    </div>
+
+    <!-- Hostinger Business Email (SMTP) Settings & Test Modal -->
+    <div id="hostingerMailModal" class="modal-overlay" onclick="if(event.target.id==='hostingerMailModal') closeHostingerMailModal();">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0"><i class="bi bi-envelope-at text-primary me-2"></i>Hostinger Mail SMTP Integration</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeHostingerMailModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="hmStatusBanner" class="alert alert-secondary small py-2 mb-3">Loading Hostinger Mail status...</div>
+                    <form onsubmit="saveHostingerMailSettings(event)">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">SMTP Host</label>
+                                <input class="form-control form-control-sm" id="hmHost" value="smtp.hostinger.com" required>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small fw-semibold">Port</label>
+                                <select class="form-select form-select-sm" id="hmPort" onchange="onHostingerPortChange()">
+                                    <option value="465" selected>465 (SSL/TLS)</option>
+                                    <option value="587">587 (STARTTLS)</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label small fw-semibold">Encryption</label>
+                                <input class="form-control form-control-sm" id="hmEncryption" value="ssl" readonly>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Hostinger Email (Username) *</label>
+                                <input class="form-control form-control-sm" type="email" id="hmUsername" placeholder="contact@knowlipop.shop" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Mailbox Password</label>
+                                <input class="form-control form-control-sm" type="password" id="hmPassword" placeholder="Enter Hostinger email password">
+                                <div class="form-text small" id="hmPassHint">Leave blank to keep existing saved password.</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">From Address</label>
+                                <input class="form-control form-control-sm" type="email" id="hmFromAddress" placeholder="Defaults to Hostinger Email">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">From Name</label>
+                                <input class="form-control form-control-sm" id="hmFromName" value="Knowlipop Vendor">
+                            </div>
+                        </div>
+                        <div class="d-flex justify-content-end gap-2 mt-3">
+                            <button type="submit" id="hmSaveBtn" class="btn btn-primary btn-sm fw-semibold"><i class="bi bi-save me-1"></i>Save Hostinger Mail Settings</button>
+                        </div>
+                    </form>
+                    <hr class="my-3">
+                    <div class="bg-light border rounded-3 p-3">
+                        <label class="form-label small fw-bold mb-1">Send Live Test Email via Hostinger Mail</label>
+                        <div class="input-group input-group-sm">
+                            <input type="email" class="form-control" id="hmTestRecipient" placeholder="recipient@example.com">
+                            <button type="button" id="hmTestBtn" class="btn btn-success fw-semibold" onclick="sendHostingerTestEmail()"><i class="bi bi-send me-1"></i>Send Test Email</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2544,23 +2798,26 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             var winStart = Math.max(1, st.page - 2);
             var winEnd = Math.min(totalPages, st.page + 2);
             if (winStart > 1) {
-                pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button>';
-                if (winStart > 2) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+                pagesHtml += '<li class="page-item"><button type="button" class="page-link pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button></li>';
+                if (winStart > 2) pagesHtml += '<li class="page-item disabled"><span class="page-link">...</span></li>';
             }
             for (var pNum = winStart; pNum <= winEnd; pNum++) {
-                pagesHtml += '<button type="button" class="pg-btn' + (pNum === st.page ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button>';
+                var isCurPg = (pNum === st.page);
+                pagesHtml += '<li class="page-item' + (isCurPg ? ' active' : '') + '"><button type="button" class="page-link pg-btn' + (isCurPg ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button></li>';
             }
             if (winEnd < totalPages) {
-                if (winEnd < totalPages - 1) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
-                pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button>';
+                if (winEnd < totalPages - 1) pagesHtml += '<li class="page-item disabled"><span class="page-link">...</span></li>';
+                pagesHtml += '<li class="page-item"><button type="button" class="page-link pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button></li>';
             }
 
-            barEl.innerHTML = '<div><strong>' + escapeHtml(summaryText) + '</strong></div>' +
-                '<div class="pg-controls">' +
-                '<select class="pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
-                '<button type="button" class="pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button>' +
+            barEl.innerHTML = '<div class="small fw-semibold text-body-secondary">' + escapeHtml(summaryText) + '</div>' +
+                '<div class="d-flex align-items-center gap-2 flex-wrap">' +
+                '<select class="form-select form-select-sm w-auto pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
+                '<nav aria-label="Table pagination"><ul class="pagination pagination-sm mb-0">' +
+                '<li class="page-item' + (st.page <= 1 ? ' disabled' : '') + '"><button type="button" class="page-link pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button></li>' +
                 pagesHtml +
-                '<button type="button" class="pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button>' +
+                '<li class="page-item' + (st.page >= totalPages ? ' disabled' : '') + '"><button type="button" class="page-link pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button></li>' +
+                '</ul></nav>' +
                 '</div>';
         }
 
@@ -3077,10 +3334,10 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 
             if (!fileExists) {
                 if (hintEl) hintEl.style.display = 'none';
-                frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;">' +
+                frameWrap.innerHTML = '<div class="p-4 text-center bg-warning-subtle text-warning-emphasis w-100 h-100 d-flex flex-column align-items-center justify-content-center gap-2">' +
                     '<strong>File Not Found on Server Disk</strong>' +
-                    '<p style="font-size:13px;max-width:440px;margin:0;line-height:1.5;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
-                    '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
+                    '<p class="small mb-1" style="max-width:440px;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
+                    '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
                     '</div>';
                 return;
             }
@@ -3178,31 +3435,31 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     document.getElementById('modalDocCount').innerText = docs.length;
                     var docsContainer = document.getElementById('modalDocumentsList');
                     if (docs.length === 0) {
-                        docsContainer.innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">No documents uploaded by this seller yet.</div>';
+                        docsContainer.innerHTML = '<div class="text-body-secondary small p-3 bg-light rounded-3 border">No documents uploaded by this seller yet.</div>';
                     } else {
                         var docsHtml = '';
                         docs.forEach(function(d) {
                             var dName = String(d.original_name || ('Document #' + d.id));
                             var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (dName.toLowerCase().slice(-4) === '.pdf'));
                             var typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
-                            var primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
-                            var missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Re-upload Needed)</span>' : '';
+                            var primaryTag = d.is_primary ? '<span class="badge text-bg-primary ms-1">Main Document</span>' : '';
+                            var missingTag = (d.file_exists === false) ? '<span class="badge text-bg-warning ms-1">File Missing (Re-upload Needed)</span>' : '';
                             var previewHref = d.admin_preview_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(d.id) + '&mode=preview');
                             var dlHref = d.admin_download_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(d.id) + '&mode=download');
 
                             docsHtml += '<div class="doc-card">' +
                                 '<div>' +
-                                '<div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                                '<div class="fw-bold small text-dark d-flex align-items-center gap-2 flex-wrap">' +
                                 typeBadge + ' ' + escapeHtml(dName) + ' ' + primaryTag + ' ' + missingTag +
                                 '</div>' +
-                                '<div style="font-size:12px; color:#64748b; margin-top:4px;">' +
+                                '<div class="small text-body-secondary mt-1">' +
                                 escapeHtml(d.file_size_formatted || '') + ' &bull; Uploaded ' + escapeHtml(d.created_at ? String(d.created_at).slice(0, 10) : '') +
                                 '</div>' +
                                 '</div>' +
-                                '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-                                '<button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
-                                '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn-view" style="background:#475569;">New Tab</a>' +
-                                '<a href="' + escapeHtml(dlHref) + '" class="btn-dl">Download</a>' +
+                                '<div class="d-flex gap-2 flex-wrap">' +
+                                '<button type="button" class="btn btn-info btn-sm text-white fw-semibold" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
+                                '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn btn-outline-secondary btn-sm fw-semibold">New Tab</a>' +
+                                '<a href="' + escapeHtml(dlHref) + '" class="btn btn-outline-dark btn-sm fw-semibold">Download</a>' +
                                 '</div>' +
                                 '</div>';
                         });
@@ -3216,18 +3473,18 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 
                     var logsContainer = document.getElementById('modalLogsList');
                     if (logs.length === 0) {
-                        logsContainer.innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">No history logs recorded yet.</div>';
+                        logsContainer.innerHTML = '<div class="text-body-secondary small py-2">No history logs recorded yet.</div>';
                     } else {
                         var logsHtml = '';
                         logs.forEach(function(l) {
                             logsHtml += '<div class="log-row">' +
-                                '<div style="color:#64748b; font-size:12px; min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
-                                '<div style="flex:1;">' +
+                                '<div class="text-body-secondary small" style="min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
+                                '<div class="flex-grow-1">' +
                                 '<strong>' + escapeHtml(String(l.action || '').toUpperCase()) + '</strong> ' +
-                                '<span style="color:#64748b;">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
+                                '<span class="text-body-secondary">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
                                 escapeHtml(l.notes || '') +
                                 '</div>' +
-                                '<div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">' + escapeHtml(l.new_status) + '</span></div>' +
+                                '<div><span class="badge text-bg-secondary">' + escapeHtml(l.new_status) + '</span></div>' +
                                 '</div>';
                         });
                         logsContainer.innerHTML = logsHtml;
@@ -3252,8 +3509,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     if (msMeta) msMeta.innerText = 'Seller ID #' + sellerId;
                     document.getElementById('modalGstStatus').innerHTML = '<span class="badge-pending">Offline / Partial</span>';
                     document.getElementById('modalDocCount').innerText = '0';
-                    document.getElementById('modalDocumentsList').innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">Document metadata unavailable while fetch failed.</div>';
-                    document.getElementById('modalLogsList').innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">Logs unavailable while fetch failed.</div>';
+                    document.getElementById('modalDocumentsList').innerHTML = '<div class="text-body-secondary small p-3 bg-light rounded-3 border">Document metadata unavailable while fetch failed.</div>';
+                    document.getElementById('modalLogsList').innerHTML = '<div class="text-body-secondary small py-2">Logs unavailable while fetch failed.</div>';
                     if (autoShowReject) {
                         focusRejectBoxInModal();
                     }
@@ -3309,9 +3566,9 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             var slot = row.querySelector('.seller-del-btn-slot');
             if (slot) {
                 if (activeReqId && accUpper !== 'DELETED') {
-                    slot.innerHTML = '<button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
+                    slot.innerHTML = '<button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
                 } else if (accUpper !== 'DELETED') {
-                    slot.innerHTML = '<button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
+                    slot.innerHTML = '<button type="button" class="btn btn-outline-danger btn-sm fw-semibold" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
                 } else {
                     slot.innerHTML = '';
                 }
@@ -3362,7 +3619,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     var tbody = document.getElementById('deletionRequestsTbody');
                     if (!tbody) return;
                     if (data.requests.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="7" class="text-body-secondary text-center py-4">No seller deletion requests submitted yet.</td></tr>';
                         refreshTablePagination('del', true);
                         return;
                     }
@@ -3372,17 +3629,17 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         var finS = dr.financial_summary || {};
                         var searchTxt = ((dr.seller_name || '') + ' ' + (dr.seller_email || '') + ' ' + (dr.seller_phone || '') + ' ' + dr.seller_id + ' ' + dr.status + ' ' + dr.stage).toLowerCase();
                         html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
-                            '<td><strong>#' + Number(dr.id) + '</strong></td>' +
-                            '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
-                            (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : '') +
-                            '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
-                            (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
+                            '<td class="fw-bold">#' + Number(dr.id) + '</td>' +
+                            '<td><span class="fw-bold text-dark">' + escapeHtml(dr.seller_name) + '</span>' +
+                            (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow ms-1" style="font-size:10px; padding:2px 6px;">Seller Request</span>' : '') +
+                            '<div class="small text-body-secondary">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
+                            (dr.seller_email ? '<div class="small text-muted">' + escapeHtml(dr.seller_email) + '</div>' : '') +
                             '</td>' +
-                            '<td><div style="font-size:13px;">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div style="font-size:11px; color:#94a3b8;">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
-                            '<td><code style="background:#f1f5f9; padding:3px 6px; border-radius:4px; font-size:12px;">' + escapeHtml(dr.stage) + '</code></td>' +
+                            '<td><div class="small">' + escapeHtml((dr.created_at || '').slice(0, 10)) + '</div><div class="small text-muted">' + escapeHtml((dr.created_at || '').slice(11, 19)) + '</div></td>' +
+                            '<td><code class="bg-light px-2 py-1 rounded border small">' + escapeHtml(dr.stage) + '</code></td>' +
                             '<td>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</td>' +
-                            '<td style="font-size:12px; color:#475569;">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
-                            '<td><button type="button" class="btn-sm" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
+                            '<td class="small text-body-secondary">Orders: <strong>' + Number(snapM.total_orders || 0) + '</strong> &bull; Balance: <strong>' + fmtCur(finS.available_seller_balance || snapM.seller_wallet_balance || 0) + '</strong></td>' +
+                            '<td><button type="button" class="btn btn-primary btn-sm fw-semibold" onclick="openDeletionWorkspaceModal(' + Number(dr.id) + ')">Manage Deletion</button></td>' +
                             '</tr>';
                     });
                     tbody.innerHTML = html;
@@ -3408,7 +3665,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     var bodyEl = document.getElementById('delPreflightBody');
                     bodyEl.style.display = 'block';
                     if (!resObj.ok || !resObj.d || !resObj.d.seller) {
-                        bodyEl.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:14px;border-radius:8px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
+                        bodyEl.innerHTML = '<div class="alert alert-danger mb-0">' + escapeHtml((resObj.d && resObj.d.message) || 'Failed to load preflight metrics.') + '</div>';
                         return;
                     }
                     var s = resObj.d.seller;
@@ -3428,33 +3685,33 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         ['Outstanding Commissions', fmtCur(m.outstanding_commissions || 0)],
                         ['Open Disputes', Number(m.open_disputes_count || 0)]
                     ];
-                    var html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
-                        '<div><strong style="font-size:16px;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
-                        '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '—') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
-                        '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div>' +
-                        '<div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(175px, 1fr));gap:10px;margin-bottom:16px;">';
+                    var html = '<div class="card bg-light border mb-3"><div class="card-body p-3 d-flex justify-content-between align-items-center flex-wrap gap-2">' +
+                        '<div><strong class="fs-6 text-dark">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
+                        '<div class="small text-body-secondary mt-1">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '—') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
+                        '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div></div>' +
+                        '<div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-2 mb-3">';
                     cards.forEach(function(c) {
-                        html += '<div class="metric-mini"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div>';
+                        html += '<div class="col"><div class="metric-mini h-100"><div class="k">' + escapeHtml(c[0]) + '</div><div class="v">' + escapeHtml(String(c[1])) + '</div></div></div>';
                     });
                     html += '</div>' +
-                        '<div style="background:#fffbeb;border:1px solid #fcd34d;padding:12px;border-radius:8px;font-size:13px;color:#92400e;margin-bottom:14px;">' +
+                        '<div class="alert alert-warning small mb-3">' +
                         'Submitting this request sets the seller account immediately to <strong>DELETION_PENDING</strong>, notifies the seller, and blocks new buyer orders without deleting any historical data.' +
                         '</div>' +
-                        '<label>Deletion Request Reason *</label>' +
-                        '<input type="text" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255">' +
-                        '<label>Admin Remarks</label>' +
-                        '<textarea id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea>' +
-                        '<div id="preflightErrBox" style="color:#b91c1c;font-size:13px;margin-top:8px;"></div>' +
-                        '<div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end;">' +
-                        '<button type="button" onclick="closeDeletionPreflightModal()" style="background:#e2e8f0;color:#334155;">Cancel</button>' +
-                        '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" style="background:#dc2626;">Confirm Deletion Request (DELETION_PENDING)</button>' +
+                        '<div class="mb-3"><label class="form-label small fw-semibold">Deletion Request Reason *</label>' +
+                        '<input type="text" class="form-control" id="preflightReason" value="Admin initiated seller deletion audit" maxlength="255"></div>' +
+                        '<div class="mb-2"><label class="form-label small fw-semibold">Admin Remarks</label>' +
+                        '<textarea class="form-control" id="preflightRemarks" rows="2" placeholder="Optional initial audit remarks..."></textarea></div>' +
+                        '<div id="preflightErrBox" class="text-danger small mt-2"></div>' +
+                        '<div class="d-flex gap-2 mt-3 justify-content-end pt-2 border-top">' +
+                        '<button type="button" onclick="closeDeletionPreflightModal()" class="btn btn-outline-secondary">Cancel</button>' +
+                        '<button type="button" onclick="submitCreateDeletionRequest(' + Number(s.id) + ')" class="btn btn-danger fw-semibold">Confirm Deletion Request (DELETION_PENDING)</button>' +
                         '</div>';
                     bodyEl.innerHTML = html;
                 })
                 .catch(function(err) {
                     document.getElementById('delPreflightLoading').style.display = 'none';
                     document.getElementById('delPreflightBody').style.display = 'block';
-                    document.getElementById('delPreflightBody').innerHTML = '<div style="color:#b91c1c;">Error: ' + escapeHtml(err.message) + '</div>';
+                    document.getElementById('delPreflightBody').innerHTML = '<div class="alert alert-danger mb-0">Error: ' + escapeHtml(err.message) + '</div>';
                 });
         }
 
@@ -3523,7 +3780,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 payload.remarks = remarksInput.value.trim();
             }
             var msgBox = document.getElementById('wsFeedbackBox');
-            if (msgBox) msgBox.innerHTML = '<span style="color:#1d4ed8;">Processing action...</span>';
+            if (msgBox) msgBox.innerHTML = '<div class="alert alert-info py-2 px-3 small mb-3">Processing action...</div>';
 
             fetch('/api/admin/seller-deletions/' + Number(reqId) + '/' + subPath, {
                 method: 'POST',
@@ -3534,7 +3791,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
             .then(function(resObj) {
                 if (!resObj.ok) {
-                    if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
+                    if (msgBox) msgBox.innerHTML = '<div class="alert alert-danger py-2 px-3 small mb-3">' + escapeHtml((resObj.d && resObj.d.message) || 'Action failed.') + '</div>';
                     return;
                 }
                 if (resObj.d && resObj.d.deletion_request) {
@@ -3547,7 +3804,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 reloadDeletionRequestsList();
             })
             .catch(function(err) {
-                if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
+                if (msgBox) msgBox.innerHTML = '<div class="alert alert-danger py-2 px-3 small mb-3">' + escapeHtml(err.message) + '</div>';
             });
         }
 
@@ -3656,141 +3913,141 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             var isTerminal = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED');
 
             var html = '<div id="wsFeedbackBox">' +
-                (successBanner ? '<div style="background:#dcfce7;color:#15803d;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;">' + escapeHtml(successBanner) + '</div>' : '') +
+                (successBanner ? '<div class="alert alert-success py-2 px-3 small fw-semibold mb-3">' + escapeHtml(successBanner) + '</div>' : '') +
                 '</div>';
 
-            html += '<div class="ws-section" style="background:#f8fafc;">' +
-                '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">' +
+            html += '<div class="ws-section bg-light">' +
+                '<div class="d-flex justify-content-between align-items-start flex-wrap gap-2">' +
                 '<div>' +
-                '<div style="font-size:17px;font-weight:800;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span style="font-size:13px;color:#64748b;">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
-                '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '—') + ' &bull; Email: ' + escapeHtml(s.email || '—') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
-                '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '—') + '</div>' +
+                '<div class="fs-6 fw-bold text-dark">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span class="small text-body-secondary">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
+                '<div class="small text-body-secondary mt-1">Phone: ' + escapeHtml(s.phone || '—') + ' &bull; Email: ' + escapeHtml(s.email || '—') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
+                '<div class="small text-muted mt-1">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '—') + '</div>' +
                 '</div>' +
-                '<div style="text-align:right;">' +
-                '<div style="margin-bottom:6px;">Stage: <code style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-weight:700;">' + escapeHtml(dr.stage) + '</code></div>' +
+                '<div class="text-md-end">' +
+                '<div class="mb-1 small">Stage: <code class="bg-primary-subtle text-primary-emphasis px-2 py-1 rounded fw-bold">' + escapeHtml(dr.stage) + '</code></div>' +
                 '<div>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</div>' +
                 '</div></div></div>';
 
             html += '<div class="ws-section"><h4><span>6-Gate Verification Checklist</span><span>' +
                 (data.all_checks_passed ? delStatusBadgeHtml('GREEN', 'ALL CHECKS PASSED') : delStatusBadgeHtml('YELLOW', 'VERIFICATION INCOMPLETE')) +
-                '</span></h4><table><thead><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
+                '</span></h4><div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
             checks.forEach(function(ck) {
                 html += '<tr><td><strong>' + escapeHtml(ck.label) + '</strong></td><td>' + delStatusBadgeHtml(ck.status, ck.status) + '</td></tr>';
             });
-            html += '</tbody></table></div>';
+            html += '</tbody></table></div></div>';
 
             html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
-                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
-                '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
+                '<div class="d-flex gap-2 align-items-center flex-wrap">' +
+                '<label class="form-check-label small fw-semibold d-inline-flex align-items-center gap-1 m-0" style="cursor:pointer;"><input type="checkbox" class="form-check-input mt-0" id="wsApproveRuleB"> Approve Accepted Order Cancellations (Rule B)</label>' +
+                '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
+                '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
                 '</div></h4>' +
-                '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
-                '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div>' +
+                '<div class="row row-cols-2 row-cols-sm-5 g-2 mb-2">' +
+                '<div class="col"><div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Confirmed (B)</div><div class="v">' + Number(m.confirmed_orders || 0) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Shipped (C)</div><div class="v">' + Number(m.shipped_orders || 0) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Delivered (D)</div><div class="v">' + Number(m.delivered_orders || 0) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Cancelled (E)</div><div class="v">' + Number(m.cancelled_orders || 0) + '</div></div></div>' +
                 '</div>';
             if (orders.length > 0) {
-                html += '<table><thead><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
+                html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Order</th><th>Status</th><th>Payment</th><th>Seller Share</th><th>Gateway / Window</th></tr></thead><tbody>';
                 orders.forEach(function(o) {
                     html += '<tr><td>#' + Number(o.id) + ' (' + escapeHtml(o.order_number || '') + ')</td>' +
                         '<td><strong>' + escapeHtml(o.effective_status) + '</strong></td>' +
                         '<td>' + escapeHtml(o.payment_method || '') + ' / ' + escapeHtml(o.payment_status || '') + '</td>' +
                         '<td>' + fmtCur(o.seller_gross || 0) + '</td>' +
-                        '<td style="font-size:12px;">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
+                        '<td class="small">' + (o.is_gateway_settled ? 'Gateway Settled' : 'Unsettled/Pending') + (o.return_window_active ? ' &bull; Return Window Active' : '') + (o.open_disputes_count > 0 ? ' &bull; Open Disputes: ' + Number(o.open_disputes_count) : '') + '</td></tr>';
                 });
-                html += '</tbody></table>';
+                html += '</tbody></table></div>';
             }
             html += '</div>';
 
             html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
-                '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
+                '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
+                '<div class="small text-body-secondary mb-2">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
             if (refunds.length === 0) {
-                html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
+                html += '<div class="small text-muted">No refund records queued for this seller.</div>';
             } else {
-                html += '<table><thead><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
+                html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
                 refunds.forEach(function(rf) {
                     html += '<tr><td>#' + Number(rf.id) + '</td><td>#' + Number(rf.order_id) + '</td><td>' + fmtCur(rf.eligible_refund_amount) + ' / ' + fmtCur(rf.refunded_amount) + '</td>' +
                         '<td><code>' + escapeHtml(rf.gateway_refund_id || '—') + '</code></td>' +
                         '<td>' + delStatusBadgeHtml(rf.badge_color || rf.status, rf.status) + '</td>' +
-                        '<td style="font-size:11px;color:#b91c1c;">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
+                        '<td class="small text-danger">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
                 });
-                html += '</tbody></table>';
+                html += '</tbody></table></div>';
             }
             html += '</div>';
 
             html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
-                '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
-                '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
-                '<div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v" style="font-size:14px;">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div>' +
-                '<div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div>' +
+                '<button type="button" class="btn btn-primary btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
+                '<div class="row row-cols-2 row-cols-md-3 g-2 mb-3">' +
+                '<div class="col"><div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Outstanding Commission</div><div class="v">' + fmtCur(set.outstanding_commissions) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Gateway Settlement</div><div class="v small fw-bold">' + (set.gateway_settled_ok ? 'ALL SETTLED' : Number(set.unsettled_gateway_count || 0) + ' UNSETTLED') + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Pending Disputes</div><div class="v">' + Number(set.pending_disputes_count || 0) + '</div></div></div>' +
+                '<div class="col"><div class="metric-mini"><div class="k">Total Obligations</div><div class="v">' + fmtCur(set.outstanding_financial_obligations) + '</div></div></div>' +
                 '</div>' +
-                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;background:#f8fafc;border-radius:8px;margin-bottom:10px;">' +
-                '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;"><input type="checkbox" id="wsConfirmGatewaySettled" style="width:auto;" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
-                '<input type="text" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;padding:6px 10px;font-size:12px;">' +
-                '<button type="button" class="btn-approve-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
+                '<div class="d-flex gap-2 align-items-center flex-wrap p-2 bg-light border rounded-3 mb-2">' +
+                '<label class="form-check-label small d-inline-flex align-items-center gap-1 m-0" style="cursor:pointer;"><input type="checkbox" class="form-check-input mt-0" id="wsConfirmGatewaySettled" ' + (set.gateway_settled_ok ? 'checked' : '') + '> Confirm Gateway Capture Settled</label>' +
+                '<input type="text" class="form-control form-control-sm" id="wsPayoutRef" placeholder="Payout Reference (e.g. UTR/NEFT)" style="max-width:220px;">' +
+                '<button type="button" class="btn btn-success btn-sm fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleSettlePayoutClick(' + Number(dr.id) + ')">Settle Payout / Clearance</button>' +
                 '</div>';
             if (disputes.length > 0) {
-                html += '<table><thead><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+                html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead class="table-light"><tr><th>Dispute #</th><th>Order ID</th><th>Type</th><th>Claim</th><th>Status</th><th>Action</th></tr></thead><tbody>';
                 disputes.forEach(function(dp) {
                     var isOpen = ['OPEN', 'UNDER_REVIEW', 'ESCALATED'].indexOf(String(dp.status || '').toUpperCase()) !== -1;
                     html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
                         '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
                         '<td>' + (isOpen && !isTerminal
-                            ? '<button type="button" class="btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
+                            ? '<button type="button" class="btn btn-primary btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
                             : 'Resolved') + '</td></tr>';
                 });
-                html += '</tbody></table>';
+                html += '</tbody></table></div>';
             }
             html += '</div>';
 
             html += '<div class="ws-section"><h4>Admin Decision &amp; Final Confirmation</h4>' +
-                '<label style="margin-top:0;">Admin Remarks</label>' +
-                '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
-                '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
-                '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">✓ Approve Deletion</button>' +
-                '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">⏸ Put On Hold</button>' +
-                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">✕ Reject Request</button>' +
-                '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
+                '<label class="form-label small fw-semibold">Admin Remarks</label>' +
+                '<textarea class="form-control" id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
+                '<div class="d-flex gap-2 flex-wrap mt-3 align-items-center">' +
+                '<button type="button" class="btn btn-success fw-semibold" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">✓ Approve Deletion</button>' +
+                '<button type="button" class="btn btn-warning fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">⏸ Put On Hold</button>' +
+                '<button type="button" class="btn btn-danger fw-semibold" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">✕ Reject Request</button>' +
+                '<button type="button" id="wsFinalDeleteBtn" class="btn btn-dark border-danger fw-semibold" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
                 '</div>' +
-                '<div id="wsHoldBox" style="display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:14px;margin-top:12px;">' +
-                '<strong style="color:#9a3412;font-size:13px;">Put Deletion Request On Hold</strong>' +
-                '<input type="text" id="wsHoldReasonInput" value="Awaiting manual verification / return period" style="margin-top:6px;">' +
-                '<div style="display:flex;gap:8px;margin-top:10px;">' +
-                '<button type="button" class="btn-hold-sm" style="padding:8px 14px;" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
-                '<button type="button" onclick="toggleWsHoldBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+                '<div id="wsHoldBox" class="alert alert-warning mt-3 mb-0 p-3" style="display:none;">' +
+                '<strong class="small d-block mb-2">Put Deletion Request On Hold</strong>' +
+                '<input type="text" class="form-control form-control-sm" id="wsHoldReasonInput" value="Awaiting manual verification / return period">' +
+                '<div class="d-flex gap-2 mt-2">' +
+                '<button type="button" class="btn btn-warning btn-sm fw-semibold" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
+                '<button type="button" onclick="toggleWsHoldBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>' +
                 '</div></div>' +
-                '<div id="wsRejectBox" style="display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px;margin-top:12px;">' +
-                '<strong style="color:#991b1b;font-size:13px;">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
-                '<textarea id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..." style="margin-top:6px;border-color:#fca5a5;"></textarea>' +
-                '<div id="wsRejectErr" style="color:#b91c1c;font-size:12px;margin-top:4px;"></div>' +
-                '<div style="display:flex;gap:8px;margin-top:10px;">' +
-                '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
-                '<button type="button" onclick="toggleWsRejectBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+                '<div id="wsRejectBox" class="alert alert-danger mt-3 mb-0 p-3" style="display:none;">' +
+                '<strong class="small d-block mb-2">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
+                '<textarea class="form-control form-control-sm border-danger-subtle" id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..."></textarea>' +
+                '<div id="wsRejectErr" class="text-danger small mt-1"></div>' +
+                '<div class="d-flex gap-2 mt-2">' +
+                '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
+                '<button type="button" onclick="toggleWsRejectBox()" class="btn btn-outline-secondary btn-sm">Cancel</button>' +
                 '</div></div>' +
-                (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
-                '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
-                '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
-                '<p style="font-size:13px;color:#7f1d1d;margin:6px 0;">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
-                '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
-                '<input type="text" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
-                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
+                (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div class="small text-body-secondary mt-2">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
+                '<div id="wsFinalConfirmBox" class="alert alert-danger border-2 border-danger mt-3 mb-0 p-3" style="display:none;">' +
+                '<strong class="small d-block">Second Explicit Confirmation Required</strong>' +
+                '<p class="small my-2">Type exact phrase <code>' + escapeHtml(dr.expected_confirmation_phrase || ('DELETE SELLER #' + dr.seller_id)) + '</code> below to soft-delete this seller, revoke tokens, and hide listings while preserving all orders and financial history.</p>' +
+                '<div class="d-flex gap-2 align-items-center flex-wrap">' +
+                '<input type="text" class="form-control form-control-sm" id="wsConfirmPhraseInput" placeholder="' + escapeHtml(dr.expected_confirmation_phrase || '') + '" style="max-width:280px;">' +
+                '<button type="button" class="btn btn-danger btn-sm fw-semibold" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
                 '</div></div></div>';
 
-            html += '<div class="ws-section"><h4>Admin Activity History (' + logs.length + ')</h4>';
+            html += '<div class="ws-section mb-0"><h4>Admin Activity History (' + logs.length + ')</h4>';
             if (logs.length === 0) {
-                html += '<div style="font-size:12px;color:#94a3b8;">No admin activity recorded yet.</div>';
+                html += '<div class="small text-muted">No admin activity recorded yet.</div>';
             } else {
                 logs.forEach(function(lg) {
-                    html += '<div class="log-row"><div style="color:#64748b;font-size:12px;min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
-                        '<div style="flex:1;"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div style="color:#475569;font-size:12px;">' + escapeHtml(lg.remarks || '') + '</div></div>' +
+                    html += '<div class="log-row"><div class="text-body-secondary small" style="min-width:140px;">' + escapeHtml((lg.created_at || '').slice(0, 19).replace('T', ' ')) + '</div>' +
+                        '<div class="flex-grow-1"><strong>' + escapeHtml(lg.action) + '</strong> (' + escapeHtml(lg.actor_role || 'admin') + ')<div class="text-body-secondary small">' + escapeHtml(lg.remarks || '') + '</div></div>' +
                         '<div>' + delStatusBadgeHtml(lg.new_status || lg.new_stage || 'INFO', lg.new_status || lg.new_stage || '') + '</div></div>';
                 });
             }
@@ -3798,6 +4055,139 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 
             document.getElementById('delWsBody').innerHTML = html;
         }
+
+        function onHostingerPortChange() {
+            var port = document.getElementById('hmPort').value;
+            document.getElementById('hmEncryption').value = (String(port) === '587') ? 'tls' : 'ssl';
+        }
+
+        function openHostingerMailModal() {
+            document.getElementById('hostingerMailModal').classList.add('active');
+            loadHostingerMailConfig();
+        }
+
+        function closeHostingerMailModal() {
+            document.getElementById('hostingerMailModal').classList.remove('active');
+        }
+
+        function loadHostingerMailConfig() {
+            var banner = document.getElementById('hmStatusBanner');
+            banner.className = 'alert alert-secondary small py-2 mb-3';
+            banner.innerText = 'Loading Hostinger Mail configuration...';
+            fetch('/api/admin/email/config', { credentials: 'same-origin' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var cfg = (data && data.email) || {};
+                    if (cfg.host) document.getElementById('hmHost').value = cfg.host;
+                    if (cfg.port) document.getElementById('hmPort').value = String(cfg.port);
+                    document.getElementById('hmEncryption').value = cfg.encryption || (String(cfg.port) === '587' ? 'tls' : 'ssl');
+                    document.getElementById('hmUsername').value = cfg.username || '';
+                    document.getElementById('hmPassword').value = '';
+                    document.getElementById('hmFromAddress').value = cfg.from_address || cfg.username || '';
+                    document.getElementById('hmFromName').value = cfg.from_name || 'Knowlipop Vendor';
+                    document.getElementById('hmPassHint').innerText = cfg.has_password
+                        ? 'A Hostinger mailbox password is currently saved. Leave blank to keep it.'
+                        : 'Enter your Hostinger Business Email mailbox password.';
+                    if (cfg.configured) {
+                        banner.className = 'alert alert-success small py-2 mb-3';
+                        banner.innerText = 'Hostinger Mail SMTP is ACTIVE (' + (cfg.username || '') + ' via ' + (cfg.host || 'smtp.hostinger.com') + ':' + (cfg.port || 465) + ', source: ' + (cfg.source || 'env') + ').';
+                    } else {
+                        banner.className = 'alert alert-warning small py-2 mb-3';
+                        banner.innerText = 'Hostinger Mail SMTP is not configured yet. Enter your Hostinger email address and password below to enable OTP & notification emails.';
+                    }
+                })
+                .catch(function() {
+                    banner.className = 'alert alert-danger small py-2 mb-3';
+                    banner.innerText = 'Could not load email settings.';
+                });
+        }
+
+        function saveHostingerMailSettings(ev) {
+            if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+            var btn = document.getElementById('hmSaveBtn');
+            var banner = document.getElementById('hmStatusBanner');
+            btn.disabled = true;
+            var payload = {
+                host: document.getElementById('hmHost').value.trim(),
+                port: parseInt(document.getElementById('hmPort').value, 10) || 465,
+                encryption: document.getElementById('hmEncryption').value.trim() || 'ssl',
+                username: document.getElementById('hmUsername').value.trim(),
+                password: document.getElementById('hmPassword').value,
+                from_address: document.getElementById('hmFromAddress').value.trim() || document.getElementById('hmUsername').value.trim(),
+                from_name: document.getElementById('hmFromName').value.trim() || 'Knowlipop Vendor'
+            };
+            fetch('/api/admin/email/config', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(res) {
+                btn.disabled = false;
+                if (res.ok && res.d && res.d.status === 'success') {
+                    banner.className = 'alert alert-success small py-2 mb-3';
+                    banner.innerText = res.d.message || 'Saved Hostinger Mail settings.';
+                    document.getElementById('hmPassword').value = '';
+                    loadHostingerMailConfig();
+                } else {
+                    banner.className = 'alert alert-danger small py-2 mb-3';
+                    banner.innerText = (res.d && res.d.message) || 'Failed to save settings.';
+                }
+            })
+            .catch(function() {
+                btn.disabled = false;
+                banner.className = 'alert alert-danger small py-2 mb-3';
+                banner.innerText = 'Network error saving mail settings.';
+            });
+        }
+
+        function sendHostingerTestEmail() {
+            var to = document.getElementById('hmTestRecipient').value.trim();
+            var banner = document.getElementById('hmStatusBanner');
+            if (!to || to.indexOf('@') === -1) {
+                banner.className = 'alert alert-danger small py-2 mb-3';
+                banner.innerText = 'Enter a valid recipient email address to send a test email.';
+                return;
+            }
+            var btn = document.getElementById('hmTestBtn');
+            btn.disabled = true;
+            banner.className = 'alert alert-info small py-2 mb-3';
+            banner.innerText = 'Connecting to Hostinger Mail SMTP and sending test email...';
+            var payload = {
+                to: to,
+                host: document.getElementById('hmHost').value.trim(),
+                port: parseInt(document.getElementById('hmPort').value, 10) || 465,
+                encryption: document.getElementById('hmEncryption').value.trim() || 'ssl',
+                username: document.getElementById('hmUsername').value.trim(),
+                password: document.getElementById('hmPassword').value,
+                from_address: document.getElementById('hmFromAddress').value.trim() || document.getElementById('hmUsername').value.trim(),
+                from_name: document.getElementById('hmFromName').value.trim() || 'Knowlipop Vendor'
+            };
+            fetch('/api/admin/email/test', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+            .then(function(res) {
+                btn.disabled = false;
+                if (res.ok && res.d && res.d.status === 'success') {
+                    banner.className = 'alert alert-success small py-2 mb-3';
+                    banner.innerText = res.d.message || 'Test email sent successfully!';
+                } else {
+                    banner.className = 'alert alert-danger small py-2 mb-3';
+                    banner.innerText = (res.d && res.d.message) || 'Test email failed.';
+                }
+            })
+            .catch(function() {
+                btn.disabled = false;
+                banner.className = 'alert alert-danger small py-2 mb-3';
+                banner.innerText = 'Network error sending test email.';
+            });
+        }
     </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>

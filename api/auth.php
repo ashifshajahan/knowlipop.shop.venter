@@ -529,6 +529,13 @@ function apiRegister(PDO $pdo): void
     $publicEmail = $email !== '' ? $email : null;
     $token = createToken($pdo, $userId, $dbPhone, 'vendor-app', $publicEmail, 'seller');
 
+    if ($publicEmail && function_exists('sendWelcomeSellerMailPhp')) {
+        try {
+            sendWelcomeSellerMailPhp($pdo, $publicEmail, $sellerName, $dbPhone);
+        } catch (Throwable $ignoreMailErr) {
+        }
+    }
+
     jsonResponse([
         'message' => 'Seller registration successful.',
         'user' => safeSeller($user),
@@ -956,8 +963,9 @@ function apiForgotPassword(PDO $pdo): void
             ':token' => $hashedOtp
         ]);
 
+        $sellerDisplayName = (string) ($user['seller_name'] ?? $user['name'] ?? 'Seller');
         $gatewayResult = $activeChannel === 'email'
-            ? sendPasswordResetEmail((string) $targetEmail, $otp, $continueUrl, $authMode)
+            ? sendPasswordResetEmail((string) $targetEmail, $otp, $continueUrl, $authMode, $pdo, $sellerDisplayName)
             : sendOtpSms((string) $targetPhone, $otp, $recaptchaToken);
     }
 

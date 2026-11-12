@@ -25,6 +25,31 @@ const {
   recordOrderPaymentCaptureNode,
   createOrderDisputeNode
 } = require('../helpers/seller_deletion');
+const { sendSellerDeletionLifecycleMailNode } = require('../helpers/mailer');
+
+function dispatchDeletionLifecycleMailAsync(pool, data, event, reason = '') {
+  setImmediate(async () => {
+    try {
+      const seller = (data && data.seller) || {};
+      const reqRow = (data && data.deletion_request) || {};
+      let to = seller.email || '';
+      let sellerName = seller.seller_name || seller.name || 'Seller';
+      const reqId = Number(reqRow.id || (data && data.request_id) || 0);
+      if (!to && seller.id && pool) {
+        try {
+          const [rows] = await pool.query('SELECT email, seller_name, name FROM users WHERE id = ? LIMIT 1', [Number(seller.id)]);
+          if (rows && rows[0]) {
+            to = rows[0].email || '';
+            if (sellerName === 'Seller') sellerName = rows[0].seller_name || rows[0].name || 'Seller';
+          }
+        } catch (ignore) {}
+      }
+      if (to) {
+        await sendSellerDeletionLifecycleMailNode(pool, { to, sellerName, event, requestId: reqId, reason });
+      }
+    } catch (ignore) {}
+  });
+}
 
 function sendErrorJson(res, statusCode, message, extras = {}) {
   const payload = { message };
@@ -103,6 +128,8 @@ function createSellerDeletionRouter({
         const extras = result.existing_request_id ? { existing_request_id: result.existing_request_id } : {};
         return sendErrorJson(res, result.code || 400, result.error, extras);
       }
+
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'REQUESTED', reason);
 
       const payload = isAdmin ? { ...result.data } : sanitizeDeletionPayloadForSellerNode(result.data);
       payload.has_request = true;
@@ -213,6 +240,7 @@ function createSellerDeletionRouter({
       if (result.error) {
         return sendErrorJson(res, result.code || 400, result.error);
       }
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'WITHDRAWN', reason);
       return res.status(result.statusCode || 200).json({
         status: 'success',
         message: 'Seller deletion request withdrawn. Account restored to ACTIVE status.',
@@ -396,6 +424,7 @@ function createSellerDeletionRouter({
         const extras = result.existing_request_id ? { existing_request_id: result.existing_request_id } : {};
         return sendErrorJson(res, result.code || 400, result.error, extras);
       }
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'REQUESTED', reason);
       return res.status(result.statusCode || 201).json({
         status: 'success',
         message: 'Seller deletion request created. Account entered DELETION_PENDING status and new orders are blocked.',
@@ -553,6 +582,7 @@ function createSellerDeletionRouter({
         const extras = result.failing_checks ? { failing_checks: result.failing_checks } : {};
         return sendErrorJson(res, result.code || 400, result.error, extras);
       }
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'APPROVED', remarks);
       return res.status(result.statusCode || 200).json({
         status: 'success',
         message: 'Seller deletion approved. Explicit second confirmation required to finalize.',
@@ -573,6 +603,7 @@ function createSellerDeletionRouter({
     try {
       const result = await deletionRejectNode(getPool(), deletionCtx, delReqId, Number(req.user.id), reason, remarks, getClientIp(req));
       if (result.error) return sendErrorJson(res, result.code || 400, result.error);
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'REJECTED', reason || remarks);
       return res.status(result.statusCode || 200).json({
         status: 'success',
         message: 'Seller deletion request rejected. Seller account restored to ACTIVE.',
@@ -593,6 +624,7 @@ function createSellerDeletionRouter({
     try {
       const result = await deletionHoldNode(getPool(), deletionCtx, delReqId, Number(req.user.id), reason, remarks, getClientIp(req));
       if (result.error) return sendErrorJson(res, result.code || 400, result.error);
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'ON_HOLD', reason || remarks);
       return res.status(result.statusCode || 200).json({
         status: 'success',
         message: 'Seller deletion request placed ON HOLD.',
@@ -610,6 +642,7 @@ function createSellerDeletionRouter({
     try {
       const result = await deletionFinalDeleteNode(getPool(), deletionCtx, delReqId, Number(req.user.id), req.body || {}, getClientIp(req));
       if (result.error) return sendErrorJson(res, result.code || 400, result.error);
+      dispatchDeletionLifecycleMailAsync(getPool(), result.data, 'DELETED', '');
       return res.status(result.statusCode || 200).json({
         status: 'success',
         message: 'Seller account permanently soft-deleted. Financial and order records preserved.',

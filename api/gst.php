@@ -9,6 +9,7 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../helpers/response.php';
 require_once __DIR__ . '/../helpers/auth.php';
 require_once __DIR__ . '/../helpers/gst.php';
+require_once __DIR__ . '/../helpers/mailer.php';
 
 /**
  * Helper to check admin role
@@ -716,6 +717,18 @@ function apiAdminApproveGst(PDO $pdo, int $sellerId): void
 
     logGstVerification($pdo, $sellerId, (int)$gst['id'], 'approved', $prevStatus, 'Approved', $notes, $adminId, 'admin');
 
+    if (function_exists('sendGstStatusMailPhp')) {
+        try {
+            $uStmt = $pdo->prepare("SELECT email, seller_name, name FROM users WHERE id = :id LIMIT 1");
+            $uStmt->execute([':id' => $sellerId]);
+            $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+            if ($uRow && !empty($uRow['email'])) {
+                sendGstStatusMailPhp($pdo, (string) $uRow['email'], (string) ($uRow['seller_name'] ?? $uRow['name'] ?? 'Seller'), 'Approved', (string) ($gst['gstin'] ?? ''), $notes);
+            }
+        } catch (Throwable $ignoreMail) {
+        }
+    }
+
     jsonResponse([
         'status' => 'success',
         'message' => 'Seller GST has been approved successfully.',
@@ -776,6 +789,18 @@ function apiAdminRejectGst(PDO $pdo, int $sellerId): void
     ]);
 
     logGstVerification($pdo, $sellerId, (int)$gst['id'], 'rejected', $prevStatus, 'Rejected', $reason, $adminId, 'admin');
+
+    if (function_exists('sendGstStatusMailPhp')) {
+        try {
+            $uStmt = $pdo->prepare("SELECT email, seller_name, name FROM users WHERE id = :id LIMIT 1");
+            $uStmt->execute([':id' => $sellerId]);
+            $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+            if ($uRow && !empty($uRow['email'])) {
+                sendGstStatusMailPhp($pdo, (string) $uRow['email'], (string) ($uRow['seller_name'] ?? $uRow['name'] ?? 'Seller'), 'Rejected', (string) ($gst['gstin'] ?? ''), $reason);
+            }
+        } catch (Throwable $ignoreMail) {
+        }
+    }
 
     jsonResponse([
         'status' => 'success',

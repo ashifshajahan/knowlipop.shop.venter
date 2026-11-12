@@ -105,52 +105,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Vendor Admin — Sign In</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 20px; }
-        .card { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 36px; max-width: 440px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
-        .brand { font-size: 20px; font-weight: 800; color: #38bdf8; margin-bottom: 24px; display: flex; align-items: center; gap: 8px; }
-        .badge { background: rgba(56,189,248,0.15); border: 1px solid rgba(56,189,248,0.3); color: #38bdf8; font-size: 11px; padding: 3px 8px; border-radius: 999px; text-transform: uppercase; font-weight: 700; }
-        h1 { margin: 0 0 8px; font-size: 24px; color: #ffffff; }
-        p.muted { color: #94a3b8; font-size: 14px; margin: 0 0 24px; line-height: 1.5; }
-        label { display: block; font-size: 13px; font-weight: 600; margin: 16px 0 6px; color: #cbd5e1; }
-        input { width: 100%; padding: 12px 14px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; font-size: 14px; color: #fff; outline: none; transition: border-color .2s; }
-        input:focus { border-color: #38bdf8; }
-        button { width: 100%; background: #0284c7; color: #fff; border: 0; border-radius: 8px; padding: 13px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 24px; transition: background .2s; }
-        button:hover { background: #0369a1; }
-        .error { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 12px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 20px; line-height: 1.4; }
-        .hint-box { margin-top: 24px; padding: 14px; background: rgba(56,189,248,0.05); border: 1px dashed rgba(56,189,248,0.3); border-radius: 8px; font-size: 12px; color: #94a3b8; }
-        .hint-box strong { color: #e2e8f0; }
+        body {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+            display: flex;
+            flex-direction: column;
+        }
+        .login-card {
+            max-width: 440px;
+            width: 100%;
+            border-radius: 1rem;
+        }
     </style>
 </head>
 <body>
-    <div class="card">
-        <div class="brand">
-            <span>Vendor</span>
-            <span class="badge">Admin Panel</span>
+    <nav class="navbar navbar-dark bg-dark shadow-sm">
+        <div class="container">
+            <span class="navbar-brand fw-bold d-flex align-items-center gap-2">
+                <i class="bi bi-shop-window text-primary"></i>
+                Vendor <span class="badge bg-primary fw-semibold">Admin Panel</span>
+            </span>
         </div>
-        <h1>Admin sign in</h1>
-        <p class="muted">Sign in with your master administrator credentials.</p>
+    </nav>
 
-        <?php if ($error): ?>
-            <div class="error"><?= htmlspecialchars($error) ?></div>
-        <?php endif; ?>
+    <main class="flex-grow-1 d-flex align-items-center justify-content-center p-3 p-md-4">
+        <div class="card login-card border-0 shadow-lg">
+            <div class="card-body p-4 p-sm-5">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <span class="rounded-3 bg-primary bg-opacity-10 text-primary p-2 d-inline-flex align-items-center justify-content-center">
+                        <i class="bi bi-shield-lock-fill fs-4"></i>
+                    </span>
+                    <div>
+                        <h1 class="h4 fw-bold mb-0 text-dark">Admin sign in</h1>
+                        <small class="text-body-secondary">Sign in with your master administrator credentials.</small>
+                    </div>
+                </div>
 
-        <form method="POST" action="/admin/login">
-            <label>Admin email</label>
-            <input type="email" name="email" value="<?= htmlspecialchars($_POST['email'] ?? 'admin@vendor.app') ?>" required autofocus autocomplete="username">
+                <?php if ($error): ?>
+                    <div class="alert alert-danger d-flex align-items-start gap-2 py-2 px-3 small" role="alert">
+                        <i class="bi bi-exclamation-triangle-fill mt-1"></i>
+                        <div><?= htmlspecialchars($error) ?></div>
+                    </div>
+                <?php endif; ?>
 
-            <label>Password</label>
-            <input type="password" name="password" value="<?= htmlspecialchars($_POST['password'] ?? 'Admin123!') ?>" required autocomplete="current-password">
+                <form method="POST" action="/admin/login" class="mt-3">
+                    <div class="mb-3">
+                        <label for="adminEmailInput" class="form-label fw-semibold small text-secondary">Admin email</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-light"><i class="bi bi-envelope text-secondary"></i></span>
+                            <input type="email" id="adminEmailInput" name="email" class="form-control" value="<?= htmlspecialchars($_POST['email'] ?? 'admin@vendor.app') ?>" required autofocus autocomplete="username">
+                        </div>
+                    </div>
 
-            <button type="submit">Sign in to Dashboard</button>
-        </form>
+                    <div class="mb-4">
+                        <label for="adminPasswordInput" class="form-label fw-semibold small text-secondary">Password</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-light"><i class="bi bi-key text-secondary"></i></span>
+                            <input type="password" id="adminPasswordInput" name="password" class="form-control" value="<?= htmlspecialchars($_POST['password'] ?? 'Admin123!') ?>" required autocomplete="current-password">
+                        </div>
+                    </div>
 
-        <div class="hint-box">
-            <strong>Default Hostinger Credentials:</strong><br>
-            Email: <code>admin@vendor.app</code><br>
-            Password: <code>Admin123!</code>
+                    <button type="submit" class="btn btn-primary w-100 fw-semibold py-2">
+                        <i class="bi bi-box-arrow-in-right me-1"></i> Sign in to Dashboard
+                    </button>
+                </form>
+
+                <div class="alert alert-light border mt-4 mb-0 small text-body-secondary">
+                    <div class="fw-semibold text-dark mb-1"><i class="bi bi-info-circle me-1 text-primary"></i> Default Hostinger Credentials</div>
+                    <div>Email: <code>admin@vendor.app</code></div>
+                    <div>Password: <code>Admin123!</code></div>
+                </div>
+            </div>
         </div>
-    </div>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>

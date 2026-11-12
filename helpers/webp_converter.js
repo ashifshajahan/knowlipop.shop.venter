@@ -208,10 +208,15 @@ function validateAnimatedWebpChunks(buf) {
 
 function isSvgBuffer(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 10) return false;
-  const headSlice = buf.subarray(0, Math.min(buf.length, 512));
+  const headSlice = buf.subarray(0, Math.min(buf.length, 2048));
   if (headSlice.includes(0)) return false;
   const head = headSlice.toString('utf8').trimStart().replace(/^\uFEFF/, '').toLowerCase();
-  return head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'));
+  const stripped = head
+    .replace(/^<\?xml[^>]*\?>\s*/i, '')
+    .replace(/^(?:<!--[\s\S]*?-->\s*)+/i, '')
+    .replace(/^<!doctype\s+svg[^>]*>\s*/i, '')
+    .trimStart();
+  return head.startsWith('<svg') || stripped.startsWith('<svg') || (head.includes('<svg') && (head.startsWith('<?xml') || head.startsWith('<!--')));
 }
 
 function isSafeSvgBuffer(buf) {
