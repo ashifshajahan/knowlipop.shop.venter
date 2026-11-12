@@ -68,6 +68,157 @@ function apiAdminCreateSellerDeletion(PDO $pdo): void
     ], $res['data']), $res['statusCode']);
 }
 
+function apiSellerRequestDeletion(PDO $pdo, ?int $urlSellerId = null, bool $requireExplicitForAdmin = false): void
+{
+    $actor = authenticateUser($pdo);
+    $isAdmin = strtolower((string) ($actor['role'] ?? 'seller')) === 'admin';
+    $input = getJsonInput();
+
+    $bodySellerRaw = $input['seller_id'] ?? null;
+    if ($urlSellerId !== null) {
+        if ($urlSellerId <= 0) {
+            errorResponse('Valid seller_id is required.', ['seller_id' => ['Valid seller_id is required.']], 422);
+        }
+        if (!$isAdmin && $urlSellerId !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only submit deletion requests for your own seller account.', [], 403);
+        }
+        $targetSellerId = $urlSellerId;
+    } elseif ($bodySellerRaw !== null && $bodySellerRaw !== '') {
+        $bodySellerId = (int) $bodySellerRaw;
+        if ($bodySellerId <= 0) {
+            errorResponse('Valid seller_id is required.', ['seller_id' => ['Valid seller_id is required.']], 422);
+        }
+        if (!$isAdmin && $bodySellerId !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only submit deletion requests for your own seller account.', [], 403);
+        }
+        $targetSellerId = $bodySellerId;
+    } else {
+        if ($requireExplicitForAdmin && $isAdmin) {
+            errorResponse('Valid seller_id is required.', ['seller_id' => ['Valid seller_id is required.']], 422);
+        }
+        $targetSellerId = (int) $actor['id'];
+    }
+
+    $actorRole = $isAdmin ? 'admin' : 'seller';
+    $reason = trim((string) ($input['reason'] ?? $input['request_reason'] ?? $input['deletion_reason'] ?? $input['notes'] ?? $input['comment'] ?? ''));
+    $remarks = $isAdmin ? trim((string) ($input['remarks'] ?? $input['admin_remarks'] ?? '')) : '';
+
+    $res = deletionCreateRequestPhp($pdo, $targetSellerId, (int) $actor['id'], $reason, $remarks, $actorRole);
+    if (!empty($res['error'])) {
+        $extra = !empty($res['existing_request_id']) ? ['existing_request_id' => $res['existing_request_id']] : [];
+        errorResponse($res['error'], $extra, (int) ($res['code'] ?? 400));
+    }
+
+    $payload = $res['data'];
+    if (!$isAdmin) {
+        $payload = sanitizeDeletionPayloadForSellerPhp($payload);
+    }
+    $payload['has_request'] = true;
+    $payload['has_active_request'] = true;
+    $payload['account_status'] = $payload['seller']['account_status'] ?? 'DELETION_PENDING';
+    $payload['can_request_deletion'] = false;
+    $payload['can_withdraw_request'] = true;
+
+    $msg = $isAdmin
+        ? 'Seller deletion request created. Account entered DELETION_PENDING status and new orders are blocked.'
+        : 'Seller deletion request submitted. Account entered DELETION_PENDING status and new orders are blocked.';
+
+    jsonResponse(array_merge([
+        'status' => 'success',
+        'message' => $msg,
+    ], $payload), $res['statusCode']);
+}
+
+function apiSellerGetDeletionStatus(PDO $pdo, ?int $urlSellerId = null, bool $allowAdminList = false): void
+{
+    $actor = authenticateUser($pdo);
+    $isAdmin = strtolower((string) ($actor['role'] ?? 'seller')) === 'admin';
+
+    if ($allowAdminList && $isAdmin && $urlSellerId === null && empty($_GET['seller_id'])) {
+        $filters = [
+            'status' => $_GET['status'] ?? '',
+            'stage' => $_GET['stage'] ?? '',
+            'search' => $_GET['search'] ?? $_GET['q'] ?? '',
+        ];
+        
+        $res = deletionListRequestsPhp($pdo, $filters);
+        jsonResponse(array_merge(['status' => 'success'], $res));
+    }
+
+    $querySellerRaw = $_GET['seller_id'] ?? null;
+    if ($urlSellerId !== null) {
+        if ($urlSellerId <= 0) {
+            errorResponse('Valid seller_id is required.', [], 422);
+        }
+        if (!$isAdmin && $urlSellerId !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only view deletion status for your own seller account.', [], 403);
+        }
+        $targetSellerId = $urlSellerId;
+    } elseif ($querySellerRaw !== null && $querySellerRaw !== '') {
+        $qSid = (int) $querySellerRaw;
+        if ($qSid <= 0) {
+            errorResponse('Valid seller_id is required.', [], 422);
+        }
+        if (!$isAdmin && $qSid !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only view deletion status for your own seller account.', [], 403);
+        }
+        $targetSellerId = $qSid;
+    } else {
+        $targetSellerId = (int) $actor['id'];
+    }
+
+    $res = deletionGetSellerStatusPhp($pdo, $targetSellerId, !$isAdmin);
+    if (!empty($res['error'])) {
+        errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
+    }
+
+    jsonResponse(array_merge(['status' => 'success'], $res['data']), $res['statusCode']);
+}
+
+function apiSellerWithdrawDeletion(PDO $pdo, ?int $urlSellerId = null, ?int $urlDeletionReqId = null): void
+{
+    $actor = authenticateUser($pdo);
+    $isAdmin = strtolower((string) ($actor['role'] ?? 'seller')) === 'admin';
+    $input = getJsonInput();
+
+    $bodySellerRaw = $input['seller_id'] ?? null;
+    if ($urlSellerId !== null) {
+        if ($urlSellerId <= 0) {
+            errorResponse('Valid seller_id is required.', [], 422);
+        }
+        if (!$isAdmin && $urlSellerId !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only withdraw deletion requests for your own seller account.', [], 403);
+        }
+        $targetSellerId = $urlSellerId;
+    } elseif ($bodySellerRaw !== null && $bodySellerRaw !== '') {
+        $bodySid = (int) $bodySellerRaw;
+        if ($bodySid <= 0) {
+            errorResponse('Valid seller_id is required.', ['seller_id' => ['Valid seller_id is required.']], 422);
+        }
+        if (!$isAdmin && $bodySid !== (int) $actor['id']) {
+            errorResponse('Forbidden. You can only withdraw deletion requests for your own seller account.', [], 403);
+        }
+        $targetSellerId = $bodySid;
+    } else {
+        $targetSellerId = (int) $actor['id'];
+    }
+
+    $delReqId = $urlDeletionReqId !== null
+        ? $urlDeletionReqId
+        : (!empty($input['deletion_request_id']) ? (int) $input['deletion_request_id'] : null);
+    $reason = trim((string) ($input['reason'] ?? $input['withdrawal_reason'] ?? $input['notes'] ?? ''));
+
+    $res = deletionWithdrawBySellerPhp($pdo, $targetSellerId, (int) $actor['id'], $reason, $isAdmin ? 'admin' : 'seller', $delReqId);
+    if (!empty($res['error'])) {
+        errorResponse($res['error'], [], (int) ($res['code'] ?? 400));
+    }
+
+    jsonResponse(array_merge([
+        'status' => 'success',
+        'message' => 'Seller deletion request withdrawn. Account restored to ACTIVE status.',
+    ], $res['data']), $res['statusCode']);
+}
+
 function apiAdminGetSellerDeletionDetail(PDO $pdo, int $delReqId): void
 {
     authenticateAdminForDeletionPhp($pdo);

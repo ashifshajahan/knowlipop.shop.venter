@@ -281,6 +281,8 @@ if ($requestUri === '/api/me') {
         apiGetSellerProfile($pdo);
     } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
         apiUpdateSellerProfile($pdo);
+    } elseif ($method === 'DELETE') {
+        apiSellerRequestDeletion($pdo);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
@@ -389,6 +391,8 @@ if ($requestUri === '/api/seller/profile') {
         apiGetSellerProfile($pdo);
     } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
         apiUpdateSellerProfile($pdo);
+    } elseif ($method === 'DELETE') {
+        apiSellerRequestDeletion($pdo);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
@@ -585,6 +589,8 @@ if (preg_match('#^/(?:api/sellers?|api/seller/profile)/(\d+)$#', $requestUri, $m
         apiGetSellerById($pdo, $sellerId);
     } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
         apiUpdateSellerProfile($pdo, $sellerId);
+    } elseif ($method === 'DELETE' && !str_starts_with($requestUri, '/api/seller/profile/')) {
+        apiSellerRequestDeletion($pdo, $sellerId);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
@@ -710,6 +716,125 @@ if (preg_match('#^/api/admin/sellers/gst/documents/(\d+)/(preview|download)$#', 
 }
 
 // ==========================================
+// Seller Self-Service Account Deletion Routes
+// ==========================================
+
+if (in_array($requestUri, [
+    '/api/seller/deletion-request',
+    '/api/seller/deletion-requests',
+    '/api/seller/deletion',
+    '/api/seller/request-deletion',
+    '/api/seller/delete-request',
+], true)) {
+    if ($method === 'GET') {
+        apiSellerGetDeletionStatus($pdo);
+    } elseif ($method === 'POST') {
+        apiSellerRequestDeletion($pdo);
+    } elseif ($method === 'DELETE') {
+        apiSellerWithdrawDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (in_array($requestUri, [
+    '/api/seller/deletion/status',
+    '/api/seller/deletion-status',
+    '/api/seller/deletion/preflight',
+    '/api/seller/deletion-request/preflight',
+], true)) {
+    if ($method === 'GET') {
+        apiSellerGetDeletionStatus($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (in_array($requestUri, [
+    '/api/seller/delete-account',
+    '/api/seller/account/delete',
+    '/api/seller/account/deletion-request',
+], true)) {
+    if ($method === 'GET') {
+        apiSellerGetDeletionStatus($pdo);
+    } elseif ($method === 'POST' || $method === 'DELETE') {
+        apiSellerRequestDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/profile/delete') {
+    if ($method === 'POST' || $method === 'DELETE') {
+        apiSellerRequestDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller/account') {
+    if ($method === 'DELETE') {
+        apiSellerRequestDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (in_array($requestUri, [
+    '/api/seller/deletion-request/cancel',
+    '/api/seller/deletion-request/withdraw',
+    '/api/seller/deletion/cancel',
+    '/api/seller/deletion/withdraw',
+], true)) {
+    if ($method === 'POST' || $method === 'DELETE') {
+        apiSellerWithdrawDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/seller/deletion-requests?/(\d+)(?:/(cancel|withdraw))?$#', $requestUri, $matches)) {
+    if (!empty($matches[2]) && ($method === 'POST' || $method === 'DELETE')) {
+        apiSellerWithdrawDeletion($pdo, null, (int) $matches[1]);
+    } elseif (empty($matches[2]) && $method === 'DELETE') {
+        apiSellerWithdrawDeletion($pdo, null, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/sellers?/(\d+)/(deletion-request|request-deletion)$#', $requestUri, $matches)) {
+    $targetSid = (int) $matches[1];
+    if ($method === 'GET') {
+        apiSellerGetDeletionStatus($pdo, $targetSid);
+    } elseif ($method === 'POST') {
+        apiSellerRequestDeletion($pdo, $targetSid);
+    } elseif ($method === 'DELETE' && $matches[2] === 'deletion-request') {
+        apiSellerWithdrawDeletion($pdo, $targetSid);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/sellers?/(\d+)/deletion-request/(cancel|withdraw)$#', $requestUri, $matches)) {
+    if ($method === 'POST' || $method === 'DELETE') {
+        apiSellerWithdrawDeletion($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/seller-deletions' || $requestUri === '/api/seller-deletions/request') {
+    if ($method === 'GET' && $requestUri === '/api/seller-deletions') {
+        apiSellerGetDeletionStatus($pdo, null, true);
+    } elseif ($method === 'POST') {
+        apiSellerRequestDeletion($pdo, null, true);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// ==========================================
 // Admin Seller Account Deletion & Refund Routes
 // ==========================================
 
@@ -717,6 +842,14 @@ if ($requestUri === '/api/admin/seller-deletions') {
     if ($method === 'GET') {
         apiAdminListSellerDeletions($pdo);
     } elseif ($method === 'POST') {
+        apiAdminCreateSellerDeletion($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if ($requestUri === '/api/admin/seller-deletions/request') {
+    if ($method === 'POST') {
         apiAdminCreateSellerDeletion($pdo);
     } else {
         errorResponse('Method Not Allowed', [], 405);
@@ -739,7 +872,7 @@ if (preg_match('#^/api/admin/seller-deletions/(\d+)$#', $requestUri, $matches)) 
     }
 }
 
-if (preg_match('#^/api/admin/seller-deletions/(\d+)/lock$#', $requestUri, $matches)) {
+if (preg_match('#^/api/admin/seller-deletions/(\d+)/(?:lock|lock-account)$#', $requestUri, $matches)) {
     if ($method === 'POST') {
         apiAdminLockSellerAccount($pdo, (int) $matches[1]);
     } else {

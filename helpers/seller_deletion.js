@@ -1307,6 +1307,7 @@ function formatWorkspacePayload({ req, computed, logs }) {
       id: Number(req.id),
       seller_id: sellerId,
       requested_by: req.requested_by ? Number(req.requested_by) : null,
+      initiated_by_role: (req.requested_by && Number(req.requested_by) === sellerId) ? 'seller' : 'admin',
       stage: req.stage,
       status: req.status,
       badge_color: getStatusColorBadgeNode(req.status),
@@ -2011,6 +2012,8 @@ async function deletionListRequestsNode(pool, ctx, filters = {}) {
     return {
       id: Number(r.id),
       seller_id: Number(r.seller_id),
+      requested_by: r.requested_by ? Number(r.requested_by) : null,
+      initiated_by_role: (r.requested_by && Number(r.requested_by) === Number(r.seller_id)) ? 'seller' : 'admin',
       seller_name: r.seller_name || r.user_name || `Seller #${r.seller_id}`,
       seller_email: safeEmail,
       seller_phone: r.user_phone || null,
@@ -2049,7 +2052,8 @@ async function deletionPreflightNode(pool, ctx, sellerId) {
   };
 }
 
-async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = '', remarks = '', ipAddress = null) {
+async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = '', remarks = '', ipAddress = null, actorRole = 'admin') {
+  const normalizedActorRole = String(actorRole || 'admin').trim().toLowerCase() === 'seller' ? 'seller' : 'admin';
   const dbActive = await checkDbReachable(pool, ctx);
 
   if (dbActive) {
@@ -2108,6 +2112,10 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
         captured_at: new Date().toISOString()
       };
 
+      const effectiveReason = reason
+        || (normalizedActorRole === 'seller' ? 'Seller requested account deletion' : 'Admin requested seller account deletion');
+      const effectiveRemarks = (normalizedActorRole === 'admin' && remarks) ? remarks : null;
+
       const [insRes] = await pool.query(
         `INSERT INTO seller_deletion_requests
           (seller_id, requested_by, stage, status, request_reason, admin_remarks, snapshot_json, financial_summary_json, created_at, updated_at)
@@ -2115,8 +2123,8 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
         [
           sellerId,
           adminId,
-          reason || 'Admin requested seller account deletion',
-          remarks || null,
+          effectiveReason,
+          effectiveRemarks,
           JSON.stringify(snapshotPayload),
           JSON.stringify(computed.settlement)
         ]
@@ -2133,19 +2141,24 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
         prevStatus: prevAccStatus,
         newStatus: 'DELETION_REQUESTED',
         actorId: adminId,
-        actorRole: 'admin',
-        remarks: remarks || reason || 'Deletion request initiated',
-        metadata: { metrics: computed.metrics },
+        actorRole: normalizedActorRole,
+        remarks: effectiveRemarks || effectiveReason,
+        metadata: { metrics: computed.metrics, initiated_by_role: normalizedActorRole },
         ipAddress
       }, true);
+
+      const notifTitle = normalizedActorRole === 'seller' ? 'Account Deletion Request Submitted' : 'Account Deletion Requested';
+      const notifMessage = normalizedActorRole === 'seller'
+        ? 'Your seller account deletion request has been submitted and is pending administrative verification. New orders are temporarily blocked during verification.'
+        : 'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.';
 
       await sendDeletionNotificationNode(pool, ctx, {
         userId: sellerId,
         phone: seller.phone || null,
-        title: 'Account Deletion Requested',
-        message: 'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.',
+        title: notifTitle,
+        message: notifMessage,
         type: 'seller_deletion_requested',
-        data: { deletion_request_id: delReqId, seller_id: sellerId }
+        data: { deletion_request_id: delReqId, seller_id: sellerId, initiated_by_role: normalizedActorRole }
       }, true);
 
       return { statusCode: 201, data: await buildDeletionWorkspacePayloadNode(pool, ctx, delReqId, true) };
@@ -2187,6 +2200,10 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
     captured_at: new Date().toISOString()
   };
 
+  const effectiveReasonFb = reason
+    || (normalizedActorRole === 'seller' ? 'Seller requested account deletion' : 'Admin requested seller account deletion');
+  const effectiveRemarksFb = (normalizedActorRole === 'admin' && remarks) ? remarks : null;
+
   const delReqId = store.nextIds.deletionRequest++;
   store.deletionRequests.push({
     id: delReqId,
@@ -2194,8 +2211,8 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
     requested_by: adminId,
     stage: 'DELETION_REQUESTED',
     status: 'DELETION_REQUESTED',
-    request_reason: reason || 'Admin requested seller account deletion',
-    admin_remarks: remarks || null,
+    request_reason: effectiveReasonFb,
+    admin_remarks: effectiveRemarksFb,
     hold_reason: null,
     rejection_reason: null,
     confirmation_token: null,
@@ -2220,22 +2237,316 @@ async function deletionCreateRequestNode(pool, ctx, sellerId, adminId, reason = 
     prevStatus: prevAccStatus,
     newStatus: 'DELETION_REQUESTED',
     actorId: adminId,
-    actorRole: 'admin',
-    remarks: remarks || reason || 'Deletion request initiated',
-    metadata: { metrics: computed.metrics },
+    actorRole: normalizedActorRole,
+    remarks: effectiveRemarksFb || effectiveReasonFb,
+    metadata: { metrics: computed.metrics, initiated_by_role: normalizedActorRole },
     ipAddress
   }, false);
+
+  const notifTitleFb = normalizedActorRole === 'seller' ? 'Account Deletion Request Submitted' : 'Account Deletion Requested';
+  const notifMessageFb = normalizedActorRole === 'seller'
+    ? 'Your seller account deletion request has been submitted and is pending administrative verification. New orders are temporarily blocked during verification.'
+    : 'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.';
 
   await sendDeletionNotificationNode(pool, ctx, {
     userId: sellerId,
     phone: seller.phone || null,
-    title: 'Account Deletion Requested',
-    message: 'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.',
+    title: notifTitleFb,
+    message: notifMessageFb,
     type: 'seller_deletion_requested',
-    data: { deletion_request_id: delReqId, seller_id: sellerId }
+    data: { deletion_request_id: delReqId, seller_id: sellerId, initiated_by_role: normalizedActorRole }
   }, false);
 
   return { statusCode: 201, data: await buildDeletionWorkspacePayloadNode(pool, ctx, delReqId, false) };
+}
+
+function sanitizeDeletionPayloadForSellerNode(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const out = { ...payload };
+  if (out.deletion_request && typeof out.deletion_request === 'object') {
+    out.deletion_request = {
+      ...out.deletion_request,
+      confirmation_token: null,
+      confirmation_expires_at: null,
+      has_confirmation_token: false,
+      expected_confirmation_phrase: null,
+      final_delete_allowed: false,
+      approve_allowed: false,
+      admin_remarks: null
+    };
+  }
+  if (Array.isArray(out.audit_logs)) {
+    out.audit_logs = out.audit_logs.map(lg => (
+      lg && typeof lg === 'object' && Object.prototype.hasOwnProperty.call(lg, 'ip_address')
+        ? { ...lg, ip_address: null }
+        : lg
+    ));
+  }
+  return out;
+}
+
+async function deletionGetSellerStatusNode(pool, ctx, sellerId, redactForSeller = true) {
+  const dbActive = await checkDbReachable(pool, ctx);
+  let seller = null;
+  let allReqs = [];
+
+  if (dbActive) {
+    await ensureSellerDeletionSchemaNode(pool);
+    const [uRows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+    seller = uRows[0] || null;
+    if (!seller) return { error: 'Seller not found.', code: 404 };
+    const [rRows] = await pool.query('SELECT * FROM seller_deletion_requests WHERE seller_id = ? ORDER BY id DESC', [sellerId]);
+    allReqs = rRows;
+  } else {
+    seller = ctx.getFallbackSellers().find(s => Number(s.id) === Number(sellerId)) || null;
+    if (!seller) return { error: 'Seller not found.', code: 404 };
+    const store = ctx.getFallbackDeletionStore();
+    allReqs = store.deletionRequests
+      .filter(r => Number(r.seller_id) === Number(sellerId))
+      .sort((a, b) => Number(b.id) - Number(a.id));
+  }
+
+  const activeReq = allReqs.find(r => !TERMINAL_DELETION_STATUSES.includes(String(r.status || '').toUpperCase())) || null;
+  const latestReq = allReqs[0] || null;
+  const targetReq = activeReq || latestReq;
+
+  const history = allReqs.map(r => ({
+    id: Number(r.id),
+    seller_id: Number(r.seller_id),
+    requested_by: r.requested_by ? Number(r.requested_by) : null,
+    initiated_by_role: (r.requested_by && Number(r.requested_by) === Number(sellerId)) ? 'seller' : 'admin',
+    stage: r.stage,
+    status: r.status,
+    badge_color: getStatusColorBadgeNode(r.status),
+    request_reason: r.request_reason || null,
+    hold_reason: r.hold_reason || null,
+    rejection_reason: r.rejection_reason || null,
+    approved_at: toIsoStringSafe(r.approved_at),
+    deleted_at: toIsoStringSafe(r.deleted_at),
+    created_at: toIsoStringSafe(r.created_at),
+    updated_at: toIsoStringSafe(r.updated_at)
+  }));
+
+  const accStatus = String(seller.account_status || 'ACTIVE').toUpperCase();
+  const isAdminUser = String(seller.role || 'seller').toLowerCase() === 'admin';
+  const canRequestDeletion = !activeReq && accStatus !== 'DELETED' && !isAdminUser;
+  const canWithdrawRequest = Boolean(
+    activeReq
+    && String(activeReq.stage || '').toUpperCase() === 'DELETION_REQUESTED'
+    && String(activeReq.status || '').toUpperCase() === 'DELETION_REQUESTED'
+  );
+
+  if (targetReq) {
+    let workspace = await buildDeletionWorkspacePayloadNode(pool, ctx, Number(targetReq.id), dbActive);
+    if (workspace) {
+      if (redactForSeller) {
+        workspace = sanitizeDeletionPayloadForSellerNode(workspace);
+      }
+      workspace.has_request = true;
+      workspace.has_active_request = Boolean(activeReq);
+      workspace.account_status = accStatus;
+      workspace.can_request_deletion = canRequestDeletion;
+      workspace.can_withdraw_request = canWithdrawRequest;
+      workspace.history = history;
+      return { statusCode: 200, data: workspace };
+    }
+  }
+
+  const computed = await computeSellerFinancialAndChecklistNode(pool, ctx, sellerId, null, dbActive);
+  return {
+    statusCode: 200,
+    data: {
+      has_request: false,
+      has_active_request: false,
+      account_status: accStatus,
+      can_request_deletion: canRequestDeletion,
+      can_withdraw_request: false,
+      deletion_request: null,
+      history: [],
+      seller: computed.seller,
+      metrics: computed.metrics,
+      settlement: computed.settlement,
+      checks: computed.checks,
+      all_checks_passed: computed.all_checks_passed,
+      blockers: computed.blockers,
+      refunds: [],
+      refund_stats: computed.refund_stats,
+      payouts: computed.payouts,
+      disputes: computed.disputes,
+      gst: computed.gst,
+      audit_logs: []
+    }
+  };
+}
+
+async function deletionWithdrawBySellerNode(pool, ctx, sellerId, actorId, reason = '', ipAddress = null, actorRole = 'seller', deletionRequestId = null) {
+  const normalizedActorRole = String(actorRole || 'seller').trim().toLowerCase() === 'admin' ? 'admin' : 'seller';
+  const cleanReason = String(reason || '').trim() || 'Withdrawn by seller';
+  const dbActive = await checkDbReachable(pool, ctx);
+
+  let req = null;
+  let seller = null;
+
+  if (dbActive) {
+    await ensureSellerDeletionSchemaNode(pool);
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [uRows] = await conn.query('SELECT * FROM users WHERE id = ? LIMIT 1 FOR UPDATE', [sellerId]);
+      if (uRows.length === 0) {
+        await conn.rollback();
+        conn.release();
+        return { error: 'Seller not found.', code: 404 };
+      }
+      seller = uRows[0];
+
+      if (deletionRequestId && Number(deletionRequestId) > 0) {
+        const [rRows] = await conn.query('SELECT * FROM seller_deletion_requests WHERE id = ? LIMIT 1 FOR UPDATE', [Number(deletionRequestId)]);
+        req = rRows[0] || null;
+        if (!req) {
+          await conn.rollback();
+          conn.release();
+          return { error: 'Deletion request not found.', code: 404 };
+        }
+        if (Number(req.seller_id) !== Number(sellerId)) {
+          await conn.rollback();
+          conn.release();
+          return { error: 'Forbidden. Deletion request does not belong to this seller.', code: 403 };
+        }
+        if (TERMINAL_DELETION_STATUSES.includes(String(req.status || '').toUpperCase())) {
+          await conn.rollback();
+          conn.release();
+          return { error: `Deletion request #${req.id} is already closed (${req.status}).`, code: 409 };
+        }
+      } else {
+        const [rRows] = await conn.query(
+          "SELECT * FROM seller_deletion_requests WHERE seller_id = ? AND status NOT IN ('DELETED', 'DELETION_REJECTED') ORDER BY id DESC LIMIT 1 FOR UPDATE",
+          [sellerId]
+        );
+        req = rRows[0] || null;
+        if (!req) {
+          await conn.rollback();
+          conn.release();
+          return { error: 'No active seller deletion request found to withdraw.', code: 404 };
+        }
+      }
+
+      const accStatus = String(seller.account_status || 'ACTIVE').toUpperCase();
+      if (['LOCKED', 'DELETED'].includes(accStatus)) {
+        await conn.rollback();
+        conn.release();
+        return { error: `Cannot withdraw deletion request because seller account is ${accStatus}. Please contact Admin support.`, code: 409 };
+      }
+      if (String(req.stage || '').toUpperCase() !== 'DELETION_REQUESTED' || String(req.status || '').toUpperCase() !== 'DELETION_REQUESTED') {
+        await conn.rollback();
+        conn.release();
+        return {
+          error: `Deletion request #${req.id} cannot be withdrawn because it has already entered stage ${req.stage} (${req.status}).`,
+          code: 409
+        };
+      }
+
+      await conn.query(
+        `UPDATE seller_deletion_requests
+         SET stage = 'DELETION_REJECTED',
+             status = 'DELETION_REJECTED',
+             rejection_reason = ?,
+             confirmation_token = NULL,
+             confirmation_expires_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [cleanReason, req.id]
+      );
+      await conn.query(
+        "UPDATE users SET account_status = 'ACTIVE', deletion_requested_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND account_status NOT IN ('LOCKED', 'DELETED')",
+        [sellerId]
+      );
+      await conn.commit();
+      conn.release();
+    } catch (e) {
+      try { await conn.rollback(); } catch (_) {}
+      conn.release();
+      return { error: `Failed to withdraw deletion request: ${e.message}`, code: 500 };
+    }
+  } else {
+    seller = ctx.getFallbackSellers().find(s => Number(s.id) === Number(sellerId)) || null;
+    if (!seller) return { error: 'Seller not found.', code: 404 };
+    const store = ctx.getFallbackDeletionStore();
+
+    if (deletionRequestId && Number(deletionRequestId) > 0) {
+      req = store.deletionRequests.find(r => Number(r.id) === Number(deletionRequestId)) || null;
+      if (!req) return { error: 'Deletion request not found.', code: 404 };
+      if (Number(req.seller_id) !== Number(sellerId)) {
+        return { error: 'Forbidden. Deletion request does not belong to this seller.', code: 403 };
+      }
+      if (TERMINAL_DELETION_STATUSES.includes(String(req.status || '').toUpperCase())) {
+        return { error: `Deletion request #${req.id} is already closed (${req.status}).`, code: 409 };
+      }
+    } else {
+      req = store.deletionRequests
+        .filter(r => Number(r.seller_id) === Number(sellerId) && !TERMINAL_DELETION_STATUSES.includes(String(r.status || '').toUpperCase()))
+        .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+      if (!req) return { error: 'No active seller deletion request found to withdraw.', code: 404 };
+    }
+
+    const accStatus = String(seller.account_status || 'ACTIVE').toUpperCase();
+    if (['LOCKED', 'DELETED'].includes(accStatus)) {
+      return { error: `Cannot withdraw deletion request because seller account is ${accStatus}. Please contact Admin support.`, code: 409 };
+    }
+    if (String(req.stage || '').toUpperCase() !== 'DELETION_REQUESTED' || String(req.status || '').toUpperCase() !== 'DELETION_REQUESTED') {
+      return {
+        error: `Deletion request #${req.id} cannot be withdrawn because it has already entered stage ${req.stage} (${req.status}).`,
+        code: 409
+      };
+    }
+
+    const nowStr = nowSqlUtc();
+    req.stage = 'DELETION_REJECTED';
+    req.status = 'DELETION_REJECTED';
+    req.rejection_reason = cleanReason;
+    req.confirmation_token = null;
+    req.confirmation_expires_at = null;
+    req.updated_at = nowStr;
+
+    seller.account_status = 'ACTIVE';
+    seller.deletion_requested_at = null;
+    seller.updated_at = nowStr;
+  }
+
+  const delReqId = Number(req.id);
+  await logSellerDeletionAuditNode(pool, ctx, {
+    deletionRequestId: delReqId,
+    sellerId,
+    action: 'DELETION_WITHDRAWN_BY_SELLER',
+    prevStage: req.stage === 'DELETION_REJECTED' ? 'DELETION_REQUESTED' : req.stage,
+    newStage: 'DELETION_REJECTED',
+    prevStatus: req.status === 'DELETION_REJECTED' ? 'DELETION_REQUESTED' : req.status,
+    newStatus: 'DELETION_REJECTED',
+    actorId,
+    actorRole: normalizedActorRole,
+    remarks: cleanReason,
+    ipAddress
+  }, dbActive);
+
+  await sendDeletionNotificationNode(pool, ctx, {
+    userId: sellerId,
+    phone: seller.phone || null,
+    title: 'Account Deletion Request Withdrawn',
+    message: `Your seller deletion request (#${delReqId}) has been withdrawn and your account has been restored to ACTIVE status.`,
+    type: 'seller_deletion_withdrawn',
+    data: { deletion_request_id: delReqId, reason: cleanReason }
+  }, dbActive);
+
+  let payload = await buildDeletionWorkspacePayloadNode(pool, ctx, delReqId, dbActive);
+  if (payload && normalizedActorRole !== 'admin') {
+    payload = sanitizeDeletionPayloadForSellerNode(payload);
+  }
+  payload.has_request = true;
+  payload.has_active_request = false;
+  payload.can_request_deletion = true;
+  payload.can_withdraw_request = false;
+  payload.account_status = 'ACTIVE';
+  return { statusCode: 200, data: payload };
 }
 
 async function loadRequestForMutation(pool, ctx, delReqId) {
@@ -3674,6 +3985,9 @@ module.exports = {
   deletionListRequestsNode,
   deletionPreflightNode,
   deletionCreateRequestNode,
+  sanitizeDeletionPayloadForSellerNode,
+  deletionGetSellerStatusNode,
+  deletionWithdrawBySellerNode,
   deletionLockAccountNode,
   deletionVerifyOrdersNode,
   deletionProcessRefundsNode,

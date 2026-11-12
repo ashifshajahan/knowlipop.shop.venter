@@ -1146,6 +1146,163 @@ async function runTests() {
     assert.ok(listAll.json.kpis.rejected >= 1);
     ok('List endpoint returns accurate KPIs across all lifecycle states');
 
+    // =========================================================================
+    // Scenario 12: Seller Self-Service Deletion Request, Aliases, Withdrawal & Privacy Redaction
+    // =========================================================================
+    console.log('\n[Scenario 12] Seller self-service deletion request, route aliases, withdrawal & security');
+    // Unauthenticated guard
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller/deletion-request', {})).status, 401);
+    assert.strictEqual((await httpReq(baseUrl, 'GET', '/api/seller/deletion-request')).status, 401);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller/deletion-request/withdraw', {})).status, 401);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', '/api/seller/profile')).status, 401);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', '/api/me')).status, 401);
+
+    const s12 = await registerSeller(baseUrl, 'self_del');
+    const s12Other = await registerSeller(baseUrl, 'self_other');
+    const p12 = await createProduct(baseUrl, s12.token, 'Self Del Gadget', 550, 5);
+    const s12Auth = { Authorization: `Bearer ${s12.token}` };
+    const s12OtherAuth = { Authorization: `Bearer ${s12Other.token}` };
+
+    // 1. Pre-request status & preflight check
+    const s12PreStatus = await httpReq(baseUrl, 'GET', '/api/seller/deletion-request', null, s12Auth);
+    assert.strictEqual(s12PreStatus.status, 200);
+    assert.strictEqual(s12PreStatus.json.has_request, false);
+    assert.strictEqual(s12PreStatus.json.has_active_request, false);
+    assert.strictEqual(s12PreStatus.json.account_status, 'ACTIVE');
+    assert.strictEqual(s12PreStatus.json.can_request_deletion, true);
+    assert.strictEqual(s12PreStatus.json.can_withdraw_request, false);
+    assert.strictEqual(s12PreStatus.json.deletion_request, null);
+    assert.strictEqual(s12PreStatus.json.metrics.total_products, 1);
+    assert.strictEqual((await httpReq(baseUrl, 'GET', '/api/seller/deletion/preflight', null, s12Auth)).status, 200);
+
+    // 2. Cross-seller RBAC isolation (403)
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller/deletion-request', { seller_id: s12Other.id }, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', `/api/sellers/${s12Other.id}/deletion-request`, {}, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'GET', `/api/sellers/${s12Other.id}/deletion-request`, null, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', `/api/sellers/${s12Other.id}`, {}, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller-deletions', { seller_id: s12Other.id }, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', `/api/sellers/${s12Other.id}/deletion-request/withdraw`, {}, s12Auth)).status, 403);
+
+    // 3. Admin self-deletion / missing seller_id guards (422)
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller/deletion-request', {}, adminAuth)).status, 422);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller-deletions', {}, adminAuth)).status, 422);
+
+    // 4. Seller submits deletion request & response is redacted
+    const s12Submit = await httpReq(baseUrl, 'POST', '/api/seller/deletion-request', {
+      reason: 'Closing my seasonal shop voluntarily'
+    }, s12Auth);
+    assert.strictEqual(s12Submit.status, 201, `Seller deletion submit failed: ${s12Submit.text}`);
+    const d12Id1 = s12Submit.json.deletion_request.id;
+    assert.strictEqual(s12Submit.json.account_status, 'DELETION_PENDING');
+    assert.strictEqual(s12Submit.json.seller.account_status, 'DELETION_PENDING');
+    assert.strictEqual(s12Submit.json.deletion_request.initiated_by_role, 'seller');
+    assert.strictEqual(Number(s12Submit.json.deletion_request.requested_by), s12.id);
+    assert.strictEqual(s12Submit.json.deletion_request.confirmation_token, null);
+    assert.strictEqual(s12Submit.json.deletion_request.confirmation_expires_at, null);
+    assert.strictEqual(s12Submit.json.deletion_request.admin_remarks, null);
+    assert.strictEqual(s12Submit.json.deletion_request.expected_confirmation_phrase, null);
+    assert.strictEqual(s12Submit.json.deletion_request.approve_allowed, false);
+    assert.strictEqual(s12Submit.json.deletion_request.final_delete_allowed, false);
+    assert.strictEqual(s12Submit.json.can_request_deletion, false);
+    assert.strictEqual(s12Submit.json.can_withdraw_request, true);
+    assert.ok(s12Submit.json.audit_logs.every((l) => l.ip_address === null), 'Seller must not see audit ip_address');
+    assert.ok(fbNotifications.some((n) => Number(n.user_id) === s12.id && n.type === 'seller_deletion_requested'));
+
+    // 5. Duplicate submission blocked (409)
+    const dupSelf12 = await httpReq(baseUrl, 'POST', '/api/seller/request-deletion', {}, s12Auth);
+    assert.strictEqual(dupSelf12.status, 409);
+    assert.strictEqual(Number(dupSelf12.json.existing_request_id), d12Id1);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', '/api/seller/profile', null, s12Auth)).status, 409);
+
+    // 6. While DELETION_PENDING: orders & mutations blocked (403), yet status check & withdraw permitted
+    const blockedOrd12 = await httpReq(baseUrl, 'POST', '/api/orders', {
+      buyer_name: 'Buyer12',
+      buyer_phone: '+919777012012',
+      shipping_address: '12 Self Ave',
+      payment_method: 'cod',
+      items: [{ product_id: p12, quantity: 1 }]
+    });
+    assert.strictEqual(blockedOrd12.status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'PUT', '/api/seller/profile', { seller_name: 'Blocked Rename' }, s12Auth)).status, 403);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/products', { name: 'Blocked Prod', price: 100, stock: 1 }, s12Auth)).status, 403);
+
+    const s12PendingStatus = await httpReq(baseUrl, 'GET', '/api/seller-deletions', null, s12Auth);
+    assert.strictEqual(s12PendingStatus.status, 200);
+    assert.strictEqual(s12PendingStatus.json.has_active_request, true);
+    assert.strictEqual(s12PendingStatus.json.can_withdraw_request, true);
+    assert.strictEqual(s12PendingStatus.json.deletion_request.confirmation_token, null);
+
+    // Cross-seller forged deletion_request_id withdrawal blocked (403)
+    assert.strictEqual((await httpReq(baseUrl, 'POST', `/api/seller/deletion-request/${d12Id1}/withdraw`, {}, s12OtherAuth)).status, 403);
+
+    // 7. Seller withdraws request -> restored to ACTIVE & can mutate again
+    const s12Withdraw1 = await httpReq(baseUrl, 'POST', '/api/seller/deletion-request/withdraw', { reason: 'Changed my mind' }, s12Auth);
+    assert.strictEqual(s12Withdraw1.status, 200);
+    assert.strictEqual(s12Withdraw1.json.account_status, 'ACTIVE');
+    assert.strictEqual(s12Withdraw1.json.has_active_request, false);
+    assert.strictEqual(s12Withdraw1.json.can_request_deletion, true);
+    assert.strictEqual(s12Withdraw1.json.can_withdraw_request, false);
+    assert.ok(fbNotifications.some((n) => Number(n.user_id) === s12.id && n.type === 'seller_deletion_withdrawn'));
+    await createProduct(baseUrl, s12.token, 'Restored Self Item', 300, 3);
+
+    // 8. Route alias coverage (submit + withdraw via all supported endpoints)
+    const subA = await httpReq(baseUrl, 'POST', '/api/seller/request-deletion', { reason: 'Alias A' }, s12Auth);
+    assert.strictEqual(subA.status, 201);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', '/api/seller/deletion-request', null, s12Auth)).status, 200);
+
+    const subB = await httpReq(baseUrl, 'DELETE', '/api/seller/profile', null, s12Auth);
+    assert.strictEqual(subB.status, 201);
+    const subBId = subB.json.deletion_request.id;
+    assert.strictEqual((await httpReq(baseUrl, 'POST', `/api/seller/deletion-request/${subBId}/cancel`, {}, s12Auth)).status, 200);
+
+    const subC = await httpReq(baseUrl, 'DELETE', '/api/me', null, s12Auth);
+    assert.strictEqual(subC.status, 201);
+    assert.strictEqual((await httpReq(baseUrl, 'DELETE', `/api/sellers/${s12.id}/deletion-request`, null, s12Auth)).status, 200);
+
+    const subD = await httpReq(baseUrl, 'POST', '/api/seller-deletions', { reason: 'Final self deletion request' }, s12Auth);
+    assert.strictEqual(subD.status, 201);
+    const d12FinalId = subD.json.deletion_request.id;
+
+    // 9. Advance stage beyond DELETION_REQUESTED -> seller withdrawal blocked (409)
+    const ver12 = await httpReq(baseUrl, 'POST', `/api/admin/seller-deletions/${d12FinalId}/verify-orders`, {}, adminAuth);
+    assert.strictEqual(ver12.status, 200);
+    assert.strictEqual((await httpReq(baseUrl, 'POST', '/api/seller/deletion-request/withdraw', {}, s12Auth)).status, 409);
+
+    const s12AfterVerify = await httpReq(baseUrl, 'GET', '/api/seller/deletion-status', null, s12Auth);
+    assert.strictEqual(s12AfterVerify.status, 200);
+    assert.strictEqual(s12AfterVerify.json.can_withdraw_request, false);
+    assert.ok(s12AfterVerify.json.history.length >= 5);
+
+    // 10. Admin aliases (/lock-account & /request) + Admin UI Seller Request badge
+    const lockAlias12 = await httpReq(baseUrl, 'POST', `/api/admin/seller-deletions/${d12FinalId}/lock-account`, { remarks: 'Lock via alias' }, adminAuth);
+    assert.strictEqual(lockAlias12.status, 200);
+    assert.strictEqual(lockAlias12.json.seller.account_status, 'LOCKED');
+    assert.strictEqual((await httpReq(baseUrl, 'GET', '/api/seller/deletion-request', null, s12Auth)).status, 403);
+
+    const app12 = await httpReq(baseUrl, 'POST', `/api/admin/seller-deletions/${d12FinalId}/approve`, {}, adminAuth);
+    assert.strictEqual(app12.status, 200);
+    assert.ok(app12.json.deletion_request.confirmation_token && app12.json.deletion_request.confirmation_token.length >= 20);
+    const fin12 = await httpReq(baseUrl, 'POST', `/api/admin/seller-deletions/${d12FinalId}/final-delete`, {
+      confirmation_token: app12.json.deletion_request.confirmation_token,
+      confirmation_phrase: `DELETE SELLER #${s12.id}`
+    }, adminAuth);
+    assert.strictEqual(fin12.status, 200);
+    assert.strictEqual(fin12.json.deletion_request.status, 'DELETED');
+
+    const adminAliasReq = await httpReq(baseUrl, 'POST', '/api/admin/seller-deletions/request', { seller_id: s12Other.id, reason: 'Admin alias test' }, adminAuth);
+    assert.strictEqual(adminAliasReq.status, 201);
+    assert.strictEqual(adminAliasReq.json.deletion_request.initiated_by_role, 'admin');
+
+    const adminListAfter12 = await httpReq(baseUrl, 'GET', '/api/admin/seller-deletions', null, adminAuth);
+    assert.strictEqual(adminListAfter12.status, 200);
+    const listed12 = adminListAfter12.json.requests.find((r) => Number(r.id) === d12FinalId);
+    assert.strictEqual(listed12.initiated_by_role, 'seller');
+
+    const delUi12 = await httpReq(baseUrl, 'GET', '/admin/seller-deletions', null, { Cookie: cookieHeader });
+    assert.strictEqual(delUi12.status, 200);
+    assert.ok(delUi12.text.includes('Seller Request'), 'Admin UI must render Seller Request indicator');
+    ok('Scenario 12: Seller self-service deletion request, withdrawal, privacy redaction, aliases & admin badges verified');
+
     console.log(`\nALL NODE SELLER DELETION TESTS PASSED (${passed} assertions).`);
   } finally {
     rzp.restore();

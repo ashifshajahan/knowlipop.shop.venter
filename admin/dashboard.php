@@ -1641,6 +1641,9 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 <td><strong>#<?= (int) $dr['id'] ?></strong></td>
                                 <td>
                                     <strong style="color:#1e1b4b;"><?= htmlspecialchars($dr['seller_name']) ?></strong>
+                                    <?php if (($dr['initiated_by_role'] ?? 'admin') === 'seller'): ?>
+                                        <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>
+                                    <?php endif; ?>
                                     <div style="font-size:12px; color:#64748b;">Seller ID #<?= (int) $dr['seller_id'] ?><?= !empty($dr['seller_phone']) ? ' &bull; ' . htmlspecialchars($dr['seller_phone']) : '' ?></div>
                                     <?php if (!empty($dr['seller_email'])): ?>
                                         <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($dr['seller_email']) ?></div>
@@ -3371,6 +3374,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
                             '<td><strong>#' + Number(dr.id) + '</strong></td>' +
                             '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
+                            (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : '') +
                             '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
                             (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
                             '</td>' +

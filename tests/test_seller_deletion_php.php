@@ -178,6 +178,26 @@ if (in_array('--worker', $argv ?? [], true)) {
     });
 
     try {
+        if ($action === 'index_route') {
+            putenv('DB_CONNECTION=sqlite');
+            putenv("SQLITE_DB_PATH={$dbFile}");
+            $_ENV['DB_CONNECTION'] = 'sqlite';
+            $_ENV['SQLITE_DB_PATH'] = $dbFile;
+            $_SERVER['DB_CONNECTION'] = 'sqlite';
+            $_SERVER['SQLITE_DB_PATH'] = $dbFile;
+
+            $reqUri = (string) ($params['uri'] ?? '/');
+            $parsedQueryStr = parse_url($reqUri, PHP_URL_QUERY);
+            if (is_string($parsedQueryStr) && $parsedQueryStr !== '') {
+                parse_str($parsedQueryStr, $uriGet);
+                $_GET = array_merge($uriGet, $_GET);
+            }
+            $_SERVER['REQUEST_URI'] = $reqUri;
+            $_SERVER['REQUEST_METHOD'] = strtoupper((string) ($server['REQUEST_METHOD'] ?? 'GET'));
+            require __DIR__ . '/../index.php';
+            exit(0);
+        }
+
         $pdo = new PDO("sqlite:{$dbFile}");
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->exec('PRAGMA busy_timeout = 5000;');
@@ -282,6 +302,27 @@ if (in_array('--worker', $argv ?? [], true)) {
                 break;
             case 'me':
                 apiMe($pdo);
+                break;
+            case 'seller_request_deletion':
+                apiSellerRequestDeletion(
+                    $pdo,
+                    isset($params['url_seller_id']) ? (int) $params['url_seller_id'] : null,
+                    !empty($params['require_explicit_admin'])
+                );
+                break;
+            case 'seller_deletion_status':
+                apiSellerGetDeletionStatus(
+                    $pdo,
+                    isset($params['url_seller_id']) ? (int) $params['url_seller_id'] : null,
+                    !empty($params['allow_admin_list'])
+                );
+                break;
+            case 'seller_withdraw_deletion':
+                apiSellerWithdrawDeletion(
+                    $pdo,
+                    isset($params['url_seller_id']) ? (int) $params['url_seller_id'] : null,
+                    isset($params['url_del_req_id']) ? (int) $params['url_del_req_id'] : null
+                );
                 break;
             default:
                 errorResponse("Unknown worker action: {$action}", [], 500);
@@ -565,6 +606,11 @@ function callWorker(string $action, ?string $token = null, array $post = [], arr
         'stderr' => $stderr,
         'exitCode' => $exitCode,
     ];
+}
+
+function callIndexRoute(string $method, string $uri, ?string $token = null, array $post = [], array $get = []): array
+{
+    return callWorker('index_route', $token, $post, ['uri' => $uri], $get, $method);
 }
 
 function createSellerViaApi(string $label, string $phone, string $email): array
@@ -1107,6 +1153,149 @@ assertEq((int) $pdo->query("SELECT COUNT(*) FROM seller_payouts WHERE seller_id 
 assertEq((int) $pdo->query("SELECT COUNT(*) FROM seller_gst_details WHERE seller_id = {$s11['id']}")->fetchColumn(), 1, 'Scenario 11 seller_gst_details preserved');
 assertTrue((int) $pdo->query("SELECT COUNT(*) FROM seller_deletion_audit_logs WHERE seller_id = {$s11['id']}")->fetchColumn() >= 4, 'Scenario 11 audit trail preserved');
 assertEq(callWorker('delete_order', $adminToken, [], ['order_id' => $o11])['status'], 403, 'Scenario 11 DELETE /api/orders/:id blocked with 403 for deleted seller order');
+
+// -----------------------------------------------------------------------------
+// Scenario 12: Seller Self-Service Deletion Request, Aliases, Withdrawal & Privacy Redaction
+// -----------------------------------------------------------------------------
+echo "\n--- Scenario 12: Seller Self-Service Deletion Request, index.php Routing, Withdrawal & Privacy ---\n";
+assertEq(callIndexRoute('POST', '/api/seller/deletion-request', null, [])['status'], 401, 'Scenario 12 unauthenticated POST /api/seller/deletion-request -> 401');
+assertEq(callIndexRoute('GET', '/api/seller/deletion-request', null)['status'], 401, 'Scenario 12 unauthenticated GET /api/seller/deletion-request -> 401');
+assertEq(callIndexRoute('POST', '/api/seller/deletion-request/withdraw', null, [])['status'], 401, 'Scenario 12 unauthenticated withdraw -> 401');
+assertEq(callIndexRoute('DELETE', '/api/seller/profile', null)['status'], 401, 'Scenario 12 unauthenticated DELETE /api/seller/profile -> 401');
+assertEq(callIndexRoute('DELETE', '/api/me', null)['status'], 401, 'Scenario 12 unauthenticated DELETE /api/me -> 401');
+
+$s12 = createSellerViaApi('Scenario12 Self Deletion', '+919800000012', 's12@php.test');
+$s12Other = createSellerViaApi('Scenario12 Other Seller', '+919800000112', 's12other@php.test');
+$p12 = createProductViaApi($s12, 'S12 Self Item', 650, 5);
+
+// 1. Pre-request status & preflight check via real index.php router
+$s12Pre = callIndexRoute('GET', '/api/seller/deletion-request', $s12['token']);
+assertEq($s12Pre['status'], 200, 'Scenario 12 GET /api/seller/deletion-request before request -> 200', $s12Pre);
+assertEq($s12Pre['json']['has_request'] ?? null, false, 'Scenario 12 has_request=false initially');
+assertEq($s12Pre['json']['has_active_request'] ?? null, false, 'Scenario 12 has_active_request=false initially');
+assertEq($s12Pre['json']['account_status'] ?? '', 'ACTIVE', 'Scenario 12 account_status=ACTIVE initially');
+assertEq($s12Pre['json']['can_request_deletion'] ?? null, true, 'Scenario 12 can_request_deletion=true initially');
+assertEq($s12Pre['json']['can_withdraw_request'] ?? null, false, 'Scenario 12 can_withdraw_request=false initially');
+assertEq($s12Pre['json']['metrics']['total_products'] ?? -1, 1, 'Scenario 12 preflight metrics total_products=1');
+assertEq(callIndexRoute('GET', '/api/seller/deletion/preflight', $s12['token'])['status'], 200, 'Scenario 12 GET /api/seller/deletion/preflight -> 200');
+
+// 2. Cross-seller RBAC isolation -> 403
+assertEq(callIndexRoute('POST', '/api/seller/deletion-request', $s12['token'], ['seller_id' => $s12Other['id']])['status'], 403, 'Scenario 12 body cross-seller request -> 403');
+assertEq(callIndexRoute('POST', "/api/sellers/{$s12Other['id']}/deletion-request", $s12['token'], [])['status'], 403, 'Scenario 12 URL cross-seller POST -> 403');
+assertEq(callIndexRoute('GET', "/api/sellers/{$s12Other['id']}/deletion-request", $s12['token'])['status'], 403, 'Scenario 12 URL cross-seller GET -> 403');
+assertEq(callIndexRoute('DELETE', "/api/sellers/{$s12Other['id']}", $s12['token'])['status'], 403, 'Scenario 12 DELETE /api/sellers/{other} -> 403');
+assertEq(callIndexRoute('POST', '/api/seller-deletions', $s12['token'], ['seller_id' => $s12Other['id']])['status'], 403, 'Scenario 12 /api/seller-deletions cross-seller -> 403');
+assertEq(callIndexRoute('POST', "/api/sellers/{$s12Other['id']}/deletion-request/withdraw", $s12['token'], [])['status'], 403, 'Scenario 12 cross-seller withdraw -> 403');
+
+// 3. Admin self-deletion / missing seller_id guards -> 422
+assertEq(callIndexRoute('POST', '/api/seller/deletion-request', $adminToken, [])['status'], 422, 'Scenario 12 admin calling seller endpoint without seller_id -> 422');
+assertEq(callIndexRoute('POST', '/api/seller-deletions', $adminToken, [])['status'], 422, 'Scenario 12 admin calling /api/seller-deletions without seller_id -> 422');
+
+// 4. Seller submits deletion request & verifies redaction + Seller attribution
+$s12Sub = callIndexRoute('POST', '/api/seller/deletion-request', $s12['token'], ['reason' => 'Closing store voluntarily']);
+assertEq($s12Sub['status'], 201, 'Scenario 12 POST /api/seller/deletion-request -> 201', $s12Sub);
+$d12Id = (int) ($s12Sub['json']['deletion_request']['id'] ?? 0);
+assertEq($s12Sub['json']['account_status'] ?? '', 'DELETION_PENDING', 'Scenario 12 account_status DELETION_PENDING');
+assertEq($s12Sub['json']['deletion_request']['initiated_by_role'] ?? '', 'seller', 'Scenario 12 initiated_by_role = seller');
+assertEq((int) ($s12Sub['json']['deletion_request']['requested_by'] ?? 0), $s12['id'], 'Scenario 12 requested_by matches seller');
+$dr12 = $s12Sub['json']['deletion_request'] ?? [];
+assertTrue(array_key_exists('confirmation_token', $dr12) && $dr12['confirmation_token'] === null, 'Scenario 12 confirmation_token redacted to null');
+assertTrue(array_key_exists('confirmation_expires_at', $dr12) && $dr12['confirmation_expires_at'] === null, 'Scenario 12 confirmation_expires_at redacted to null');
+assertTrue(array_key_exists('admin_remarks', $dr12) && $dr12['admin_remarks'] === null, 'Scenario 12 admin_remarks redacted to null');
+assertTrue(array_key_exists('expected_confirmation_phrase', $dr12) && $dr12['expected_confirmation_phrase'] === null, 'Scenario 12 expected_confirmation_phrase redacted to null');
+assertEq($s12Sub['json']['deletion_request']['approve_allowed'] ?? null, false, 'Scenario 12 approve_allowed=false for seller');
+assertEq($s12Sub['json']['deletion_request']['final_delete_allowed'] ?? null, false, 'Scenario 12 final_delete_allowed=false for seller');
+assertEq($s12Sub['json']['can_request_deletion'] ?? null, false, 'Scenario 12 can_request_deletion=false');
+assertEq($s12Sub['json']['can_withdraw_request'] ?? null, true, 'Scenario 12 can_withdraw_request=true');
+$ipRedactedOk = true;
+foreach (($s12Sub['json']['audit_logs'] ?? []) as $lg) {
+    if (($lg['ip_address'] ?? null) !== null) {
+        $ipRedactedOk = false;
+    }
+}
+assertTrue($ipRedactedOk, 'Scenario 12 audit ip_address redacted for seller');
+
+// 5. Duplicate submission -> 409 with existing_request_id
+$dup12 = callIndexRoute('POST', '/api/seller/request-deletion', $s12['token'], []);
+assertEq($dup12['status'], 409, 'Scenario 12 duplicate request -> 409');
+assertEq((int) ($dup12['json']['existing_request_id'] ?? ($dup12['json']['errors']['existing_request_id'] ?? 0)), $d12Id, 'Scenario 12 existing_request_id matches active request');
+assertEq(callIndexRoute('DELETE', '/api/seller/profile', $s12['token'])['status'], 409, 'Scenario 12 duplicate DELETE /api/seller/profile -> 409');
+
+// 6. Orders & seller mutations blocked (403), yet GET /api/seller-deletions works (200)
+assertEq(callWorker('create_order', null, ['buyer_name' => 'Buyer12', 'buyer_phone' => '+919700012012', 'shipping_address' => '12 St', 'items' => [['product_id' => $p12, 'quantity' => 1]]])['status'], 403, 'Scenario 12 new order blocked while DELETION_PENDING');
+assertEq(callIndexRoute('PUT', '/api/seller/profile', $s12['token'], ['seller_name' => 'Blocked Rename'])['status'], 403, 'Scenario 12 profile update blocked while DELETION_PENDING');
+assertEq(callWorker('create_product', $s12['token'], ['name' => 'Blocked Item', 'price' => 100, 'stock' => 1])['status'], 403, 'Scenario 12 product creation blocked while DELETION_PENDING');
+$pendingStat12 = callIndexRoute('GET', '/api/seller-deletions', $s12['token']);
+assertEq($pendingStat12['status'], 200, 'Scenario 12 GET /api/seller-deletions returns own status -> 200');
+assertEq($pendingStat12['json']['can_withdraw_request'] ?? null, true, 'Scenario 12 GET /api/seller-deletions shows can_withdraw_request=true');
+
+// Cross-seller forged deletion_request_id withdraw -> 403
+assertEq(callIndexRoute('POST', "/api/seller/deletion-request/{$d12Id}/withdraw", $s12Other['token'], [])['status'], 403, 'Scenario 12 cross-seller withdrawal of specific request -> 403');
+
+// 7. Withdraw restores ACTIVE & re-enables mutations
+$wd12 = callIndexRoute('POST', '/api/seller/deletion-request/withdraw', $s12['token'], ['reason' => 'Changed mind']);
+assertEq($wd12['status'], 200, 'Scenario 12 POST /api/seller/deletion-request/withdraw -> 200', $wd12);
+assertEq($wd12['json']['account_status'] ?? '', 'ACTIVE', 'Scenario 12 seller restored to ACTIVE after withdraw');
+assertEq($wd12['json']['has_active_request'] ?? null, false, 'Scenario 12 has_active_request=false after withdraw');
+assertEq($wd12['json']['can_request_deletion'] ?? null, true, 'Scenario 12 can_request_deletion=true after withdraw');
+createProductViaApi($s12, 'S12 Restored Item', 300, 3);
+
+// 8. Exercise remaining route aliases through real index.php dispatcher
+$aliasA = callIndexRoute('POST', '/api/seller/request-deletion', $s12['token'], ['reason' => 'Alias A']);
+assertEq($aliasA['status'], 201, 'Scenario 12 POST /api/seller/request-deletion -> 201');
+assertEq(callIndexRoute('DELETE', '/api/seller/deletion-request', $s12['token'])['status'], 200, 'Scenario 12 DELETE /api/seller/deletion-request -> 200');
+
+$aliasB = callIndexRoute('DELETE', '/api/seller/profile', $s12['token']);
+assertEq($aliasB['status'], 201, 'Scenario 12 DELETE /api/seller/profile -> 201');
+$aliasBId = (int) ($aliasB['json']['deletion_request']['id'] ?? 0);
+assertEq(callIndexRoute('POST', "/api/seller/deletion-request/{$aliasBId}/cancel", $s12['token'], [])['status'], 200, 'Scenario 12 POST /api/seller/deletion-request/{id}/cancel -> 200');
+
+$aliasC = callIndexRoute('DELETE', '/api/me', $s12['token']);
+assertEq($aliasC['status'], 201, 'Scenario 12 DELETE /api/me -> 201');
+assertEq(callIndexRoute('DELETE', "/api/sellers/{$s12['id']}/deletion-request", $s12['token'])['status'], 200, 'Scenario 12 DELETE /api/sellers/{id}/deletion-request -> 200');
+
+$aliasD = callIndexRoute('POST', '/api/seller/delete-account', $s12['token'], ['reason' => 'Alias D']);
+assertEq($aliasD['status'], 201, 'Scenario 12 POST /api/seller/delete-account -> 201');
+assertEq(callIndexRoute('POST', '/api/seller/deletion/withdraw', $s12['token'], [])['status'], 200, 'Scenario 12 POST /api/seller/deletion/withdraw -> 200');
+
+$aliasE = callIndexRoute('DELETE', "/api/sellers/{$s12['id']}", $s12['token']);
+assertEq($aliasE['status'], 201, 'Scenario 12 DELETE /api/sellers/{id} -> 201');
+assertEq(callIndexRoute('POST', '/api/seller/deletion/cancel', $s12['token'], [])['status'], 200, 'Scenario 12 POST /api/seller/deletion/cancel -> 200');
+
+$finalSelf = callIndexRoute('POST', '/api/seller-deletions', $s12['token'], ['reason' => 'Final seller request']);
+assertEq($finalSelf['status'], 201, 'Scenario 12 POST /api/seller-deletions -> 201');
+$d12FinalId = (int) ($finalSelf['json']['deletion_request']['id'] ?? 0);
+
+// 9. Advance beyond DELETION_REQUESTED -> seller withdrawal blocked (409)
+assertEq(callIndexRoute('POST', "/api/admin/seller-deletions/{$d12FinalId}/verify-orders", $adminToken, [])['status'], 200, 'Scenario 12 admin verify-orders via index.php -> 200');
+assertEq(callIndexRoute('POST', '/api/seller/deletion-request/withdraw', $s12['token'], [])['status'], 409, 'Scenario 12 withdraw after ADMIN_REVIEW -> 409');
+$afterVer12 = callIndexRoute('GET', '/api/seller/deletion-status', $s12['token']);
+assertEq($afterVer12['status'], 200, 'Scenario 12 GET /api/seller/deletion-status -> 200');
+assertEq($afterVer12['json']['can_withdraw_request'] ?? null, false, 'Scenario 12 can_withdraw_request=false after ADMIN_REVIEW');
+assertTrue(count($afterVer12['json']['history'] ?? []) >= 6, 'Scenario 12 full request history recorded');
+
+// 10. Admin aliases (/lock-account & /request) + complete deletion + Admin UI Seller Request badge
+$lockAlias = callIndexRoute('POST', "/api/admin/seller-deletions/{$d12FinalId}/lock-account", $adminToken, ['remarks' => 'Lock via alias']);
+assertEq($lockAlias['status'], 200, 'Scenario 12 POST /api/admin/seller-deletions/{id}/lock-account -> 200');
+assertEq($lockAlias['json']['seller']['account_status'] ?? '', 'LOCKED', 'Scenario 12 seller LOCKED');
+assertEq(callIndexRoute('GET', '/api/seller/deletion-request', $s12['token'])['status'], 403, 'Scenario 12 LOCKED seller JWT rejected -> 403');
+finalizeToDeleted($d12FinalId, $s12['id'], 'Scenario 12');
+
+$adminAliasReq = callIndexRoute('POST', '/api/admin/seller-deletions/request', $adminToken, ['seller_id' => $s12Other['id'], 'reason' => 'Admin alias test']);
+assertEq($adminAliasReq['status'], 201, 'Scenario 12 POST /api/admin/seller-deletions/request -> 201');
+assertEq($adminAliasReq['json']['deletion_request']['initiated_by_role'] ?? '', 'admin', 'Scenario 12 admin initiated_by_role = admin');
+
+$adminList12 = callIndexRoute('GET', '/api/admin/seller-deletions', $adminToken);
+assertEq($adminList12['status'], 200, 'Scenario 12 GET /api/admin/seller-deletions -> 200');
+$found12 = null;
+foreach (($adminList12['json']['requests'] ?? []) as $rq) {
+    if ((int) ($rq['id'] ?? 0) === $d12FinalId) {
+        $found12 = $rq;
+        break;
+    }
+}
+assertTrue($found12 !== null && ($found12['initiated_by_role'] ?? '') === 'seller', 'Scenario 12 admin list exposes initiated_by_role = seller');
+assertTrue(str_contains($dashHtml, 'Seller Request'), 'admin/dashboard.php contains Seller Request badge indicator');
 
 echo "\n===================================================================\n";
 echo "🎉 ALL PHP SELLER DELETION TESTS PASSED ({$assertCount} assertions)!\n";

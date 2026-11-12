@@ -8,6 +8,9 @@ const {
   deletionListRequestsNode,
   deletionPreflightNode,
   deletionCreateRequestNode,
+  sanitizeDeletionPayloadForSellerNode,
+  deletionGetSellerStatusNode,
+  deletionWithdrawBySellerNode,
   buildDeletionWorkspacePayloadNode,
   deletionLockAccountNode,
   deletionVerifyOrdersNode,
@@ -48,6 +51,296 @@ function createSellerDeletionRouter({
 }) {
   const router = express.Router();
 
+  // =========================================================================
+  // Seller Self-Service Account Deletion Request, Status & Withdrawal Routes
+  // =========================================================================
+
+  async function handleSellerRequestDeletion(req, res, { urlSellerId = null, requireExplicitForAdmin = false } = {}) {
+    const isAdmin = String(req.user?.role || 'seller').toLowerCase() === 'admin';
+    const body = req.body || {};
+    let targetSellerId;
+
+    if (urlSellerId !== null) {
+      if (!Number.isFinite(urlSellerId) || urlSellerId <= 0) {
+        return sendErrorJson(res, 422, 'Valid seller_id is required.', { seller_id: ['Valid seller_id is required.'] });
+      }
+      if (!isAdmin && urlSellerId !== Number(req.user.id)) {
+        return sendErrorJson(res, 403, 'Forbidden. You can only submit deletion requests for your own seller account.');
+      }
+      targetSellerId = urlSellerId;
+    } else if (body.seller_id !== undefined && body.seller_id !== null && String(body.seller_id).trim() !== '') {
+      const bodySid = parseInt(body.seller_id, 10);
+      if (!bodySid || bodySid <= 0) {
+        return sendErrorJson(res, 422, 'Valid seller_id is required.', { seller_id: ['Valid seller_id is required.'] });
+      }
+      if (!isAdmin && bodySid !== Number(req.user.id)) {
+        return sendErrorJson(res, 403, 'Forbidden. You can only submit deletion requests for your own seller account.');
+      }
+      targetSellerId = bodySid;
+    } else {
+      if (requireExplicitForAdmin && isAdmin) {
+        return sendErrorJson(res, 422, 'Valid seller_id is required.', { seller_id: ['Valid seller_id is required.'] });
+      }
+      targetSellerId = Number(req.user.id);
+    }
+
+    const actorRole = isAdmin ? 'admin' : 'seller';
+    const reason = String(body.reason || body.request_reason || body.deletion_reason || body.notes || body.comment || '').trim();
+    const remarks = isAdmin ? String(body.remarks || body.admin_remarks || '').trim() : '';
+
+    try {
+      const result = await deletionCreateRequestNode(
+        getPool(),
+        deletionCtx,
+        targetSellerId,
+        Number(req.user.id),
+        reason,
+        remarks,
+        getClientIp(req),
+        actorRole
+      );
+      if (result.error) {
+        const extras = result.existing_request_id ? { existing_request_id: result.existing_request_id } : {};
+        return sendErrorJson(res, result.code || 400, result.error, extras);
+      }
+
+      const payload = isAdmin ? { ...result.data } : sanitizeDeletionPayloadForSellerNode(result.data);
+      payload.has_request = true;
+      payload.has_active_request = true;
+      payload.account_status = payload.seller?.account_status || 'DELETION_PENDING';
+      payload.can_request_deletion = false;
+      payload.can_withdraw_request = true;
+
+      return res.status(result.statusCode || 201).json({
+        status: 'success',
+        message: isAdmin
+          ? 'Seller deletion request created. Account entered DELETION_PENDING status and new orders are blocked.'
+          : 'Seller deletion request submitted. Account entered DELETION_PENDING status and new orders are blocked.',
+        ...payload
+      });
+    } catch (err) {
+      return sendErrorJson(res, 500, `Failed to submit deletion request: ${err.message}`);
+    }
+  }
+
+  async function handleSellerGetDeletionStatus(req, res, { urlSellerId = null, allowAdminList = false } = {}) {
+    const isAdmin = String(req.user?.role || 'seller').toLowerCase() === 'admin';
+    try {
+      if (allowAdminList && isAdmin && urlSellerId === null && !req.query.seller_id) {
+        const filters = {
+          status: req.query.status || '',
+          stage: req.query.stage || '',
+          search: req.query.search || req.query.q || ''
+        };
+        const out = await deletionListRequestsNode(getPool(), deletionCtx, filters);
+        return res.json({ status: 'success', ...out });
+      }
+
+      let targetSellerId;
+      if (urlSellerId !== null) {
+        if (!Number.isFinite(urlSellerId) || urlSellerId <= 0) {
+          return sendErrorJson(res, 422, 'Valid seller_id is required.');
+        }
+        if (!isAdmin && urlSellerId !== Number(req.user.id)) {
+          return sendErrorJson(res, 403, 'Forbidden. You can only view deletion status for your own seller account.');
+        }
+        targetSellerId = urlSellerId;
+      } else if (req.query.seller_id !== undefined && req.query.seller_id !== null && String(req.query.seller_id).trim() !== '') {
+        const qSid = parseInt(req.query.seller_id, 10);
+        if (!qSid || qSid <= 0) {
+          return sendErrorJson(res, 422, 'Valid seller_id is required.');
+        }
+        if (!isAdmin && qSid !== Number(req.user.id)) {
+          return sendErrorJson(res, 403, 'Forbidden. You can only view deletion status for your own seller account.');
+        }
+        targetSellerId = qSid;
+      } else {
+        targetSellerId = Number(req.user.id);
+      }
+
+      const result = await deletionGetSellerStatusNode(getPool(), deletionCtx, targetSellerId, !isAdmin);
+      if (result.error) {
+        return sendErrorJson(res, result.code || 400, result.error);
+      }
+      return res.status(result.statusCode || 200).json({ status: 'success', ...result.data });
+    } catch (err) {
+      return sendErrorJson(res, 500, `Failed to load seller deletion status: ${err.message}`);
+    }
+  }
+
+  async function handleSellerWithdrawDeletion(req, res, { urlSellerId = null, urlDeletionReqId = null } = {}) {
+    const isAdmin = String(req.user?.role || 'seller').toLowerCase() === 'admin';
+    const body = req.body || {};
+    let targetSellerId;
+
+    if (urlSellerId !== null) {
+      if (!Number.isFinite(urlSellerId) || urlSellerId <= 0) {
+        return sendErrorJson(res, 422, 'Valid seller_id is required.');
+      }
+      if (!isAdmin && urlSellerId !== Number(req.user.id)) {
+        return sendErrorJson(res, 403, 'Forbidden. You can only withdraw deletion requests for your own seller account.');
+      }
+      targetSellerId = urlSellerId;
+    } else if (body.seller_id !== undefined && body.seller_id !== null && String(body.seller_id).trim() !== '') {
+      const bodySid = parseInt(body.seller_id, 10);
+      if (!bodySid || bodySid <= 0) {
+        return sendErrorJson(res, 422, 'Valid seller_id is required.', { seller_id: ['Valid seller_id is required.'] });
+      }
+      if (!isAdmin && bodySid !== Number(req.user.id)) {
+        return sendErrorJson(res, 403, 'Forbidden. You can only withdraw deletion requests for your own seller account.');
+      }
+      targetSellerId = bodySid;
+    } else {
+      targetSellerId = Number(req.user.id);
+    }
+
+    const delReqId = urlDeletionReqId !== null
+      ? urlDeletionReqId
+      : (body.deletion_request_id ? parseInt(body.deletion_request_id, 10) : null);
+    const reason = String(body.reason || body.withdrawal_reason || body.notes || '').trim();
+
+    try {
+      const result = await deletionWithdrawBySellerNode(
+        getPool(),
+        deletionCtx,
+        targetSellerId,
+        Number(req.user.id),
+        reason,
+        getClientIp(req),
+        isAdmin ? 'admin' : 'seller',
+        delReqId
+      );
+      if (result.error) {
+        return sendErrorJson(res, result.code || 400, result.error);
+      }
+      return res.status(result.statusCode || 200).json({
+        status: 'success',
+        message: 'Seller deletion request withdrawn. Account restored to ACTIVE status.',
+        ...result.data
+      });
+    } catch (err) {
+      return sendErrorJson(res, 500, `Failed to withdraw deletion request: ${err.message}`);
+    }
+  }
+
+  // Seller self-service GET status & preflight routes
+  router.get([
+    '/api/seller/deletion-request',
+    '/api/seller/deletion-requests',
+    '/api/seller/deletion',
+    '/api/seller/deletion/status',
+    '/api/seller/deletion-status',
+    '/api/seller/request-deletion',
+    '/api/seller/delete-request',
+    '/api/seller/delete-account',
+    '/api/seller/account/deletion-request',
+    '/api/seller/deletion/preflight',
+    '/api/seller/deletion-request/preflight'
+  ], authenticateToken, (req, res) => handleSellerGetDeletionStatus(req, res));
+
+  router.get(['/api/sellers/:seller_id/deletion-request', '/api/seller/:seller_id/deletion-request'], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.seller_id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerGetDeletionStatus(req, res, { urlSellerId: parseInt(req.params.seller_id, 10) }));
+
+  router.get('/api/seller-deletions', authenticateToken, (req, res) => handleSellerGetDeletionStatus(req, res, { allowAdminList: true }));
+
+  // Seller self-service POST / DELETE submit deletion request routes
+  router.post([
+    '/api/seller/deletion-request',
+    '/api/seller/deletion-requests',
+    '/api/seller/request-deletion',
+    '/api/seller/deletion',
+    '/api/seller/delete-request',
+    '/api/seller/delete-account',
+    '/api/seller/account/delete',
+    '/api/seller/account/deletion-request',
+    '/api/seller/profile/delete'
+  ], authenticateToken, (req, res) => handleSellerRequestDeletion(req, res));
+
+  router.delete([
+    '/api/seller/profile',
+    '/api/seller/account',
+    '/api/me',
+    '/api/seller/delete-account',
+    '/api/seller/account/delete'
+  ], authenticateToken, (req, res) => handleSellerRequestDeletion(req, res));
+
+  router.post([
+    '/api/sellers/:seller_id/deletion-request',
+    '/api/seller/:seller_id/deletion-request',
+    '/api/sellers/:seller_id/request-deletion',
+    '/api/seller/:seller_id/request-deletion'
+  ], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.seller_id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerRequestDeletion(req, res, { urlSellerId: parseInt(req.params.seller_id, 10) }));
+
+  router.delete(['/api/sellers/:seller_id', '/api/seller/:seller_id'], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.seller_id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerRequestDeletion(req, res, { urlSellerId: parseInt(req.params.seller_id, 10) }));
+
+  router.post(['/api/seller-deletions', '/api/seller-deletions/request'], authenticateToken, (req, res) =>
+    handleSellerRequestDeletion(req, res, { requireExplicitForAdmin: true })
+  );
+
+  // Seller self-service withdraw / cancel initial pending request
+  router.post([
+    '/api/seller/deletion-request/cancel',
+    '/api/seller/deletion-request/withdraw',
+    '/api/seller/deletion/cancel',
+    '/api/seller/deletion/withdraw'
+  ], authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res));
+
+  router.delete([
+    '/api/seller/deletion-request',
+    '/api/seller/deletion-requests',
+    '/api/seller/deletion'
+  ], authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res));
+
+  router.post([
+    '/api/seller/deletion-request/:id/cancel',
+    '/api/seller/deletion-request/:id/withdraw',
+    '/api/seller/deletion-requests/:id/cancel',
+    '/api/seller/deletion-requests/:id/withdraw'
+  ], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res, { urlDeletionReqId: parseInt(req.params.id, 10) }));
+
+  router.delete([
+    '/api/seller/deletion-request/:id',
+    '/api/seller/deletion-requests/:id',
+    '/api/seller/deletion-request/:id/cancel',
+    '/api/seller/deletion-request/:id/withdraw'
+  ], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res, { urlDeletionReqId: parseInt(req.params.id, 10) }));
+
+  router.post([
+    '/api/sellers/:seller_id/deletion-request/cancel',
+    '/api/sellers/:seller_id/deletion-request/withdraw',
+    '/api/seller/:seller_id/deletion-request/cancel',
+    '/api/seller/:seller_id/deletion-request/withdraw'
+  ], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.seller_id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res, { urlSellerId: parseInt(req.params.seller_id, 10) }));
+
+  router.delete([
+    '/api/sellers/:seller_id/deletion-request',
+    '/api/seller/:seller_id/deletion-request'
+  ], (req, res, next) => {
+    if (!/^\d+$/.test(req.params.seller_id)) return next('route');
+    return next();
+  }, authenticateToken, (req, res) => handleSellerWithdrawDeletion(req, res, { urlSellerId: parseInt(req.params.seller_id, 10) }));
+
+  // =========================================================================
+  // Admin Seller Account Deletion & Refund Routes
+  // =========================================================================
+
   // 1. GET /api/admin/seller-deletions
   router.get('/api/admin/seller-deletions', authenticateToken, requireAdminRole, async (req, res) => {
     try {
@@ -80,8 +373,8 @@ function createSellerDeletionRouter({
     }
   });
 
-  // 3. POST /api/admin/seller-deletions
-  router.post('/api/admin/seller-deletions', authenticateToken, requireAdminRole, async (req, res) => {
+  // 3. POST /api/admin/seller-deletions (and /request alias)
+  router.post(['/api/admin/seller-deletions', '/api/admin/seller-deletions/request'], authenticateToken, requireAdminRole, async (req, res) => {
     const body = req.body || {};
     const sellerId = parseInt(body.seller_id || body.id || 0, 10);
     if (!sellerId || sellerId <= 0) {
@@ -130,8 +423,8 @@ function createSellerDeletionRouter({
     }
   });
 
-  // 5. POST /api/admin/seller-deletions/:id/lock
-  router.post('/api/admin/seller-deletions/:id/lock', authenticateToken, requireAdminRole, async (req, res) => {
+  // 5. POST /api/admin/seller-deletions/:id/lock (and /lock-account alias)
+  router.post(['/api/admin/seller-deletions/:id/lock', '/api/admin/seller-deletions/:id/lock-account'], authenticateToken, requireAdminRole, async (req, res) => {
     const delReqId = parseInt(req.params.id, 10);
     if (!delReqId || delReqId <= 0) return sendErrorJson(res, 404, 'Deletion request not found.');
     const body = req.body || {};

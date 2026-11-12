@@ -3126,12 +3126,24 @@ app.get('/api/seller/profile', async (req, res) => {
 });
 
 // PUT / PATCH / POST /api/seller/profile and /api/seller/profile/update
-app.all(['/api/seller/profile', '/api/seller/profile/update'], authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res) => {
-  if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
-    return handleSellerProfileUpdate(req, res, null);
+app.all(
+  ['/api/seller/profile', '/api/seller/profile/update'],
+  (req, res, next) => {
+    if (req.method === 'DELETE' && req.path === '/api/seller/profile') {
+      return next('route');
+    }
+    return next();
+  },
+  authenticateToken,
+  requireActiveSellerForMutation,
+  avatarUpload.any(),
+  (req, res) => {
+    if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
+      return handleSellerProfileUpdate(req, res, null);
+    }
+    res.status(405).json({ message: 'Method Not Allowed' });
   }
-  res.status(405).json({ message: 'Method Not Allowed' });
-});
+);
 
 // Separate Password Update: (current_password, new_password, confirm_password)
 app.all(['/api/seller/change-password', '/api/change-password', '/api/seller/password'], authenticateToken, requireActiveSellerForMutation, (req, res) => {
@@ -3233,7 +3245,7 @@ app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], asyn
 app.all(
   ['/api/sellers/:id', '/api/seller/:id'],
   (req, res, next) => {
-    if (!/^\d+$/.test(req.params.id)) {
+    if (!/^\d+$/.test(req.params.id) || req.method === 'DELETE') {
       return next('route');
     }
     return next();
@@ -12404,6 +12416,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
                     <td><strong>#${dr.id}</strong></td>
                     <td>
                       <strong style="color:#1e1b4b;">${escapeHtml(dr.seller_name)}</strong>
+                      ${dr.initiated_by_role === 'seller' ? '<span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : ''}
                       <div style="font-size:12px; color:#64748b;">Seller ID #${dr.seller_id} ${dr.seller_phone ? '&bull; ' + escapeHtml(dr.seller_phone) : ''}</div>
                       ${dr.seller_email ? `<div style="font-size:11px; color:#94a3b8;">${escapeHtml(dr.seller_email)}</div>` : ''}
                     </td>
@@ -14092,6 +14105,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
                 html += '<tr class="del-req-row" data-status="' + escapeHtml(dr.status) + '" data-search="' + escapeHtml(searchTxt) + '">' +
                   '<td><strong>#' + Number(dr.id) + '</strong></td>' +
                   '<td><strong style="color:#1e1b4b;">' + escapeHtml(dr.seller_name) + '</strong>' +
+                  (dr.initiated_by_role === 'seller' ? ' <span class="del-badge del-yellow" style="font-size:10px; padding:1px 6px; margin-left:4px;">Seller Request</span>' : '') +
                   '<div style="font-size:12px; color:#64748b;">Seller ID #' + Number(dr.seller_id) + (dr.seller_phone ? ' &bull; ' + escapeHtml(dr.seller_phone) : '') + '</div>' +
                   (dr.seller_email ? '<div style="font-size:11px; color:#94a3b8;">' + escapeHtml(dr.seller_email) + '</div>' : '') +
                   '</td>' +

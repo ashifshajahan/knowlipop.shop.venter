@@ -131,11 +131,16 @@ A complete, multi-stage deletion workflow implemented identically across both **
 * Missing gateway payment ID routes to `REFUND_REQUIRES_REVIEW`; gateway errors set `REFUND_FAILED` and block deletion.
 * Prevents double payouts and blocks payout release while unresolved orders, pending/failed refunds, unsettled gateway captures, or open disputes remain.
 
+### Seller Self-Service Deletion Request APIs (`Authorization: Bearer <seller_token>`)
+* `POST /api/seller/deletion-request` (aliases: `/api/seller/request-deletion`, `/api/seller/deletion`, `/api/seller/delete-request`, `/api/seller/delete-account`, `/api/seller/account/delete`, `/api/seller/account/deletion-request`, `/api/seller/profile/delete`, `/api/seller-deletions`, `/api/seller-deletions/request`, `/api/sellers/:seller_id/deletion-request`, `DELETE /api/seller/profile`, `DELETE /api/seller/account`, `DELETE /api/me`, `DELETE /api/sellers/:seller_id`) — Authenticated seller submits an account deletion request (optional `reason` / `request_reason`), moving `account_status` to `DELETION_PENDING`, blocking new orders (`403`), notifying the seller, and setting `initiated_by_role = 'seller'`. Enforces `403` cross-seller isolation and `409` duplicate prevention (`existing_request_id`).
+* `GET /api/seller/deletion-request` (aliases: `/api/seller/deletion/status`, `/api/seller/deletion-status`, `/api/seller/deletion/preflight`, `/api/seller/deletion-request/preflight`, `/api/seller-deletions`, `/api/sellers/:seller_id/deletion-request`) — Returns the seller's live preflight metrics, 6-gate checklist, active/latest deletion request, history, and `can_request_deletion` / `can_withdraw_request` flags (with admin confirmation tokens, admin remarks, and audit IP addresses redacted).
+* `POST /api/seller/deletion-request/withdraw` (aliases: `/api/seller/deletion-request/cancel`, `/api/seller/deletion/withdraw`, `/api/seller/deletion/cancel`, `/api/seller/deletion-request/:id/withdraw`, `DELETE /api/seller/deletion-request`, `DELETE /api/seller/deletion-request/:id`, `/api/sellers/:seller_id/deletion-request/withdraw`) — Allows the seller to withdraw an initial `DELETION_REQUESTED` request and restore `ACTIVE` status (returns `409` once locked or advanced to admin review/processing).
+
 ### Admin Deletion API Endpoints (`Authorization: Bearer <admin_token>`)
 * `GET /api/admin/seller-deletions/preflight/:seller_id` — Live seller details + 13+ metrics (products, A–E order breakdown, successful payments, pending refunds, wallet balance, pending payouts, commissions, disputes)
-* `POST /api/admin/seller-deletions` — Create deletion request, set `users.account_status = 'DELETION_PENDING'`, block new buyer orders, notify seller
-* `GET /api/admin/seller-deletions` & `GET /api/admin/seller-deletions/:id` — Filtered request list & full review workspace payload
-* `POST /api/admin/seller-deletions/:id/lock` — Lock seller account (`LOCKED`) and revoke seller mutations
+* `POST /api/admin/seller-deletions` (alias: `POST /api/admin/seller-deletions/request`) — Create deletion request, set `users.account_status = 'DELETION_PENDING'`, block new buyer orders, notify seller
+* `GET /api/admin/seller-deletions` & `GET /api/admin/seller-deletions/:id` — Filtered request list & full review workspace payload (includes `initiated_by_role`: `'seller'` vs `'admin'`)
+* `POST /api/admin/seller-deletions/:id/lock` (alias: `POST /api/admin/seller-deletions/:id/lock-account`) — Lock seller account (`LOCKED`) and revoke seller mutations
 * `POST /api/admin/seller-deletions/:id/verify-orders` — Execute Rules A–E verification & queue eligible refunds
 * `GET /api/admin/seller-deletions/:id/refunds` & `POST /api/admin/seller-deletions/:id/process-refunds` — Track & execute idempotent Razorpay refunds
 * `POST /api/admin/seller-deletions/:id/verify-settlement` & `POST /api/admin/seller-deletions/:id/settle-payout` — Audit financial obligations & safely release payouts
@@ -159,10 +164,10 @@ node tests/test_e2e_node.js
 # 2. Pure PHP End-to-End Multi-Vendor Suite
 php tests/test_php_multi_vendor.php
 
-# 3. Node.js Seller Deletion & Refund 11-Scenario Suite
+# 3. Node.js Seller Deletion & Refund 12-Scenario Suite
 node tests/test_seller_deletion_node.js
 
-# 4. Pure PHP Seller Deletion & Refund 11-Scenario Suite
+# 4. Pure PHP Seller Deletion & Refund 12-Scenario Suite
 php tests/test_seller_deletion_php.php
 
 # 5. API Cleanliness & Postman JSON Validation

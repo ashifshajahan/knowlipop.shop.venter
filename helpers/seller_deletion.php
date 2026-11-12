@@ -1308,6 +1308,7 @@ function buildDeletionWorkspacePayloadPhp(PDO $pdo, int $deletionRequestId): ?ar
             'id' => (int) $req['id'],
             'seller_id' => $sellerId,
             'requested_by' => $req['requested_by'] ? (int) $req['requested_by'] : null,
+            'initiated_by_role' => ($req['requested_by'] && (int) $req['requested_by'] === $sellerId) ? 'seller' : 'admin',
             'stage' => $req['stage'],
             'status' => $req['status'],
             'badge_color' => getStatusColorBadgePhp((string) $req['status']),
@@ -1804,6 +1805,8 @@ function deletionListRequestsPhp(PDO $pdo, array $filters = []): array
         return [
             'id' => (int) $r['id'],
             'seller_id' => (int) $r['seller_id'],
+            'requested_by' => !empty($r['requested_by']) ? (int) $r['requested_by'] : null,
+            'initiated_by_role' => (!empty($r['requested_by']) && (int) $r['requested_by'] === (int) $r['seller_id']) ? 'seller' : 'admin',
             'seller_name' => $r['seller_name'] ?: ($r['user_name'] ?: "Seller #{$r['seller_id']}"),
             'seller_email' => getPublicSellerEmailPhp($r['user_email'] ?? null, 'seller'),
             'seller_phone' => $r['user_phone'] ?? null,
@@ -1825,9 +1828,10 @@ function deletionListRequestsPhp(PDO $pdo, array $filters = []): array
     return ['requests' => $requests, 'kpis' => $kpis];
 }
 
-function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string $reason = '', string $remarks = ''): array
+function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string $reason = '', string $remarks = '', string $actorRole = 'admin'): array
 {
     ensureSellerDeletionSchemaPhp($pdo);
+    $normalizedActorRole = strtolower(trim($actorRole)) === 'seller' ? 'seller' : 'admin';
     $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
     $lockSuffix = ($driver === 'mysql') ? ' FOR UPDATE' : '';
 
@@ -1877,6 +1881,11 @@ function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string 
             'captured_at' => gmdate('c'),
         ];
 
+        $effectiveReason = $reason !== ''
+            ? $reason
+            : ($normalizedActorRole === 'seller' ? 'Seller requested account deletion' : 'Admin requested seller account deletion');
+        $effectiveRemarks = ($normalizedActorRole === 'admin' && $remarks !== '') ? $remarks : null;
+
         $ins = $pdo->prepare("
             INSERT INTO seller_deletion_requests
                 (seller_id, requested_by, stage, status, request_reason, admin_remarks, snapshot_json, financial_summary_json, created_at, updated_at)
@@ -1886,8 +1895,8 @@ function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string 
         $ins->execute([
             ':sid' => $sellerId,
             ':req_by' => $adminId,
-            ':reason' => $reason !== '' ? $reason : 'Admin requested seller account deletion',
-            ':remarks' => $remarks !== '' ? $remarks : null,
+            ':reason' => $effectiveReason,
+            ':remarks' => $effectiveRemarks,
             ':snap' => json_encode($snapshotPayload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
             ':fin' => json_encode($computed['settlement'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         ]);
@@ -1906,19 +1915,24 @@ function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string 
             $prevAccountStatus,
             'DELETION_REQUESTED',
             $adminId,
-            'admin',
-            $remarks !== '' ? $remarks : ($reason ?: 'Deletion request initiated'),
-            ['metrics' => $computed['metrics']]
+            $normalizedActorRole,
+            $effectiveRemarks !== null ? $effectiveRemarks : $effectiveReason,
+            ['metrics' => $computed['metrics'], 'initiated_by_role' => $normalizedActorRole]
         );
+
+        $notifTitle = $normalizedActorRole === 'seller' ? 'Account Deletion Request Submitted' : 'Account Deletion Requested';
+        $notifMessage = $normalizedActorRole === 'seller'
+            ? 'Your seller account deletion request has been submitted and is pending administrative verification. New orders are temporarily blocked during verification.'
+            : 'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.';
 
         sendDeletionNotificationPhp(
             $pdo,
             $sellerId,
             $seller['phone'] ?? null,
-            'Account Deletion Requested',
-            'Your seller account has entered DELETION_PENDING status following an administrative deletion request. New orders are temporarily blocked during verification.',
+            $notifTitle,
+            $notifMessage,
             'seller_deletion_requested',
-            ['deletion_request_id' => $delReqId, 'seller_id' => $sellerId]
+            ['deletion_request_id' => $delReqId, 'seller_id' => $sellerId, 'initiated_by_role' => $normalizedActorRole]
         );
 
         $pdo->commit();
@@ -1926,6 +1940,243 @@ function deletionCreateRequestPhp(PDO $pdo, int $sellerId, int $adminId, string 
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         return ['error' => 'Failed to create deletion request: ' . $e->getMessage(), 'code' => 500];
+    }
+}
+
+function sanitizeDeletionPayloadForSellerPhp(array $payload): array
+{
+    if (!empty($payload['deletion_request']) && is_array($payload['deletion_request'])) {
+        $payload['deletion_request']['confirmation_token'] = null;
+        $payload['deletion_request']['confirmation_expires_at'] = null;
+        $payload['deletion_request']['has_confirmation_token'] = false;
+        $payload['deletion_request']['expected_confirmation_phrase'] = null;
+        $payload['deletion_request']['final_delete_allowed'] = false;
+        $payload['deletion_request']['approve_allowed'] = false;
+        $payload['deletion_request']['admin_remarks'] = null;
+    }
+    if (!empty($payload['audit_logs']) && is_array($payload['audit_logs'])) {
+        foreach ($payload['audit_logs'] as &$lg) {
+            if (is_array($lg) && array_key_exists('ip_address', $lg)) {
+                $lg['ip_address'] = null;
+            }
+        }
+        unset($lg);
+    }
+    return $payload;
+}
+
+function deletionGetSellerStatusPhp(PDO $pdo, int $sellerId, bool $redactForSeller = true): array
+{
+    ensureSellerDeletionSchemaPhp($pdo);
+    $uStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+    $uStmt->execute([':id' => $sellerId]);
+    $seller = $uStmt->fetch(PDO::FETCH_ASSOC);
+    if (!$seller) {
+        return ['error' => 'Seller not found.', 'code' => 404];
+    }
+
+    $rStmt = $pdo->prepare("SELECT * FROM seller_deletion_requests WHERE seller_id = :sid ORDER BY id DESC");
+    $rStmt->execute([':sid' => $sellerId]);
+    $allReqs = $rStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $activeReq = null;
+    foreach ($allReqs as $row) {
+        if (!in_array(strtoupper((string) $row['status']), ['DELETED', 'DELETION_REJECTED'], true)) {
+            $activeReq = $row;
+            break;
+        }
+    }
+    $latestReq = $allReqs[0] ?? null;
+    $targetReq = $activeReq ?? $latestReq;
+
+    $history = array_map(function (array $r) use ($sellerId): array {
+        return [
+            'id' => (int) $r['id'],
+            'seller_id' => (int) $r['seller_id'],
+            'requested_by' => !empty($r['requested_by']) ? (int) $r['requested_by'] : null,
+            'initiated_by_role' => (!empty($r['requested_by']) && (int) $r['requested_by'] === $sellerId) ? 'seller' : 'admin',
+            'stage' => $r['stage'],
+            'status' => $r['status'],
+            'badge_color' => getStatusColorBadgePhp((string) $r['status']),
+            'request_reason' => $r['request_reason'],
+            'hold_reason' => $r['hold_reason'],
+            'rejection_reason' => $r['rejection_reason'],
+            'approved_at' => $r['approved_at'],
+            'deleted_at' => $r['deleted_at'],
+            'created_at' => $r['created_at'],
+            'updated_at' => $r['updated_at'],
+        ];
+    }, $allReqs);
+
+    $accStatus = strtoupper((string) ($seller['account_status'] ?? 'ACTIVE'));
+    $isAdminUser = strtolower((string) ($seller['role'] ?? 'seller')) === 'admin';
+    $canRequestDeletion = ($activeReq === null && $accStatus !== 'DELETED' && !$isAdminUser);
+    $canWithdrawRequest = ($activeReq !== null && strtoupper((string) $activeReq['stage']) === 'DELETION_REQUESTED' && strtoupper((string) $activeReq['status']) === 'DELETION_REQUESTED');
+
+    if ($targetReq) {
+        $workspace = buildDeletionWorkspacePayloadPhp($pdo, (int) $targetReq['id']);
+        if ($workspace) {
+            if ($redactForSeller) {
+                $workspace = sanitizeDeletionPayloadForSellerPhp($workspace);
+            }
+            $workspace['has_request'] = true;
+            $workspace['has_active_request'] = ($activeReq !== null);
+            $workspace['account_status'] = $accStatus;
+            $workspace['can_request_deletion'] = $canRequestDeletion;
+            $workspace['can_withdraw_request'] = $canWithdrawRequest;
+            $workspace['history'] = $history;
+            return ['statusCode' => 200, 'data' => $workspace];
+        }
+    }
+
+    $computed = computeSellerFinancialAndChecklistPhp($pdo, $sellerId, null);
+    return [
+        'statusCode' => 200,
+        'data' => [
+            'has_request' => false,
+            'has_active_request' => false,
+            'account_status' => $accStatus,
+            'can_request_deletion' => $canRequestDeletion,
+            'can_withdraw_request' => false,
+            'deletion_request' => null,
+            'history' => [],
+            'seller' => $computed['seller'],
+            'metrics' => $computed['metrics'],
+            'settlement' => $computed['settlement'],
+            'checks' => $computed['checks'],
+            'all_checks_passed' => $computed['all_checks_passed'],
+            'blockers' => $computed['blockers'],
+            'refunds' => [],
+            'refund_stats' => $computed['refund_stats'],
+            'payouts' => $computed['payouts'],
+            'disputes' => $computed['disputes'],
+            'gst' => $computed['gst'],
+            'audit_logs' => [],
+        ],
+    ];
+}
+
+function deletionWithdrawBySellerPhp(PDO $pdo, int $sellerId, int $actorId, string $reason = '', string $actorRole = 'seller', ?int $deletionRequestId = null): array
+{
+    ensureSellerDeletionSchemaPhp($pdo);
+    $normalizedActorRole = strtolower(trim($actorRole)) === 'admin' ? 'admin' : 'seller';
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    $lockSuffix = ($driver === 'mysql') ? ' FOR UPDATE' : '';
+
+    $pdo->beginTransaction();
+    try {
+        $uStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1" . $lockSuffix);
+        $uStmt->execute([':id' => $sellerId]);
+        $seller = $uStmt->fetch(PDO::FETCH_ASSOC);
+        if (!$seller) {
+            $pdo->rollBack();
+            return ['error' => 'Seller not found.', 'code' => 404];
+        }
+
+        if ($deletionRequestId !== null && $deletionRequestId > 0) {
+            $rStmt = $pdo->prepare("SELECT * FROM seller_deletion_requests WHERE id = :id LIMIT 1" . $lockSuffix);
+            $rStmt->execute([':id' => $deletionRequestId]);
+            $req = $rStmt->fetch(PDO::FETCH_ASSOC);
+            if (!$req) {
+                $pdo->rollBack();
+                return ['error' => 'Deletion request not found.', 'code' => 404];
+            }
+            if ((int) $req['seller_id'] !== $sellerId) {
+                $pdo->rollBack();
+                return ['error' => 'Forbidden. Deletion request does not belong to this seller.', 'code' => 403];
+            }
+            if (in_array(strtoupper((string) $req['status']), ['DELETED', 'DELETION_REJECTED'], true)) {
+                $pdo->rollBack();
+                return ['error' => "Deletion request #{$req['id']} is already closed ({$req['status']}).", 'code' => 409];
+            }
+        } else {
+            $rStmt = $pdo->prepare("
+                SELECT * FROM seller_deletion_requests
+                WHERE seller_id = :sid AND status NOT IN ('DELETED', 'DELETION_REJECTED')
+                ORDER BY id DESC LIMIT 1
+            " . $lockSuffix);
+            $rStmt->execute([':sid' => $sellerId]);
+            $req = $rStmt->fetch(PDO::FETCH_ASSOC);
+            if (!$req) {
+                $pdo->rollBack();
+                return ['error' => 'No active seller deletion request found to withdraw.', 'code' => 404];
+            }
+        }
+
+        $accStatus = strtoupper((string) ($seller['account_status'] ?? 'ACTIVE'));
+        if (in_array($accStatus, ['LOCKED', 'DELETED'], true)) {
+            $pdo->rollBack();
+            return ['error' => "Cannot withdraw deletion request because seller account is {$accStatus}. Please contact Admin support.", 'code' => 409];
+        }
+
+        if (strtoupper((string) $req['stage']) !== 'DELETION_REQUESTED' || strtoupper((string) $req['status']) !== 'DELETION_REQUESTED') {
+            $pdo->rollBack();
+            return [
+                'error' => "Deletion request #{$req['id']} cannot be withdrawn because it has already entered stage {$req['stage']} ({$req['status']}).",
+                'code' => 409,
+            ];
+        }
+
+        $delReqId = (int) $req['id'];
+        $cleanReason = trim($reason) !== '' ? trim($reason) : 'Withdrawn by seller';
+
+        $pdo->prepare("
+            UPDATE seller_deletion_requests
+            SET stage = 'DELETION_REJECTED',
+                status = 'DELETION_REJECTED',
+                rejection_reason = :rr,
+                confirmation_token = NULL,
+                confirmation_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+        ")->execute([':rr' => $cleanReason, ':id' => $delReqId]);
+
+        $pdo->prepare("
+            UPDATE users
+            SET account_status = 'ACTIVE',
+                deletion_requested_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :sid AND account_status NOT IN ('LOCKED', 'DELETED')
+        ")->execute([':sid' => $sellerId]);
+
+        logSellerDeletionAuditPhp(
+            $pdo,
+            $delReqId,
+            $sellerId,
+            'DELETION_WITHDRAWN_BY_SELLER',
+            $req['stage'],
+            'DELETION_REJECTED',
+            $req['status'],
+            'DELETION_REJECTED',
+            $actorId,
+            $normalizedActorRole,
+            $cleanReason
+        );
+
+        sendDeletionNotificationPhp(
+            $pdo,
+            $sellerId,
+            $seller['phone'] ?? null,
+            'Account Deletion Request Withdrawn',
+            "Your seller deletion request (#{$delReqId}) has been withdrawn and your account has been restored to ACTIVE status.",
+            'seller_deletion_withdrawn',
+            ['deletion_request_id' => $delReqId, 'reason' => $cleanReason]
+        );
+
+        $pdo->commit();
+        $payload = buildDeletionWorkspacePayloadPhp($pdo, $delReqId);
+        if ($payload && $normalizedActorRole !== 'admin') {
+            $payload = sanitizeDeletionPayloadForSellerPhp($payload);
+        }
+        $payload['has_request'] = true;
+        $payload['has_active_request'] = false;
+        $payload['can_request_deletion'] = true;
+        $payload['can_withdraw_request'] = false;
+        $payload['account_status'] = 'ACTIVE';
+        return ['statusCode' => 200, 'data' => $payload];
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        return ['error' => 'Failed to withdraw deletion request: ' . $e->getMessage(), 'code' => 500];
     }
 }
 
