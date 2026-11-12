@@ -34,8 +34,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = 'Email and password are required.';
     } else {
         try {
-            $stmt = $pdo->prepare("SELECT * FROM users WHERE (LOWER(email) = :email OR LOWER(email) IN ('admin@vendor.app', 'admin@venter.app')) AND role = 'admin' LIMIT 1");
-            $stmt->execute([':email' => $email]);
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE (LOWER(email) = :email1 OR (:email2 IN ('admin@vendor.app', 'admin@venter.app', 'admin') AND LOWER(email) IN ('admin@vendor.app', 'admin@venter.app'))) AND role = 'admin' LIMIT 1");
+            $stmt->execute([':email1' => $email, ':email2' => $email]);
             $admin = $stmt->fetch();
 
             // Auto-provision admin user if empty or fresh database

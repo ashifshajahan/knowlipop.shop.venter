@@ -168,13 +168,55 @@ if ($requestUri === '/admin/login') {
     exit;
 }
 
+if ($requestUri === '/admin/get_gst_details') {
+    $_GET['action'] = 'get_gst_details';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/view_gst_doc') {
+    $_GET['action'] = 'view_gst_doc';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
 if ($requestUri === '/admin/seller-deletions') {
     $_GET['tab'] = $_GET['tab'] ?? 'seller-deletions';
     require __DIR__ . '/admin/dashboard.php';
     exit;
 }
 
-if ($requestUri === '/admin' || $requestUri === '/admin/dashboard' || $requestUri === '/admin/sellers') {
+if ($requestUri === '/admin/products') {
+    $_GET['tab'] = $_GET['tab'] ?? 'products';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/sellers') {
+    $_GET['tab'] = $_GET['tab'] ?? 'sellers';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/create-seller') {
+    $_GET['tab'] = $_GET['tab'] ?? 'create-seller';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/gst-verifications') {
+    $_GET['tab'] = $_GET['tab'] ?? 'gst';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/categories') {
+    $_GET['tab'] = $_GET['tab'] ?? 'categories';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin' || $requestUri === '/admin/dashboard' || $requestUri === '/admin/dashboard.php') {
     require __DIR__ . '/admin/dashboard.php';
     exit;
 }

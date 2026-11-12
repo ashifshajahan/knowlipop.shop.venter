@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS `users` (
   `remember_token` VARCHAR(100) NULL DEFAULT NULL,
   `seller_name` VARCHAR(120) NULL DEFAULT NULL,
   `phone` VARCHAR(30) NULL DEFAULT NULL UNIQUE,
+  `normalized_phone` VARCHAR(30) NULL DEFAULT NULL,
   `address` TEXT NULL DEFAULT NULL,
   `landmark` VARCHAR(200) NULL DEFAULT NULL,
   `state` VARCHAR(100) NULL DEFAULT NULL,
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS `users` (
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_users_normalized_phone` (`normalized_phone`),
   INDEX `idx_users_role` (`role`),
   INDEX `idx_users_phone` (`phone`),
   INDEX `idx_users_account_status` (`account_status`)

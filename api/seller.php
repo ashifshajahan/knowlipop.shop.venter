@@ -18,6 +18,7 @@ function hasUserColumn(PDO $pdo, string $column): bool
 function ensureUserColumns(PDO $pdo): void
 {
     ensureSellerDeletionSchemaPhp($pdo);
+    ensureNormalizedPhoneSchemaPhp($pdo);
     try {
         if (!hasUserColumn($pdo, 'avatar_url')) {
             $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
@@ -271,7 +272,9 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     $landmark = extractFieldPhp($input, ['landmark', 'land_mark', 'nearby']);
     $state = extractFieldPhp($input, ['state', 'province', 'region']);
     $country = extractFieldPhp($input, ['country', 'nation']);
-    $rawPhone = extractPhonePhp($input);
+    $phoneParts = extractPhonePartsPhp($input);
+    $rawPhone = $phoneParts['rawPhone'];
+    $dialCode = $phoneParts['dialCode'];
     $email = trim(extractFieldPhp($input, ['email', 'email_address']));
 
     // Separate password fields: current_password, new_password, confirm_password
@@ -281,16 +284,17 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
 
     // Validate phone if provided
     $phone = '';
+    $phoneConflict = false;
     if (!empty($rawPhone)) {
-        $phone = normalizePhonePhp($rawPhone);
-        if (!preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        $phone = normalizePhoneNumberPhp($rawPhone, $dialCode);
+        $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+        if ($phoneErr !== null) {
+            $errors['phone'] = [$phoneErr];
         } else {
-            $rawNoPrefix = preg_replace('/^\+91|^\+/', '', $rawPhone);
-            $chkPhone = $pdo->prepare("SELECT id FROM users WHERE (phone = :p OR phone = :rp OR phone = :rnp) AND id != :id LIMIT 1");
-            $chkPhone->execute([':p' => $phone, ':rp' => $rawPhone, ':rnp' => $rawNoPrefix, ':id' => $sellerId]);
-            if ($chkPhone->fetch()) {
+            $existingMatches = findUsersByPhonePhp($pdo, $rawPhone, $phone, $dialCode, $sellerId);
+            if (!empty($existingMatches)) {
                 $errors['phone'] = ['This phone number is already registered to another account.'];
+                $phoneConflict = true;
             }
         }
     }
@@ -325,7 +329,21 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     }
 
     if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
+        if ($phoneConflict && count($errors) === 1) {
+            errorResponse(
+                'This phone number is already registered to another account.',
+                $errors,
+                409,
+                ['status' => false, 'error_code' => 'PHONE_ALREADY_REGISTERED']
+            );
+        }
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse(
+            count($errors) === 1 ? $firstMsg : 'Validation error occurred.',
+            $errors,
+            422,
+            ['status' => false, 'error_code' => 'VALIDATION_ERROR']
+        );
     }
 
     // Handle avatar image if provided
@@ -371,6 +389,10 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     if ($phone !== '') {
         $updates[] = "phone = :phone";
         $params[':phone'] = $phone;
+        if (hasUserColumn($pdo, 'normalized_phone')) {
+            $updates[] = "normalized_phone = :normalized_phone";
+            $params[':normalized_phone'] = $phone;
+        }
     }
     if ($email !== '') {
         $updates[] = "email = :email";
@@ -388,8 +410,19 @@ function apiUpdateSellerProfile(PDO $pdo, ?int $targetId = null): void
     if (!empty($updates)) {
         $updates[] = "updated_at = CURRENT_TIMESTAMP";
         $sql = "UPDATE users SET " . implode(', ', $updates) . " WHERE id = :id";
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute($params);
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+        } catch (PDOException $e) {
+            if (isDuplicateKeyExceptionPhp($e)) {
+                $msgLower = strtolower($e->getMessage());
+                if ($phone !== '' && (str_contains($msgLower, 'phone') || !str_contains($msgLower, 'email'))) {
+                    errorResponse('This phone number is already registered to another account.', ['phone' => ['This phone number is already registered to another account.']], 409, ['status' => false, 'error_code' => 'PHONE_ALREADY_REGISTERED']);
+                }
+                errorResponse('This email address is already in use by another account.', ['email' => ['This email address is already in use by another account.']], 422, ['status' => false, 'error_code' => 'EMAIL_ALREADY_REGISTERED']);
+            }
+            throw $e;
+        }
     }
 
     // Fetch refreshed user record

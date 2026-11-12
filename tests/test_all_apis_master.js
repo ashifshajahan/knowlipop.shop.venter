@@ -308,7 +308,7 @@ async function runMasterTestSuite() {
       password: 'WrongPassword1!'
     }
   });
-  assert(loginWrongPassRes.status === 422, 'POST /api/login rejects incorrect password with 422');
+  assert(loginWrongPassRes.status === 401 && loginWrongPassRes.body.error_code === 'INVALID_PASSWORD', 'POST /api/login rejects incorrect password with 401');
 
   const loginMissingContactRes = await dispatch(app, {
     method: 'POST',

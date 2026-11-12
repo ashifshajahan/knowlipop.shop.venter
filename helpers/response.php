@@ -27,9 +27,19 @@ function jsonResponse(mixed $data, int $statusCode = 200): void
     exit;
 }
 
-function errorResponse(string $message, array $errors = [], int $statusCode = 400): void
+function errorResponse(string $message, array $errors = [], int $statusCode = 400, array $extra = []): void
 {
-    $payload = ['message' => $message];
+    $payload = [];
+    if (array_key_exists('status', $extra)) {
+        $payload['status'] = $extra['status'];
+    }
+    $payload['message'] = $message;
+    foreach ($extra as $k => $v) {
+        if ($k === 'status' || $k === 'message' || $k === 'errors') {
+            continue;
+        }
+        $payload[$k] = $v;
+    }
     if (!empty($errors)) {
         $payload['errors'] = $errors;
     }

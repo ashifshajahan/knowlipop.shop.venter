@@ -349,9 +349,9 @@ function getFirebaseTestOtp(): string
 
 function isFirebaseTestPhone(string $phone): bool
 {
-    $clean1 = preg_replace('/\D+/', '', $phone);
-    $clean2 = preg_replace('/\D+/', '', getFirebaseTestPhone());
-    return !empty($clean1) && !empty($clean2) && strlen($clean1) >= 10 && strlen($clean2) >= 10 && str_ends_with($clean1, substr($clean2, -10));
+    $normInput = normalizePhoneNumberPhp($phone);
+    $normTest = normalizePhoneNumberPhp(getFirebaseTestPhone());
+    return $normInput !== '' && $normTest !== '' && $normInput === $normTest;
 }
 
 function isFirebaseTestEmail(string $email): bool
@@ -414,15 +414,498 @@ function firebaseHttpJsonPostPhp(string $url, array $payload): array
     ];
 }
 
-function normalizePhoneSimplePhp(string $raw): string
+function validatePhoneFormatPhp(string $normalizedPhone, string $rawPhone = ''): ?string
 {
-    if ($raw === '') return '';
-    $str = preg_replace('/[\s\-\(\)]/', '', trim($raw));
-    if ($str === '' || $str === null) return '';
-    if (str_starts_with($str, '+')) return $str;
-    if (preg_match('/^\d{10}$/', $str)) return '+91' . $str;
-    if (preg_match('/^91\d{10}$/', $str)) return '+' . $str;
-    return '+' . $str;
+    if ($rawPhone !== '') {
+        $stripped = preg_replace('/[\s\-\(\)\.]+/u', '', trim($rawPhone));
+        if ($stripped === '' || $stripped === null || !preg_match('/^\+?\d+$/', $stripped)) {
+            return 'The phone number contains invalid characters. Enter digits only with optional country code (e.g. +919876543210).';
+        }
+    }
+
+    if ($normalizedPhone === '') {
+        return $rawPhone !== ''
+            ? 'The phone format is invalid (must include country code, e.g. +919876543210).'
+            : null;
+    }
+
+    // Country-specific phone number length & prefix validation
+    if (str_starts_with($normalizedPhone, '+91')) {
+        if (!preg_match('/^\+91[6-9]\d{9}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for India (+91 followed by 10 digits starting with 6-9, e.g. +919876543210).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+1')) {
+        if (!preg_match('/^\+1[2-9]\d{9}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for US/Canada (+1 followed by 10 digits, e.g. +12025550143).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+44')) {
+        if (!preg_match('/^\+44[1-9]\d{8,9}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for UK (+44 followed by 9-10 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+971')) {
+        if (!preg_match('/^\+971[2-9]\d{7,8}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for UAE (+971 followed by 8-9 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+966')) {
+        if (!preg_match('/^\+966[1-9]\d{8}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Saudi Arabia (+966 followed by 9 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+65')) {
+        if (!preg_match('/^\+65[689]\d{7}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Singapore (+65 followed by 8 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+61')) {
+        if (!preg_match('/^\+61[2-478]\d{8}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Australia (+61 followed by 9 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+49')) {
+        if (!preg_match('/^\+49[1-9]\d{6,11}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Germany (+49 followed by 7-12 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+60')) {
+        if (!preg_match('/^\+60[1-9]\d{7,9}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Malaysia (+60 followed by 8-10 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+974')) {
+        if (!preg_match('/^\+974[3-7]\d{7}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Qatar (+974 followed by 8 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+968')) {
+        if (!preg_match('/^\+968[279]\d{7}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Oman (+968 followed by 8 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+965')) {
+        if (!preg_match('/^\+965[2569]\d{7}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Kuwait (+965 followed by 8 digits).';
+        }
+        return null;
+    }
+    if (str_starts_with($normalizedPhone, '+973')) {
+        if (!preg_match('/^\+973[13678]\d{7}$/', $normalizedPhone)) {
+            return 'The phone format is invalid for Bahrain (+973 followed by 8 digits).';
+        }
+        return null;
+    }
+
+    if (!preg_match('/^\+[1-9]\d{7,14}$/', $normalizedPhone)) {
+        return 'The phone format is invalid (must include country code, e.g. +919876543210).';
+    }
+
+    return null;
+}
+
+function normalizePhoneNumberPhp(string $raw, string $dialCode = ''): string
+{
+    $trimmed = trim($raw);
+    if ($trimmed === '') {
+        return '';
+    }
+
+    $cleaned = preg_replace('/[\s\-\(\)\.]+/u', '', $trimmed);
+    if ($cleaned === '' || $cleaned === null || !preg_match('/^\+?\d+$/', $cleaned)) {
+        return '';
+    }
+
+    // International IDD prefix 00 -> +
+    if (str_starts_with($cleaned, '00') && strlen($cleaned) > 4) {
+        $cleaned = '+' . substr($cleaned, 2);
+    }
+
+    // Clean explicit country dial code if provided separately
+    $cleanDial = '';
+    $rawDial = preg_replace('/[\s\-\(\)]+/', '', trim($dialCode));
+    if ($rawDial !== '' && $rawDial !== null) {
+        if (str_starts_with($rawDial, '00')) {
+            $rawDial = '+' . substr($rawDial, 2);
+        } elseif (!str_starts_with($rawDial, '+') && preg_match('/^\d{1,4}$/', $rawDial)) {
+            $rawDial = '+' . $rawDial;
+        }
+        if (preg_match('/^\+[1-9]\d{0,3}$/', $rawDial)) {
+            $cleanDial = $rawDial;
+        }
+    }
+
+    // If raw phone already starts with +, preserve its country code carefully
+    if (str_starts_with($cleaned, '+')) {
+        // Normalize Indian +910XXXXXXXXXX trunk zero typo
+        if (preg_match('/^\+910([6-9]\d{9})$/', $cleaned, $m)) {
+            return '+91' . $m[1];
+        }
+        return $cleaned;
+    }
+
+    // Separate country dial code supplied (e.g. country picker + local input)
+    if ($cleanDial !== '') {
+        $dialDigits = substr($cleanDial, 1);
+        if ($dialDigits === '91') {
+            if (preg_match('/^91\d{10}$/', $cleaned)) {
+                return '+' . $cleaned;
+            }
+            if (preg_match('/^0(\d{10})$/', $cleaned, $m)) {
+                return '+91' . $m[1];
+            }
+            return '+91' . $cleaned;
+        }
+
+        // International country code selected explicitly
+        if (preg_match('/^0(\d{5,14})$/', $cleaned, $m)) {
+            $cleaned = $m[1];
+        }
+        if (str_starts_with($cleaned, $dialDigits)) {
+            $candAsFull = '+' . $cleaned;
+            $candPrefixed = '+' . $dialDigits . $cleaned;
+            if (validatePhoneFormatPhp($candAsFull) === null && validatePhoneFormatPhp($candPrefixed) !== null) {
+                return $candAsFull;
+            }
+        }
+        return '+' . $dialDigits . $cleaned;
+    }
+
+    // No explicit dial code and no leading +
+    if (preg_match('/^\d{10}$/', $cleaned)) {
+        return '+91' . $cleaned;
+    }
+    if (preg_match('/^0(\d{10})$/', $cleaned, $m)) {
+        return '+91' . $m[1];
+    }
+    if (preg_match('/^91\d{10}$/', $cleaned)) {
+        return '+' . $cleaned;
+    }
+
+    return '+' . $cleaned;
+}
+
+function normalizePhoneSimplePhp(string $raw, string $dialCode = ''): string
+{
+    return normalizePhoneNumberPhp($raw, $dialCode);
+}
+
+function getPhoneLookupVariantsPhp(string $rawPhone, string $normalizedPhone = '', string $dialCode = ''): array
+{
+    $norm = $normalizedPhone !== '' ? $normalizedPhone : normalizePhoneNumberPhp($rawPhone, $dialCode);
+    $variants = [];
+
+    if ($norm !== '') {
+        $variants[] = $norm;
+        if (preg_match('/^\+91(\d{10})$/', $norm, $m)) {
+            $ten = $m[1];
+            $variants[] = '+91' . $ten;
+            $variants[] = '91' . $ten;
+            $variants[] = $ten;
+            $variants[] = '0' . $ten;
+            $variants[] = '0091' . $ten;
+            $variants[] = '+910' . $ten;
+        } elseif (preg_match('/^\+(\d{7,15})$/', $norm, $m)) {
+            $digits = $m[1];
+            $variants[] = $digits;
+            $variants[] = '00' . $digits;
+        }
+    }
+
+    $trimmedRaw = trim($rawPhone);
+    if ($trimmedRaw !== '') {
+        $cleanedRaw = preg_replace('/[\s\-\(\)\.]+/u', '', $trimmedRaw);
+        if ($cleanedRaw !== '' && $cleanedRaw !== null && preg_match('/^\+?\d{8,15}$/', $cleanedRaw)) {
+            $variants[] = $cleanedRaw;
+        }
+    }
+
+    return array_values(array_unique(array_filter($variants, fn($v) => $v !== '')));
+}
+
+function authUsersHasColumnPhp(PDO $pdo, string $column): bool
+{
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    try {
+        if ($driver === 'sqlite') {
+            $stmt = $pdo->query('PRAGMA table_info("users")');
+            $cols = $stmt ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
+            foreach ($cols as $col) {
+                if (strtolower((string) ($col['name'] ?? '')) === strtolower($column)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        $stmt = $pdo->prepare('SHOW COLUMNS FROM `users` LIKE :col');
+        $stmt->execute([':col' => $column]);
+        return (bool) $stmt->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function authUsersHasUniqueNormalizedPhoneIndexPhp(PDO $pdo): bool
+{
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    try {
+        if ($driver === 'sqlite') {
+            $idxStmt = $pdo->query('PRAGMA index_list("users")');
+            $indexes = $idxStmt ? $idxStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+            foreach ($indexes as $idx) {
+                if ((int) ($idx['unique'] ?? 0) !== 1) {
+                    continue;
+                }
+                $idxName = (string) ($idx['name'] ?? '');
+                if ($idxName === '') {
+                    continue;
+                }
+                $infoStmt = $pdo->query('PRAGMA index_info("' . str_replace('"', '""', $idxName) . '")');
+                $cols = $infoStmt ? $infoStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+                if (count($cols) === 1 && strtolower((string) ($cols[0]['name'] ?? '')) === 'normalized_phone') {
+                    return true;
+                }
+            }
+            return false;
+        }
+        $stmt = $pdo->query("SHOW INDEX FROM `users` WHERE Column_name = 'normalized_phone' AND Non_unique = 0");
+        $rows = $stmt ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
+        foreach ($rows as $row) {
+            if ((int) ($row['Seq_in_index'] ?? 0) === 1) {
+                return true;
+            }
+        }
+        return false;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function ensureNormalizedPhoneSchemaPhp(PDO $pdo, bool $force = false): array
+{
+    static $ensured = [];
+    $oid = spl_object_id($pdo);
+    if (!$force && !empty($ensured[$oid])) {
+        return ['skipped' => true];
+    }
+
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    $isSqlite = ($driver === 'sqlite');
+    $report = [
+        'column_added' => false,
+        'index_added' => false,
+        'backfilled_rows' => 0,
+        'duplicate_groups' => [],
+    ];
+
+    try {
+        if (!authUsersHasColumnPhp($pdo, 'normalized_phone')) {
+            if ($isSqlite) {
+                $pdo->exec('ALTER TABLE users ADD COLUMN normalized_phone TEXT NULL');
+            } else {
+                $pdo->exec('ALTER TABLE `users` ADD COLUMN `normalized_phone` VARCHAR(30) NULL DEFAULT NULL AFTER `phone`');
+            }
+            $report['column_added'] = true;
+        }
+    } catch (Throwable $e) {
+        if (!$force && str_contains(strtolower($e->getMessage()), 'duplicate column')) {
+            // Concurrent schema init already added the column
+        }
+    }
+
+    $hasUniqueIdx = authUsersHasUniqueNormalizedPhoneIndexPhp($pdo);
+    $hasStatusCol = authUsersHasColumnPhp($pdo, 'account_status');
+    $statusSelect = $hasStatusCol ? "COALESCE(account_status, 'ACTIVE') AS account_status" : "'ACTIVE' AS account_status";
+    if ($force || !$hasUniqueIdx || $report['column_added']) {
+        try {
+            $rows = $pdo->query("SELECT id, phone, normalized_phone, role, {$statusSelect} FROM users WHERE phone IS NOT NULL AND TRIM(phone) != '' ORDER BY id ASC")
+                ->fetchAll(PDO::FETCH_ASSOC);
+
+            $groups = [];
+            foreach ($rows as $row) {
+                $norm = normalizePhoneNumberPhp((string) ($row['phone'] ?? ''));
+                if ($norm === '') {
+                    continue;
+                }
+                if (!isset($groups[$norm])) {
+                    $groups[$norm] = [];
+                }
+                $row['_computed_norm'] = $norm;
+                $groups[$norm][] = $row;
+            }
+
+            foreach ($groups as $norm => $members) {
+                usort($members, function (array $a, array $b) use ($norm): int {
+                    $aBlocked = in_array(strtoupper((string) ($a['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true) ? 1 : 0;
+                    $bBlocked = in_array(strtoupper((string) ($b['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true) ? 1 : 0;
+                    if ($aBlocked !== $bBlocked) {
+                        return $aBlocked <=> $bBlocked;
+                    }
+                    $aHeld = ((string) ($a['normalized_phone'] ?? '') === $norm) ? 0 : 1;
+                    $bHeld = ((string) ($b['normalized_phone'] ?? '') === $norm) ? 0 : 1;
+                    if ($aHeld !== $bHeld) {
+                        return $aHeld <=> $bHeld;
+                    }
+                    return ((int) $a['id']) <=> ((int) $b['id']);
+                });
+
+                $canonical = $members[0];
+                if ((string) ($canonical['normalized_phone'] ?? '') !== $norm) {
+                    // Clear any conflicting row holding $norm before assigning canonical row
+                    $pdo->prepare('UPDATE users SET normalized_phone = NULL WHERE normalized_phone = :norm AND id != :cid')
+                        ->execute([':norm' => $norm, ':cid' => (int) $canonical['id']]);
+                    $pdo->prepare('UPDATE users SET normalized_phone = :norm WHERE id = :id')
+                        ->execute([':norm' => $norm, ':id' => (int) $canonical['id']]);
+                    $report['backfilled_rows']++;
+                }
+
+                if (count($members) > 1) {
+                    $dupIds = array_map(fn($m) => (int) $m['id'], array_slice($members, 1));
+                    $report['duplicate_groups'][] = [
+                        'normalized_phone' => $norm,
+                        'canonical_user_id' => (int) $canonical['id'],
+                        'duplicate_user_ids' => $dupIds,
+                    ];
+                    foreach (array_slice($members, 1) as $dupMember) {
+                        if ($dupMember['normalized_phone'] !== null && $dupMember['normalized_phone'] !== '') {
+                            $pdo->prepare('UPDATE users SET normalized_phone = NULL WHERE id = :id')
+                                ->execute([':id' => (int) $dupMember['id']]);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // Preserve safely without interrupting runtime requests
+        }
+
+        if (!$hasUniqueIdx) {
+            try {
+                if ($isSqlite) {
+                    $pdo->exec('CREATE UNIQUE INDEX IF NOT EXISTS uniq_users_normalized_phone ON users (normalized_phone)');
+                } else {
+                    $pdo->exec('ALTER TABLE `users` ADD UNIQUE INDEX `uniq_users_normalized_phone` (`normalized_phone`)');
+                }
+                $report['index_added'] = true;
+            } catch (Throwable $e) {
+                if (!str_contains(strtolower($e->getMessage()), 'already exists') && !str_contains(strtolower($e->getMessage()), 'duplicate key name')) {
+                    // Surface only if called via forced migration; runtime lookup still protects via transaction + lock
+                }
+            }
+        }
+    }
+
+    if (authUsersHasColumnPhp($pdo, 'normalized_phone')) {
+        $ensured[$oid] = true;
+    }
+
+    return $report;
+}
+
+function findUsersByPhonePhp(PDO $pdo, string $rawPhone, string $normalizedPhone = '', string $dialCode = '', ?int $excludeUserId = null): array
+{
+    $norm = $normalizedPhone !== '' ? $normalizedPhone : normalizePhoneNumberPhp($rawPhone, $dialCode);
+    $variants = getPhoneLookupVariantsPhp($rawPhone, $norm, $dialCode);
+    if (empty($variants) && $norm === '') {
+        return [];
+    }
+
+    $hasNormCol = authUsersHasColumnPhp($pdo, 'normalized_phone');
+    $clauses = [];
+    $params = [];
+
+    if ($hasNormCol && $norm !== '') {
+        $clauses[] = 'normalized_phone = :norm_phone';
+        $params[':norm_phone'] = $norm;
+    }
+
+    if (!empty($variants)) {
+        $ph1 = [];
+        $ph2 = [];
+        foreach ($variants as $idx => $val) {
+            $k1 = ':vp' . $idx;
+            $k2 = ':vr' . $idx;
+            $ph1[] = $k1;
+            $ph2[] = $k2;
+            $params[$k1] = $val;
+            $params[$k2] = $val;
+        }
+        $clauses[] = 'phone IN (' . implode(', ', $ph1) . ')';
+        $clauses[] = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '') IN (" . implode(', ', $ph2) . ')';
+    }
+
+    if (empty($clauses)) {
+        return [];
+    }
+
+    $sql = 'SELECT * FROM users WHERE (' . implode(' OR ', $clauses) . ')';
+    if ($excludeUserId !== null && $excludeUserId > 0) {
+        $sql .= ' AND id != :exclude_user_id';
+        $params[':exclude_user_id'] = $excludeUserId;
+    }
+    $sql .= ' ORDER BY id ASC';
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+    // Filter out any accidental non-exact country collisions (e.g. compare computed normalized E.164 strictly)
+    if ($norm !== '') {
+        $filtered = [];
+        foreach ($rows as $row) {
+            $rowNorm = normalizePhoneNumberPhp((string) ($row['phone'] ?? ''), '');
+            $colNorm = trim((string) ($row['normalized_phone'] ?? ''));
+            if ($colNorm === $norm || $rowNorm === $norm) {
+                $filtered[] = $row;
+            }
+        }
+        $rows = $filtered;
+    }
+
+    usort($rows, function (array $a, array $b) use ($norm): int {
+        $aBlocked = in_array(strtoupper((string) ($a['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true) ? 1 : 0;
+        $bBlocked = in_array(strtoupper((string) ($b['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true) ? 1 : 0;
+        if ($aBlocked !== $bBlocked) {
+            return $aBlocked <=> $bBlocked;
+        }
+        $aNormMatch = ($norm !== '' && (string) ($a['normalized_phone'] ?? '') === $norm) ? 0 : 1;
+        $bNormMatch = ($norm !== '' && (string) ($b['normalized_phone'] ?? '') === $norm) ? 0 : 1;
+        if ($aNormMatch !== $bNormMatch) {
+            return $aNormMatch <=> $bNormMatch;
+        }
+        return ((int) $a['id']) <=> ((int) $b['id']);
+    });
+
+    return $rows;
+}
+
+function findUserByPhonePhp(PDO $pdo, string $rawPhone, string $normalizedPhone = '', string $dialCode = '', ?int $excludeUserId = null): ?array
+{
+    $rows = findUsersByPhonePhp($pdo, $rawPhone, $normalizedPhone, $dialCode, $excludeUserId);
+    return $rows[0] ?? null;
+}
+
+function isDuplicateKeyExceptionPhp(Throwable $e): bool
+{
+    $code = (string) $e->getCode();
+    $msg = strtolower($e->getMessage());
+    if ($code === '23000' || $code === '1062' || $code === '19') {
+        return true;
+    }
+    return str_contains($msg, 'duplicate entry')
+        || str_contains($msg, 'unique constraint failed')
+        || str_contains($msg, 'integrity constraint violation');
 }
 
 function isValidEmailForGatewayPhp(string $email): bool
@@ -613,7 +1096,7 @@ function verifyFirebaseIdentity(array $params): array
         return ['approved' => false];
     }
 
-    $cleanPhone = preg_replace('/\D+/', '', $phone);
+    $reqNormPhone = $phone !== '' ? normalizePhoneNumberPhp($phone) : '';
 
     // Flow A: Client-side Firebase Auth ID Token (Phone Auth, Email Link Sign-In, or Email Auth)
     if ($idToken !== '') {
@@ -622,23 +1105,23 @@ function verifyFirebaseIdentity(array $params): array
         if ($res['ok'] && !empty($res['data']['users'][0])) {
             $fbUser = $res['data']['users'][0];
             $fbPhoneRaw = (string) ($fbUser['phoneNumber'] ?? '');
-            $fbPhoneDigits = preg_replace('/\D+/', '', $fbPhoneRaw);
+            $fbNormPhone = $fbPhoneRaw !== '' ? normalizePhoneNumberPhp($fbPhoneRaw) : '';
             $fbEmail = strtolower(trim((string) ($fbUser['email'] ?? '')));
 
-            $phoneMatched = $fbPhoneDigits !== '' && ($cleanPhone === '' || (strlen($cleanPhone) >= 10 && str_ends_with($fbPhoneDigits, substr($cleanPhone, -10))));
+            $phoneMatched = $fbNormPhone !== '' && ($reqNormPhone === '' || $fbNormPhone === $reqNormPhone);
             $emailMatched = $fbEmail !== '' && isValidEmailForGatewayPhp($fbEmail) && ($email === '' || $fbEmail === $email);
 
             if (
-                ($cleanPhone !== '' && $email !== '' && $phoneMatched && $emailMatched) ||
-                ($cleanPhone !== '' && $email === '' && $phoneMatched) ||
-                ($cleanPhone === '' && $email !== '' && $emailMatched) ||
-                ($cleanPhone === '' && $email === '' && ($phoneMatched || $emailMatched))
+                ($reqNormPhone !== '' && $email !== '' && $phoneMatched && $emailMatched) ||
+                ($reqNormPhone !== '' && $email === '' && $phoneMatched) ||
+                ($reqNormPhone === '' && $email !== '' && $emailMatched) ||
+                ($reqNormPhone === '' && $email === '' && ($phoneMatched || $emailMatched))
             ) {
                 return [
                     'approved' => true,
                     'provider' => 'firebase',
                     'method' => 'id_token',
-                    'resolvedPhone' => $phone !== '' ? $phone : ($fbPhoneRaw !== '' ? normalizePhoneSimplePhp($fbPhoneRaw) : null),
+                    'resolvedPhone' => $reqNormPhone !== '' ? $reqNormPhone : ($fbNormPhone !== '' ? $fbNormPhone : null),
                     'resolvedEmail' => $email !== '' ? $email : (isValidEmailForGatewayPhp($fbEmail) ? $fbEmail : null)
                 ];
             }
@@ -651,13 +1134,13 @@ function verifyFirebaseIdentity(array $params): array
         $res = firebaseHttpJsonPostPhp($url, ['sessionInfo' => $sessionInfo, 'code' => $code]);
         if ($res['ok'] && !empty($res['data']['phoneNumber'])) {
             $fbPhoneRaw = (string) $res['data']['phoneNumber'];
-            $fbPhoneDigits = preg_replace('/\D+/', '', $fbPhoneRaw);
-            if ($cleanPhone === '' || (strlen($cleanPhone) >= 10 && str_ends_with($fbPhoneDigits, substr($cleanPhone, -10)))) {
+            $fbNormPhone = normalizePhoneNumberPhp($fbPhoneRaw);
+            if ($reqNormPhone === '' || ($fbNormPhone !== '' && $fbNormPhone === $reqNormPhone)) {
                 return [
                     'approved' => true,
                     'provider' => 'firebase',
                     'method' => 'session_info',
-                    'resolvedPhone' => $phone !== '' ? $phone : normalizePhoneSimplePhp($fbPhoneRaw),
+                    'resolvedPhone' => $reqNormPhone !== '' ? $reqNormPhone : ($fbNormPhone !== '' ? $fbNormPhone : null),
                     'resolvedEmail' => $email !== '' ? $email : null
                 ];
             }

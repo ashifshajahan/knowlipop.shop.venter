@@ -14,27 +14,56 @@ require_once __DIR__ . '/../helpers/gst.php';
 require_once __DIR__ . '/../api/products.php';
 require_once __DIR__ . '/../helpers/seller_deletion.php';
 
+$pdo = getDatabaseConnection();
+ensureGstTables($pdo);
+ensureProductPriceColumns($pdo);
+ensureProductCategoriesTable($pdo);
+ensureSellerDeletionSchemaPhp($pdo);
+ensureNormalizedPhoneSchemaPhp($pdo);
+
 $rawJwtToken = getBearerToken();
 $adminJwtPayload = !empty($rawJwtToken) ? verifyJwtToken((string) $rawJwtToken, getJwtSecret()) : null;
-$hasValidAdminJwt = is_array($adminJwtPayload) && strtolower((string) ($adminJwtPayload['role'] ?? '')) === 'admin';
+$hasValidAdminJwt = false;
+$verifiedAdminRow = null;
 
+if (is_array($adminJwtPayload) && strtolower((string) ($adminJwtPayload['role'] ?? '')) === 'admin' && !empty($adminJwtPayload['id'])) {
+    try {
+        $admStmt = $pdo->prepare("SELECT id, name, email, role, token_version FROM users WHERE id = :id AND LOWER(role) = 'admin' LIMIT 1");
+        $admStmt->execute([':id' => (int) $adminJwtPayload['id']]);
+        $admRow = $admStmt->fetch(PDO::FETCH_ASSOC);
+        if ($admRow) {
+            $dbTv = max(1, (int) ($admRow['token_version'] ?? 1));
+            $tokTv = isset($adminJwtPayload['tv']) ? max(1, (int) $adminJwtPayload['tv']) : 1;
+            if ($tokTv === $dbTv) {
+                $hasValidAdminJwt = true;
+                $verifiedAdminRow = $admRow;
+            }
+        }
+    } catch (Throwable $e) {
+        $hasValidAdminJwt = true;
+    }
+}
+
+$isJsonSubAction = isset($_GET['action']) && $_GET['action'] === 'get_gst_details';
 if (empty($_SESSION['admin_logged_in'])) {
     if ($hasValidAdminJwt) {
         $_SESSION['admin_logged_in'] = true;
-        $_SESSION['admin_id'] = (int) ($adminJwtPayload['id'] ?? 1);
-        $_SESSION['admin_email'] = $adminJwtPayload['email'] ?? ($_COOKIE['admin_email'] ?? 'admin@vendor.app');
+        $_SESSION['admin_id'] = (int) ($verifiedAdminRow['id'] ?? $adminJwtPayload['id'] ?? 1);
+        $_SESSION['admin_name'] = $verifiedAdminRow['name'] ?? ($adminJwtPayload['name'] ?? 'Admin');
+        $_SESSION['admin_email'] = $verifiedAdminRow['email'] ?? ($adminJwtPayload['email'] ?? ($_COOKIE['admin_email'] ?? 'admin@vendor.app'));
     } else {
+        if ($isJsonSubAction) {
+            http_response_code(401);
+            header('Content-Type: application/json');
+            echo json_encode(['status' => 'error', 'message' => 'Admin authentication required.']);
+            exit;
+        }
         header('Location: /admin/login');
         exit;
     }
 }
 
-$pdo = getDatabaseConnection();
-ensureGstTables($pdo);
-ensureProductCategoriesTable($pdo);
-ensureSellerDeletionSchemaPhp($pdo);
-
-if (!$hasValidAdminJwt && empty($_SERVER['HTTP_AUTHORIZATION']) && !headers_sent()) {
+if (empty($_COOKIE['admin_token']) && empty($_SERVER['HTTP_AUTHORIZATION']) && !headers_sent()) {
     $mintedAdminJwt = createToken(
         $pdo,
         (int) ($_SESSION['admin_id'] ?? 1),
@@ -42,7 +71,7 @@ if (!$hasValidAdminJwt && empty($_SERVER['HTTP_AUTHORIZATION']) && !headers_sent
         'admin-dashboard',
         $_SESSION['admin_email'] ?? 'admin@vendor.app',
         'admin',
-        1
+        null
     );
     setcookie('admin_token', $mintedAdminJwt, time() + 86400 * 7, '/');
 }
@@ -56,35 +85,91 @@ if (isset($_GET['action']) && $_GET['action'] === 'view_gst_doc' && !empty($_GET
     $docStmt = $pdo->prepare("SELECT * FROM seller_gst_documents WHERE id = :id LIMIT 1");
     $docStmt->execute([':id' => $docId]);
     $doc = $docStmt->fetch();
-    $filePath = $doc ? resolveGstFilePathPhp($doc) : null;
-    if (!$doc || !$filePath) {
+    if (!$doc) {
         http_response_code(404);
-        echo 'Document file not found on server.';
+        echo 'Document not found in database.';
         exit;
     }
-    $ext = strtolower(pathinfo($doc['original_name'] ?: $filePath, PATHINFO_EXTENSION));
-    $mimeType = ($ext === 'pdf') ? 'application/pdf' : ($doc['mime_type'] ?: 'application/octet-stream');
-    $fileName = $doc['original_name'] ?: basename($filePath);
+    $filePath = resolveGstFilePathPhp($doc);
+    if (!$filePath) {
+        http_response_code(404);
+        $safeName = htmlspecialchars((string) ($doc['original_name'] ?: 'Document.pdf'), ENT_QUOTES, 'UTF-8');
+        echo "<!doctype html><html><head><meta charset=\"utf-8\"><title>Document Unavailable</title>"
+            . "<style>body{font-family:system-ui,sans-serif;background:#f8fafc;color:#1e293b;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}"
+            . ".box{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;max-width:520px;box-shadow:0 10px 25px rgba(0,0,0,0.06);}"
+            . "h2{margin-top:0;color:#b91c1c;}p{color:#475569;line-height:1.6;}"
+            . ".btn{display:inline-block;background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700;margin-top:12px;}</style></head>"
+            . "<body><div class=\"box\"><h2>📄 Document File Not Available</h2>"
+            . "<p>The file <strong>{$safeName}</strong> (Document #" . (int) $doc['id'] . ") is missing from server storage or was uploaded to a temporary directory prior to persistent storage.</p>"
+            . "<p>Please reject this verification with a request to re-upload the PDF certificate.</p>"
+            . "<a href=\"/admin\" class=\"btn\">← Back to Admin Dashboard</a></div></body></html>";
+        exit;
+    }
+
+    $mimeType = '';
+    $fh = @fopen($filePath, 'rb');
+    if ($fh) {
+        $magic = fread($fh, 8);
+        fclose($fh);
+        if (is_string($magic)) {
+            if (str_starts_with($magic, '%PDF-')) {
+                $mimeType = 'application/pdf';
+            } elseif (strlen($magic) >= 4 && $magic[0] === "\x89" && $magic[1] === 'P' && $magic[2] === 'N' && $magic[3] === 'G') {
+                $mimeType = 'image/png';
+            } elseif (strlen($magic) >= 3 && $magic[0] === "\xFF" && $magic[1] === "\xD8" && $magic[2] === "\xFF") {
+                $mimeType = 'image/jpeg';
+            }
+        }
+    }
+    if ($mimeType === '') {
+        $ext = strtolower(pathinfo((string) ($doc['original_name'] ?: ($doc['file_name'] ?? $filePath)), PATHINFO_EXTENSION));
+        if ($ext === 'pdf') $mimeType = 'application/pdf';
+        elseif ($ext === 'png') $mimeType = 'image/png';
+        elseif ($ext === 'jpg' || $ext === 'jpeg') $mimeType = 'image/jpeg';
+        elseif (!empty($doc['mime_type']) && $doc['mime_type'] !== 'application/octet-stream') $mimeType = (string) $doc['mime_type'];
+        else $mimeType = 'application/pdf';
+    }
+
+    $fileName = (string) ($doc['original_name'] ?: basename($filePath));
+    $safeAsciiName = preg_replace('/[^a-zA-Z0-9._-]/', '_', $fileName) ?: 'document.pdf';
     $disposition = ($mode === 'download') ? 'attachment' : 'inline';
-    if (ob_get_level()) ob_end_clean();
+    if (ob_get_level() > 0 && (int) ob_get_length() > 0) ob_clean();
     header('Content-Type: ' . $mimeType);
     header('Content-Length: ' . filesize($filePath));
-    header('Content-Disposition: ' . $disposition . '; filename="' . rawurlencode($fileName) . '"');
+    header("Content-Disposition: {$disposition}; filename=\"{$safeAsciiName}\"; filename*=UTF-8''" . rawurlencode($fileName));
     header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: SAMEORIGIN');
+    header('Cache-Control: private, max-age=0, must-revalidate');
     readfile($filePath);
     exit;
 }
 
 // Handle JSON fetch of seller GST details & documents for review modal
-if (isset($_GET['action']) && $_GET['action'] === 'get_gst_details' && !empty($_GET['seller_id'])) {
-    $targetId = (int) $_GET['seller_id'];
+if (isset($_GET['action']) && $_GET['action'] === 'get_gst_details') {
+    $targetId = (int) ($_GET['seller_id'] ?? 0);
+    if ($targetId <= 0) {
+        http_response_code(400);
+        header('Content-Type: application/json');
+        echo json_encode(['status' => 'error', 'message' => 'Missing seller_id']);
+        exit;
+    }
+    $uStmt = $pdo->prepare("SELECT id, name, seller_name, phone, email FROM users WHERE id = :id LIMIT 1");
+    $uStmt->execute([':id' => $targetId]);
+    $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+
     $gstStmt = $pdo->prepare("SELECT * FROM seller_gst_details WHERE seller_id = :id LIMIT 1");
     $gstStmt->execute([':id' => $targetId]);
     $gst = $gstStmt->fetch();
 
     $docsStmt = $pdo->prepare("SELECT * FROM seller_gst_documents WHERE seller_id = :id ORDER BY is_primary DESC, id DESC");
     $docsStmt->execute([':id' => $targetId]);
-    $docs = array_map(fn($d) => formatGstDocument($d, true), $docsStmt->fetchAll());
+    $docs = array_map(function($d) {
+        $fmt = formatGstDocument($d, true);
+        $fmt['admin_preview_url'] = '/admin/dashboard.php?action=view_gst_doc&id=' . (int) $d['id'] . '&mode=preview';
+        $fmt['admin_download_url'] = '/admin/dashboard.php?action=view_gst_doc&id=' . (int) $d['id'] . '&mode=download';
+        $fmt['file_exists'] = (resolveGstFilePathPhp($d) !== null);
+        return $fmt;
+    }, $docsStmt->fetchAll());
 
     $logsStmt = $pdo->prepare("SELECT * FROM seller_gst_verification_logs WHERE seller_id = :id ORDER BY id DESC");
     $logsStmt->execute([':id' => $targetId]);
@@ -93,7 +178,14 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_gst_details' && !empty($_
     header('Content-Type: application/json');
     echo json_encode([
         'status' => 'success',
-        'gst' => $gst,
+        'seller' => $uRow ? [
+            'id' => (int) $uRow['id'],
+            'name' => $uRow['name'] ?? null,
+            'seller_name' => $uRow['seller_name'] ?? null,
+            'phone' => $uRow['phone'] ?? null,
+            'email' => getPublicSellerEmailPhp($uRow['email'] ?? null),
+        ] : null,
+        'gst' => $gst ?: null,
         'documents' => $docs,
         'logs' => $logs
     ]);
@@ -104,7 +196,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_gst_details' && !empty($_
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'approve_gst') {
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $notes = trim($_POST['notes'] ?? 'Approved by administrator');
-    $adminId = 1;
+    $adminId = (int) ($_SESSION['admin_id'] ?? 1);
 
     $gstStmt = $pdo->prepare("SELECT * FROM seller_gst_details WHERE seller_id = :seller_id LIMIT 1");
     $gstStmt->execute([':seller_id' => $sellerId]);
@@ -129,7 +221,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'reject_gst') {
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $reason = trim($_POST['rejection_reason'] ?? '');
-    $adminId = 1;
+    $adminId = (int) ($_SESSION['admin_id'] ?? 1);
 
     if (empty($reason)) {
         $error = 'A rejection reason is mandatory when rejecting GST documents.';
@@ -158,19 +250,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_seller') {
     $name = trim($_POST['seller_name'] ?? '');
     $rawPhone = trim($_POST['phone'] ?? '');
-    $phone = '';
-    if ($rawPhone !== '') {
-        $strP = preg_replace('/[\s\-\(\)]/', '', $rawPhone);
-        if (str_starts_with($strP, '+')) {
-            $phone = $strP;
-        } elseif (preg_match('/^\d{10}$/', $strP)) {
-            $phone = '+91' . $strP;
-        } elseif (preg_match('/^91\d{10}$/', $strP)) {
-            $phone = '+' . $strP;
-        } else {
-            $phone = '+' . $strP;
-        }
-    }
+    $dialCode = trim((string) ($_POST['country_code'] ?? $_POST['dial_code'] ?? ''));
+    $phone = $rawPhone !== '' ? normalizePhoneNumberPhp($rawPhone, $dialCode) : '';
     $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '') ?: 'None';
@@ -178,24 +259,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $country = trim($_POST['country'] ?? 'India');
     $password = $_POST['password'] ?? '';
     $confirmPassword = $_POST['password_confirmation'] ?? '';
+    $phoneErr = $rawPhone !== '' ? validatePhoneFormatPhp($phone, $rawPhone) : null;
 
     if (empty($name) || (empty($email) && empty($rawPhone)) || empty($address) || empty($state) || empty($password)) {
         $error = 'Seller name, email or phone number, address, state, and password are required.';
     } elseif ($email !== '' && (str_ends_with($email, '@phone.vendor.local') || !filter_var($email, FILTER_VALIDATE_EMAIL))) {
         $error = 'The email address format is invalid.';
-    } elseif ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-        $error = 'Phone must be in international format with country code (e.g. +919876543210).';
+    } elseif ($phoneErr !== null) {
+        $error = $phoneErr;
     } elseif (strlen($password) < 8) {
         $error = 'Password must be at least 8 characters.';
     } elseif ($password !== $confirmPassword) {
         $error = 'Password confirmation does not match.';
     } else {
-        $dupPhone = false;
-        if ($phone !== '') {
-            $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone LIMIT 1");
-            $chk->execute([':phone' => $phone]);
-            $dupPhone = (bool) $chk->fetch();
-        }
+        $dupPhone = ($phone !== '') ? (bool) findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode) : false;
         $dupEmail = false;
         if ($email !== '') {
             $chkEmail = $pdo->prepare("SELECT id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
@@ -211,24 +288,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $digits = preg_replace('/\D+/', '', $phone) ?: (string) time();
             $dbEmail = $email !== '' ? $email : "seller_{$digits}@phone.vendor.local";
             $dbPhone = $phone !== '' ? $phone : null;
+            $hasNormCol = authUsersHasColumnPhp($pdo, 'normalized_phone');
 
-            $ins = $pdo->prepare("
-                INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-                VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ");
-            $ins->execute([
-                ':name' => $name,
-                ':email' => $dbEmail,
-                ':seller_name' => $name,
-                ':phone' => $dbPhone,
-                ':address' => $address,
-                ':landmark' => $landmark,
-                ':state' => $state,
-                ':country' => $country,
-                ':password' => $hashed,
-            ]);
-
-            $success = 'Seller account created successfully!';
+            try {
+                if ($hasNormCol) {
+                    $ins = $pdo->prepare("
+                        INSERT INTO users (name, email, seller_name, phone, normalized_phone, address, landmark, state, country, password, role, created_at, updated_at)
+                        VALUES (:name, :email, :seller_name, :phone, :normalized_phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ");
+                    $ins->execute([
+                        ':name' => $name,
+                        ':email' => $dbEmail,
+                        ':seller_name' => $name,
+                        ':phone' => $dbPhone,
+                        ':normalized_phone' => $dbPhone,
+                        ':address' => $address,
+                        ':landmark' => $landmark,
+                        ':state' => $state,
+                        ':country' => $country,
+                        ':password' => $hashed,
+                    ]);
+                } else {
+                    $ins = $pdo->prepare("
+                        INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+                        VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ");
+                    $ins->execute([
+                        ':name' => $name,
+                        ':email' => $dbEmail,
+                        ':seller_name' => $name,
+                        ':phone' => $dbPhone,
+                        ':address' => $address,
+                        ':landmark' => $landmark,
+                        ':state' => $state,
+                        ':country' => $country,
+                        ':password' => $hashed,
+                    ]);
+                }
+                $success = 'Seller account created successfully!';
+            } catch (PDOException $e) {
+                if (isDuplicateKeyExceptionPhp($e)) {
+                    $error = str_contains(strtolower($e->getMessage()), 'email')
+                        ? 'A seller with this email address already exists.'
+                        : 'A seller with this phone number already exists.';
+                } else {
+                    $error = 'Failed to create seller: ' . $e->getMessage();
+                }
+            }
         }
     }
 }
@@ -238,19 +344,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $sellerId = (int) ($_POST['seller_id'] ?? 0);
     $name = trim($_POST['seller_name'] ?? '');
     $rawPhone = trim($_POST['phone'] ?? '');
-    $phone = '';
-    if ($rawPhone !== '') {
-        $strP = preg_replace('/[\s\-\(\)]/', '', $rawPhone);
-        if (str_starts_with($strP, '+')) {
-            $phone = $strP;
-        } elseif (preg_match('/^\d{10}$/', $strP)) {
-            $phone = '+91' . $strP;
-        } elseif (preg_match('/^91\d{10}$/', $strP)) {
-            $phone = '+' . $strP;
-        } else {
-            $phone = '+' . $strP;
-        }
-    }
+    $dialCode = trim((string) ($_POST['country_code'] ?? $_POST['dial_code'] ?? ''));
+    $phone = $rawPhone !== '' ? normalizePhoneNumberPhp($rawPhone, $dialCode) : '';
     $email = strtolower(trim($_POST['email'] ?? ''));
     $address = trim($_POST['address'] ?? '');
     $landmark = trim($_POST['landmark'] ?? '');
@@ -259,20 +354,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $currentPassword = $_POST['current_password'] ?? '';
     $newPassword = $_POST['new_password'] ?? $_POST['password'] ?? '';
     $confirmPassword = $_POST['confirm_password'] ?? '';
+    $phoneErr = $rawPhone !== '' ? validatePhoneFormatPhp($phone, $rawPhone) : null;
 
     if (empty($sellerId) || empty($name) || (empty($rawPhone) && empty($email)) || empty($address) || empty($state)) {
         $error = 'Seller ID, name, email or phone number, address, and state are required.';
     } elseif (!empty($email) && (str_ends_with($email, '@phone.vendor.local') || !filter_var($email, FILTER_VALIDATE_EMAIL))) {
         $error = 'The email address format is invalid.';
-    } elseif ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-        $error = 'Phone must be in international format with country code (e.g. +919876543210).';
+    } elseif ($phoneErr !== null) {
+        $error = $phoneErr;
     } else {
-        $dupPhone = false;
-        if ($phone !== '') {
-            $chk = $pdo->prepare("SELECT id FROM users WHERE phone = :phone AND id != :id LIMIT 1");
-            $chk->execute([':phone' => $phone, ':id' => $sellerId]);
-            $dupPhone = (bool) $chk->fetch();
-        }
+        $dupPhone = ($phone !== '') ? (bool) findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode, $sellerId) : false;
         if ($dupPhone) {
             $error = 'This phone number is already registered to another account.';
         } else {
@@ -305,17 +396,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             }
 
             if (empty($error)) {
-                $sql = "UPDATE users SET name = :name, seller_name = :seller_name, phone = :phone, address = :address, landmark = :landmark, state = :state, country = :country";
+                $hasNormCol = authUsersHasColumnPhp($pdo, 'normalized_phone');
+                $sql = "UPDATE users SET name = :name, seller_name = :seller_name, phone = :phone";
                 $params = [
                     ':id' => $sellerId,
                     ':name' => $name,
                     ':seller_name' => $name,
                     ':phone' => $phone !== '' ? $phone : null,
-                    ':address' => $address,
-                    ':landmark' => $landmark,
-                    ':state' => $state,
-                    ':country' => $country,
                 ];
+                if ($hasNormCol) {
+                    $sql .= ", normalized_phone = :normalized_phone";
+                    $params[':normalized_phone'] = $phone !== '' ? $phone : null;
+                }
+                $sql .= ", address = :address, landmark = :landmark, state = :state, country = :country";
+                $params[':address'] = $address;
+                $params[':landmark'] = $landmark;
+                $params[':state'] = $state;
+                $params[':country'] = $country;
                 if (!empty($email)) {
                     $sql .= ", email = :email";
                     $params[':email'] = $email;
@@ -325,10 +422,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $params[':password'] = $passwordToUpdate;
                 }
                 $sql .= ", updated_at = CURRENT_TIMESTAMP WHERE id = :id";
-                $upd = $pdo->prepare($sql);
-                $upd->execute($params);
-
-                $success = "Seller #{$sellerId} profile updated successfully!";
+                try {
+                    $upd = $pdo->prepare($sql);
+                    $upd->execute($params);
+                    $success = "Seller #{$sellerId} profile updated successfully!";
+                } catch (PDOException $e) {
+                    if (isDuplicateKeyExceptionPhp($e)) {
+                        $error = str_contains(strtolower($e->getMessage()), 'email')
+                            ? 'This email address is already registered to another account.'
+                            : 'This phone number is already registered to another account.';
+                    } else {
+                        $error = 'Failed to update seller: ' . $e->getMessage();
+                    }
+                }
             }
         }
     }
@@ -454,6 +560,288 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// Handle Admin Create Product
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_product') {
+    $targetSellerId = (int) ($_POST['seller_id'] ?? 0);
+    $prodName = trim((string) ($_POST['name'] ?? ''));
+    $rawPrice = $_POST['price'] ?? '';
+    $rawStock = $_POST['stock'] ?? '0';
+    $prodDesc = trim((string) ($_POST['description'] ?? ''));
+    $prodSku = trim((string) ($_POST['sku'] ?? ''));
+    $prodBrand = trim((string) ($_POST['brand'] ?? '')) ?: 'Generic';
+    $prodActive = isset($_POST['is_active']) ? 1 : 0;
+
+    if ($targetSellerId <= 0 || $prodName === '' || $rawPrice === '' || !is_numeric($rawPrice) || (float) $rawPrice < 0) {
+        $error = 'Valid seller, product name, and non-negative price are required.';
+    } elseif (!is_numeric($rawStock) || (int) $rawStock < 0) {
+        $error = 'Stock quantity must be zero or a positive integer.';
+    } else {
+        $sStmt = $pdo->prepare("SELECT id, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = :id LIMIT 1");
+        $sStmt->execute([':id' => $targetSellerId]);
+        $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+        $sAcc = strtoupper((string) ($sRow['account_status'] ?? 'ACTIVE'));
+        if (!$sRow) {
+            $error = "Seller #{$targetSellerId} was not found.";
+        } elseif (in_array($sAcc, ['DELETED', 'LOCKED', 'DELETION_PENDING'], true)) {
+            $error = "Cannot create products for seller #{$targetSellerId} because account status is {$sAcc}.";
+        } else {
+            $catRes = resolveProductCategoryPhp($pdo, $_POST, true);
+            if (!empty($catRes['error'])) {
+                $error = 'Selected category was not found.';
+            } else {
+                $urlText = trim((string) ($_POST['image_urls'] ?? ($_POST['images'] ?? '')));
+                $imgInput = $urlText !== '' ? ['images' => $urlText] : [];
+                $imgResult = saveUploadedProductImages($imgInput);
+                if (!empty($imgResult['uploadErrors'])) {
+                    $error = $imgResult['uploadErrors'][0];
+                } else {
+                    $finalImages = array_slice(dedupeImagesByFilename($imgResult['images'] ?? []), 0, 4);
+                    $finalPrimaryUrl = $finalImages[0] ?? null;
+                    $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
+                    $pricing = resolveProductPricing([
+                        'price' => $rawPrice,
+                        'mrp' => $_POST['mrp'] ?? null,
+                    ]);
+                    $insStmt = $pdo->prepare("
+                        INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+                        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ");
+                    $insStmt->execute([
+                        ':seller_id' => $targetSellerId,
+                        ':name' => $prodName,
+                        ':description' => $prodDesc !== '' ? $prodDesc : null,
+                        ':sku' => $prodSku !== '' ? $prodSku : null,
+                        ':category' => $catRes['category'],
+                        ':category_id' => $catRes['category_id'],
+                        ':brand' => $prodBrand,
+                        ':mrp' => number_format((float) $pricing['mrp'], 2, '.', ''),
+                        ':seller_price' => number_format((float) $pricing['seller_price'], 2, '.', ''),
+                        ':commission' => number_format((float) $pricing['commission'], 2, '.', ''),
+                        ':delivery_charge' => number_format((float) $pricing['delivery_charge'], 2, '.', ''),
+                        ':gst' => number_format((float) $pricing['gst'], 2, '.', ''),
+                        ':other_charges' => number_format((float) $pricing['other_charges'], 2, '.', ''),
+                        ':price' => number_format((float) $pricing['price'], 2, '.', ''),
+                        ':stock' => (int) $rawStock,
+                        ':image_url' => $finalPrimaryUrl,
+                        ':images' => $finalImagesJson,
+                        ':is_active' => $prodActive,
+                    ]);
+                    $newProdId = (int) $pdo->lastInsertId();
+                    if (!empty($finalImages)) {
+                        syncProductImagesRecordPHP($pdo, $targetSellerId, $newProdId, $finalImages, $imgResult['filesInfo'] ?? []);
+                    }
+                    $success = "Product #{$newProdId} (\"{$prodName}\") created successfully!";
+                }
+            }
+        }
+    }
+}
+
+// Handle Admin Edit Product
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'edit_product') {
+    $prodId = (int) ($_POST['product_id'] ?? 0);
+    $prodName = trim((string) ($_POST['name'] ?? ''));
+    $rawPrice = $_POST['price'] ?? '';
+    $rawStock = $_POST['stock'] ?? '0';
+    $prodDesc = trim((string) ($_POST['description'] ?? ''));
+    $prodSku = trim((string) ($_POST['sku'] ?? ''));
+    $prodBrand = trim((string) ($_POST['brand'] ?? '')) ?: 'Generic';
+    $prodActive = isset($_POST['is_active']) ? 1 : 0;
+
+    $pStmt = $pdo->prepare("SELECT * FROM products WHERE id = :id LIMIT 1");
+    $pStmt->execute([':id' => $prodId]);
+    $existingProd = $pStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$existingProd) {
+        $error = "Product #{$prodId} not found.";
+    } elseif ($prodName === '' || $rawPrice === '' || !is_numeric($rawPrice) || (float) $rawPrice < 0) {
+        $error = 'Product name and valid non-negative price are required.';
+    } elseif (!is_numeric($rawStock) || (int) $rawStock < 0) {
+        $error = 'Stock quantity must be zero or a positive integer.';
+    } else {
+        $targetSellerId = (int) ($_POST['seller_id'] ?? $existingProd['seller_id']);
+        $sellerChanged = ($targetSellerId !== (int) $existingProd['seller_id']);
+        $sStmt = $pdo->prepare("SELECT id, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = :id LIMIT 1");
+        $sStmt->execute([':id' => $targetSellerId]);
+        $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+        $sAcc = strtoupper((string) ($sRow['account_status'] ?? 'ACTIVE'));
+
+        if (!$sRow) {
+            $error = "Selected seller #{$targetSellerId} was not found.";
+        } elseif ($sellerChanged && in_array($sAcc, ['DELETED', 'LOCKED', 'DELETION_PENDING'], true)) {
+            $error = "Cannot reassign product to seller #{$targetSellerId} with account status {$sAcc}.";
+        } else {
+            $catRes = resolveProductCategoryPhp($pdo, $_POST, false);
+            if (!empty($catRes['error'])) {
+                $error = 'Selected category was not found.';
+            } else {
+                $oldImgs = [];
+                if (!empty($existingProd['images'])) {
+                    $dec = json_decode((string) $existingProd['images'], true);
+                    if (is_array($dec)) $oldImgs = array_values(array_filter($dec, fn($u) => is_string($u) && trim($u) !== ''));
+                } elseif (!empty($existingProd['image_url'])) {
+                    $oldImgs = [(string) $existingProd['image_url']];
+                }
+
+                $clearImgs = !empty($_POST['clear_images']);
+                $replaceImgs = !empty($_POST['replace_images']);
+                $hasControl = !empty($_POST['existing_images_control']);
+                $retainedRaw = (isset($_POST['retain_images']) && is_array($_POST['retain_images'])) ? array_values(array_filter($_POST['retain_images'], 'is_string')) : [];
+                $newUrlsRaw = trim((string) ($_POST['image_urls'] ?? ''));
+
+                if ($clearImgs) {
+                    $imgResult = ['hasImages' => false, 'images' => [], 'filesInfo' => [], 'uploadErrors' => []];
+                } else {
+                    if ($replaceImgs) {
+                        $candidateList = $newUrlsRaw !== '' ? [$newUrlsRaw] : [];
+                    } elseif ($hasControl) {
+                        $candidateList = array_merge($retainedRaw, $newUrlsRaw !== '' ? [$newUrlsRaw] : []);
+                    } else {
+                        $candidateList = array_merge($oldImgs, $newUrlsRaw !== '' ? [$newUrlsRaw] : []);
+                    }
+
+                    $imgResult = saveUploadedProductImages(!empty($candidateList) ? ['images' => $candidateList] : []);
+                }
+                if (!empty($imgResult['uploadErrors'])) {
+                    $error = $imgResult['uploadErrors'][0];
+                } else {
+                    $finalImages = array_slice(dedupeImagesByFilename($imgResult['images'] ?? []), 0, 4);
+                    if (!$clearImgs && !$replaceImgs && !$hasControl && empty($imgResult['hasImages'])) {
+                        $finalImages = $oldImgs;
+                    }
+                    $finalPrimaryUrl = $finalImages[0] ?? null;
+                    $finalImagesJson = !empty($finalImages) ? json_encode($finalImages) : null;
+
+                    $pricing = resolveProductPricing([
+                        'price' => $rawPrice,
+                        'mrp' => $_POST['mrp'] ?? null,
+                    ], $existingProd);
+
+                    $updStmt = $pdo->prepare("
+                        UPDATE products
+                        SET seller_id = :seller_id,
+                            name = :name,
+                            description = :description,
+                            sku = :sku,
+                            category = :category,
+                            category_id = :category_id,
+                            brand = :brand,
+                            mrp = :mrp,
+                            seller_price = :seller_price,
+                            commission = :commission,
+                            delivery_charge = :delivery_charge,
+                            price = :price,
+                            stock = :stock,
+                            image_url = :image_url,
+                            images = :images,
+                            is_active = :is_active,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = :id
+                    ");
+                    $updStmt->execute([
+                        ':seller_id' => $targetSellerId,
+                        ':name' => $prodName,
+                        ':description' => $prodDesc !== '' ? $prodDesc : null,
+                        ':sku' => $prodSku !== '' ? $prodSku : null,
+                        ':category' => !empty($catRes['provided']) ? $catRes['category'] : ($existingProd['category'] ?: 'General'),
+                        ':category_id' => !empty($catRes['provided']) ? $catRes['category_id'] : ($existingProd['category_id'] ?? null),
+                        ':brand' => $prodBrand,
+                        ':mrp' => number_format((float) $pricing['mrp'], 2, '.', ''),
+                        ':seller_price' => number_format((float) $pricing['seller_price'], 2, '.', ''),
+                        ':commission' => number_format((float) $pricing['commission'], 2, '.', ''),
+                        ':delivery_charge' => number_format((float) $pricing['delivery_charge'], 2, '.', ''),
+                        ':price' => number_format((float) $pricing['price'], 2, '.', ''),
+                        ':stock' => (int) $rawStock,
+                        ':image_url' => $finalPrimaryUrl,
+                        ':images' => $finalImagesJson,
+                        ':is_active' => $prodActive,
+                        ':id' => $prodId,
+                    ]);
+
+                    // Sync & clean up removed image files safely
+                    $keptNames = array_map('getImageBasename', $finalImages);
+                    foreach ($oldImgs as $oldU) {
+                        $oldBn = getImageBasename($oldU);
+                        if ($oldBn !== '' && !in_array($oldBn, $keptNames, true)) {
+                            try {
+                                $pdo->prepare("DELETE FROM product_images WHERE product_id = :pid AND file_name = :fn")
+                                    ->execute([':pid' => $prodId, ':fn' => $oldBn]);
+                            } catch (Throwable $e) {}
+                            safeDeleteLocalImageFilePHP($pdo, $oldBn, $prodId);
+                        }
+                    }
+                    if (!empty($finalImages)) {
+                        syncProductImagesRecordPHP($pdo, $targetSellerId, $prodId, $finalImages, $imgResult['filesInfo'] ?? []);
+                    }
+
+                    $success = "Product #{$prodId} (\"{$prodName}\") updated successfully!";
+                }
+            }
+        }
+    }
+}
+
+// Handle Admin Activate / Deactivate Product
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'toggle_product_status') {
+    $prodId = (int) ($_POST['product_id'] ?? 0);
+    $pStmt = $pdo->prepare("SELECT id, name, is_active FROM products WHERE id = :id LIMIT 1");
+    $pStmt->execute([':id' => $prodId]);
+    $prodRow = $pStmt->fetch(PDO::FETCH_ASSOC);
+    if ($prodRow) {
+        $nextActive = ((int) ($prodRow['is_active'] ?? 1) === 1) ? 0 : 1;
+        $pdo->prepare("UPDATE products SET is_active = :st, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+            ->execute([':st' => $nextActive, ':id' => $prodId]);
+        $stateWord = $nextActive ? 'ACTIVATED' : 'DEACTIVATED';
+        $success = "Product #{$prodId} (\"{$prodRow['name']}\") has been {$stateWord}.";
+    } else {
+        $error = "Product #{$prodId} not found.";
+    }
+}
+
+// Handle Admin Order-Safe Delete / Archive Product
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'delete_product') {
+    $prodId = (int) ($_POST['product_id'] ?? 0);
+    $pStmt = $pdo->prepare("SELECT id, name, image_url, images FROM products WHERE id = :id LIMIT 1");
+    $pStmt->execute([':id' => $prodId]);
+    $prodRow = $pStmt->fetch(PDO::FETCH_ASSOC);
+    if (!$prodRow) {
+        $error = "Product #{$prodId} not found.";
+    } else {
+        $orderRefCount = 0;
+        try {
+            $oiStmt = $pdo->prepare("SELECT COUNT(*) FROM order_items WHERE product_id = :id");
+            $oiStmt->execute([':id' => $prodId]);
+            $orderRefCount = (int) $oiStmt->fetchColumn();
+        } catch (Throwable $e) {
+            $orderRefCount = 0;
+        }
+
+        if ($orderRefCount > 0) {
+            $pdo->prepare("UPDATE products SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+                ->execute([':id' => $prodId]);
+            $success = "Product #{$prodId} (\"{$prodRow['name']}\") has {$orderRefCount} historical order item(s), so it was archived (deactivated) instead of deleted to preserve order history.";
+        } else {
+            $imgsToDel = [];
+            if (!empty($prodRow['images'])) {
+                $dec = json_decode((string) $prodRow['images'], true);
+                if (is_array($dec)) $imgsToDel = $dec;
+            } elseif (!empty($prodRow['image_url'])) {
+                $imgsToDel = [(string) $prodRow['image_url']];
+            }
+            $pdo->prepare("DELETE FROM products WHERE id = :id")->execute([':id' => $prodId]);
+            try {
+                $pdo->prepare("DELETE FROM product_images WHERE product_id = :id")->execute([':id' => $prodId]);
+            } catch (Throwable $e) {}
+            foreach ($imgsToDel as $imgU) {
+                if (is_string($imgU) && str_contains($imgU, '/uploads/products/')) {
+                    safeDeleteLocalImageFilePHP($pdo, basename(explode('?', $imgU)[0]), $prodId);
+                }
+            }
+            $success = "Product #{$prodId} (\"{$prodRow['name']}\") deleted permanently.";
+        }
+    }
+}
+
 // Marketplace Stats
 try {
     $sellerCount = (int) $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'")->fetchColumn();
@@ -479,15 +867,30 @@ try {
 
 try {
     $adminProductsStmt = $pdo->query("
-        SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
-               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+        SELECT p.id, p.seller_id, p.name, p.description, p.sku, p.category, p.category_id, p.brand,
+               p.mrp, p.seller_price, p.price, p.stock, p.image_url, p.images, p.is_active,
+               p.created_at, p.updated_at,
+               COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+               COALESCE(u.account_status, 'ACTIVE') AS seller_account_status
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
         ORDER BY p.id DESC
-        LIMIT 80
+        LIMIT 1000
     ");
     $adminProducts = $adminProductsStmt ? $adminProductsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
 } catch (Throwable $e) { $adminProducts = []; }
+
+try {
+    $eligibleSellersStmt = $pdo->query("
+        SELECT id, COALESCE(seller_name, name, 'Verified Seller') AS display_name,
+               phone, email, COALESCE(account_status, 'ACTIVE') AS account_status
+        FROM users
+        WHERE role = 'seller'
+        ORDER BY id DESC
+        LIMIT 1000
+    ");
+    $eligibleSellersForProducts = $eligibleSellersStmt ? $eligibleSellersStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+} catch (Throwable $e) { $eligibleSellersForProducts = []; }
 
 try {
     $orderCount = (int) $pdo->query("SELECT COUNT(*) FROM orders")->fetchColumn();
@@ -519,11 +922,13 @@ $gstSellersStmt = $pdo->query("
            (SELECT COUNT(*) FROM seller_gst_documents d WHERE d.seller_id = g.seller_id AND (LOWER(d.mime_type) = 'application/pdf' OR d.original_name LIKE '%.pdf')) as pdf_count,
            (SELECT d.id FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_id,
            (SELECT d.original_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_name,
+           (SELECT d.file_name FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_name,
+           (SELECT d.file_path FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_file_path,
            (SELECT d.file_size FROM seller_gst_documents d WHERE d.seller_id = g.seller_id ORDER BY d.is_primary DESC, d.id DESC LIMIT 1) as latest_doc_size
     FROM seller_gst_details g
     JOIN users u ON g.seller_id = u.id
     ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
-    LIMIT 100
+    LIMIT 1000
 ");
 $gstSellers = $gstSellersStmt ? $gstSellersStmt->fetchAll() : [];
 
@@ -539,14 +944,82 @@ $sellersStmt = $pdo->query("
     FROM users u
     WHERE u.role = 'seller'
     ORDER BY u.id DESC
-    LIMIT 100
+    LIMIT 1000
 ");
 $sellers = $sellersStmt ? $sellersStmt->fetchAll() : [];
 
 $deletionData = deletionListRequestsPhp($pdo, []);
 $delRequests = $deletionData['requests'] ?? [];
 $delKpis = $deletionData['kpis'] ?? ['total' => 0, 'pending' => 0, 'processing' => 0, 'failed' => 0, 'on_hold' => 0, 'approved' => 0, 'deleted' => 0, 'rejected' => 0];
-$focusDeletionTab = str_contains($_SERVER['REQUEST_URI'] ?? '', 'seller-deletions') || (($_GET['tab'] ?? '') === 'seller-deletions');
+
+$totalListedProducts = count($adminProducts);
+$activeListedProducts = 0;
+$outOfStockProducts = 0;
+foreach ($adminProducts as $apCountRow) {
+    if ((int) ($apCountRow['is_active'] ?? 1) === 1) {
+        $activeListedProducts++;
+    }
+    if ((int) ($apCountRow['stock'] ?? 0) <= 0) {
+        $outOfStockProducts++;
+    }
+}
+$inactiveListedProducts = max(0, $totalListedProducts - $activeListedProducts);
+
+$allowedAdminTabs = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+$reqPathOnly = strtolower((string) (parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?: ''));
+$defaultPathTab = 'overview';
+if (str_contains($reqPathOnly, 'seller-deletions')) {
+    $defaultPathTab = 'seller-deletions';
+} elseif ($reqPathOnly === '/admin/products') {
+    $defaultPathTab = 'products';
+} elseif ($reqPathOnly === '/admin/sellers') {
+    $defaultPathTab = 'sellers';
+} elseif ($reqPathOnly === '/admin/create-seller') {
+    $defaultPathTab = 'create-seller';
+} elseif ($reqPathOnly === '/admin/gst-verifications') {
+    $defaultPathTab = 'gst';
+} elseif ($reqPathOnly === '/admin/categories') {
+    $defaultPathTab = 'categories';
+}
+$defaultTabByAction = [
+    'approve_gst' => 'gst',
+    'reject_gst' => 'gst',
+    'add_category' => 'categories',
+    'edit_category' => 'categories',
+    'delete_category' => 'categories',
+    'update_product_category' => 'products',
+    'create_product' => 'products',
+    'edit_product' => 'products',
+    'toggle_product_status' => 'products',
+    'delete_product' => 'products',
+    'create_seller' => 'sellers',
+    'edit_seller' => 'sellers',
+];
+$rawPostRetTab = strtolower(trim((string) ($_POST['return_tab'] ?? '')));
+$rawQueryTab = strtolower(trim((string) ($_GET['tab'] ?? '')));
+$postActionKey = trim((string) ($_POST['action'] ?? ''));
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($rawPostRetTab, $allowedAdminTabs, true)) {
+    $activeTab = $rawPostRetTab;
+} elseif ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($defaultTabByAction[$postActionKey])) {
+    $activeTab = $defaultTabByAction[$postActionKey];
+} elseif (in_array($rawQueryTab, $allowedAdminTabs, true)) {
+    $activeTab = $rawQueryTab;
+} else {
+    $activeTab = $defaultPathTab;
+}
+$focusDeletionTab = ($activeTab === 'seller-deletions');
+$panelVisiblePhp = static fn(string $panelTab): bool => ($activeTab === 'all' || $activeTab === $panelTab);
+$tabMetaPhp = [
+    'overview' => ['title' => 'Dashboard Overview', 'sub' => 'Structured Admin Header, Portal KPIs, Page-Wise Category Stepper & Footer Navigation.'],
+    'gst' => ['title' => 'PDF Verifications', 'sub' => 'Page 1 — Inspect seller-uploaded PDF certificates inline, approve compliance, or reject with mandatory feedback.'],
+    'sellers' => ['title' => 'Seller Accounts', 'sub' => 'Page 2 — Manage registered sellers, search & filter accounts, edit profiles, or trigger deletion audits.'],
+    'create-seller' => ['title' => 'Create Seller Account', 'sub' => 'Page 3 — Register a new merchant account manually with normalized phone or email credentials.'],
+    'seller-deletions' => ['title' => 'Seller Management → Seller Deletion Requests', 'sub' => 'Page 4 — Verify orders (Rules A–E), automated Razorpay refunds, settlements, and 6-gate deletion approvals.'],
+    'products' => ['title' => 'Manage Products', 'sub' => 'Page 5 — Add products, upload gallery photos, edit pricing/stock, filter catalog, reassign categories, or archive safely.'],
+    'categories' => ['title' => 'Product Categories', 'sub' => 'Page 6 — Create, edit, sort, and manage product categories with automatic catalog sync.'],
+    'all' => ['title' => 'Complete Admin Portal (All Lists)', 'sub' => 'All management lists displayed together on a single page.'],
+];
+$curMetaPhp = $tabMetaPhp[$activeTab] ?? $tabMetaPhp['overview'];
 
 function formatBytesPhp($bytes): string {
     if (!$bytes) return '0 KB';
@@ -568,41 +1041,85 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Vendor Admin Dashboard</title>
+    <title><?= htmlspecialchars($curMetaPhp['title']) ?> — Vendor Admin Portal</title>
     <style>
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
-        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-        .brand { font-size: 21px; font-weight: 800; }
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; min-height: 100vh; display: flex; flex-direction: column; }
+        .top { background: #25204a; color: white; padding: 14px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; position: sticky; top: 0; z-index: 200; box-shadow: 0 4px 16px rgba(20, 16, 48, 0.16); }
+        .brand { font-size: 20px; font-weight: 800; color: #fff; text-decoration: none; }
         .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; }
+        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; white-space: nowrap; }
         .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
-        .wrap { max-width: 1180px; margin: 28px auto; padding: 0 18px; }
+        .wrap { flex: 1; width: 100%; max-width: 1220px; margin: 24px auto; padding: 0 18px; }
         .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-        .stat { font-size: 32px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
+        .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
         p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
+        .admin-view-panel { display: none; }
+        .admin-view-panel.is-visible { display: block; }
+        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 20px; }
+        .cat-pager { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; box-shadow: 0 4px 16px rgba(37,32,74,0.04); }
+        .cat-pager-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+        .cat-page-pill { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; border-radius: 8px; background: #f1f5f9; color: #475569; text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid #e2e8f0; transition: all .15s; white-space: nowrap; }
+        .cat-page-pill:hover { background: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
+        .cat-page-pill.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .cat-pager-nav { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .cat-step-btn { background: #f8fafc; color: #1e1b4b; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .cat-step-btn:hover:not(:disabled) { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .cat-step-indicator { font-size: 12px; font-weight: 700; color: #475569; padding: 0 4px; white-space: nowrap; }
+        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #475569; }
+        .pg-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+        .pg-btn { background: #f8fafc; color: #334155; border: 1px solid #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; min-width: 32px; text-align: center; }
+        .pg-btn:hover:not(:disabled) { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
+        .pg-btn.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .pg-select { width: auto !important; min-width: 105px; padding: 5px 8px !important; font-size: 12px !important; border-radius: 6px !important; border: 1px solid #cbd5e1 !important; background: #fff; }
+        .reject-presets { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+        .reject-chip { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 9999px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .reject-chip:hover { background: #fecaca; }
+        .modal-err-banner { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; border-left: 4px solid #dc2626; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+        .kpi-card-link { cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; border: 1px solid #eef2ff; }
+        .kpi-card-link:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(37,32,74,0.1); border-color: #c7d2fe; }
+        .dir-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 8px; }
+        .dir-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; gap: 14px; box-shadow: 0 6px 20px rgba(37,32,74,0.04); transition: transform .15s ease, border-color .15s ease; }
+        .dir-card:hover { transform: translateY(-2px); border-color: #a5b4fc; }
+        .dir-card h3 { margin: 0 0 6px; font-size: 16px; color: #1e1b4b; }
+        .dir-card p { margin: 0; font-size: 13px; color: #64748b; line-height: 1.5; }
+        .dir-card-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 10px; border-top: 1px solid #f1f5f9; }
+        .sub-kpi-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+        .admin-footer { background: #1e1b4b; color: #cbd5e1; padding: 22px 5%; margin-top: 32px; border-top: 1px solid #312e81; }
+        .footer-inner { max-width: 1220px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; font-size: 13px; }
+        .footer-links { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+        .footer-links a { color: #cbd5e1; text-decoration: none; font-weight: 600; transition: color .15s; }
+        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
         label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
         input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
         input:focus, textarea:focus, select:focus { border-color: #6366f1; }
-        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 12px 20px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
+        button, .btn { background: #5b4bd8; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; }
         button:hover, .btn:hover { background: #4a3cb8; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
         table { width: 100%; border-collapse: collapse; margin-top: 14px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; vertical-align: middle; }
-        th { color: #64748b; font-weight: 600; }
+        th { color: #64748b; font-weight: 600; font-size: 13px; }
         .error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
         .success { background: #ecfdf5; color: #047857; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
         .logout-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
         .logout-btn:hover { background: rgba(255,255,255,0.25); }
-        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-sm { background: #6366f1; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }
         .btn-sm:hover { background: #4f46e5; }
-        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; }
+        .btn-hold-sm { background: #ea580c; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
         .btn-hold-sm:hover { background: #c2410c; }
-        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .btn-del-req:hover { background: #fee2e2; }
         .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        .prod-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid #e2e8f0; background: #f8fafc; flex-shrink: 0; }
+        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 8px; border: 1px dashed #cbd5e1; background: #f8fafc; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #94a3b8; flex-shrink: 0; }
+        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 10px; margin-top: 6px; }
+        .existing-img-item { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; background: #f8fafc; text-align: center; font-size: 11px; }
+        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 6px; display: block; margin-bottom: 4px; }
+        .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .filter-bar select { width: auto; min-width: 145px; padding: 7px 10px; font-size: 13px; }
         .del-badge { font-weight: 700; font-size: 11px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
         .del-yellow { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
         .del-blue { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
@@ -610,13 +1127,13 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         .del-red { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
         .del-orange { background: #ffedd5; color: #c2410c; border: 1px solid #fdba74; }
         /* Modal Styles */
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; }
         .modal-overlay.active { display: flex; }
-        .modal-box { background: #fff; width: 92%; max-width: 650px; max-height: 90vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
+        .modal-box { background: #fff; width: 94%; max-width: 780px; max-height: 92vh; overflow-y: auto; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); border: 1px solid #e2e8f0; }
         .modal-box.wide { max-width: 1040px; }
-        .modal-header { padding: 20px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
+        .modal-header { padding: 18px 24px; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #fff; z-index: 5; }
         .modal-header h3 { margin: 0; font-size: 18px; color: #1e1b4b; }
-        .modal-close { background: transparent; border: none; font-size: 20px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
+        .modal-close { background: transparent; border: none; font-size: 22px; font-weight: 700; color: #94a3b8; cursor: pointer; padding: 4px; }
         .modal-close:hover { color: #0f172a; }
         .modal-body { padding: 24px; }
         .metric-mini { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
@@ -641,17 +1158,17 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         .doc-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
         .doc-title { font-weight: 700; font-size: 14px; color: #1e293b; display: flex; align-items: center; gap: 8px; }
         .doc-meta { font-size: 12px; color: #64748b; margin-top: 4px; }
-        .btn-view { background: #0284c7; color: white; padding: 6px 12px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
+        .btn-view { background: #0284c7; color: white; padding: 5px 11px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px; }
         .btn-view:hover { background: #0369a1; }
-        .btn-dl { background: #475569; color: white; padding: 6px 12px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
+        .btn-dl { background: #475569; color: white; padding: 5px 9px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: 700; display: inline-block; }
         .btn-dl:hover { background: #334155; }
         .btn-approve { background: #16a34a; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
         .btn-approve:hover { background: #15803d; }
-        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-approve-sm { background: #16a34a; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
         .btn-approve-sm:hover { background: #15803d; }
         .btn-reject { background: #dc2626; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
         .btn-reject:hover { background: #b91c1c; }
-        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
+        .btn-reject-sm { background: #dc2626; color: white; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px; transition: background .15s; }
         .btn-reject-sm:hover { background: #b91c1c; }
         .search-box { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 320px; }
         .search-box input { width: 100%; padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid #cbd5e1; outline: none; }
@@ -662,23 +1179,28 @@ function delBadgeClassPhp(?string $statusOrColor): string {
 </head>
 <body>
     <header class="top">
-        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin</span></div>
-        <nav class="top-nav">
-            <a href="/admin#sellersSection" class="nav-pill <?= !$focusDeletionTab ? 'active' : '' ?>">Seller Management</a>
-            <a href="/admin/seller-deletions" class="nav-pill <?= $focusDeletionTab ? 'active' : '' ?>">Seller Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
-            <a href="/admin#gstSection" class="nav-pill">PDF Verifications</a>
-            <a href="/admin#categoriesSection" class="nav-pill">Categories</a>
+        <a href="/admin" class="brand" onclick="return switchAdminTab('overview', event);">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></a>
+        <nav class="top-nav" id="adminTopNav">
+            <a href="/admin" data-tab="overview" class="nav-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">Overview</a>
+            <a href="/admin/gst-verifications" data-tab="gst" class="nav-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">PDF Verifications<?= $pendingGstCount > 0 ? ' (' . (int) $pendingGstCount . ')' : '' ?></a>
+            <a href="/admin/sellers" data-tab="sellers" class="nav-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">Seller Accounts (<?= (int) $sellerCount ?>)</a>
+            <a href="/admin/create-seller" data-tab="create-seller" class="nav-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
+            <a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount"><?= (int) ($delKpis['total'] ?? 0) ?></span>)</a>
+            <a href="/admin/products" data-tab="products" class="nav-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products (<?= (int) $totalListedProducts ?>)</a>
+            <a href="/admin/categories" data-tab="categories" class="nav-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories (<?= count($categoriesList) ?>)</a>
+            <a href="/admin?tab=all" data-tab="all" class="nav-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a>
         </nav>
-        <div>
-            <span style="margin-right:15px; font-size:14px; opacity:.9;">Welcome, <?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?></span>
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button type="button" class="btn-approve-sm" style="padding:7px 11px;" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
+            <span style="font-size:13px; opacity:.9;">Welcome, <?= htmlspecialchars($_SESSION['admin_name'] ?? 'Admin') ?></span>
             <a href="/admin/logout" class="logout-btn">Sign out</a>
         </div>
     </header>
     <main class="wrap">
-        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
             <div>
-                <h1 style="margin-bottom:6px;"><?= $focusDeletionTab ? 'Seller Management → Seller Deletion Requests' : 'Dashboard' ?></h1>
-                <p class="muted" style="margin:0;">Manage marketplace sellers, Seller Account Deletion & Refund workflows, categories, and PDF verifications.</p>
+                <h1 id="adminPageTitle" style="margin-bottom:6px;"><?= htmlspecialchars($curMetaPhp['title']) ?></h1>
+                <p id="adminPageSubtitle" class="muted" style="margin:0;"><?= htmlspecialchars($curMetaPhp['sub']) ?></p>
             </div>
             <div class="status-legend">
                 <span class="del-badge del-yellow">PENDING</span>
@@ -692,16 +1214,37 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         <?php if ($success): ?><div class="success"><?= htmlspecialchars($success) ?></div><?php endif; ?>
         <?php if ($error): ?><div class="error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
 
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 24px;">
-            <section class="card">
+        <!-- Page-Wise Admin Category Stepper Bar -->
+        <nav class="cat-pager" id="adminCategoryPager" aria-label="Admin Category Pages">
+            <div class="cat-pager-pills">
+                <a href="/admin" data-tab="overview" class="cat-page-pill <?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">🏠 Overview</a>
+                <a href="/admin/gst-verifications" data-tab="gst" class="cat-page-pill <?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (<?= (int) $totalGstCount ?>)</a>
+                <a href="/admin/sellers" data-tab="sellers" class="cat-page-pill <?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (<?= (int) $sellerCount ?>)</a>
+                <a href="/admin/create-seller" data-tab="create-seller" class="cat-page-pill <?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
+                <a href="/admin/seller-deletions" data-tab="seller-deletions" class="cat-page-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
+                <a href="/admin/products" data-tab="products" class="cat-page-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">5. Manage Products (<?= (int) $totalListedProducts ?>)</a>
+                <a href="/admin/categories" data-tab="categories" class="cat-page-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">6. Categories (<?= count($categoriesList) ?>)</a>
+                <a href="/admin?tab=all" data-tab="all" class="cat-page-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Pages</a>
+            </div>
+            <div class="cat-pager-nav">
+                <button type="button" id="catPrevBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(-1)">← Previous</button>
+                <span id="categoryPageIndicator" class="cat-step-indicator">Overview</span>
+                <button type="button" id="catNextBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(1)">Next →</button>
+            </div>
+        </nav>
+
+        <!-- KPI Metrics Grid (shown cleanly on Overview & All Lists; clickable to jump directly to any module list) -->
+        <div class="admin-view-panel <?= ($activeTab === 'overview' || $activeTab === 'all') ? 'is-visible' : '' ?>" data-admin-panel="overview,all">
+        <div class="grid" style="margin-bottom: 24px;">
+            <section class="card kpi-card-link" onclick="switchAdminTab('sellers')">
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
                 <div class="stat"><?= $sellerCount ?></div>
             </section>
-            <section class="card">
+            <section class="card kpi-card-link" onclick="switchAdminTab('products')">
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
                 <div class="stat" style="color:#2563eb;"><?= $productCount ?></div>
             </section>
-            <section class="card">
+            <section class="card kpi-card-link" onclick="switchAdminTab('categories')">
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
                 <div class="stat" style="color:#7c3aed;"><?= $categoryCount ?></div>
             </section>
@@ -709,7 +1252,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
                 <div class="stat" style="color:#0891b2;"><?= $orderCount ?></div>
             </section>
-            <section class="card" style="border-left: 4px solid #f59e0b; background: <?= $pendingGstCount > 0 ? '#fffbeb' : '#fff' ?>;">
+            <section class="card kpi-card-link" style="border-left: 4px solid #f59e0b; background: <?= $pendingGstCount > 0 ? '#fffbeb' : '#fff' ?>;" onclick="switchAdminTab('gst')">
                 <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
                     Pending PDF Reviews
                     <?php if ($pendingGstCount > 0): ?>
@@ -718,18 +1261,99 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 </div>
                 <div class="stat" style="color:#b45309;"><?= $pendingGstCount ?></div>
             </section>
-            <section class="card" style="border-left: 4px solid #10b981;">
+            <section class="card kpi-card-link" style="border-left: 4px solid #10b981;" onclick="switchAdminTab('gst')">
                 <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
                 <div class="stat" style="color:#10b981;"><?= $approvedGstCount ?></div>
             </section>
-            <section class="card" style="border-left: 4px solid #ef4444;">
-                <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Rejected Requests</div>
-                <div class="stat" style="color:#ef4444;"><?= $rejectedGstCount ?></div>
+            <section class="card kpi-card-link" style="border-left: 4px solid #ef4444;" onclick="switchAdminTab('seller-deletions')">
+                <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Deletion Requests</div>
+                <div class="stat" style="color:#dc2626;"><?= (int) ($delKpis['total'] ?? 0) ?></div>
+            </section>
+        </div>
+        </div>
+
+        <!-- Overview Directory Grid (clean page-wise category cards into each Admin page/list) -->
+        <div class="admin-view-panel <?= $activeTab === 'overview' ? 'is-visible' : '' ?>" data-admin-panel="overview" id="overviewSection">
+            <section class="card">
+                <h2>Admin Categories — Page-Wise Navigation</h2>
+                <p class="muted">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
+                <div class="dir-grid">
+                    <div class="dir-card" style="border-left: 4px solid #f59e0b;">
+                        <div>
+                            <h3>📄 Page 1: Seller PDF Document Verification</h3>
+                            <p>Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <span class="badge-pending"><?= (int) $pendingGstCount ?> pending &bull; <?= (int) $rejectedGstCount ?> rejected</span>
+                            <a href="/admin/gst-verifications" class="btn-sm" style="background:#d97706;" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                        </div>
+                    </div>
+                    <div class="dir-card">
+                        <div>
+                            <h3>🏪 Page 2: Seller Accounts</h3>
+                            <p>Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <span class="badge-prod"><?= (int) $sellerCount ?> sellers</span>
+                            <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                        </div>
+                    </div>
+                    <div class="dir-card">
+                        <div>
+                            <h3>➕ Page 3: Create Seller Account</h3>
+                            <p>Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <a href="/admin/create-seller" class="btn-sm" style="background:#4f46e5;" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                        </div>
+                    </div>
+                    <div class="dir-card" style="border-left: 4px solid #dc2626;">
+                        <div>
+                            <h3>🗑 Page 4: Seller Deletion &amp; Refunds</h3>
+                            <p>Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <span class="badge-pending"><?= (int) (($delKpis['pending'] ?? 0) + ($delKpis['processing'] ?? 0)) ?> active &bull; <?= (int) ($delKpis['total'] ?? 0) ?> total</span>
+                            <a href="/admin/seller-deletions" class="btn-sm" style="background:#dc2626;" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
+                        </div>
+                    </div>
+                    <div class="dir-card">
+                        <div>
+                            <h3>📦 Page 5: Manage Products</h3>
+                            <p>Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <span class="badge-prod"><?= (int) $totalListedProducts ?> total &bull; <?= (int) $activeListedProducts ?> active</span>
+                            <a href="/admin/products" class="btn-sm" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
+                            <button type="button" class="btn-approve-sm" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
+                        </div>
+                    </div>
+                    <div class="dir-card">
+                        <div>
+                            <h3>🏷 Page 6: Product Categories</h3>
+                            <p>Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <span class="badge-prod"><?= count($categoriesList) ?> categories</span>
+                            <a href="/admin/categories" class="btn-sm" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
+                        </div>
+                    </div>
+                    <div class="dir-card">
+                        <div>
+                            <h3>📋 Combined All-Lists Mode</h3>
+                            <p>View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
+                        </div>
+                        <div class="dir-card-actions">
+                            <a href="/admin?tab=all" class="btn-sm" style="background:#475569;" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                        </div>
+                    </div>
+                </div>
             </section>
         </div>
 
         <!-- Section 1: Seller PDF Document Verification Hub (Primary Function) -->
-        <section class="card" id="gstSection">
+        <div class="admin-view-panel <?= $panelVisiblePhp('gst') ? 'is-visible' : '' ?>" data-admin-panel="gst">
+        <section class="card" id="gstSection" style="margin-top:0;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
                 <div>
                     <h2>Seller PDF Document Verification</h2>
@@ -772,6 +1396,10 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 $sellerLabel = $g['seller_name'] ?? $g['user_name'] ?? 'Seller #' . $g['seller_id'];
                                 $displayGstEmail = getPublicSellerEmailPhp($g['email'] ?? null);
                                 $searchString = strtolower($sellerLabel . ' ' . ($g['phone'] ?? '') . ' ' . ($displayGstEmail ?? ''));
+                                $docExistsPhp = !empty($g['latest_doc_id']) && (resolveGstFilePathPhp([
+                                    'file_name' => $g['latest_doc_file_name'] ?? null,
+                                    'file_path' => $g['latest_doc_file_path'] ?? null,
+                                ]) !== null);
                             ?>
                             <tr class="gst-row" data-status="<?= $st ?>" data-search="<?= htmlspecialchars($searchString) ?>">
                                 <td>
@@ -790,12 +1418,18 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                             <span class="badge-pdf">PDF</span>
                                             <strong style="color:#334155; font-size:13px;"><?= htmlspecialchars($g['latest_doc_name'] ?: 'Certificate.pdf') ?></strong>
                                             <span style="color:#94a3b8; font-size:11px;">(<?= formatBytesPhp($g['latest_doc_size']) ?>)</span>
+                                            <?php if (!$docExistsPhp): ?>
+                                                <span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>
+                                            <?php endif; ?>
                                         </div>
-                                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center;">
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $g['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn-view" style="font-size:11px; padding:4px 10px;">
-                                                📄 1-Click Preview PDF
+                                        <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                                            <button type="button" class="btn-view" style="border:none; cursor:pointer; font-size:11px; padding:4px 10px;" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false, <?= (int)$g['latest_doc_id'] ?>)">
+                                                📄 Preview PDF
+                                            </button>
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=preview" target="_blank" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Open in New Tab">
+                                                ↗ New Tab
                                             </a>
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $g['latest_doc_id'] ?>&mode=download" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Download PDF">
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int)$g['latest_doc_id'] ?>&mode=download" class="btn-dl" style="font-size:11px; padding:4px 8px;" title="Download PDF">
                                                 ⬇
                                             </a>
                                             <?php if ((int)$g['doc_count'] > 1): ?>
@@ -824,7 +1458,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 <td>
                                     <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
                                         <?php if ($st !== 'approved'): ?>
-                                            <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Approve verification for <?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>?');">
+                                            <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Approve GST Verification" data-confirm-msg="<?= htmlspecialchars('Approve GST verification for ' . $sellerLabel . '?', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
                                                 <input type="hidden" name="action" value="approve_gst">
                                                 <input type="hidden" name="seller_id" value="<?= (int)$g['seller_id'] ?>">
                                                 <input type="hidden" name="notes" value="Approved by administrator">
@@ -833,10 +1467,10 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                         <?php endif; ?>
 
                                         <?php if ($st !== 'rejected'): ?>
-                                            <button type="button" class="btn-reject-sm" onclick="openGstModalWithReject(<?= (int)$g['seller_id'] ?>, '<?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>')" title="Reject with Reason">✕ Reject</button>
+                                            <button type="button" class="btn-reject-sm" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModalWithReject(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
                                         <?php endif; ?>
 
-                                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, '<?= htmlspecialchars(addslashes($sellerLabel), ENT_QUOTES) ?>')">Details & Logs</button>
+                                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="<?= htmlspecialchars($sellerLabel, ENT_QUOTES, 'UTF-8') ?>" onclick="openGstModal(<?= (int)$g['seller_id'] ?>, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
                                     </div>
                                 </td>
                             </tr>
@@ -844,15 +1478,33 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <?php endif; ?>
                 </tbody>
             </table>
+            <div id="gstPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
-        <!-- Section 2: Seller Accounts Overview with Account Status & Deletion Controls -->
-        <section class="card" id="sellersSection" style="margin-top:24px;">
+        <!-- Section 2: Seller Accounts Overview with Search, Status Filter, Pagination & Deletion Controls -->
+        <div class="admin-view-panel <?= $panelVisiblePhp('sellers') ? 'is-visible' : '' ?>" data-admin-panel="sellers">
+        <section class="card" id="sellersSection" style="margin-top:0;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
                 <div>
                     <h2>Seller Accounts</h2>
-                    <p class="muted">All registered sellers on Venter App with inventory counts, verification status, and deletion controls.</p>
+                    <p class="muted">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
                 </div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                    <a href="/admin/create-seller" class="btn-sm" style="background:#16a34a; padding:8px 13px; font-size:12px;" onclick="return switchAdminTab('create-seller', event);">+ Add New Seller</a>
+                </div>
+            </div>
+            <div class="filter-bar" style="margin-bottom:12px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
+                <div class="search-box" style="max-width:280px; flex:1; min-width:190px;">
+                    <input type="text" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+                </div>
+                <select id="sellersStatusFilter" onchange="applySellerFilters()">
+                    <option value="all">All Account Statuses</option>
+                    <option value="ACTIVE">ACTIVE</option>
+                    <option value="DELETION_PENDING">DELETION_PENDING</option>
+                    <option value="LOCKED">LOCKED</option>
+                    <option value="DELETED">DELETED</option>
+                </select>
             </div>
             <table>
                 <thead>
@@ -868,7 +1520,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         <th>Actions</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="sellersTableBody">
                     <?php if (empty($sellers)): ?>
                         <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
                     <?php else: ?>
@@ -879,15 +1531,17 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 $docBadgeClass = ($dSt === 'approved') ? 'badge-approved' : (($dSt === 'rejected') ? 'badge-rejected' : (($dSt === 'pending') ? 'badge-pending' : ''));
                                 $accStatus = strtoupper((string) ($s['account_status'] ?? 'ACTIVE'));
                                 $accBadgeCls = $accStatus === 'ACTIVE' ? 'del-badge del-green' : ($accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : ($accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
+                                $pubSellerEmail = getPublicSellerEmailPhp($s['email'] ?? null) ?? '';
+                                $sellerSearchStr = strtolower(($s['seller_name'] ?? $s['name'] ?? '') . ' ' . ($s['phone'] ?? '') . ' ' . $pubSellerEmail . ' ' . ($s['state'] ?? '') . ' #' . (int) $s['id']);
                             ?>
-                            <tr>
-                                <td>#<?= $s['id'] ?></td>
+                            <tr id="seller-row-<?= (int) $s['id'] ?>" class="seller-account-row" data-status="<?= htmlspecialchars($accStatus, ENT_QUOTES, 'UTF-8') ?>" data-search="<?= htmlspecialchars($sellerSearchStr, ENT_QUOTES, 'UTF-8') ?>">
+                                <td>#<?= (int) $s['id'] ?></td>
                                 <td>
                                     <strong><?= htmlspecialchars($s['seller_name'] ?? $s['name']) ?></strong>
                                 </td>
                                 <td>
                                     <div><?= htmlspecialchars($s['phone'] ?? '—') ?></div>
-                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars(getPublicSellerEmailPhp($s['email'] ?? null) ?? '') ?></div>
+                                    <div style="font-size:11px; color:#94a3b8;"><?= htmlspecialchars($pubSellerEmail) ?></div>
                                 </td>
                                 <td><?= htmlspecialchars($s['state'] ?? '—') ?></td>
                                 <td><span class="badge-prod"><?= (int)($s['products_count'] ?? 0) ?> products</span></td>
@@ -895,22 +1549,24 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                     <?php if (!empty($docBadgeClass)): ?>
                                         <span class="<?= $docBadgeClass ?>"><?= htmlspecialchars($s['doc_status']) ?></span>
                                         <?php if (!empty($s['latest_doc_id'])): ?>
-                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= $s['latest_doc_id'] ?>&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>
+                                            <a href="/admin/dashboard.php?action=view_gst_doc&id=<?= (int) $s['latest_doc_id'] ?>&mode=preview" target="_blank" style="margin-left:4px; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">📄 View</a>
                                         <?php endif; ?>
                                     <?php else: ?>
                                         <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
                                     <?php endif; ?>
                                 </td>
-                                <td><span class="<?= $accBadgeCls ?>"><?= htmlspecialchars($accStatus) ?></span></td>
+                                <td class="seller-acc-cell"><span class="<?= $accBadgeCls ?>"><?= htmlspecialchars($accStatus) ?></span></td>
                                 <td><?= htmlspecialchars(substr($s['created_at'] ?? '', 0, 10)) ?></td>
                                 <td>
-                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                                        <button type="button" class="btn-sm" onclick='openSellerModal(<?= htmlspecialchars(json_encode($s, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>View / Edit</button>
-                                        <?php if (!empty($s['active_deletion_request_id'])): ?>
-                                            <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(<?= (int) $s['active_deletion_request_id'] ?>)">Manage Deletion #<?= (int) $s['active_deletion_request_id'] ?></button>
-                                        <?php elseif ($accStatus !== 'DELETED'): ?>
-                                            <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(<?= (int) $s['id'] ?>)">Request Seller Deletion</button>
-                                        <?php endif; ?>
+                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;" data-seller-id="<?= (int) $s['id'] ?>">
+                                        <button type="button" class="btn-sm" data-seller="<?= htmlspecialchars(json_encode($s, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openSellerModal(this)">View / Edit</button>
+                                        <span class="seller-del-btn-slot">
+                                            <?php if (!empty($s['active_deletion_request_id'])): ?>
+                                                <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(<?= (int) $s['active_deletion_request_id'] ?>)">Manage Deletion #<?= (int) $s['active_deletion_request_id'] ?></button>
+                                            <?php elseif ($accStatus !== 'DELETED'): ?>
+                                                <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(<?= (int) $s['id'] ?>)">Request Seller Deletion</button>
+                                            <?php endif; ?>
+                                        </span>
                                     </div>
                                 </td>
                             </tr>
@@ -918,10 +1574,13 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <?php endif; ?>
                 </tbody>
             </table>
+            <div id="sellersPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
         <!-- Section 2B: Seller Management → Seller Deletion Requests -->
-        <section class="card" id="deletionRequestsSection" style="margin-top:24px; border-top: 4px solid #dc2626;">
+        <div class="admin-view-panel <?= $panelVisiblePhp('seller-deletions') ? 'is-visible' : '' ?>" data-admin-panel="seller-deletions">
+        <section class="card" id="deletionRequestsSection" style="margin-top:0; border-top: 4px solid #dc2626;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
                 <div>
                     <h2>Seller Management → Seller Deletion Requests</h2>
@@ -1005,14 +1664,20 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <?php endif; ?>
                 </tbody>
             </table>
+            <div id="delPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
         <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
-        <section class="card" id="categoriesSection" style="margin-top:24px;">
+        <div class="admin-view-panel <?= $panelVisiblePhp('categories') ? 'is-visible' : '' ?>" data-admin-panel="categories">
+        <section class="card" id="categoriesSection" style="margin-top:0;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
                 <div>
                     <h2>Product Categories (Editable)</h2>
                     <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+                </div>
+                <div class="search-box">
+                    <input type="text" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
                 </div>
             </div>
 
@@ -1029,12 +1694,13 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         <th>Actions</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="categoriesTableBody">
                     <?php if (empty($categoriesList)): ?>
                         <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
                     <?php else: ?>
                         <?php foreach ($categoriesList as $cat): ?>
-                            <tr>
+                            <?php $catSearchStr = strtolower(($cat['name'] ?? '') . ' ' . ($cat['slug'] ?? '') . ' ' . ($cat['description'] ?? '') . ' #' . (int) $cat['id']); ?>
+                            <tr class="cat-list-row" data-search="<?= htmlspecialchars($catSearchStr, ENT_QUOTES, 'UTF-8') ?>">
                                 <td>#<?= (int)$cat['id'] ?></td>
                                 <td>
                                     <span style="font-size:16px; margin-right:4px;"><?= htmlspecialchars($cat['icon'] ?? '🏷️') ?></span>
@@ -1053,8 +1719,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 </td>
                                 <td>
                                     <div style="display:flex; gap:6px; align-items:center;">
-                                        <button type="button" class="btn-sm" onclick='openCategoryModal(<?= htmlspecialchars(json_encode($cat, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, "UTF-8") ?>)'>Edit</button>
-                                        <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Delete category <?= htmlspecialchars(addslashes($cat['name']), ENT_QUOTES) ?>? Products will be moved to General.');">
+                                        <button type="button" class="btn-sm" data-cat="<?= htmlspecialchars(json_encode($cat, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openCategoryModal(this)">Edit</button>
+                                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete Category" data-confirm-msg="<?= htmlspecialchars('Delete category "' . $cat['name'] . '"? Products will be moved to General.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
                                             <input type="hidden" name="action" value="delete_category">
                                             <input type="hidden" name="category_id" value="<?= (int)$cat['id'] ?>">
                                             <button type="submit" class="btn-reject-sm">Delete</button>
@@ -1066,6 +1732,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <?php endif; ?>
                 </tbody>
             </table>
+            <div id="categoriesPaginationBar" class="pagination-bar"></div>
 
             <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
                 <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
@@ -1098,17 +1765,47 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 </form>
             </div>
         </section>
+        </div>
 
-        <!-- Section 4: Assign / Edit Product Category -->
-        <section class="card" id="productCategoriesSection" style="margin-top:24px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+        <!-- Section 4: Dedicated Admin Manage Products Page -->
+        <div class="admin-view-panel <?= $panelVisiblePhp('products') ? 'is-visible' : '' ?>" data-admin-panel="products">
+            <div class="sub-kpi-bar">
+                <div class="metric-mini"><div class="k">Total Catalog Products</div><div class="v"><?= (int) $totalListedProducts ?></div></div>
+                <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Active on Storefront</div><div class="v" style="color:#15803d;"><?= (int) $activeListedProducts ?></div></div>
+                <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Inactive / Archived</div><div class="v" style="color:#b91c1c;"><?= (int) $inactiveListedProducts ?></div></div>
+                <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Out of Stock</div><div class="v" style="color:#b45309;"><?= (int) $outOfStockProducts ?></div></div>
+            </div>
+        <section class="card" id="productCategoriesSection" style="margin-top:0;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
                 <div>
-                    <h2>Products — Edit Category</h2>
-                    <p class="muted">Reassign or update the category of any active product directly.</p>
+                    <h2>Products — Catalog &amp; Category Management</h2>
+                    <p class="muted">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
                 </div>
-                <div class="search-box">
-                    <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search product or current category...">
+                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                    <button type="button" class="btn-sm" style="background:#16a34a; padding:9px 14px; font-size:13px;" onclick="openProductModal(null)">+ Add New Product</button>
                 </div>
+            </div>
+            <div class="filter-bar" style="margin-bottom:14px; padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
+                <div class="search-box" style="max-width:260px; flex:1; min-width:190px;">
+                    <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+                </div>
+                <select id="prodSellerFilter" onchange="applyAdminProductFilters()">
+                    <option value="">All Sellers</option>
+                    <?php foreach ($eligibleSellersForProducts as $sfOpt): ?>
+                        <option value="<?= (int) $sfOpt['id'] ?>"><?= htmlspecialchars($sfOpt['display_name'] . ' (#' . (int) $sfOpt['id'] . ')') ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <select id="prodCategoryFilter" onchange="applyAdminProductFilters()">
+                    <option value="">All Categories</option>
+                    <?php foreach ($categoriesList as $cfOpt): ?>
+                        <option value="<?= htmlspecialchars(strtolower((string) $cfOpt['name']), ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($cfOpt['name']) ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <select id="prodStatusFilter" onchange="applyAdminProductFilters()">
+                    <option value="all">All Statuses</option>
+                    <option value="1">Active Only</option>
+                    <option value="0">Inactive Only</option>
+                </select>
             </div>
             <table>
                 <thead>
@@ -1116,31 +1813,84 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         <th>ID</th>
                         <th>Product</th>
                         <th>Seller</th>
-                        <th>Price</th>
-                        <th>Current Category</th>
-                        <th>Change Category</th>
+                        <th>Pricing &amp; Stock</th>
+                        <th>Status</th>
+                        <th>Category &amp; Reassign</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="productsTableBody">
                     <?php if (empty($adminProducts)): ?>
-                        <tr><td colspan="6" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet.</td></tr>
+                        <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
                     <?php else: ?>
                         <?php foreach ($adminProducts as $ap): ?>
-                            <?php $pSearch = strtolower(($ap['name'] ?? '') . ' ' . ($ap['category'] ?? '') . ' ' . ($ap['seller_name'] ?? '')); ?>
-                            <tr class="prod-cat-row" data-search="<?= htmlspecialchars($pSearch) ?>">
-                                <td>#<?= (int)$ap['id'] ?></td>
+                            <?php
+                                $formattedAp = formatProductRecord($ap, true);
+                                $sAccProd = strtoupper((string) ($ap['seller_account_status'] ?? 'ACTIVE'));
+                                $formattedAp['seller_account_status'] = $sAccProd;
+                                $isProdActive = !empty($formattedAp['is_active']);
+                                $thumbRaw = $formattedAp['image_url'] ?? '';
+                                $thumbSrc = ($thumbRaw !== '' && str_contains($thumbRaw, '/uploads/products/'))
+                                    ? '/uploads/products/' . basename(explode('?', $thumbRaw)[0])
+                                    : $thumbRaw;
+                                $pSearch = strtolower(
+                                    ($formattedAp['name'] ?? '') . ' ' .
+                                    ($formattedAp['sku'] ?? '') . ' ' .
+                                    ($formattedAp['brand'] ?? '') . ' ' .
+                                    ($formattedAp['category'] ?? '') . ' ' .
+                                    ($formattedAp['seller_name'] ?? '') . ' #' . $formattedAp['id']
+                                );
+                            ?>
+                            <tr class="prod-cat-row"
+                                data-search="<?= htmlspecialchars($pSearch, ENT_QUOTES, 'UTF-8') ?>"
+                                data-seller-id="<?= (int) $ap['seller_id'] ?>"
+                                data-category="<?= htmlspecialchars(strtolower((string) ($formattedAp['category'] ?? 'General')), ENT_QUOTES, 'UTF-8') ?>"
+                                data-active="<?= $isProdActive ? '1' : '0' ?>">
+                                <td><strong>#<?= (int) $ap['id'] ?></strong></td>
                                 <td>
-                                    <strong><?= htmlspecialchars($ap['name']) ?></strong>
-                                    <div style="font-size:11px; color:#64748b;">Stock: <?= (int)$ap['stock'] ?></div>
+                                    <div style="display:flex; gap:10px; align-items:center;">
+                                        <?php if (!empty($thumbSrc)): ?>
+                                            <img src="<?= htmlspecialchars($thumbSrc, ENT_QUOTES, 'UTF-8') ?>" alt="" class="prod-thumb" loading="lazy">
+                                        <?php else: ?>
+                                            <div class="prod-thumb-empty" title="No Image">📦</div>
+                                        <?php endif; ?>
+                                        <div>
+                                            <strong style="color:#1e1b4b;"><?= htmlspecialchars($formattedAp['name']) ?></strong>
+                                            <div style="font-size:11px; color:#64748b; margin-top:2px;">
+                                                SKU: <code><?= htmlspecialchars($formattedAp['sku']) ?></code> &bull; Brand: <?= htmlspecialchars($formattedAp['brand']) ?>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </td>
-                                <td><?= htmlspecialchars($ap['seller_name']) ?></td>
-                                <td>₹<?= number_format((float)$ap['price'], 2) ?></td>
-                                <td><span class="badge-prod"><?= htmlspecialchars($ap['category'] ?: 'General') ?></span></td>
                                 <td>
+                                    <div><?= htmlspecialchars($formattedAp['seller_name']) ?></div>
+                                    <div style="font-size:11px; color:#64748b;">
+                                        Seller #<?= (int) $ap['seller_id'] ?>
+                                        <?php if ($sAccProd !== 'ACTIVE'): ?>
+                                            &bull; <span class="<?= delBadgeClassPhp($sAccProd) ?>" style="font-size:9px; padding:1px 5px;"><?= htmlspecialchars($sAccProd) ?></span>
+                                        <?php endif; ?>
+                                    </div>
+                                </td>
+                                <td>
+                                    <div><strong>₹<?= number_format((float) $formattedAp['price'], 2) ?></strong></div>
+                                    <?php if ((float) $formattedAp['mrp'] > (float) $formattedAp['price']): ?>
+                                        <div style="font-size:11px; color:#94a3b8; text-decoration:line-through;">MRP ₹<?= number_format((float) $formattedAp['mrp'], 2) ?></div>
+                                    <?php endif; ?>
+                                    <div style="font-size:11px; color:#475569;">Stock: <strong><?= (int) $formattedAp['stock'] ?></strong></div>
+                                </td>
+                                <td>
+                                    <?php if ($isProdActive): ?>
+                                        <span class="badge-approved">Active</span>
+                                    <?php else: ?>
+                                        <span class="badge-rejected">Inactive</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <div style="margin-bottom:5px;"><span class="badge-prod"><?= htmlspecialchars($formattedAp['category'] ?: 'General') ?></span></div>
                                     <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
                                         <input type="hidden" name="action" value="update_product_category">
                                         <input type="hidden" name="product_id" value="<?= (int)$ap['id'] ?>">
-                                        <select name="category_id" required style="padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                                        <select name="category_id" required style="padding:5px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; max-width:155px;">
                                             <?php
                                                 $hasSelectedCat = false;
                                                 foreach ($categoriesList as $catOptCheck) {
@@ -1161,18 +1911,43 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                         <button type="submit" class="btn-sm">Save</button>
                                     </form>
                                 </td>
+                                <td>
+                                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                                        <button type="button" class="btn-sm" data-product="<?= htmlspecialchars(json_encode($formattedAp, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>" onclick="openProductModal(this)">Edit</button>
+                                        <form method="POST" action="/admin" style="display:inline;">
+                                            <input type="hidden" name="action" value="toggle_product_status">
+                                            <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
+                                            <button type="submit" class="<?= $isProdActive ? 'btn-hold-sm' : 'btn-approve-sm' ?>" title="<?= $isProdActive ? 'Hide from storefront' : 'Make visible on storefront' ?>">
+                                                <?= $isProdActive ? 'Deactivate' : 'Activate' ?>
+                                            </button>
+                                        </form>
+                                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete / Archive Product" data-confirm-msg="<?= htmlspecialchars('Delete product #' . (int)$ap['id'] . ' ("' . $formattedAp['name'] . '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.', ENT_QUOTES, 'UTF-8') ?>" onsubmit="return openFormConfirmModal(this);">
+                                            <input type="hidden" name="action" value="delete_product">
+                                            <input type="hidden" name="product_id" value="<?= (int) $ap['id'] ?>">
+                                            <button type="submit" class="btn-reject-sm">Delete</button>
+                                        </form>
+                                    </div>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                     <?php endif; ?>
                 </tbody>
             </table>
+            <div id="productsPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
-        <!-- Section 5: Create Seller Account -->
-        <section class="card" style="margin-top:24px;">
-            <h2>Create New Seller Account</h2>
-            <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with international country code, e.g. +919876543210).</p>
-            <form method="POST" action="/admin">
+        <!-- Section 5: Create Seller Account (Dedicated Page 3 or visible in All Lists) -->
+        <div class="admin-view-panel <?= $panelVisiblePhp('create-seller') ? 'is-visible' : '' ?>" data-admin-panel="create-seller">
+        <section class="card" id="createSellerSection" style="margin-top:0;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+                <div>
+                    <h2>Create New Seller Account</h2>
+                    <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with international country code, e.g. +919876543210).</p>
+                </div>
+                <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
+            </div>
+            <form method="POST" action="/admin" data-default-tab="sellers">
                 <input type="hidden" name="action" value="create_seller">
                 <div class="grid">
                     <div>
@@ -1212,37 +1987,58 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
             </form>
         </section>
+        </div>
     </main>
+
+    <footer class="admin-footer">
+        <div class="footer-inner">
+            <div>
+                <strong>Vendor Admin Portal</strong> &bull; Venter App Marketplace Operations
+                <div style="font-size:11px; color:#94a3b8; margin-top:3px;">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
+            </div>
+            <nav class="footer-links" id="adminFooterNav">
+                <a href="/admin" data-tab="overview" class="<?= $activeTab === 'overview' ? 'active' : '' ?>" onclick="return switchAdminTab('overview', event);">Overview</a>
+                <a href="/admin/gst-verifications" data-tab="gst" class="<?= $activeTab === 'gst' ? 'active' : '' ?>" onclick="return switchAdminTab('gst', event);">PDF Verifications</a>
+                <a href="/admin/sellers" data-tab="sellers" class="<?= $activeTab === 'sellers' ? 'active' : '' ?>" onclick="return switchAdminTab('sellers', event);">Seller Accounts</a>
+                <a href="/admin/create-seller" data-tab="create-seller" class="<?= $activeTab === 'create-seller' ? 'active' : '' ?>" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
+                <a href="/admin/seller-deletions" data-tab="seller-deletions" class="<?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests</a>
+                <a href="/admin/products" data-tab="products" class="<?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products</a>
+                <a href="/admin/categories" data-tab="categories" class="<?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories</a>
+                <a href="/admin?tab=all" data-tab="all" class="<?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a>
+            </nav>
+            <div style="font-size:12px; color:#94a3b8;">
+                <a href="/admin/logout" style="color:#f8fafc; font-weight:700; text-decoration:none;">Sign out</a>
+            </div>
+        </div>
+    </footer>
 
     <!-- GST Review & Verification Modal -->
     <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
         <div class="modal-box" style="max-width: 780px;">
             <div class="modal-header">
-                <h3 id="gstModalTitle">GST Verification Review</h3>
+                <h3 id="gstModalTitle">Document Verification Review</h3>
                 <button type="button" class="modal-close" onclick="closeGstModal()">&times;</button>
             </div>
             <div class="modal-body">
                 <div id="gstModalLoading" style="text-align:center; padding:32px; color:#64748b;">
-                    Loading GST details & documents...
+                    Loading details &amp; documents...
                 </div>
 
                 <div id="gstModalContent" style="display:none;">
-                    <div class="info-pill" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
-                        <div class="info-pill-item">Seller<strong id="modalSellerName">—</strong></div>
-                        <div class="info-pill-item">Status<strong id="modalGstStatus">—</strong></div>
-                        <div class="info-pill-item">Submitted At<strong id="modalSubmittedAt">—</strong></div>
-                        <div class="info-pill-item">Verified At<strong id="modalVerifiedAt">—</strong></div>
-                    </div>
-
+                    <div id="gstFetchErrorBox" class="modal-err-banner" style="display:none;"></div>
                     <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:18px;">
-                        <div style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Registered GST Information</div>
-                        <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
-                            <span style="font-size:13px; color:#475569;">GSTIN:</span>
-                            <span class="gstin-pill" id="modalGstin" style="font-size:15px;">—</span>
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:6px;">
+                            <strong style="font-size:16px; color:#1e1b4b;" id="modalSellerName">—</strong>
+                            <div id="modalGstStatus">—</div>
                         </div>
-                        <div style="font-size:14px; margin-bottom:4px;"><strong>Business Name:</strong> <span id="modalBusinessName">—</span></div>
-                        <div style="font-size:14px; margin-bottom:4px;"><strong>Address:</strong> <span id="modalBusinessAddress">—</span></div>
-                        <div style="font-size:14px;"><strong>State & PIN:</strong> <span id="modalStatePin">—</span></div>
+                        <div id="modalSellerMeta" style="font-size:12px; color:#475569; margin-bottom:8px;">—</div>
+                        <div id="modalGstinRow" style="display:none; font-size:13px; color:#334155; margin-bottom:6px;">
+                            <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
+                            <div style="font-size:12px; color:#475569; margin-top:4px;"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
+                        </div>
+                        <div style="font-size:13px; color:#64748b;">
+                            <div><strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span></div>
+                        </div>
 
                         <div id="rejectionAlertBox" style="display:none; background:#fee2e2; border-left:4px solid #ef4444; padding:12px; border-radius:6px; margin-top:12px;">
                             <strong style="color:#b91c1c; font-size:13px;">Rejection Reason:</strong>
@@ -1251,8 +2047,22 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     </div>
 
                     <h4 style="margin: 18px 0 10px; color:#1e1b4b;">Uploaded Documents (<span id="modalDocCount">0</span>)</h4>
-                    <div id="modalDocumentsList" style="margin-bottom: 24px;">
+                    <div id="modalDocumentsList" style="margin-bottom: 16px;">
                         <!-- Documents rendered via JS -->
+                    </div>
+
+                    <!-- Embedded Live PDF / Document Viewer -->
+                    <div id="modalInlinePreviewBox" style="display:none; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; margin-bottom:20px; background:#f8fafc;">
+                        <div style="background:#f1f5f9; padding:8px 14px; border-bottom:1px solid #cbd5e1; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                            <strong style="font-size:13px; color:#334155;" id="modalPreviewLabel">Live Document Preview</strong>
+                            <div style="display:flex; gap:8px; align-items:center;">
+                                <a id="modalPreviewNewTab" href="#" target="_blank" style="font-size:12px; font-weight:700; color:#0284c7; text-decoration:none;">↗ Open Full Screen</a>
+                                <a id="modalPreviewDownload" href="#" style="font-size:12px; font-weight:700; color:#475569; text-decoration:none;">⬇ Download</a>
+                                <button type="button" class="btn-dl" style="font-size:11px; padding:4px 8px;" onclick="closeInlineDocPreview()">Close Preview</button>
+                            </div>
+                        </div>
+                        <div id="modalPreviewFrameWrap" style="width:100%; height:440px; background:#e2e8f0; display:flex; align-items:center; justify-content:center;"></div>
+                        <div id="modalPreviewHint" style="font-size:12px; color:#64748b; padding:6px 14px; background:#f8fafc; border-top:1px solid #e2e8f0;">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
                     </div>
 
                     <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
@@ -1260,15 +2070,15 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         
                         <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
                             <!-- Approve Form -->
-                            <form method="POST" action="/admin" onsubmit="return confirm('Are you sure you want to APPROVE this seller GST verification?');">
+                            <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
                                 <input type="hidden" name="action" value="approve_gst">
                                 <input type="hidden" name="seller_id" id="approveSellerId">
                                 <input type="hidden" name="notes" value="Approved by administrator">
-                                <button type="submit" class="btn-approve">Approve GST</button>
+                                <button type="submit" class="btn-approve">Approve Document</button>
                             </form>
 
                             <!-- Reject Toggle Button -->
-                            <button type="button" class="btn-reject" onclick="toggleRejectBox()">Reject GST...</button>
+                            <button type="button" class="btn-reject" onclick="toggleRejectBox()">Reject Document...</button>
                         </div>
 
                         <!-- Reject Reason Form Box -->
@@ -1277,7 +2087,13 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 <input type="hidden" name="action" value="reject_gst">
                                 <input type="hidden" name="seller_id" id="rejectSellerId">
                                 <label style="margin-top:0; color:#991b1b; font-weight:700;">Mandatory Rejection Reason <span style="color:#ef4444;">*</span></label>
-                                <textarea name="rejection_reason" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their GST documents were rejected (e.g. invalid document, blurry certificate, name mismatch)..."></textarea>
+                                <div class="reject-presets">
+                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
+                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
+                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
+                                    <button type="button" class="reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
+                                </div>
+                                <textarea name="rejection_reason" id="rejectReasonInput" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry certificate, name mismatch)..."></textarea>
                                 <div style="display:flex; gap:10px; margin-top:10px;">
                                     <button type="submit" class="btn-reject">Confirm Rejection</button>
                                     <button type="button" onclick="toggleRejectBox()" style="background:#e2e8f0; color:#334155;" class="btn">Cancel</button>
@@ -1386,7 +2202,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         </div>
                         <div style="grid-column: 1 / -1;">
                             <label>Landmark</label>
-                            <input name="landmark" id="formLandmark" required>
+                            <input name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
                         </div>
                         <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
                             <strong style="color: #334155; font-size: 13px;">Change Password</strong>
@@ -1443,15 +2259,532 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         </div>
     </div>
 
+    <!-- Admin Product Add / Edit Modal -->
+    <div id="productModal" class="modal-overlay" onclick="if(event.target.id==='productModal') closeProductModal();">
+        <div class="modal-box" style="max-width:760px;">
+            <div class="modal-header">
+                <h3 id="prodModalTitle">Add New Product</h3>
+                <button type="button" class="modal-close" onclick="closeProductModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form method="POST" action="/admin" enctype="multipart/form-data">
+                    <input type="hidden" name="action" id="prodFormAction" value="create_product">
+                    <input type="hidden" name="product_id" id="prodFormId" value="">
+                    <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
+                    <div class="grid">
+                        <div style="grid-column: 1 / -1;">
+                            <label>Product Name *</label>
+                            <input name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+                        </div>
+                        <div>
+                            <label>Seller Account *</label>
+                            <select name="seller_id" id="prodFormSeller" required>
+                                <option value="">-- Select Seller --</option>
+                                <?php foreach ($eligibleSellersForProducts as $spOpt): ?>
+                                    <?php $spAcc = strtoupper((string) ($spOpt['account_status'] ?? 'ACTIVE')); ?>
+                                    <option value="<?= (int) $spOpt['id'] ?>" data-acc-status="<?= htmlspecialchars($spAcc, ENT_QUOTES, 'UTF-8') ?>">
+                                        <?= htmlspecialchars($spOpt['display_name'] . ' (#' . (int) $spOpt['id'] . ')' . ($spAcc !== 'ACTIVE' ? ' [' . $spAcc . ']' : '')) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Category *</label>
+                            <select name="category_id" id="prodFormCategory" required>
+                                <?php foreach ($categoriesList as $catOpt): ?>
+                                    <option value="<?= (int) $catOpt['id'] ?>"><?= htmlspecialchars($catOpt['name']) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Selling Price (₹) *</label>
+                            <input type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
+                        </div>
+                        <div>
+                            <label>MRP (₹)</label>
+                            <input type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (defaults +30%)">
+                        </div>
+                        <div>
+                            <label>Stock Quantity *</label>
+                            <input type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
+                        </div>
+                        <div>
+                            <label>SKU</label>
+                            <input name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if left blank">
+                        </div>
+                        <div>
+                            <label>Brand</label>
+                            <input name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
+                        </div>
+                        <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
+                            <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
+                                <input type="checkbox" name="is_active" id="prodFormActive" value="1" checked style="width:auto;"> Active (Visible on Storefront)
+                            </label>
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label>Description</label>
+                            <textarea name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
+                        </div>
+                        <div id="prodExistingImagesWrap" style="grid-column: 1 / -1; display:none;">
+                            <label style="margin-bottom:4px;">Current Product Images (uncheck to remove)</label>
+                            <div id="prodModalExistingImgs" class="existing-img-grid"></div>
+                        </div>
+                        <div>
+                            <label>Upload Product Images (up to 4, auto-WebP)</label>
+                            <input type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
+                        </div>
+                        <div>
+                            <label>Add Image URLs (optional, comma/newline separated)</label>
+                            <textarea name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
+                        </div>
+                        <div id="prodEditImageOptions" style="grid-column: 1 / -1; display:none; gap:16px; flex-wrap:wrap; align-items:center; padding:8px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
+                            <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px;">
+                                <input type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1" style="width:auto;"> Replace all existing images with new uploads/URLs
+                            </label>
+                            <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px; color:#b91c1c;">
+                                <input type="checkbox" name="clear_images" id="prodFormClearImgs" value="1" style="width:auto;"> Remove all images
+                            </label>
+                        </div>
+                    </div>
+                    <br>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <button type="submit" id="prodFormSubmitBtn">Save Product</button>
+                        <button type="button" onclick="closeProductModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Shared In-Page Form Confirmation Modal (replaces native confirm()) -->
+    <div id="confirmActionModal" class="modal-overlay" style="z-index: 1100;" onclick="if(event.target.id==='confirmActionModal') closeConfirmModal();">
+        <div class="modal-box" style="max-width:460px;">
+            <div class="modal-header">
+                <h3 id="confirmModalTitle">Confirm Action</h3>
+                <button type="button" class="modal-close" onclick="closeConfirmModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmModalMessage" style="margin:0 0 18px; color:#334155; font-size:14px; line-height:1.5;">Are you sure?</p>
+                <div style="display:flex; justify-content:flex-end; gap:10px;">
+                    <button type="button" onclick="closeConfirmModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+                    <button type="button" onclick="confirmPendingForm()" style="background:#dc2626;">Confirm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
-        function openCategoryModal(cat) {
-            document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' — ' + (cat.name || '');
+        window._pendingConfirmForm = null;
+        window._activeGstStatus = 'all';
+        window._activeGstSearch = '';
+        window._activeSellerSearch = '';
+        window._activeSellerStatus = 'all';
+        window._activeCategorySearch = '';
+        window._modalGstDocs = {};
+        window._activeDelStatusFilter = 'all';
+        window._activeDelSearch = '';
+        window._currentWsData = null;
+        window._tablePagerState = {};
+
+        var ADMIN_CATEGORY_ORDER = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+        var ADMIN_PAGE_LABELS = {
+            overview: 'Overview Directory',
+            gst: 'Page 1 of 6: PDF Verification',
+            sellers: 'Page 2 of 6: Seller Accounts',
+            'create-seller': 'Page 3 of 6: Create Seller',
+            'seller-deletions': 'Page 4 of 6: Deletion Requests',
+            products: 'Page 5 of 6: Manage Products',
+            categories: 'Page 6 of 6: Categories',
+            all: 'Combined All-Pages View'
+        };
+
+        var TABLE_PAGER_CFG = {
+            gst: { tbodyId: 'gstTableBody', rowSelector: '.gst-row', barId: 'gstPaginationBar', defaultSize: 10, label: 'verification records' },
+            sellers: { tbodyId: 'sellersTableBody', rowSelector: '.seller-account-row', barId: 'sellersPaginationBar', defaultSize: 10, label: 'sellers' },
+            del: { tbodyId: 'deletionRequestsTbody', rowSelector: '.del-req-row', barId: 'delPaginationBar', defaultSize: 10, label: 'deletion requests' },
+            products: { tbodyId: 'productsTableBody', rowSelector: '.prod-cat-row', barId: 'productsPaginationBar', defaultSize: 10, label: 'products' },
+            categories: { tbodyId: 'categoriesTableBody', rowSelector: '.cat-list-row', barId: 'categoriesPaginationBar', defaultSize: 10, label: 'categories' }
+        };
+
+        var ADMIN_TAB_META = {
+            overview: {
+                url: '/admin',
+                title: 'Dashboard Overview',
+                sub: 'Structured Admin Header, Portal KPIs, Page-Wise Category Stepper & Footer Navigation.'
+            },
+            gst: {
+                url: '/admin/gst-verifications',
+                title: 'PDF Verifications',
+                sub: 'Page 1 \u2014 Inspect seller-uploaded PDF certificates inline, approve compliance, or reject with mandatory feedback.'
+            },
+            sellers: {
+                url: '/admin/sellers',
+                title: 'Seller Accounts',
+                sub: 'Page 2 \u2014 Manage registered sellers, search & filter accounts, edit profiles, or trigger deletion audits.'
+            },
+            'create-seller': {
+                url: '/admin/create-seller',
+                title: 'Create Seller Account',
+                sub: 'Page 3 \u2014 Register a new merchant account manually with normalized phone or email credentials.'
+            },
+            'seller-deletions': {
+                url: '/admin/seller-deletions',
+                title: 'Seller Management \u2192 Seller Deletion Requests',
+                sub: 'Page 4 \u2014 Verify orders (Rules A\u2013E), automated Razorpay refunds, settlements, and 6-gate deletion approvals.'
+            },
+            products: {
+                url: '/admin/products',
+                title: 'Manage Products',
+                sub: 'Page 5 \u2014 Add products, upload gallery photos, edit pricing/stock, filter catalog, reassign categories, or archive safely.'
+            },
+            categories: {
+                url: '/admin/categories',
+                title: 'Product Categories',
+                sub: 'Page 6 \u2014 Create, edit, sort, and manage product categories with automatic catalog sync.'
+            },
+            all: {
+                url: '/admin?tab=all',
+                title: 'Complete Admin Portal (All Lists)',
+                sub: 'All management lists displayed together on a single page.'
+            }
+        };
+
+        function detectInitialAdminTab() {
+            var activePill = document.querySelector('#adminTopNav .nav-pill.active');
+            if (activePill && activePill.getAttribute('data-tab')) {
+                return activePill.getAttribute('data-tab');
+            }
+            var p = String(window.location.pathname || '').toLowerCase();
+            var q = String(window.location.search || '').toLowerCase();
+            if (q.indexOf('tab=all') !== -1) return 'all';
+            if (p.indexOf('/admin/create-seller') !== -1 || q.indexOf('tab=create-seller') !== -1) return 'create-seller';
+            if (p.indexOf('seller-deletions') !== -1 || q.indexOf('seller-deletions') !== -1) return 'seller-deletions';
+            if (p.indexOf('/admin/products') !== -1 || q.indexOf('tab=products') !== -1) return 'products';
+            if (p.indexOf('/admin/sellers') !== -1 || q.indexOf('tab=sellers') !== -1) return 'sellers';
+            if (p.indexOf('/admin/gst-verifications') !== -1 || q.indexOf('tab=gst') !== -1) return 'gst';
+            if (p.indexOf('/admin/categories') !== -1 || q.indexOf('tab=categories') !== -1) return 'categories';
+            return 'overview';
+        }
+
+        window._activeAdminTab = detectInitialAdminTab();
+
+        function getTableRows(key) {
+            var cfg = TABLE_PAGER_CFG[key];
+            if (!cfg) return [];
+            var tbody = cfg.tbodyId ? document.getElementById(cfg.tbodyId) : null;
+            var list = [];
+            if (tbody && typeof tbody.querySelectorAll === 'function') {
+                list = Array.prototype.slice.call(tbody.querySelectorAll(cfg.rowSelector) || []);
+            }
+            if (!list.length && typeof document.querySelectorAll === 'function') {
+                list = Array.prototype.slice.call(document.querySelectorAll(cfg.rowSelector) || []);
+            }
+            return list;
+        }
+
+        function refreshTablePagination(key, resetPage) {
+            var cfg = TABLE_PAGER_CFG[key];
+            if (!cfg) return;
+            if (!window._tablePagerState[key]) {
+                window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+            }
+            var st = window._tablePagerState[key];
+            if (resetPage) st.page = 1;
+
+            var allRows = getTableRows(key);
+            var matchedRows = [];
+            allRows.forEach(function(r) {
+                var flag = typeof r.getAttribute === 'function' ? r.getAttribute('data-filter-match') : null;
+                if (flag !== '0') matchedRows.push(r);
+            });
+
+            var pageSize = Number(st.pageSize) || 10;
+            var totalMatched = matchedRows.length;
+            var totalPages = Math.max(1, Math.ceil(totalMatched / pageSize));
+            if (st.page > totalPages) st.page = totalPages;
+            if (st.page < 1) st.page = 1;
+
+            var startIdx = (st.page - 1) * pageSize;
+            var endIdx = startIdx + pageSize;
+
+            allRows.forEach(function(r) {
+                if (r && r.style) r.style.display = 'none';
+            });
+            matchedRows.forEach(function(r, idx) {
+                if (r && r.style && idx >= startIdx && idx < endIdx) {
+                    r.style.display = '';
+                }
+            });
+
+            var barEl = cfg.barId ? document.getElementById(cfg.barId) : null;
+            if (!barEl) return;
+
+            var summaryText = '';
+            if (allRows.length === 0) {
+                summaryText = '0 ' + cfg.label;
+            } else if (totalMatched === 0) {
+                summaryText = '0 of ' + allRows.length + ' ' + cfg.label + ' match filter';
+            } else {
+                var fromNum = startIdx + 1;
+                var toNum = Math.min(endIdx, totalMatched);
+                summaryText = 'Showing ' + fromNum + '\u2013' + toNum + ' of ' + totalMatched + ' ' + cfg.label + ' (Page ' + st.page + ' of ' + totalPages + ')';
+            }
+
+            var sizeOpts = [10, 20, 50, 100];
+            var optsHtml = '';
+            sizeOpts.forEach(function(sz) {
+                optsHtml += '<option value="' + sz + '"' + (pageSize === sz ? ' selected' : '') + '>' + sz + ' / page</option>';
+            });
+
+            var pagesHtml = '';
+            var safeKey = escapeHtml(key);
+            var winStart = Math.max(1, st.page - 2);
+            var winEnd = Math.min(totalPages, st.page + 2);
+            if (winStart > 1) {
+                pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button>';
+                if (winStart > 2) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+            }
+            for (var pNum = winStart; pNum <= winEnd; pNum++) {
+                pagesHtml += '<button type="button" class="pg-btn' + (pNum === st.page ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button>';
+            }
+            if (winEnd < totalPages) {
+                if (winEnd < totalPages - 1) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+                pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button>';
+            }
+
+            barEl.innerHTML = '<div><strong>' + escapeHtml(summaryText) + '</strong></div>' +
+                '<div class="pg-controls">' +
+                '<select class="pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
+                '<button type="button" class="pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button>' +
+                pagesHtml +
+                '<button type="button" class="pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button>' +
+                '</div>';
+        }
+
+        function setTablePageFromBtn(btn) {
+            if (!btn || typeof btn.getAttribute !== 'function') return;
+            setTablePage(btn.getAttribute('data-pg-key'), btn.getAttribute('data-pg-num'));
+        }
+
+        function setTablePageSizeFromEl(sel) {
+            if (!sel || typeof sel.getAttribute !== 'function') return;
+            setTablePageSize(sel.getAttribute('data-pg-key'), sel.value);
+        }
+
+        function setTablePage(key, pageNum) {
+            var cfg = TABLE_PAGER_CFG[key];
+            if (!cfg) return;
+            if (!window._tablePagerState[key]) {
+                window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+            }
+            window._tablePagerState[key].page = Math.max(1, parseInt(pageNum, 10) || 1);
+            refreshTablePagination(key, false);
+        }
+
+        function setTablePageSize(key, sizeVal) {
+            var cfg = TABLE_PAGER_CFG[key];
+            if (!cfg) return;
+            if (!window._tablePagerState[key]) {
+                window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+            }
+            var parsed = parseInt(sizeVal, 10);
+            window._tablePagerState[key].pageSize = (parsed > 0) ? parsed : (cfg.defaultSize || 10);
+            window._tablePagerState[key].page = 1;
+            refreshTablePagination(key, false);
+        }
+
+        function refreshAllTablePaginations() {
+            Object.keys(TABLE_PAGER_CFG).forEach(function(k) {
+                refreshTablePagination(k, false);
+            });
+        }
+
+        function updateCategoryPagerUI(tab) {
+            var idx = ADMIN_CATEGORY_ORDER.indexOf(tab);
+            if (idx === -1) idx = 0;
+            var indEl = document.getElementById('categoryPageIndicator');
+            if (indEl) indEl.innerText = ADMIN_PAGE_LABELS[tab] || ADMIN_PAGE_LABELS.overview;
+            var prevBtn = document.getElementById('catPrevBtn');
+            if (prevBtn) prevBtn.disabled = (idx <= 0);
+            var nextBtn = document.getElementById('catNextBtn');
+            if (nextBtn) nextBtn.disabled = (idx >= ADMIN_CATEGORY_ORDER.length - 1);
+        }
+
+        function stepAdminCategoryPage(delta) {
+            var cur = window._activeAdminTab || 'overview';
+            var idx = ADMIN_CATEGORY_ORDER.indexOf(cur);
+            if (idx === -1) idx = 0;
+            var nextIdx = idx + (Number(delta) || 0);
+            if (nextIdx < 0) nextIdx = 0;
+            if (nextIdx >= ADMIN_CATEGORY_ORDER.length) nextIdx = ADMIN_CATEGORY_ORDER.length - 1;
+            return switchAdminTab(ADMIN_CATEGORY_ORDER[nextIdx]);
+        }
+
+        function syncReturnTabInputs(tab) {
+            var currentTab = ADMIN_TAB_META[tab] ? tab : 'overview';
+            document.querySelectorAll('form[method="POST"], form[method="post"]').forEach(function(formEl) {
+                var panelEl = formEl.closest ? formEl.closest('[data-admin-panel]') : null;
+                var actionInput = formEl.querySelector('input[name="action"]');
+                var actName = actionInput ? String(actionInput.value || '') : '';
+                var defaultTab = formEl.getAttribute('data-default-tab');
+                if (!defaultTab && panelEl) {
+                    var rawPanel = String(panelEl.getAttribute('data-admin-panel') || '');
+                    var firstToken = rawPanel.split(',')[0].trim();
+                    if (firstToken && firstToken !== 'overview') {
+                        defaultTab = firstToken;
+                    }
+                }
+                if (!defaultTab) {
+                    if (actName === 'approve_gst' || actName === 'reject_gst') defaultTab = 'gst';
+                    else if (actName === 'add_category' || actName === 'edit_category' || actName === 'delete_category') defaultTab = 'categories';
+                    else if (actName === 'create_product' || actName === 'edit_product' || actName === 'toggle_product_status' || actName === 'delete_product' || actName === 'update_product_category') defaultTab = 'products';
+                    else if (actName === 'create_seller' || actName === 'edit_seller') defaultTab = 'sellers';
+                    else defaultTab = currentTab;
+                }
+                var targetReturnTab = (currentTab === 'all') ? 'all' : (defaultTab || currentTab);
+                var retInput = formEl.querySelector('input[name="return_tab"]');
+                if (!retInput) {
+                    retInput = document.createElement('input');
+                    retInput.type = 'hidden';
+                    retInput.name = 'return_tab';
+                    formEl.appendChild(retInput);
+                }
+                retInput.value = targetReturnTab;
+            });
+        }
+
+        function switchAdminTab(tab, ev, skipPush) {
+            if (ev && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button === 1)) {
+                return true;
+            }
+            if (ev && typeof ev.preventDefault === 'function') {
+                ev.preventDefault();
+            }
+            var nextTab = ADMIN_TAB_META[tab] ? tab : 'overview';
+            window._activeAdminTab = nextTab;
+
+            document.querySelectorAll('[data-admin-panel]').forEach(function(el) {
+                var tokens = String(el.getAttribute('data-admin-panel') || '').split(',');
+                var visible = (nextTab === 'all')
+                    ? (tokens.indexOf('all') !== -1 || tokens.indexOf('overview') === -1)
+                    : (tokens.indexOf(nextTab) !== -1);
+                if (visible) el.classList.add('is-visible');
+                else el.classList.remove('is-visible');
+            });
+
+            document.querySelectorAll('#adminTopNav .nav-pill, #adminFooterNav a[data-tab], #adminCategoryPager .cat-page-pill').forEach(function(link) {
+                var lt = link.getAttribute('data-tab');
+                if (lt === nextTab) link.classList.add('active');
+                else link.classList.remove('active');
+            });
+
+            var meta = ADMIN_TAB_META[nextTab] || ADMIN_TAB_META.overview;
+            var titleEl = document.getElementById('adminPageTitle');
+            var subEl = document.getElementById('adminPageSubtitle');
+            if (titleEl) titleEl.innerText = meta.title;
+            if (subEl) subEl.innerText = meta.sub;
+            document.title = meta.title + ' \u2014 Vendor Admin Portal';
+
+            updateCategoryPagerUI(nextTab);
+            syncReturnTabInputs(nextTab);
+            refreshAllTablePaginations();
+
+            if (!skipPush && window.history && typeof window.history.pushState === 'function') {
+                var currentPath = window.location.pathname + window.location.search;
+                if (currentPath !== meta.url) {
+                    window.history.pushState({ adminTab: nextTab }, '', meta.url);
+                }
+            }
+            if (typeof window.scrollTo === 'function') {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+            return false;
+        }
+
+        window.addEventListener('popstate', function(ev) {
+            var stTab = (ev.state && ev.state.adminTab) ? ev.state.adminTab : detectInitialAdminTab();
+            switchAdminTab(stTab, null, true);
+        });
+
+        window.addEventListener('DOMContentLoaded', function() {
+            syncReturnTabInputs(window._activeAdminTab);
+            updateCategoryPagerUI(window._activeAdminTab);
+            refreshAllTablePaginations();
+        });
+
+        document.addEventListener('submit', function() {
+            syncReturnTabInputs(window._activeAdminTab);
+        }, true);
+
+        function parseDataJson(btnOrObj, attrName) {
+            if (!btnOrObj) return null;
+            if (typeof btnOrObj.getAttribute === 'function') {
+                try {
+                    return JSON.parse(btnOrObj.getAttribute(attrName) || 'null');
+                } catch (e) {
+                    return null;
+                }
+            }
+            return btnOrObj;
+        }
+
+        function toAdminPreviewUrl(u) {
+            if (!u) return '';
+            var s = String(u);
+            var idx = s.indexOf('/uploads/products/');
+            if (idx !== -1) {
+                return s.slice(idx);
+            }
+            return s;
+        }
+
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str).replace(/[&<>'"]/g, function(tag) {
+                return ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                })[tag] || tag;
+            });
+        }
+
+        function openFormConfirmModal(form) {
+            if (!form) return false;
+            syncReturnTabInputs(window._activeAdminTab);
+            window._pendingConfirmForm = form;
+            document.getElementById('confirmModalTitle').innerText = form.getAttribute('data-confirm-title') || 'Confirm Action';
+            document.getElementById('confirmModalMessage').innerText = form.getAttribute('data-confirm-msg') || 'Are you sure you want to proceed?';
+            document.getElementById('confirmActionModal').classList.add('active');
+            return false;
+        }
+
+        function closeConfirmModal() {
+            window._pendingConfirmForm = null;
+            document.getElementById('confirmActionModal').classList.remove('active');
+        }
+
+        function confirmPendingForm() {
+            var f = window._pendingConfirmForm;
+            closeConfirmModal();
+            if (f) {
+                HTMLFormElement.prototype.submit.call(f);
+            }
+        }
+
+        function openCategoryModal(btnOrCat) {
+            var cat = parseDataJson(btnOrCat, 'data-cat');
+            if (!cat) return;
+            document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' \u2014 ' + (cat.name || '');
             document.getElementById('editCatId').value = cat.id;
             document.getElementById('editCatName').value = cat.name || '';
             document.getElementById('editCatIcon').value = cat.icon || '';
             document.getElementById('editCatDesc').value = cat.description || '';
             document.getElementById('editCatSort').value = cat.sort_order !== undefined ? cat.sort_order : 0;
             document.getElementById('editCatActive').checked = Boolean(Number(cat.is_active));
+            syncReturnTabInputs(window._activeAdminTab);
             document.getElementById('editCategoryModal').classList.add('active');
         }
 
@@ -1459,23 +2792,185 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             document.getElementById('editCategoryModal').classList.remove('active');
         }
 
-        function filterAdminProductSearch(query) {
-            const q = (query || '').toLowerCase().trim();
-            document.querySelectorAll('.prod-cat-row').forEach(r => {
-                const s = r.getAttribute('data-search') || '';
-                r.style.display = (!q || s.includes(q)) ? '' : 'none';
-            });
+        function openProductModal(btnOrProd) {
+            var prod = btnOrProd ? parseDataJson(btnOrProd, 'data-product') : null;
+            var isEdit = Boolean(prod && prod.id);
+            document.getElementById('prodModalTitle').innerText = isEdit
+                ? ('Edit Product #' + prod.id + ' \u2014 ' + (prod.name || ''))
+                : 'Add New Product';
+            document.getElementById('prodFormAction').value = isEdit ? 'edit_product' : 'create_product';
+            document.getElementById('prodFormId').value = isEdit ? prod.id : '';
+            document.getElementById('prodFormName').value = isEdit ? (prod.name || '') : '';
+            document.getElementById('prodFormSku').value = isEdit ? (prod.sku || '') : '';
+            document.getElementById('prodFormBrand').value = isEdit ? (prod.brand || 'Generic') : 'Generic';
+            document.getElementById('prodFormPrice').value = isEdit ? (prod.price !== undefined && prod.price !== null ? prod.price : '') : '';
+            document.getElementById('prodFormMrp').value = isEdit ? (prod.mrp !== undefined && prod.mrp !== null ? prod.mrp : '') : '';
+            document.getElementById('prodFormStock').value = isEdit ? (prod.stock !== undefined && prod.stock !== null ? prod.stock : 0) : 0;
+            document.getElementById('prodFormDesc').value = isEdit ? (prod.description || '') : '';
+            document.getElementById('prodFormActive').checked = isEdit ? Boolean(prod.is_active) : true;
+            document.getElementById('prodFormFiles').value = '';
+            document.getElementById('prodFormImageUrls').value = '';
+            document.getElementById('prodFormReplaceImgs').checked = false;
+            document.getElementById('prodFormClearImgs').checked = false;
+            document.getElementById('prodEditImageOptions').style.display = isEdit ? 'flex' : 'none';
+            document.getElementById('prodFormSubmitBtn').innerText = isEdit ? 'Save Product Changes' : '+ Create Product';
+
+            var sellerSel = document.getElementById('prodFormSeller');
+            if (isEdit) {
+                var targetSid = String(prod.seller_id || '');
+                var hasOpt = false;
+                Array.from(sellerSel.options).forEach(function(opt) {
+                    if (opt.value === targetSid) hasOpt = true;
+                });
+                if (!hasOpt && targetSid) {
+                    var extra = document.createElement('option');
+                    extra.value = targetSid;
+                    extra.text = (prod.seller_name || ('Seller #' + targetSid)) + ' (#' + targetSid + ')';
+                    sellerSel.appendChild(extra);
+                }
+                sellerSel.value = targetSid;
+            } else {
+                var firstActive = '';
+                Array.from(sellerSel.options).forEach(function(opt) {
+                    if (!firstActive && opt.value && (opt.getAttribute('data-acc-status') || 'ACTIVE') === 'ACTIVE') {
+                        firstActive = opt.value;
+                    }
+                });
+                sellerSel.value = firstActive || '';
+            }
+
+            var catSel = document.getElementById('prodFormCategory');
+            if (isEdit) {
+                var matchedCat = '';
+                var targetCid = prod.category_id ? String(prod.category_id) : '';
+                var targetCname = String(prod.category || '').toLowerCase();
+                Array.from(catSel.options).forEach(function(opt) {
+                    if ((targetCid && opt.value === targetCid) || (!matchedCat && opt.text.toLowerCase() === targetCname)) {
+                        matchedCat = opt.value;
+                    }
+                });
+                if (matchedCat) catSel.value = matchedCat;
+            } else if (catSel.options.length > 0) {
+                catSel.selectedIndex = 0;
+            }
+
+            var existingWrap = document.getElementById('prodExistingImagesWrap');
+            var existingGrid = document.getElementById('prodModalExistingImgs');
+            var imgs = (isEdit && Array.isArray(prod.images)) ? prod.images : ((isEdit && prod.image_url) ? [prod.image_url] : []);
+            if (isEdit && imgs.length > 0) {
+                existingWrap.style.display = 'block';
+                var imgHtml = '';
+                imgs.forEach(function(u, idx) {
+                    var previewUrl = toAdminPreviewUrl(u);
+                    imgHtml += '<div class="existing-img-item">' +
+                        '<img src="' + escapeHtml(previewUrl) + '" alt="Image ' + (idx + 1) + '">' +
+                        '<label style="margin:0;display:inline-flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;">' +
+                        '<input type="checkbox" name="retain_images[]" value="' + escapeHtml(u) + '" checked style="width:auto;"> Keep #' + (idx + 1) +
+                        '</label>' +
+                        '</div>';
+                });
+                existingGrid.innerHTML = imgHtml;
+            } else {
+                existingWrap.style.display = 'none';
+                existingGrid.innerHTML = '';
+            }
+
+            syncReturnTabInputs(window._activeAdminTab);
+            document.getElementById('productModal').classList.add('active');
         }
 
-        function openSellerModal(seller) {
-            document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
+        function closeProductModal() {
+            document.getElementById('productModal').classList.remove('active');
+        }
+
+        function applyAdminProductFilters(preservePage) {
+            var q = (document.getElementById('prodCatSearchInput') ? document.getElementById('prodCatSearchInput').value : '').toLowerCase().trim();
+            var sellerFilter = document.getElementById('prodSellerFilter') ? document.getElementById('prodSellerFilter').value : '';
+            var catFilter = (document.getElementById('prodCategoryFilter') ? document.getElementById('prodCategoryFilter').value : '').toLowerCase();
+            var statusFilter = document.getElementById('prodStatusFilter') ? document.getElementById('prodStatusFilter').value : 'all';
+
+            getTableRows('products').forEach(function(r) {
+                var s = r.getAttribute('data-search') || '';
+                var rSid = r.getAttribute('data-seller-id') || '';
+                var rCat = (r.getAttribute('data-category') || '').toLowerCase();
+                var rAct = r.getAttribute('data-active') || '1';
+
+                var matchQ = (!q || s.indexOf(q) !== -1);
+                var matchS = (!sellerFilter || rSid === sellerFilter);
+                var matchC = (!catFilter || rCat === catFilter);
+                var matchSt = (statusFilter === 'all' || rAct === statusFilter);
+                var okMatch = (matchQ && matchS && matchC && matchSt);
+                if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+            });
+            refreshTablePagination('products', !preservePage);
+        }
+
+        function filterAdminProductSearch(query) {
+            var inp = document.getElementById('prodCatSearchInput');
+            if (inp && typeof query === 'string' && inp.value !== query) {
+                inp.value = query;
+            }
+            applyAdminProductFilters(false);
+        }
+
+        function applySellerFilters(preservePage) {
+            var searchEl = document.getElementById('sellersSearchInput');
+            var q = (searchEl && typeof searchEl.value === 'string' && searchEl.value) ? searchEl.value.toLowerCase().trim() : (window._activeSellerSearch || '');
+            var statusEl = document.getElementById('sellersStatusFilter');
+            var st = statusEl ? (statusEl.value || 'all') : (window._activeSellerStatus || 'all');
+            window._activeSellerStatus = st;
+
+            getTableRows('sellers').forEach(function(r) {
+                var s = r.getAttribute('data-search') || '';
+                var rSt = r.getAttribute('data-status') || '';
+                var matchQ = (!q || s.indexOf(q) !== -1);
+                var matchSt = (st === 'all' || rSt === st);
+                var okMatch = (matchQ && matchSt);
+                if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+            });
+            refreshTablePagination('sellers', !preservePage);
+        }
+
+        function filterSellersSearch(query) {
+            window._activeSellerSearch = (query || '').toLowerCase().trim();
+            var inp = document.getElementById('sellersSearchInput');
+            if (inp && typeof query === 'string' && inp.value !== query) {
+                inp.value = query;
+            }
+            applySellerFilters(false);
+        }
+
+        function applyCategoryFilters(preservePage) {
+            var searchEl = document.getElementById('categoriesSearchInput');
+            var q = (searchEl && typeof searchEl.value === 'string' && searchEl.value) ? searchEl.value.toLowerCase().trim() : (window._activeCategorySearch || '');
+            getTableRows('categories').forEach(function(r) {
+                var s = r.getAttribute('data-search') || '';
+                var okMatch = (!q || s.indexOf(q) !== -1);
+                if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+            });
+            refreshTablePagination('categories', !preservePage);
+        }
+
+        function filterCategorySearch(query) {
+            window._activeCategorySearch = (query || '').toLowerCase().trim();
+            var inp = document.getElementById('categoriesSearchInput');
+            if (inp && typeof query === 'string' && inp.value !== query) {
+                inp.value = query;
+            }
+            applyCategoryFilters(false);
+        }
+
+        function openSellerModal(btnOrSeller) {
+            var seller = parseDataJson(btnOrSeller, 'data-seller');
+            if (!seller) return;
+            document.getElementById('modalTitle').innerText = 'Seller Profile \u2014 ' + (seller.seller_name || seller.name || 'Seller');
             document.getElementById('viewSellerId').innerText = '#' + seller.id;
-            document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
+            document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '\u2014';
 
             document.getElementById('formSellerId').value = seller.id;
             document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
             document.getElementById('formPhone').value = seller.phone || '';
-            document.getElementById('formEmail').value = (seller.email && !seller.email.endsWith('@phone.vendor.local')) ? seller.email : '';
+            document.getElementById('formEmail').value = (seller.email && seller.email.indexOf('@phone.vendor.local') === -1) ? seller.email : '';
             document.getElementById('formAddress').value = seller.address || '';
             document.getElementById('formLandmark').value = seller.landmark || '';
             document.getElementById('formState').value = seller.state || '';
@@ -1485,6 +2980,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             document.getElementById('formNewPassword').value = '';
             document.getElementById('formConfirmPassword').value = '';
 
+            syncReturnTabInputs(window._activeAdminTab);
             document.getElementById('sellerModal').classList.add('active');
         }
 
@@ -1498,87 +2994,177 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             }
         }
 
-        // GST Verification Table Filter by Status
+        function applyGstFilters(preservePage) {
+            var status = window._activeGstStatus || 'all';
+            var q = window._activeGstSearch || '';
+            getTableRows('gst').forEach(function(r) {
+                var rStatus = r.getAttribute('data-status') || '';
+                var searchData = r.getAttribute('data-search') || '';
+                var matchStatus = (status === 'all' || rStatus === status);
+                var matchQuery = (!q || searchData.indexOf(q) !== -1);
+                var okMatch = (matchStatus && matchQuery);
+                if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+            });
+            refreshTablePagination('gst', !preservePage);
+        }
+
         function filterGstRows(status, btn) {
-            document.querySelectorAll('#gstSection .tab-btn').forEach(b => b.classList.remove('active'));
-            if (btn) btn.classList.add('active');
-
-            const rows = document.querySelectorAll('.gst-row');
-            rows.forEach(r => {
-                const rStatus = r.getAttribute('data-status');
-                if (status === 'all' || rStatus === status) {
-                    r.style.display = '';
-                } else {
-                    r.style.display = 'none';
-                }
-            });
+            window._activeGstStatus = status || 'all';
+            document.querySelectorAll('#gstSection .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+            if (btn && btn.classList) btn.classList.add('active');
+            applyGstFilters(false);
         }
 
-        // Live Search Filter for GST PDF Table
         function filterGstSearch(query) {
-            const q = (query || '').toLowerCase().trim();
-            const rows = document.querySelectorAll('.gst-row');
-            rows.forEach(r => {
-                const searchData = r.getAttribute('data-search') || '';
-                if (!q || searchData.includes(q)) {
-                    r.style.display = '';
-                } else {
-                    r.style.display = 'none';
-                }
-            });
+            window._activeGstSearch = (query || '').toLowerCase().trim();
+            applyGstFilters(false);
         }
 
-        // Quick Reject Shortcut
+        function closeInlineDocPreview() {
+            var box = document.getElementById('modalInlinePreviewBox');
+            var wrap = document.getElementById('modalPreviewFrameWrap');
+            if (wrap) wrap.innerHTML = '';
+            if (box) box.style.display = 'none';
+        }
+
+        function focusRejectBoxInModal() {
+            var b = document.getElementById('rejectBox');
+            if (b) {
+                b.style.display = 'block';
+                if (typeof b.scrollIntoView === 'function') b.scrollIntoView({ behavior: 'smooth' });
+            }
+            var rInp = document.getElementById('rejectReasonInput');
+            if (rInp && typeof rInp.focus === 'function') rInp.focus();
+        }
+
+        function setRejectPreset(reasonText) {
+            var inp = document.getElementById('rejectReasonInput');
+            if (inp) inp.value = String(reasonText || '');
+            focusRejectBoxInModal();
+        }
+
+        function focusRejectWithReuploadPrompt() {
+            setRejectPreset('Uploaded file missing from storage \u2014 please re-upload PDF certificate.');
+        }
+
         function openGstModalWithReject(sellerId, sellerName) {
-            openGstModal(sellerId, sellerName);
-            setTimeout(() => {
-                const b = document.getElementById('rejectBox');
-                if (b) {
-                    b.style.display = 'block';
-                    b.scrollIntoView({ behavior: 'smooth' });
-                }
-            }, 300);
+            openGstModal(sellerId, sellerName, true, null);
         }
 
-        // GST Review Modal
-        function openGstModal(sellerId, sellerName) {
-            document.getElementById('gstModalTitle').innerText = 'GST Verification Review — ' + (sellerName || 'Seller #' + sellerId);
+        function showInlineDocPreview(docId) {
+            var d = (window._modalGstDocs && window._modalGstDocs[docId]) || {};
+            var docName = d.original_name || ('Document #' + docId);
+            var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (docName.toLowerCase().slice(-4) === '.pdf'));
+            var fileExists = (d.file_exists !== false);
+
+            var previewBox = document.getElementById('modalInlinePreviewBox');
+            var frameWrap = document.getElementById('modalPreviewFrameWrap');
+            var labelEl = document.getElementById('modalPreviewLabel');
+            var newTabEl = document.getElementById('modalPreviewNewTab');
+            var dlEl = document.getElementById('modalPreviewDownload');
+            var hintEl = document.getElementById('modalPreviewHint');
+            if (!previewBox || !frameWrap) return;
+
+            var previewUrl = d.admin_preview_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(docId) + '&mode=preview');
+            var dlUrl = d.admin_download_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(docId) + '&mode=download');
+            if (labelEl) labelEl.innerText = 'Preview: ' + docName;
+            if (newTabEl) newTabEl.href = previewUrl;
+            if (dlEl) dlEl.href = dlUrl;
+            previewBox.style.display = 'block';
+
+            if (!fileExists) {
+                if (hintEl) hintEl.style.display = 'none';
+                frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;">' +
+                    '<strong>File Not Found on Server Disk</strong>' +
+                    '<p style="font-size:13px;max-width:440px;margin:0;line-height:1.5;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
+                    '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
+                    '</div>';
+                return;
+            }
+
+            if (hintEl) hintEl.style.display = 'block';
+            if (isPdf) {
+                frameWrap.innerHTML = '<iframe src="' + escapeHtml(previewUrl) + '#toolbar=1&navpanes=0" title="PDF Preview" style="width:100%;height:100%;border:none;background:#fff;"></iframe>';
+            } else {
+                frameWrap.innerHTML = '<img src="' + escapeHtml(previewUrl) + '" alt="Document Preview" style="max-width:100%;max-height:100%;object-fit:contain;">';
+            }
+        }
+
+        function openGstModal(sellerId, sellerName, autoShowReject, previewDocId) {
+            document.getElementById('gstModalTitle').innerText = 'Verification Review \u2014 ' + (sellerName || 'Seller #' + sellerId);
             document.getElementById('approveSellerId').value = sellerId;
             document.getElementById('rejectSellerId').value = sellerId;
-            document.getElementById('rejectBox').style.display = 'none';
+            var rejInputEl = document.getElementById('rejectReasonInput');
+            if (rejInputEl) rejInputEl.value = '';
+            document.getElementById('rejectBox').style.display = autoShowReject ? 'block' : 'none';
+            var errBox = document.getElementById('gstFetchErrorBox');
+            if (errBox) {
+                errBox.style.display = 'none';
+                errBox.innerText = '';
+            }
+            closeInlineDocPreview();
+            window._modalGstDocs = {};
 
-            document.getElementById('gstModalLoading').style.display = 'block';
+            var loadingEl = document.getElementById('gstModalLoading');
+            loadingEl.innerText = 'Loading details & documents...';
+            loadingEl.style.display = 'block';
             document.getElementById('gstModalContent').style.display = 'none';
+            syncReturnTabInputs(window._activeAdminTab);
             document.getElementById('gstReviewModal').classList.add('active');
 
-            fetch('/admin/dashboard.php?action=get_gst_details&seller_id=' + sellerId)
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('gstModalLoading').style.display = 'none';
+            fetch('/admin/dashboard.php?action=get_gst_details&seller_id=' + Number(sellerId), { credentials: 'same-origin' })
+                .then(function(res) {
+                    if (!res.ok) {
+                        return res.text().then(function(t) { throw new Error('HTTP ' + res.status + ': ' + String(t || '').slice(0, 120)); });
+                    }
+                    return res.json();
+                })
+                .then(function(data) {
+                    loadingEl.style.display = 'none';
                     document.getElementById('gstModalContent').style.display = 'block';
 
-                    const g = data.gst || {};
-                    const docs = data.documents || [];
-                    const logs = data.logs || [];
+                    var sl = data.seller || {};
+                    var g = data.gst || {};
+                    var docs = data.documents || [];
+                    var logs = data.logs || [];
 
-                    document.getElementById('modalSellerName').innerText = sellerName + ' (#' + sellerId + ')';
-                    document.getElementById('modalSubmittedAt').innerText = (g.submitted_at || g.created_at || '—').slice(0, 16);
-                    document.getElementById('modalVerifiedAt').innerText = (g.verified_at || '—').slice(0, 16);
+                    window._modalGstDocs = {};
+                    docs.forEach(function(d) { window._modalGstDocs[d.id] = d; });
 
-                    // Status Badge
-                    const st = (g.status || 'Pending').toLowerCase();
-                    let badgeHtml = '<span class="badge-pending">' + (g.status || 'Pending') + '</span>';
-                    if (st === 'approved') badgeHtml = '<span class="badge-approved">' + g.status + '</span>';
-                    if (st === 'rejected') badgeHtml = '<span class="badge-rejected">' + g.status + '</span>';
+                    var resolvedName = sellerName || sl.seller_name || sl.name || ('Seller #' + sellerId);
+                    document.getElementById('modalSellerName').innerText = resolvedName + ' (#' + sellerId + ')';
+                    var metaParts = [];
+                    if (sl.phone) metaParts.push('Phone: ' + sl.phone);
+                    if (sl.email) metaParts.push('Email: ' + sl.email);
+                    var metaEl = document.getElementById('modalSellerMeta');
+                    if (metaEl) metaEl.innerText = metaParts.length ? metaParts.join(' \u2022 ') : ('Seller ID #' + sellerId);
+
+                    document.getElementById('modalSubmittedAt').innerText = String(g.submitted_at || g.created_at || '\u2014').slice(0, 16).replace('T', ' ');
+                    document.getElementById('modalVerifiedAt').innerText = String(g.verified_at || '\u2014').slice(0, 16).replace('T', ' ');
+
+                    var gstinRow = document.getElementById('modalGstinRow');
+                    if (gstinRow) {
+                        if (g.gstin || g.business_name || g.business_address || g.state || g.pincode) {
+                            gstinRow.style.display = 'block';
+                            document.getElementById('modalGstin').innerText = g.gstin || '\u2014';
+                            document.getElementById('modalBusinessName').innerText = g.business_name || '\u2014';
+                            var addrEl = document.getElementById('modalBusinessAddress');
+                            if (addrEl) addrEl.innerText = g.business_address || '\u2014';
+                            var spEl = document.getElementById('modalStatePin');
+                            var statePinStr = ((g.state || '') + (g.pincode ? (' - ' + g.pincode) : '')).trim();
+                            if (spEl) spEl.innerText = statePinStr || '\u2014';
+                        } else {
+                            gstinRow.style.display = 'none';
+                        }
+                    }
+
+                    var st = String(g.status || 'Pending').toLowerCase();
+                    var badgeHtml = '<span class="badge-pending">' + escapeHtml(g.status || 'Pending') + '</span>';
+                    if (st === 'approved') badgeHtml = '<span class="badge-approved">' + escapeHtml(g.status) + '</span>';
+                    if (st === 'rejected') badgeHtml = '<span class="badge-rejected">' + escapeHtml(g.status) + '</span>';
                     document.getElementById('modalGstStatus').innerHTML = badgeHtml;
 
-                    document.getElementById('modalGstin').innerText = g.gstin || '—';
-                    document.getElementById('modalBusinessName').innerText = g.business_name || '—';
-                    document.getElementById('modalBusinessAddress').innerText = g.business_address || '—';
-                    document.getElementById('modalStatePin').innerText = (g.state || '—') + (g.pincode ? ' (PIN: ' + g.pincode + ')' : '');
-
-                    // Rejection alert box
-                    const rejBox = document.getElementById('rejectionAlertBox');
+                    var rejBox = document.getElementById('rejectionAlertBox');
                     if (g.rejection_reason) {
                         rejBox.style.display = 'block';
                         document.getElementById('modalRejectionReason').innerText = g.rejection_reason;
@@ -1586,69 +3172,104 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         rejBox.style.display = 'none';
                     }
 
-                    // Render Documents
                     document.getElementById('modalDocCount').innerText = docs.length;
-                    const docsContainer = document.getElementById('modalDocumentsList');
+                    var docsContainer = document.getElementById('modalDocumentsList');
                     if (docs.length === 0) {
                         docsContainer.innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">No documents uploaded by this seller yet.</div>';
                     } else {
-                        let docsHtml = '';
-                        docs.forEach(d => {
-                            const isPdf = d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf');
-                            const typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
-                            const primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Certificate</span>' : '';
-                            const docLabel = (d.document_type === 'gst_certificate') ? 'GST Registration Certificate' : 'Supporting Document';
+                        var docsHtml = '';
+                        docs.forEach(function(d) {
+                            var dName = String(d.original_name || ('Document #' + d.id));
+                            var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (dName.toLowerCase().slice(-4) === '.pdf'));
+                            var typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
+                            var primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
+                            var missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Re-upload Needed)</span>' : '';
+                            var previewHref = d.admin_preview_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(d.id) + '&mode=preview');
+                            var dlHref = d.admin_download_url || ('/admin/dashboard.php?action=view_gst_doc&id=' + Number(d.id) + '&mode=download');
 
-                            docsHtml += `
-                                <div class="doc-card">
-                                    <div>
-                                        <div class="doc-title">${typeBadge} ${escapeHtml(docLabel)} ${primaryTag}</div>
-                                        <div class="doc-meta">${escapeHtml(d.original_name)} &bull; ${d.file_size_formatted || ''} &bull; Uploaded ${d.created_at ? d.created_at.slice(0, 10) : ''}</div>
-                                    </div>
-                                    <div style="display:flex; gap:8px;">
-                                        <a href="/admin/dashboard.php?action=view_gst_doc&id=${d.id}&mode=preview" target="_blank" class="btn-view">${isPdf ? '📄 Preview PDF' : '🔍 Preview'}</a>
-                                        <a href="/admin/dashboard.php?action=view_gst_doc&id=${d.id}&mode=download" class="btn-dl">⬇ Download</a>
-                                    </div>
-                                </div>
-                            `;
+                            docsHtml += '<div class="doc-card">' +
+                                '<div>' +
+                                '<div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                                typeBadge + ' ' + escapeHtml(dName) + ' ' + primaryTag + ' ' + missingTag +
+                                '</div>' +
+                                '<div style="font-size:12px; color:#64748b; margin-top:4px;">' +
+                                escapeHtml(d.file_size_formatted || '') + ' &bull; Uploaded ' + escapeHtml(d.created_at ? String(d.created_at).slice(0, 10) : '') +
+                                '</div>' +
+                                '</div>' +
+                                '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
+                                '<button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
+                                '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn-view" style="background:#475569;">New Tab</a>' +
+                                '<a href="' + escapeHtml(dlHref) + '" class="btn-dl">Download</a>' +
+                                '</div>' +
+                                '</div>';
                         });
                         docsContainer.innerHTML = docsHtml;
+
+                        var firstDocId = previewDocId || (docs[0] && docs[0].id);
+                        if (firstDocId && (!autoShowReject || previewDocId)) {
+                            showInlineDocPreview(firstDocId);
+                        }
                     }
 
-                    // Render Audit Logs
-                    const logsContainer = document.getElementById('modalLogsList');
+                    var logsContainer = document.getElementById('modalLogsList');
                     if (logs.length === 0) {
                         logsContainer.innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">No history logs recorded yet.</div>';
                     } else {
-                        let logsHtml = '';
-                        logs.forEach(l => {
-                            logsHtml += `
-                                <div class="log-row">
-                                    <div class="log-time">${escapeHtml((l.created_at || '').slice(0, 16))}</div>
-                                    <div style="flex:1;">
-                                        <strong>${escapeHtml(l.action.toUpperCase())}</strong>
-                                        <span style="color:#64748b;">(${escapeHtml(l.performer_role || 'seller')}):</span>
-                                        ${escapeHtml(l.notes || '')}
-                                    </div>
-                                    <div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">${escapeHtml(l.new_status)}</span></div>
-                                </div>
-                            `;
+                        var logsHtml = '';
+                        logs.forEach(function(l) {
+                            logsHtml += '<div class="log-row">' +
+                                '<div style="color:#64748b; font-size:12px; min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
+                                '<div style="flex:1;">' +
+                                '<strong>' + escapeHtml(String(l.action || '').toUpperCase()) + '</strong> ' +
+                                '<span style="color:#64748b;">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
+                                escapeHtml(l.notes || '') +
+                                '</div>' +
+                                '<div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">' + escapeHtml(l.new_status) + '</span></div>' +
+                                '</div>';
                         });
                         logsContainer.innerHTML = logsHtml;
                     }
+
+                    if (autoShowReject) {
+                        focusRejectBoxInModal();
+                    }
                 })
-                .catch(err => {
-                    document.getElementById('gstModalLoading').innerText = 'Failed to load GST details: ' + err.message;
+                .catch(function(err) {
+                    loadingEl.style.display = 'none';
+                    var contentEl = document.getElementById('gstModalContent');
+                    if (contentEl) contentEl.style.display = 'block';
+                    var eBox = document.getElementById('gstFetchErrorBox');
+                    if (eBox) {
+                        eBox.style.display = 'block';
+                        eBox.innerText = 'Could not load server details (' + ((err && err.message) ? err.message : 'Request failed') + '). You can still Approve or Reject this seller below.';
+                    }
+                    var msName = document.getElementById('modalSellerName');
+                    if (msName) msName.innerText = (sellerName || ('Seller #' + sellerId)) + ' (#' + sellerId + ')';
+                    var msMeta = document.getElementById('modalSellerMeta');
+                    if (msMeta) msMeta.innerText = 'Seller ID #' + sellerId;
+                    document.getElementById('modalGstStatus').innerHTML = '<span class="badge-pending">Offline / Partial</span>';
+                    document.getElementById('modalDocCount').innerText = '0';
+                    document.getElementById('modalDocumentsList').innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">Document metadata unavailable while fetch failed.</div>';
+                    document.getElementById('modalLogsList').innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">Logs unavailable while fetch failed.</div>';
+                    if (autoShowReject) {
+                        focusRejectBoxInModal();
+                    }
                 });
         }
 
         function closeGstModal() {
+            closeInlineDocPreview();
             document.getElementById('gstReviewModal').classList.remove('active');
         }
 
         function toggleRejectBox() {
-            const b = document.getElementById('rejectBox');
+            var b = document.getElementById('rejectBox');
+            if (!b) return;
             b.style.display = (b.style.display === 'none' || !b.style.display) ? 'block' : 'none';
+            if (b.style.display === 'block') {
+                var rInp = document.getElementById('rejectReasonInput');
+                if (rInp && typeof rInp.focus === 'function') rInp.focus();
+            }
         }
 
         function handleGstOverlayClick(e) {
@@ -1657,21 +3278,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             }
         }
 
-        function escapeHtml(str) {
-            if (!str) return '';
-            return String(str).replace(/[&<>'"]/g, tag => ({
-                '&': '&amp;',
-                '<': '&lt;',
-                '>': '&gt;',
-                "'": '&#39;',
-                '"': '&quot;'
-            }[tag] || tag));
-        }
-
         // === Seller Deletion & Refund Management UI Controller ===
-        window._activeDelStatusFilter = 'all';
-        window._currentWsData = null;
-
         function delStatusBadgeHtml(statusOrColor, textOverride) {
             var s = String(statusOrColor || '').toUpperCase();
             var cls = 'del-yellow';
@@ -1683,31 +3290,55 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         }
 
         function fmtCur(v) {
-            return '₹' + Number(v || 0).toFixed(2);
+            return '\u20B9' + Number(v || 0).toFixed(2);
+        }
+
+        function syncSellerAccountRow(sellerId, accountStatus, activeReqId) {
+            var row = document.getElementById('seller-row-' + Number(sellerId));
+            if (!row) return;
+            var accUpper = String(accountStatus || 'ACTIVE').toUpperCase();
+            if (typeof row.setAttribute === 'function') row.setAttribute('data-status', accUpper);
+            var accCell = row.querySelector('.seller-acc-cell');
+            if (accCell) {
+                var cls = accUpper === 'ACTIVE' ? 'del-green' : (accUpper === 'DELETION_PENDING' ? 'del-yellow' : (accUpper === 'LOCKED' ? 'del-orange' : 'del-red'));
+                accCell.innerHTML = '<span class="del-badge ' + cls + '">' + escapeHtml(accUpper) + '</span>';
+            }
+            var slot = row.querySelector('.seller-del-btn-slot');
+            if (slot) {
+                if (activeReqId && accUpper !== 'DELETED') {
+                    slot.innerHTML = '<button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
+                } else if (accUpper !== 'DELETED') {
+                    slot.innerHTML = '<button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
+                } else {
+                    slot.innerHTML = '';
+                }
+            }
         }
 
         function filterDeletionStatus(status, btn) {
             window._activeDelStatusFilter = status || 'all';
             document.querySelectorAll('#delFilterTabs .tab-btn').forEach(function(b) { b.classList.remove('active'); });
-            if (btn) btn.classList.add('active');
-            applyDeletionTableFilters();
+            if (btn && btn.classList) btn.classList.add('active');
+            applyDeletionTableFilters(false);
         }
 
         function filterDeletionTableSearch(q) {
             window._activeDelSearch = (q || '').toLowerCase().trim();
-            applyDeletionTableFilters();
+            applyDeletionTableFilters(false);
         }
 
-        function applyDeletionTableFilters() {
+        function applyDeletionTableFilters(preservePage) {
             var st = window._activeDelStatusFilter || 'all';
             var q = window._activeDelSearch || '';
-            document.querySelectorAll('.del-req-row').forEach(function(r) {
+            getTableRows('del').forEach(function(r) {
                 var rSt = r.getAttribute('data-status') || '';
                 var rTxt = r.getAttribute('data-search') || '';
                 var matchSt = (st === 'all' || rSt === st);
                 var matchQ = (!q || rTxt.indexOf(q) !== -1);
-                r.style.display = (matchSt && matchQ) ? '' : 'none';
+                var okMatch = (matchSt && matchQ);
+                if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
             });
+            refreshTablePagination('del', !preservePage);
         }
 
         function reloadDeletionRequestsList() {
@@ -1718,6 +3349,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     var k = data.kpis || {};
                     var el;
                     if ((el = document.getElementById('delKpiTotal'))) el.innerText = Number(k.total || 0);
+                    if ((el = document.getElementById('navDelCount'))) el.innerText = Number(k.total || 0);
                     if ((el = document.getElementById('delKpiPending'))) el.innerText = Number(k.pending || 0);
                     if ((el = document.getElementById('delKpiProcessing'))) el.innerText = Number(k.processing || 0);
                     if ((el = document.getElementById('delKpiFailed'))) el.innerText = Number(k.failed || 0);
@@ -1728,6 +3360,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     if (!tbody) return;
                     if (data.requests.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                        refreshTablePagination('del', true);
                         return;
                     }
                     var html = '';
@@ -1749,7 +3382,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                             '</tr>';
                     });
                     tbody.innerHTML = html;
-                    applyDeletionTableFilters();
+                    applyDeletionTableFilters(true);
                 })
                 .catch(function() {});
         }
@@ -1841,6 +3474,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 closeDeletionPreflightModal();
                 reloadDeletionRequestsList();
                 if (resObj.d && resObj.d.deletion_request) {
+                    syncSellerAccountRow(sellerId, (resObj.d.seller && resObj.d.seller.account_status) || 'DELETION_PENDING', resObj.d.deletion_request.id);
                     openDeletionWorkspaceModal(resObj.d.deletion_request.id);
                 }
             })
@@ -1900,6 +3534,10 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     return;
                 }
                 if (resObj.d && resObj.d.deletion_request) {
+                    var dr = resObj.d.deletion_request;
+                    var sl = resObj.d.seller || {};
+                    var nextActiveReq = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED') ? null : dr.id;
+                    syncSellerAccountRow(dr.seller_id, sl.account_status || 'DELETION_PENDING', nextActiveReq);
                     renderDeletionWorkspace(resObj.d, (resObj.d.message || 'Action completed.'));
                 }
                 reloadDeletionRequestsList();
@@ -1907,6 +3545,38 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             .catch(function(err) {
                 if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
             });
+        }
+
+        function wsLockAccount(reqId) {
+            runDelAction(reqId, 'lock', {});
+        }
+
+        function wsVerifyOrders(reqId) {
+            var chk = document.getElementById('wsApproveRuleB');
+            runDelAction(reqId, 'verify-orders', {
+                approve_accepted_cancellations: Boolean(chk && chk.checked)
+            });
+        }
+
+        function wsProcessRefunds(reqId) {
+            runDelAction(reqId, 'process-refunds', {});
+        }
+
+        function wsVerifySettlement(reqId) {
+            runDelAction(reqId, 'verify-settlement', {});
+        }
+
+        function wsResolveDispute(reqId, dpId) {
+            runDelAction(reqId, 'resolve-dispute', {
+                dispute_id: Number(dpId),
+                resolution: 'RESOLVED',
+                mark_delivered: true,
+                close_return_window: true
+            });
+        }
+
+        function wsApproveDeletion(reqId) {
+            runDelAction(reqId, 'approve', {});
         }
 
         function handleSettlePayoutClick(reqId) {
@@ -1918,16 +3588,38 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             });
         }
 
-        function handleHoldClick(reqId) {
-            var reason = prompt('Enter reason for putting this seller deletion request ON HOLD:', 'Awaiting manual verification / return period');
-            if (reason === null) return;
-            runDelAction(reqId, 'hold', { reason: reason });
+        function toggleWsHoldBox() {
+            var h = document.getElementById('wsHoldBox');
+            var r = document.getElementById('wsRejectBox');
+            if (r) r.style.display = 'none';
+            if (h) h.style.display = (h.style.display === 'none' || !h.style.display) ? 'block' : 'none';
         }
 
-        function handleRejectClick(reqId) {
-            var reason = prompt('Enter MANDATORY reason to REJECT seller deletion and restore seller to ACTIVE:', '');
-            if (!reason || !reason.trim()) return;
-            runDelAction(reqId, 'reject', { reason: reason.trim() });
+        function submitWsHold(reqId) {
+            var inp = document.getElementById('wsHoldReasonInput');
+            var reason = inp ? inp.value.trim() : '';
+            runDelAction(reqId, 'hold', { reason: reason || 'Awaiting manual verification / return period' });
+        }
+
+        function toggleWsRejectBox() {
+            var h = document.getElementById('wsHoldBox');
+            var r = document.getElementById('wsRejectBox');
+            var err = document.getElementById('wsRejectErr');
+            if (h) h.style.display = 'none';
+            if (err) err.innerText = '';
+            if (r) r.style.display = (r.style.display === 'none' || !r.style.display) ? 'block' : 'none';
+        }
+
+        function submitWsReject(reqId) {
+            var inp = document.getElementById('wsRejectReasonInput');
+            var err = document.getElementById('wsRejectErr');
+            var reason = inp ? inp.value.trim() : '';
+            if (!reason) {
+                if (err) err.innerText = 'Rejection reason is required to reject deletion and restore seller to ACTIVE.';
+                return;
+            }
+            if (err) err.innerText = '';
+            runDelAction(reqId, 'reject', { reason: reason });
         }
 
         function toggleFinalDeleteConfirm() {
@@ -1986,8 +3678,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
                 '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
                 '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'lock\', {})">Lock Account</button>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-orders\', { approve_accepted_cancellations: Boolean(document.getElementById(\'wsApproveRuleB\') && document.getElementById(\'wsApproveRuleB\').checked) })">Verify Orders</button>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
                 '</div></h4>' +
                 '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
                 '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
@@ -2010,7 +3702,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             html += '</div>';
 
             html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'process-refunds\', {})">Process Eligible Refunds (Razorpay)</button></h4>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
                 '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
             if (refunds.length === 0) {
                 html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
@@ -2027,7 +3719,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             html += '</div>';
 
             html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
-                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-settlement\', {})">Verify Settlement</button></h4>' +
+                '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
                 '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
                 '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
                 '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
@@ -2048,7 +3740,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
                         '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
                         '<td>' + (isOpen && !isTerminal
-                            ? '<button type="button" class="btn-sm" onclick="runDelAction(' + Number(dr.id) + ', \'resolve-dispute\', { dispute_id: ' + Number(dp.id) + ', resolution: \'RESOLVED\', mark_delivered: true, close_return_window: true })">Mark Delivered &amp; Resolve</button>'
+                            ? '<button type="button" class="btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
                             : 'Resolved') + '</td></tr>';
                 });
                 html += '</tbody></table>';
@@ -2059,11 +3751,26 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 '<label style="margin-top:0;">Admin Remarks</label>' +
                 '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
                 '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
-                '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'approve\', {})">✓ Approve Deletion</button>' +
-                '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleHoldClick(' + Number(dr.id) + ')">⏸ Put On Hold</button>' +
-                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleRejectClick(' + Number(dr.id) + ')">✕ Reject Request</button>' +
+                '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">✓ Approve Deletion</button>' +
+                '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">⏸ Put On Hold</button>' +
+                '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">✕ Reject Request</button>' +
                 '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
                 '</div>' +
+                '<div id="wsHoldBox" style="display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:14px;margin-top:12px;">' +
+                '<strong style="color:#9a3412;font-size:13px;">Put Deletion Request On Hold</strong>' +
+                '<input type="text" id="wsHoldReasonInput" value="Awaiting manual verification / return period" style="margin-top:6px;">' +
+                '<div style="display:flex;gap:8px;margin-top:10px;">' +
+                '<button type="button" class="btn-hold-sm" style="padding:8px 14px;" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
+                '<button type="button" onclick="toggleWsHoldBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+                '</div></div>' +
+                '<div id="wsRejectBox" style="display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px;margin-top:12px;">' +
+                '<strong style="color:#991b1b;font-size:13px;">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
+                '<textarea id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..." style="margin-top:6px;border-color:#fca5a5;"></textarea>' +
+                '<div id="wsRejectErr" style="color:#b91c1c;font-size:12px;margin-top:4px;"></div>' +
+                '<div style="display:flex;gap:8px;margin-top:10px;">' +
+                '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
+                '<button type="button" onclick="toggleWsRejectBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+                '</div></div>' +
                 (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
                 '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
                 '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
@@ -2086,13 +3793,6 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             html += '</div>';
 
             document.getElementById('delWsBody').innerHTML = html;
-        }
-
-        if (window.location.pathname.indexOf('seller-deletions') !== -1 || window.location.search.indexOf('seller-deletions') !== -1) {
-            window.addEventListener('DOMContentLoaded', function() {
-                var sec = document.getElementById('deletionRequestsSection');
-                if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth' });
-            });
         }
     </script>
 </body>

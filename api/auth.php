@@ -27,15 +27,33 @@ function extractFieldPhp(array $input, array $candidates, string $default = ''):
     return $default;
 }
 
-function extractPhonePhp(array $input): string
+function extractDialCodePhp(array $input): string
+{
+    foreach (['country_code', 'countryCode', 'dial_code', 'dialCode'] as $k) {
+        if (isset($input[$k]) && !is_array($input[$k]) && trim((string) $input[$k]) !== '') {
+            return trim((string) $input[$k]);
+        }
+    }
+    foreach (['phone', 'mobile', 'contact', 'telephone'] as $k) {
+        if (isset($input[$k]) && is_array($input[$k])) {
+            $code = $input[$k]['country_code'] ?? $input[$k]['countryCode'] ?? $input[$k]['dial_code'] ?? $input[$k]['dialCode'] ?? '';
+            if (trim((string) $code) !== '') {
+                return trim((string) $code);
+            }
+        }
+    }
+    return '';
+}
+
+function extractPhonePartsPhp(array $input): array
 {
     // Object / array check
     foreach (['phone', 'mobile', 'contact', 'telephone'] as $k) {
         if (isset($input[$k]) && is_array($input[$k])) {
-            $num = $input[$k]['number'] ?? $input[$k]['phone'] ?? $input[$k]['value'] ?? '';
-            $code = $input[$k]['country_code'] ?? $input[$k]['countryCode'] ?? $input[$k]['dial_code'] ?? $input[$k]['dialCode'] ?? '+91';
+            $num = trim((string) ($input[$k]['number'] ?? $input[$k]['phone'] ?? $input[$k]['value'] ?? ''));
+            $code = trim((string) ($input[$k]['country_code'] ?? $input[$k]['countryCode'] ?? $input[$k]['dial_code'] ?? $input[$k]['dialCode'] ?? '+91'));
             if ($num !== '') {
-                return (str_starts_with((string)$num, '+') ? '' : $code) . (string)$num;
+                return ['rawPhone' => $num, 'dialCode' => str_starts_with($num, '+') ? '' : $code];
             }
         }
     }
@@ -64,25 +82,27 @@ function extractPhonePhp(array $input): string
         }
     }
 
-    if ($raw === '') return '';
-
-    $dialCode = $input['country_code'] ?? $input['countryCode'] ?? $input['dial_code'] ?? $input['dialCode'] ?? null;
-    if ($dialCode && !str_starts_with($raw, '+')) {
-        $raw = trim((string)$dialCode) . $raw;
+    if ($raw === '') {
+        return ['rawPhone' => '', 'dialCode' => ''];
     }
 
-    return $raw;
+    $dialCode = extractDialCodePhp($input);
+    return ['rawPhone' => $raw, 'dialCode' => $dialCode];
 }
 
-function normalizePhonePhp(string $raw): string
+function extractPhonePhp(array $input): string
 {
-    if (!$raw) return '';
-    $str = preg_replace('/[\s\-\(\)]/', '', trim($raw));
-    if (!$str) return '';
-    if (str_starts_with($str, '+')) return $str;
-    if (preg_match('/^\d{10}$/', $str)) return '+91' . $str;
-    if (preg_match('/^91\d{10}$/', $str)) return '+' . $str;
-    return '+' . $str;
+    $parts = extractPhonePartsPhp($input);
+    if ($parts['rawPhone'] === '') {
+        return '';
+    }
+    $norm = normalizePhoneNumberPhp($parts['rawPhone'], $parts['dialCode']);
+    return $norm !== '' ? $norm : $parts['rawPhone'];
+}
+
+function normalizePhonePhp(string $raw, string $dialCode = ''): string
+{
+    return normalizePhoneNumberPhp($raw, $dialCode);
 }
 
 function isValidEmailAddressPhp(string $email): bool
@@ -109,7 +129,12 @@ function extractAuthIdentifiersPhp(array $input, bool $allowUsername = false): a
         'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
         'user_email', 'seller_email', 'business_email', 'mail'
     ], '');
-    $rawPhone = extractPhonePhp($input);
+    $phoneParts = extractPhonePartsPhp($input);
+    $rawPhone = $phoneParts['rawPhone'];
+    $dialCode = $phoneParts['dialCode'];
+    if ($dialCode === '') {
+        $dialCode = extractDialCodePhp($input);
+    }
 
     $singleCandidates = [
         'identifier', 'login', 'login_id', 'loginId',
@@ -129,42 +154,33 @@ function extractAuthIdentifiersPhp(array $input, bool $allowUsername = false): a
     $rawIdentifier = extractFieldPhp($input, $singleCandidates, '');
     $identifierError = '';
 
-    $dialCode = $input['country_code'] ?? $input['countryCode'] ?? $input['dial_code'] ?? $input['dialCode'] ?? null;
-    $attachDialCode = function (string $val) use ($dialCode): string {
-        $trimmed = trim($val);
-        if ($trimmed === '') return '';
-        if ($dialCode && !str_starts_with($trimmed, '+')) {
-            return trim((string)$dialCode) . $trimmed;
-        }
-        return $trimmed;
-    };
-
     if ($rawEmail === '' && $rawPhone === '' && $rawIdentifier !== '') {
         if (str_contains($rawIdentifier, '@')) {
             $rawEmail = $rawIdentifier;
         } elseif (preg_match('/^\+?[\d\s\-().]+$/', $rawIdentifier)) {
-            $rawPhone = $attachDialCode($rawIdentifier);
+            $rawPhone = $rawIdentifier;
         } else {
             $identifierError = 'Please provide a valid email address or phone number.';
         }
-    }
+    } 
 
     // Handle single-input forms wired only to `email` or `phone`
     if ($rawEmail === '' && $rawPhone !== '' && str_contains($rawPhone, '@')) {
         $rawEmail = $rawPhone;
         $rawPhone = '';
     } elseif ($rawPhone === '' && $rawEmail !== '' && !str_contains($rawEmail, '@') && preg_match('/^\+?[\d\s\-().]{7,20}$/', $rawEmail)) {
-        $rawPhone = $attachDialCode($rawEmail);
+        $rawPhone = $rawEmail;
         $rawEmail = '';
     }
 
     $email = $rawEmail !== '' ? strtolower(trim($rawEmail)) : '';
-    $phone = $rawPhone !== '' ? normalizePhonePhp($rawPhone) : '';
+    $phone = $rawPhone !== '' ? normalizePhoneNumberPhp($rawPhone, $dialCode) : '';
 
     return [
         'rawEmail' => $rawEmail,
         'email' => $email,
         'rawPhone' => $rawPhone,
+        'dialCode' => $dialCode,
         'phone' => $phone,
         'rawIdentifier' => $rawIdentifier,
         'identifierError' => $identifierError,
@@ -206,6 +222,7 @@ function apiRegister(PDO $pdo): void
     $ids = extractAuthIdentifiersPhp($input, false);
     $email = $ids['email'];
     $rawPhone = $ids['rawPhone'];
+    $dialCode = $ids['dialCode'] ?? '';
     $phone = $ids['phone'];
     $identifierError = $ids['identifierError'];
 
@@ -223,19 +240,17 @@ function apiRegister(PDO $pdo): void
     }
     if ($identifierError !== '') {
         $errors['email_or_phone'] = [$identifierError];
-        $errors['email'] = [$identifierError];
-        $errors['phone'] = [$identifierError];
     } elseif ($email === '' && $rawPhone === '') {
-        $contactMsg = 'Please provide an email address or phone number.';
-        $errors['email_or_phone'] = [$contactMsg];
-        $errors['email'] = [$contactMsg];
-        $errors['phone'] = [$contactMsg];
+        $errors['email_or_phone'] = ['Please provide an email address or phone number.'];
     } else {
         if ($email !== '' && !isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         }
-        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        if ($rawPhone !== '') {
+            $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+            if ($phoneErr !== null) {
+                $errors['phone'] = [$phoneErr];
+            }
         }
     }
     if (empty($address)) {
@@ -250,122 +265,269 @@ function apiRegister(PDO $pdo): void
     }
 
     if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse(
+            count($errors) === 1 ? $firstMsg : 'Validation error occurred.',
+            $errors,
+            422,
+            ['status' => false, 'error_code' => 'VALIDATION_ERROR']
+        );
     }
 
-    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
+    // Ensure normalized_phone column & unique index BEFORE starting transaction (DDL causes implicit commit in MySQL)
+    ensureNormalizedPhoneSchemaPhp($pdo);
 
-    $phoneMatch = null;
-    if ($phone !== '') {
-        $phoneStmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
-        $phoneStmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix]);
-        $phoneMatch = $phoneStmt->fetch(PDO::FETCH_ASSOC) ?: null;
-    }
-
-    $emailMatch = null;
-    if ($email !== '') {
-        $emailStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
-        $emailStmt->execute([':email' => $email]);
-        $emailMatch = $emailStmt->fetch(PDO::FETCH_ASSOC) ?: null;
-    }
-
-    if ($phoneMatch) {
-        $pmStatus = strtoupper((string) ($phoneMatch['account_status'] ?? 'ACTIVE'));
-        if (in_array($pmStatus, ['LOCKED', 'DELETED'], true)) {
-            errorResponse(
-                $pmStatus === 'DELETED' ? 'This seller account has been permanently deactivated and cannot be registered again.' : 'This seller account is locked during deletion verification.',
-                ['account_status' => [$pmStatus]],
-                403
-            );
-        }
-        if (verifyPassword($password, $phoneMatch['password'])) {
-            if ($emailMatch && (int) $emailMatch['id'] !== (int) $phoneMatch['id']) {
-                errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
-            }
-            $existingPublicEmail = getPublicSellerEmailPhp($phoneMatch['email'] ?? null, $phoneMatch['role'] ?? 'seller');
-            if ($email !== '' && $existingPublicEmail !== null && strtolower($existingPublicEmail) !== $email) {
-                errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
-            }
-            $resolvedEmail = $phoneMatch['email'] ?? '';
-            if ($email !== '' && (empty($resolvedEmail) || str_ends_with(strtolower((string) $resolvedEmail), '@phone.vendor.local'))) {
-                $updEmail = $pdo->prepare("UPDATE users SET email = :email, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
-                $updEmail->execute([':email' => $email, ':id' => (int) $phoneMatch['id']]);
-                $resolvedEmail = $email;
-            }
-            $role = $phoneMatch['role'] ?? 'seller';
-            $publicEmail = getPublicSellerEmailPhp($resolvedEmail, $role);
-            $resolvedPhone = !empty($phoneMatch['phone']) ? $phoneMatch['phone'] : $phone;
-            $token = createToken($pdo, (int) $phoneMatch['id'], $resolvedPhone, 'vendor-app', $publicEmail, $role, (int) ($phoneMatch['token_version'] ?? 1));
-            jsonResponse([
-                'message' => 'Seller account already exists. Successfully signed in.',
-                'user' => safeSeller([
-                    'id' => $phoneMatch['id'],
-                    'seller_name' => $sellerName ?: ($phoneMatch['seller_name'] ?? $phoneMatch['name'] ?? ''),
-                    'email' => $resolvedEmail,
-                    'phone' => $resolvedPhone,
-                    'address' => $address ?: ($phoneMatch['address'] ?? null),
-                    'landmark' => $landmark ?: ($phoneMatch['landmark'] ?? null),
-                    'state' => $state ?: ($phoneMatch['state'] ?? null),
-                    'country' => $country ?: ($phoneMatch['country'] ?? 'India'),
-                    'account_status' => $phoneMatch['account_status'] ?? 'ACTIVE',
-                    'role' => $role,
-                ]),
-                'token' => $token,
-                'token_type' => 'Bearer'
-            ], 200);
-        }
-        errorResponse('The phone has already been taken.', ['phone' => ['The phone has already been taken.']], 422);
-    }
-
-    if ($emailMatch) {
-        $emStatus = strtoupper((string) ($emailMatch['account_status'] ?? 'ACTIVE'));
-        if (in_array($emStatus, ['LOCKED', 'DELETED'], true)) {
-            errorResponse(
-                $emStatus === 'DELETED' ? 'This seller account has been permanently deactivated.' : 'This seller account is locked during deletion verification.',
-                ['account_status' => [$emStatus]],
-                403
-            );
-        }
-        errorResponse('The email has already been taken.', ['email' => ['The email has already been taken.']], 422);
-    }
-
+    $driver = strtolower((string) $pdo->getAttribute(PDO::ATTR_DRIVER_NAME));
+    $isSqlite = ($driver === 'sqlite');
+    $hasNormCol = authUsersHasColumnPhp($pdo, 'normalized_phone');
     $hashedPassword = hashPassword($password);
     $dbEmail = $email !== '' ? $email : makeSyntheticPhoneEmailPhp($phone);
     $dbPhone = $phone !== '' ? $phone : null;
 
-    $stmt = $pdo->prepare("
-        INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-        VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    ");
-    $stmt->execute([
-        ':name' => $sellerName,
-        ':email' => $dbEmail,
-        ':seller_name' => $sellerName,
-        ':phone' => $dbPhone,
-        ':address' => $address,
-        ':landmark' => $landmark,
-        ':state' => $state,
-        ':country' => $country ?: 'India',
-        ':password' => $hashedPassword,
-    ]);
+    $outcome = null;
+    $maxAttempts = $isSqlite ? 3 : 1;
 
-    $userId = (int) $pdo->lastInsertId();
+    for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        $mysqlLockKey = null;
+        $inTx = false;
+        try {
+            if (!$isSqlite && $phone !== '') {
+                $mysqlLockKey = 'venter_reg_' . sha1($phone);
+                $lockStmt = $pdo->prepare('SELECT GET_LOCK(:k, 5)');
+                $lockStmt->execute([':k' => $mysqlLockKey]);
+            }
+
+            if ($isSqlite) {
+                $pdo->exec('BEGIN IMMEDIATE');
+                $inTx = true;
+            } else {
+                $pdo->beginTransaction();
+                $inTx = true;
+            }
+
+            $phoneMatches = $phone !== '' ? findUsersByPhonePhp($pdo, $rawPhone, $phone, $dialCode) : [];
+            $emailMatch = null;
+            if ($email !== '') {
+                $emailSql = $isSqlite
+                    ? 'SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1'
+                    : 'SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1 FOR UPDATE';
+                $emailStmt = $pdo->prepare($emailSql);
+                $emailStmt->execute([':email' => $email]);
+                $emailMatch = $emailStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+            }
+
+            if (!empty($phoneMatches)) {
+                $activePhoneMatch = null;
+                $blockedPhoneMatch = null;
+                foreach ($phoneMatches as $pm) {
+                    $pmStatus = strtoupper((string) ($pm['account_status'] ?? 'ACTIVE'));
+                    if (($pm['role'] ?? 'seller') !== 'admin' && in_array($pmStatus, ['LOCKED', 'DELETED'], true)) {
+                        if ($blockedPhoneMatch === null) {
+                            $blockedPhoneMatch = $pm;
+                        }
+                    } else {    
+                        $activePhoneMatch = $pm;
+                        break;
+                    }
+                }
+
+                if ($activePhoneMatch !== null) {
+                    $outcome = [
+                        'ok' => false,
+                        'status' => 409,
+                        'message' => 'This phone number is already registered. Please log in.',
+                        'errors' => [],
+                        'extra' => ['status' => false, 'error_code' => 'PHONE_ALREADY_REGISTERED'],
+                    ];
+                    break;
+                }
+
+                if ($blockedPhoneMatch !== null) {
+                    $pmStatus = strtoupper((string) ($blockedPhoneMatch['account_status'] ?? 'LOCKED'));
+                    $outcome = [
+                        'ok' => false,
+                        'status' => 403,
+                        'message' => $pmStatus === 'DELETED'
+                            ? 'This seller account has been permanently deactivated and cannot be registered again.'
+                            : 'This seller account is locked during deletion verification.',
+                        'errors' => ['account_status' => [$pmStatus]],
+                        'extra' => ['status' => false, 'error_code' => 'ACCOUNT_' . $pmStatus],
+                    ];
+                    break;
+                }
+            }
+
+            if ($emailMatch) {
+                $emStatus = strtoupper((string) ($emailMatch['account_status'] ?? 'ACTIVE'));
+                if (($emailMatch['role'] ?? 'seller') !== 'admin' && in_array($emStatus, ['LOCKED', 'DELETED'], true)) {
+                    $outcome = [
+                        'ok' => false,
+                        'status' => 403,
+                        'message' => $emStatus === 'DELETED'
+                            ? 'This seller account has been permanently deactivated.'
+                            : 'This seller account is locked during deletion verification.',
+                        'errors' => ['account_status' => [$emStatus]],
+                        'extra' => ['status' => false, 'error_code' => 'ACCOUNT_' . $emStatus],
+                    ];
+                    break;
+                }
+
+                $outcome = [
+                    'ok' => false,
+                    'status' => 422,
+                    'message' => 'The email has already been taken.',
+                    'errors' => ['email' => ['The email has already been taken.']],
+                    'extra' => ['status' => false, 'error_code' => 'EMAIL_ALREADY_REGISTERED'],
+                ];
+                break;
+            }
+
+            if ($hasNormCol) {
+                $stmt = $pdo->prepare("
+                    INSERT INTO users (name, email, seller_name, phone, normalized_phone, address, landmark, state, country, password, role, created_at, updated_at)
+                    VALUES (:name, :email, :seller_name, :phone, :normalized_phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ");
+                $stmt->execute([
+                    ':name' => $sellerName,
+                    ':email' => $dbEmail,
+                    ':seller_name' => $sellerName,
+                    ':phone' => $dbPhone,
+                    ':normalized_phone' => $dbPhone,
+                    ':address' => $address,
+                    ':landmark' => $landmark,
+                    ':state' => $state,
+                    ':country' => $country ?: 'India',
+                    ':password' => $hashedPassword,
+                ]);
+            } else {
+                $stmt = $pdo->prepare("
+                    INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+                    VALUES (:name, :email, :seller_name, :phone, :address, :landmark, :state, :country, :password, 'seller', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ");
+                $stmt->execute([
+                    ':name' => $sellerName,
+                    ':email' => $dbEmail,
+                    ':seller_name' => $sellerName,
+                    ':phone' => $dbPhone,
+                    ':address' => $address,
+                    ':landmark' => $landmark,
+                    ':state' => $state,
+                    ':country' => $country ?: 'India',
+                    ':password' => $hashedPassword,
+                ]);
+            }
+
+            $userId = (int) $pdo->lastInsertId();
+            if ($isSqlite) {
+                $pdo->exec('COMMIT');
+            } else {
+                $pdo->commit();
+            }
+            $inTx = false;
+
+            $fetchStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+            $fetchStmt->execute([':id' => $userId]);
+            $user = $fetchStmt->fetch() ?: [
+                'id' => $userId,
+                'seller_name' => $sellerName,
+                'email' => $dbEmail,
+                'phone' => $dbPhone,
+                'normalized_phone' => $dbPhone,
+                'address' => $address,
+                'landmark' => $landmark,
+                'state' => $state,
+                'country' => $country ?: 'India',
+                'role' => 'seller',
+            ];
+
+            $outcome = [
+                'ok' => true,
+                'userId' => $userId,
+                'user' => $user,
+            ];
+            break;
+        } catch (PDOException $e) {
+            if ($inTx) {
+                try {
+                    if ($isSqlite) {
+                        $pdo->exec('ROLLBACK');
+                    } elseif ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+                } catch (Throwable $ignore) {}
+                $inTx = false;
+            }
+
+            $msgLower = strtolower($e->getMessage());
+            if ($isSqlite && $attempt < $maxAttempts && (str_contains($msgLower, 'database is locked') || str_contains($msgLower, 'busy'))) {
+                usleep(50000);
+                continue;
+            }
+
+            if (isDuplicateKeyExceptionPhp($e)) {
+                $isPhoneDup = false;
+                if ($phone !== '') {
+                    if (str_contains($msgLower, 'normalized_phone') || str_contains($msgLower, 'users.phone') || str_contains($msgLower, 'phone')) {
+                        $isPhoneDup = true;
+                    } else {
+                        try {
+                            $isPhoneDup = (bool) findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode);
+                        } catch (Throwable $ignore) {}
+                    }
+                }
+                if ($isPhoneDup) {
+                    $outcome = [
+                        'ok' => false,
+                        'status' => 409,
+                        'message' => 'This phone number is already registered. Please log in.',
+                        'errors' => [],
+                        'extra' => ['status' => false, 'error_code' => 'PHONE_ALREADY_REGISTERED'],
+                    ];
+                } else {
+                    $outcome = [
+                        'ok' => false,
+                        'status' => 422,
+                        'message' => 'The email has already been taken.',
+                        'errors' => ['email' => ['The email has already been taken.']],
+                        'extra' => ['status' => false, 'error_code' => 'EMAIL_ALREADY_REGISTERED'],
+                    ];
+                }
+                break;
+            }
+
+            throw $e;
+        } finally {
+            if ($inTx) {
+                try {
+                    if ($isSqlite) {
+                        $pdo->exec('ROLLBACK');
+                    } elseif ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+                } catch (Throwable $ignore) {}
+            }
+            if ($mysqlLockKey !== null) {
+                try {
+                    $relStmt = $pdo->prepare('SELECT RELEASE_LOCK(:k)');
+                    $relStmt->execute([':k' => $mysqlLockKey]);
+                } catch (Throwable $ignore) {}
+            }
+        }
+    }
+
+    if (!$outcome || empty($outcome['ok'])) {
+        errorResponse(
+            $outcome['message'] ?? 'Registration could not be completed.',
+            $outcome['errors'] ?? [],
+            (int) ($outcome['status'] ?? 409),
+            $outcome['extra'] ?? ['status' => false, 'error_code' => 'REGISTRATION_FAILED']
+        );
+    }
+
+    $userId = (int) $outcome['userId'];
+    $user = $outcome['user'];
     $publicEmail = $email !== '' ? $email : null;
     $token = createToken($pdo, $userId, $dbPhone, 'vendor-app', $publicEmail, 'seller');
-
-    $fetchStmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
-    $fetchStmt->execute([':id' => $userId]);
-    $user = $fetchStmt->fetch() ?: [
-        'id' => $userId,
-        'seller_name' => $sellerName,
-        'email' => $dbEmail,
-        'phone' => $dbPhone,
-        'address' => $address,
-        'landmark' => $landmark,
-        'state' => $state,
-        'country' => $country ?: 'India',
-        'role' => 'seller',
-    ];
 
     jsonResponse([
         'message' => 'Seller registration successful.',
@@ -385,6 +547,7 @@ function apiLogin(PDO $pdo): void
     $ids = extractAuthIdentifiersPhp($input, true);
     $email = $ids['email'];
     $rawPhone = $ids['rawPhone'];
+    $dialCode = $ids['dialCode'] ?? '';
     $phone = $ids['phone'];
     $identifierError = $ids['identifierError'];
     $password = extractPasswordPhp($input);
@@ -393,19 +556,17 @@ function apiLogin(PDO $pdo): void
 
     if ($identifierError !== '') {
         $errors['email_or_phone'] = [$identifierError];
-        $errors['email'] = [$identifierError];
-        $errors['phone'] = [$identifierError];
     } elseif ($email === '' && $rawPhone === '') {
-        $contactMsg = 'The email or phone field is required.';
-        $errors['email_or_phone'] = [$contactMsg];
-        $errors['email'] = [$contactMsg];
-        $errors['phone'] = [$contactMsg];
+        $errors['email_or_phone'] = ['The email or phone field is required.'];
     } else {
         if ($email !== '' && !isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         }
-        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        if ($rawPhone !== '') {
+            $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+            if ($phoneErr !== null) {
+                $errors['phone'] = [$phoneErr];
+            }
         }
     }
     if (empty($password)) {
@@ -413,48 +574,82 @@ function apiLogin(PDO $pdo): void
     }
 
     if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse(
+            count($errors) === 1 ? $firstMsg : 'Validation error occurred.',
+            $errors,
+            422,
+            ['status' => false, 'error_code' => 'VALIDATION_ERROR']
+        );
     }
 
-    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
-   $invalidCredsMsg = 'Invalid email/phone number or password. Please try again.';
-    $invalidCredsErrors = [
-        'email_or_phone' => [$invalidCredsMsg],
-        'email' => [$invalidCredsMsg],
-        'phone' => [$invalidCredsMsg],
-    ];
+    ensureNormalizedPhoneSchemaPhp($pdo);
 
     $user = null;
     if ($email !== '' && $rawPhone !== '') {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = LOWER(:email) LIMIT 1");
-        $stmt->execute([
-            ':phone' => $phone,
-            ':rawPhone' => $rawPhone,
-            ':rawNoPrefix' => $rawNoPrefix,
-            ':email' => $email,
-        ]);
-        $user = $stmt->fetch() ?: null;
+        $emailStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
+        $emailStmt->execute([':email' => $email]);
+        $emailUser = $emailStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        if (!$emailUser && $email === 'admin@venter.app') {
+            $adminStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = 'admin@vendor.app' AND role = 'admin' LIMIT 1");
+            $adminStmt->execute();
+            $emailUser = $adminStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        }
+        $phoneUser = findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode);
+
+        if (!$emailUser && !$phoneUser) {
+            errorResponse(
+                'This phone number is not registered. Please sign up.',
+                [],
+                404,
+                ['status' => false, 'error_code' => 'PHONE_NOT_REGISTERED']
+            );
+        }
+        if (!$emailUser || !$phoneUser || (int) $emailUser['id'] !== (int) $phoneUser['id']) {
+            errorResponse(
+                'The supplied email and phone number do not match the same account.',
+                [],
+                422,
+                ['status' => false, 'error_code' => 'CREDENTIALS_MISMATCH']
+            );
+        }
+        $user = $emailUser;
     } elseif ($email !== '') {
         $stmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
         $stmt->execute([':email' => $email]);
-        $user = $stmt->fetch() ?: null;
+        $user = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
         if (!$user && $email === 'admin@venter.app') {
             $adminStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = 'admin@vendor.app' AND role = 'admin' LIMIT 1");
             $adminStmt->execute();
-            $user = $adminStmt->fetch() ?: null;
+            $user = $adminStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        }
+        if (!$user) {
+            errorResponse(
+                'This email address is not registered. Please sign up.',
+                [],
+                404,
+                ['status' => false, 'error_code' => 'EMAIL_NOT_REGISTERED']
+            );
         }
     } else {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
-        $stmt->execute([
-            ':phone' => $phone,
-            ':rawPhone' => $rawPhone,
-            ':rawNoPrefix' => $rawNoPrefix,
-        ]);
-        $user = $stmt->fetch() ?: null;
+        $user = findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode);
+        if (!$user) {
+            errorResponse(
+                'This phone number is not registered. Please sign up.',
+                [],
+                404,
+                ['status' => false, 'error_code' => 'PHONE_NOT_REGISTERED']
+            );
+        }
     }
 
-    if (!$user || !verifyPassword($password, $user['password'])) {
-        errorResponse($invalidCredsMsg, $invalidCredsErrors, 422);
+    if (!verifyPassword($password, (string) ($user['password'] ?? ''))) {
+        errorResponse(
+            'Incorrect password. Please try again.',
+            [],
+            401,
+            ['status' => false, 'error_code' => 'INVALID_PASSWORD']
+        );
     }
 
     $accStatus = strtoupper((string) ($user['account_status'] ?? 'ACTIVE'));
@@ -462,7 +657,7 @@ function apiLogin(PDO $pdo): void
         $msg = $accStatus === 'DELETED'
             ? 'This seller account has been permanently deactivated and can no longer sign in.'
             : 'This seller account is locked pending administrative account deletion.';
-        errorResponse($msg, ['account_status' => [$accStatus]], 403);
+        errorResponse($msg, ['account_status' => [$accStatus]], 403, ['status' => false, 'error_code' => 'ACCOUNT_' . $accStatus]);
     }
 
     $role = $user['role'] ?? 'seller';
@@ -572,81 +767,106 @@ function ensurePasswordResetSchemaPhp(PDO $pdo): void
     $ensured = true;
 }
 
-function findPasswordResetUserPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): ?array
+function findPasswordResetUserPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $dialCode = ''): ?array
 {
-    if ($email !== '' && $rawPhone !== '') {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE (phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix) AND LOWER(email) = :email LIMIT 1");
-        $stmt->execute([':phone' => $phone, ':rawPhone' => $rawPhone, ':rawNoPrefix' => $rawNoPrefix, ':email' => $email]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return $row ?: null;
-    }
-    if ($email !== '') {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = :email LIMIT 1");
-        $stmt->execute([':email' => $email]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return $row ?: null;
-    }
-    if ($rawPhone !== '' || $phone !== '') {
-        $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
-        $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix LIMIT 1");
-        $stmt->execute([':phone' => $phone, ':rawPhone' => $effRaw, ':rawNoPrefix' => $effNoPrefix]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return $row ?: null;
-    }
-    return null;
-}
-
-function findLatestOtpRecordPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): ?array
-{
-    $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
-    $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
+    ensureNormalizedPhoneSchemaPhp($pdo);
 
     if ($email !== '' && ($rawPhone !== '' || $phone !== '')) {
+        $matches = findUsersByPhonePhp($pdo, $rawPhone, $phone, $dialCode);
+        foreach ($matches as $m) {
+            if (strtolower(trim((string) ($m['email'] ?? ''))) === strtolower(trim($email))) {
+                return $m;
+            }
+        }
+        return null;
+    }
+    if ($email !== '') {
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1");
+        $stmt->execute([':email' => $email]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row && strtolower(trim($email)) === 'admin@venter.app') {
+            $adminStmt = $pdo->prepare("SELECT * FROM users WHERE LOWER(email) = 'admin@vendor.app' AND role = 'admin' LIMIT 1");
+            $adminStmt->execute();
+            $row = $adminStmt->fetch(PDO::FETCH_ASSOC);
+        }
+        return $row ?: null;
+    }
+    if ($rawPhone !== '' || $phone !== '') {
+        return findUserByPhonePhp($pdo, $rawPhone, $phone, $dialCode);
+    }
+    return null;
+}
+
+function findLatestOtpRecordPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $dialCode = ''): ?array
+{
+    $variants = ($rawPhone !== '' || $phone !== '')
+        ? getPhoneLookupVariantsPhp($rawPhone, $phone, $dialCode)
+        : [];
+    $normExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '')";
+
+    if ($email !== '' && !empty($variants)) {
+        $params = [':email1' => $email, ':email2' => $email];
+        $ph1 = [];
+        $ph2 = [];
+        foreach ($variants as $idx => $v) {
+            $ph1[] = ':pa' . $idx;
+            $ph2[] = ':pb' . $idx;
+            $params[':pa' . $idx] = $v;
+            $params[':pb' . $idx] = $v;
+        }
+        $in1 = implode(', ', $ph1);
+        $in2 = implode(', ', $ph2);
         $stmt = $pdo->prepare("
             SELECT * FROM password_reset_otps
-            WHERE (LOWER(email) = :email1 AND (phone IS NULL OR phone = :p1 OR phone = :rp1 OR phone = :np1))
-               OR ((email IS NULL OR LOWER(email) = :email2) AND (phone = :p2 OR phone = :rp2 OR phone = :np2))
+            WHERE (LOWER(email) = LOWER(:email1) AND (phone IS NULL OR {$normExpr} IN ({$in1})))
+               OR ((email IS NULL OR LOWER(email) = LOWER(:email2)) AND {$normExpr} IN ({$in2}))
             ORDER BY id DESC LIMIT 1
         ");
-        $stmt->execute([
-            ':email1' => $email, ':p1' => $phone, ':rp1' => $effRaw, ':np1' => $effNoPrefix,
-            ':email2' => $email, ':p2' => $phone, ':rp2' => $effRaw, ':np2' => $effNoPrefix
-        ]);
+        $stmt->execute($params);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
     }
     if ($email !== '') {
-        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE LOWER(email) = :email ORDER BY id DESC LIMIT 1");
+        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE LOWER(email) = LOWER(:email) ORDER BY id DESC LIMIT 1");
         $stmt->execute([':email' => $email]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
     }
-    if ($rawPhone !== '' || $phone !== '') {
-        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix ORDER BY id DESC LIMIT 1");
-        $stmt->execute([':phone' => $phone, ':rawPhone' => $effRaw, ':rawNoPrefix' => $effNoPrefix]);
+    if (!empty($variants)) {
+        $params = [];
+        $ph = [];
+        foreach ($variants as $idx => $v) {
+            $ph[] = ':p' . $idx;
+            $params[':p' . $idx] = $v;
+        }
+        $stmt = $pdo->prepare("SELECT * FROM password_reset_otps WHERE {$normExpr} IN (" . implode(', ', $ph) . ") ORDER BY id DESC LIMIT 1");
+        $stmt->execute($params);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         return $row ?: null;
     }
     return null;
 }
 
-function clearOtpRecordsPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $rawNoPrefix): void
+function clearOtpRecordsPhp(PDO $pdo, string $email, string $rawPhone, string $phone, string $dialCode = ''): void
 {
-    $effRaw = $rawPhone !== '' ? $rawPhone : $phone;
-    $effNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $effRaw);
+    $variants = ($rawPhone !== '' || $phone !== '')
+        ? getPhoneLookupVariantsPhp($rawPhone, $phone, $dialCode)
+        : [];
+    $normExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '')";
     $clauses = [];
     $params = [];
 
     if ($email !== '') {
-        $clauses[] = "LOWER(email) = :email";
+        $clauses[] = "LOWER(email) = LOWER(:email)";
         $params[':email'] = strtolower(trim($email));
     }
-    if ($phone !== '' || $rawPhone !== '') {
-        $clauses[] = "phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix";
-        $params[':phone'] = $phone !== '' ? $phone : $effRaw;
-        $params[':rawPhone'] = $effRaw;
-        $params[':rawNoPrefix'] = $effNoPrefix;
+    if (!empty($variants)) {
+        $ph = [];
+        foreach ($variants as $idx => $v) {
+            $ph[] = ':cp' . $idx;
+            $params[':cp' . $idx] = $v;
+        }
+        $clauses[] = "{$normExpr} IN (" . implode(', ', $ph) . ")";
     }
 
     if (!empty($clauses)) {
@@ -662,6 +882,7 @@ function apiForgotPassword(PDO $pdo): void
     $ids = extractAuthIdentifiersPhp($input, false);
     $email = $ids['email'];
     $rawPhone = $ids['rawPhone'];
+    $dialCode = $ids['dialCode'] ?? '';
     $phone = $ids['phone'];
     $identifierError = $ids['identifierError'];
 
@@ -673,38 +894,44 @@ function apiForgotPassword(PDO $pdo): void
     $errors = [];
     if ($identifierError !== '') {
         $errors['email_or_phone'] = [$identifierError];
-        $errors['email'] = [$identifierError];
-        $errors['phone'] = [$identifierError];
     } elseif ($email === '' && $rawPhone === '') {
-        $msg = 'Please provide an email address or phone number.';
-        $errors['email_or_phone'] = [$msg];
-        $errors['email'] = [$msg];
-        $errors['phone'] = [$msg];
+        $errors['email_or_phone'] = ['Please provide an email address or phone number.'];
     } else {
         if ($email !== '' && !isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         }
-        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        if ($rawPhone !== '') {
+            $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+            if ($phoneErr !== null) {
+                $errors['phone'] = [$phoneErr];
+            }
         }
     }
 
     if (!empty($errors)) {
-        errorResponse('Validation error occurred.', $errors, 422);
+        $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
+        errorResponse(
+            count($errors) === 1 ? $firstMsg : 'Validation error occurred.',
+            $errors,
+            422,
+            ['status' => false, 'error_code' => 'VALIDATION_ERROR']
+        );
     }
 
-    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
     $activeChannel = ($requestedChannel === 'email' || ($rawPhone === '' && $email !== '')) ? 'email' : 'phone';
 
-    $user = findPasswordResetUserPhp($pdo, $email, $rawPhone, $phone, $rawNoPrefix);
+    $user = findPasswordResetUserPhp($pdo, $email, $rawPhone, $phone, $dialCode);
     if ($user && ($user['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($user['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
-        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$user['account_status']]], 403);
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$user['account_status']]], 403, ['status' => false, 'error_code' => 'ACCOUNT_' . strtoupper((string) ($user['account_status'] ?? 'LOCKED'))]);
     }
 
     $otp = null;
     $gatewayResult = null;
     if ($user) {
-        $targetPhone = (!empty($user['phone'])) ? trim((string) $user['phone']) : ($phone !== '' ? $phone : null);
+        $userRawPhone = !empty($user['normalized_phone'])
+            ? trim((string) $user['normalized_phone'])
+            : (!empty($user['phone']) ? normalizePhoneNumberPhp((string) $user['phone']) : '');
+        $targetPhone = $userRawPhone !== '' ? $userRawPhone : ($phone !== '' ? $phone : null);
         $publicEmail = getPublicSellerEmailPhp($user['email'] ?? null, (string) ($user['role'] ?? 'seller'));
         $targetEmail = $publicEmail ?: ($email !== '' ? $email : null);
 
@@ -720,7 +947,7 @@ function apiForgotPassword(PDO $pdo): void
         $otp = $isTestTarget ? getFirebaseTestOtp() : sprintf('%06d', mt_rand(100000, 999999));
         $hashedOtp = hashPassword($otp);
 
-        clearOtpRecordsPhp($pdo, $targetEmail ?: $email, $rawPhone, $targetPhone ?: $phone, $rawNoPrefix);
+        clearOtpRecordsPhp($pdo, $targetEmail ?: $email, $rawPhone, $targetPhone ?: $phone, $dialCode);
         $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (:phone, :email, :channel, :token, CURRENT_TIMESTAMP)");
         $ins->execute([
             ':phone' => $targetPhone,
@@ -775,6 +1002,7 @@ function apiVerifyOtp(PDO $pdo): void
     $ids = extractAuthIdentifiersPhp($input, false);
     $email = $ids['email'];
     $rawPhone = $ids['rawPhone'];
+    $dialCode = $ids['dialCode'] ?? '';
     $phone = $ids['phone'];
     $identifierError = $ids['identifierError'];
 
@@ -786,14 +1014,15 @@ function apiVerifyOtp(PDO $pdo): void
     $errors = [];
     if ($identifierError !== '') {
         $errors['email_or_phone'] = [$identifierError];
-        $errors['email'] = [$identifierError];
-        $errors['phone'] = [$identifierError];
     } else {
         if ($email !== '' && !isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         }
-        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        if ($rawPhone !== '') {
+            $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+            if ($phoneErr !== null) {
+                $errors['phone'] = [$phoneErr];
+            }
         }
         if ($email === '' && $rawPhone === '' && $idToken === '' && $oobCode === '') {
             $errors['email_or_phone'] = ['Email or phone number (or Firebase ID Token / OOB code) is required.'];
@@ -805,10 +1034,9 @@ function apiVerifyOtp(PDO $pdo): void
 
     if (!empty($errors)) {
         $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
-        errorResponse($firstMsg, $errors, 422);
+        errorResponse($firstMsg, $errors, 422, ['status' => false, 'error_code' => 'VALIDATION_ERROR']);
     }
 
-    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
     $firebaseRes = verifyFirebaseIdentity([
         'phone' => $phone,
         'email' => $email,
@@ -818,40 +1046,44 @@ function apiVerifyOtp(PDO $pdo): void
         'oobCode' => $oobCode
     ]);
 
-    $resolvedEmail = $email !== '' ? $email : (string) ($firebaseRes['resolvedEmail'] ?? '');
-    $resolvedPhone = $phone !== '' ? $phone : (string) ($firebaseRes['resolvedPhone'] ?? '');
-    $resolvedRawNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $resolvedPhone);
+    $resolvedEmail = $email !== '' ? $email : strtolower(trim((string) ($firebaseRes['resolvedEmail'] ?? '')));
+    $resolvedPhoneRaw = $phone !== '' ? $phone : trim((string) ($firebaseRes['resolvedPhone'] ?? ''));
+    $resolvedPhone = $resolvedPhoneRaw !== '' ? (normalizePhoneNumberPhp($resolvedPhoneRaw, $dialCode) ?: $resolvedPhoneRaw) : '';
 
     if ($resolvedEmail !== '' && !isValidEmailAddressPhp($resolvedEmail)) {
-        errorResponse('The email address format is invalid.', ['email' => ['The email address format is invalid.']], 422);
+        errorResponse('The email address format is invalid.', ['email' => ['The email address format is invalid.']], 422, ['status' => false, 'error_code' => 'VALIDATION_ERROR']);
     }
 
-    $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
-    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $dialCode);
+    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $dialCode);
     if ($matchedUser && ($matchedUser['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($matchedUser['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
-        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403);
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403, ['status' => false, 'error_code' => 'ACCOUNT_' . strtoupper((string) ($matchedUser['account_status'] ?? 'LOCKED'))]);
     }
 
     $firebaseApproved = !empty($firebaseRes['approved']);
     $localValid = $row && $code !== '' && verifyPassword($code, $row['token']);
 
     if (!$firebaseApproved && !$localValid) {
-        errorResponse('Invalid or expired OTP code.', ['code' => ['Invalid or expired OTP code.']], 422);
+        errorResponse('Invalid or expired OTP code.', ['code' => ['Invalid or expired OTP code.']], 422, ['status' => false, 'error_code' => 'INVALID_OTP']);
     }
 
     if ($firebaseApproved && !$localValid && !isFirebaseTestPhone($resolvedPhone) && !isFirebaseTestEmail($resolvedEmail) && !$matchedUser) {
-        errorResponse('No seller account matches this verified Firebase email or phone number.', [], 422);
+        errorResponse('No seller account matches this verified Firebase email or phone number.', [], 422, ['status' => false, 'error_code' => 'ACCOUNT_NOT_FOUND']);
     }
 
     $resetToken = bin2hex(random_bytes(32));
     $hashedResetToken = hashPassword($resetToken);
 
-    $targetPhone = ($matchedUser['phone'] ?? null) ?: (($row['phone'] ?? null) ?: ($resolvedPhone !== '' ? $resolvedPhone : null));
+    $userNormPhone = ($matchedUser && !empty($matchedUser['normalized_phone']))
+        ? trim((string) $matchedUser['normalized_phone'])
+        : (($matchedUser && !empty($matchedUser['phone'])) ? normalizePhoneNumberPhp((string) $matchedUser['phone']) : '');
+    $targetPhone = ($userNormPhone !== '' ? $userNormPhone : null)
+        ?: (($row['phone'] ?? null) ?: ($resolvedPhone !== '' ? $resolvedPhone : null));
     $targetEmail = ($matchedUser ? getPublicSellerEmailPhp($matchedUser['email'] ?? null, (string) ($matchedUser['role'] ?? 'seller')) : null)
         ?: (($row['email'] ?? null) ?: ($resolvedEmail !== '' ? $resolvedEmail : null));
     $resolvedChannel = ($row['channel'] ?? null) ?: (($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone');
 
-    clearOtpRecordsPhp($pdo, $targetEmail ?: $resolvedEmail, $rawPhone, $targetPhone ?: $resolvedPhone, $resolvedRawNoPrefix);
+    clearOtpRecordsPhp($pdo, $targetEmail ?: $resolvedEmail, $rawPhone, $targetPhone ?: $resolvedPhone, $dialCode);
     $ins = $pdo->prepare("INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (:phone, :email, :channel, :token, CURRENT_TIMESTAMP)");
     $ins->execute([
         ':phone' => $targetPhone,
@@ -872,10 +1104,12 @@ function apiResetPassword(PDO $pdo): void
 {
     ensurePasswordResetSchemaPhp($pdo);
     ensureSellerDeletionSchemaPhp($pdo);
+    ensureNormalizedPhoneSchemaPhp($pdo);
     $input = getJsonInput();
     $ids = extractAuthIdentifiersPhp($input, false);
     $email = $ids['email'];
     $rawPhone = $ids['rawPhone'];
+    $dialCode = $ids['dialCode'] ?? '';
     $phone = $ids['phone'];
     $identifierError = $ids['identifierError'];
 
@@ -888,14 +1122,15 @@ function apiResetPassword(PDO $pdo): void
     $errors = [];
     if ($identifierError !== '') {
         $errors['email_or_phone'] = [$identifierError];
-        $errors['email'] = [$identifierError];
-        $errors['phone'] = [$identifierError];
     } else {
         if ($email !== '' && !isValidEmailAddressPhp($email)) {
             $errors['email'] = ['The email address format is invalid.'];
         }
-        if ($rawPhone !== '' && !preg_match('/^\+[1-9]\d{7,14}$/', $phone)) {
-            $errors['phone'] = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+        if ($rawPhone !== '') {
+            $phoneErr = validatePhoneFormatPhp($phone, $rawPhone);
+            if ($phoneErr !== null) {
+                $errors['phone'] = [$phoneErr];
+            }
         }
         if ($email === '' && $rawPhone === '' && $idToken === '' && $oobCode === '') {
             $errors['email_or_phone'] = ['Please provide an email address or phone number.'];
@@ -914,22 +1149,22 @@ function apiResetPassword(PDO $pdo): void
 
     if (!empty($errors)) {
         $firstMsg = reset($errors)[0] ?? 'Validation error occurred.';
-        errorResponse($firstMsg, $errors, 422);
+        errorResponse($firstMsg, $errors, 422, ['status' => false, 'error_code' => 'VALIDATION_ERROR']);
     }
 
-    $rawNoPrefix = $rawPhone !== '' ? preg_replace('/^\+91|^\+/', '', $rawPhone) : '';
     $resolvedEmail = $email;
     $resolvedPhone = $phone;
     $resolvedChannel = ($email !== '' && $rawPhone === '') ? 'email' : 'phone';
     $firebaseResetDone = false;
 
     if ($resetToken !== '') {
-        $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $rawNoPrefix);
+        $row = findLatestOtpRecordPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $dialCode);
         if (!$row || !verifyPassword($resetToken, $row['token'])) {
-            errorResponse('Invalid or expired reset token.', ['reset_token' => ['The reset token is invalid or expired. Verify your OTP again.']], 422);
+            errorResponse('Invalid or expired reset token.', ['reset_token' => ['The reset token is invalid or expired. Verify your OTP again.']], 422, ['status' => false, 'error_code' => 'INVALID_RESET_TOKEN']);
         }
-        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($row['email'] ?? '');
-        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : (string) ($row['phone'] ?? '');
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : strtolower(trim((string) ($row['email'] ?? '')));
+        $rowPhone = trim((string) ($row['phone'] ?? ''));
+        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : ($rowPhone !== '' ? (normalizePhoneNumberPhp($rowPhone, $dialCode) ?: $rowPhone) : '');
         $resolvedChannel = ($row['channel'] ?? null) ?: (($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone');
     } elseif ($idToken !== '') {
         $fbCheck = verifyFirebaseIdentity([
@@ -938,10 +1173,11 @@ function apiResetPassword(PDO $pdo): void
             'idToken' => $idToken
         ]);
         if (empty($fbCheck['approved'])) {
-            errorResponse('Invalid or expired Firebase ID token.', ['id_token' => ['Invalid or expired Firebase ID token.']], 422);
+            errorResponse('Invalid or expired Firebase ID token.', ['id_token' => ['Invalid or expired Firebase ID token.']], 422, ['status' => false, 'error_code' => 'INVALID_FIREBASE_TOKEN']);
         }
-        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($fbCheck['resolvedEmail'] ?? '');
-        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : (string) ($fbCheck['resolvedPhone'] ?? '');
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : strtolower(trim((string) ($fbCheck['resolvedEmail'] ?? '')));
+        $fbPhone = trim((string) ($fbCheck['resolvedPhone'] ?? ''));
+        $resolvedPhone = $resolvedPhone !== '' ? $resolvedPhone : ($fbPhone !== '' ? (normalizePhoneNumberPhp($fbPhone, $dialCode) ?: $fbPhone) : '');
         $resolvedChannel = ($resolvedEmail !== '' && $resolvedPhone === '') ? 'email' : 'phone';
     } elseif ($oobCode !== '') {
         $fbCheck = verifyFirebaseIdentity([
@@ -949,26 +1185,25 @@ function apiResetPassword(PDO $pdo): void
             'oobCode' => $oobCode
         ]);
         if (empty($fbCheck['approved'])) {
-            errorResponse('Invalid or expired Firebase OOB reset code.', ['oob_code' => ['Invalid or expired Firebase OOB reset code.']], 422);
+            errorResponse('Invalid or expired Firebase OOB reset code.', ['oob_code' => ['Invalid or expired Firebase OOB reset code.']], 422, ['status' => false, 'error_code' => 'INVALID_OOB_CODE']);
         }
-        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : (string) ($fbCheck['resolvedEmail'] ?? '');
+        $resolvedEmail = $resolvedEmail !== '' ? $resolvedEmail : strtolower(trim((string) ($fbCheck['resolvedEmail'] ?? '')));
         $resolvedChannel = 'email';
     }
 
-    $resolvedRawNoPrefix = $rawNoPrefix !== '' ? $rawNoPrefix : preg_replace('/^\+91|^\+/', '', $resolvedPhone);
-    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    $matchedUser = findPasswordResetUserPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $dialCode);
     if ($matchedUser && ($matchedUser['role'] ?? 'seller') !== 'admin' && in_array(strtoupper((string) ($matchedUser['account_status'] ?? 'ACTIVE')), ['LOCKED', 'DELETED'], true)) {
-        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403);
+        errorResponse('Password reset is disabled because this seller account is locked or deleted.', ['account_status' => [$matchedUser['account_status']]], 403, ['status' => false, 'error_code' => 'ACCOUNT_' . strtoupper((string) ($matchedUser['account_status'] ?? 'LOCKED'))]);
     }
 
     if (!$matchedUser && !isFirebaseTestPhone($resolvedPhone) && !isFirebaseTestEmail($resolvedEmail)) {
-        errorResponse('No seller account matches the supplied email or phone number.', [], 422);
+        errorResponse('No seller account matches the supplied email or phone number.', [], 404, ['status' => false, 'error_code' => 'ACCOUNT_NOT_FOUND']);
     }
 
     if ($oobCode !== '' && $resetToken === '') {
         $applied = applyFirebaseOobPasswordResetPhp($oobCode, $password);
         if (empty($applied['ok'])) {
-            errorResponse((string) ($applied['error'] ?? 'Invalid or expired Firebase OOB reset code.'), [], 422);
+            errorResponse((string) ($applied['error'] ?? 'Invalid or expired Firebase OOB reset code.'), [], 422, ['status' => false, 'error_code' => 'INVALID_OOB_CODE']);
         }
         $firebaseResetDone = true;
     }
@@ -981,20 +1216,17 @@ function apiResetPassword(PDO $pdo): void
             $pdo->prepare("DELETE FROM personal_access_tokens WHERE tokenable_id = :id")->execute([':id' => (int) $matchedUser['id']]);
         } catch (Throwable $e) {}
     } elseif ($resolvedEmail !== '' && $resolvedPhone === '') {
-        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = :email")
+        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = LOWER(:email)")
             ->execute([':password' => $hashed, ':email' => $resolvedEmail]);
     } elseif ($resolvedPhone !== '') {
-        $effRaw = $rawPhone !== '' ? $rawPhone : $resolvedPhone;
-        $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE phone = :phone OR phone = :rawPhone OR phone = :rawNoPrefix")
-            ->execute([
-                ':password' => $hashed,
-                ':phone' => $resolvedPhone,
-                ':rawPhone' => $effRaw,
-                ':rawNoPrefix' => $resolvedRawNoPrefix
-            ]);
+        $targetRow = findUserByPhonePhp($pdo, $rawPhone, $resolvedPhone, $dialCode);
+        if ($targetRow) {
+            $pdo->prepare("UPDATE users SET password = :password, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+                ->execute([':password' => $hashed, ':id' => (int) $targetRow['id']]);
+        }
     }
 
-    clearOtpRecordsPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $resolvedRawNoPrefix);
+    clearOtpRecordsPhp($pdo, $resolvedEmail, $rawPhone, $resolvedPhone, $dialCode);
 
     $resPayload = [
         'message' => 'Password reset successful. Please log in again.',

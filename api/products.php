@@ -1087,6 +1087,18 @@ function ensureProductPriceColumns(PDO $pdo): void
     }
 }
 
+function parseProductBoolBitPhp(mixed $val): int
+{
+    if (is_bool($val)) {
+        return $val ? 1 : 0;
+    }
+    if (is_int($val) || is_float($val)) {
+        return ((int) $val) !== 0 ? 1 : 0;
+    }
+    $s = strtolower(trim((string) $val));
+    return in_array($s, ['0', 'false', 'no', 'off', ''], true) ? 0 : 1;
+}
+
 function apiGetProducts(PDO $pdo): void
 {
     ensureProductPriceColumns($pdo);
@@ -1098,18 +1110,31 @@ function apiGetProducts(PDO $pdo): void
     $category = trim((string) ($_GET['category'] ?? ''));
     $categoryIdParam = trim((string) ($_GET['category_id'] ?? ''));
 
-    $where = "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
+    $reqIncludeInactive = isset($_GET['include_inactive']) && in_array(strtolower((string) $_GET['include_inactive']), ['1', 'true', 'yes'], true);
+    $optionalUser = $reqIncludeInactive ? getAuthenticatedUserOptional($pdo) : null;
+    $isAdminIncludeInactive = $reqIncludeInactive && is_array($optionalUser) && strtolower((string) ($optionalUser['role'] ?? '')) === 'admin';
+
+    $where = $isAdminIncludeInactive
+        ? "WHERE 1=1"
+        : "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
     $params = [];
+    if ($isAdminIncludeInactive && isset($_GET['is_active']) && $_GET['is_active'] !== '') {
+        $where .= " AND p.is_active = :is_active";
+        $params[':is_active'] = parseProductBoolBitPhp($_GET['is_active']);
+    }
     if ($sellerId !== null) {
         $where .= " AND p.seller_id = :seller_id";
         $params[':seller_id'] = $sellerId;
     }
     if ($search !== '') {
-        $where .= " AND (p.name LIKE :search_q1 OR p.description LIKE :search_q2 OR p.category LIKE :search_q3)";
+        $where .= " AND (p.name LIKE :search_q1 OR p.description LIKE :search_q2 OR p.category LIKE :search_q3 OR COALESCE(p.sku, '') LIKE :search_q4 OR COALESCE(p.brand, '') LIKE :search_q5 OR COALESCE(u.seller_name, u.name, '') LIKE :search_q6)";
         $sLike = '%' . $search . '%';
         $params[':search_q1'] = $sLike;
         $params[':search_q2'] = $sLike;
         $params[':search_q3'] = $sLike;
+        $params[':search_q4'] = $sLike;
+        $params[':search_q5'] = $sLike;
+        $params[':search_q6'] = $sLike;
     }
     if ($categoryIdParam !== '' && ctype_digit($categoryIdParam)) {
         $catRow = findCategoryByIdOrSlugPhp($pdo, $categoryIdParam);
@@ -1196,6 +1221,12 @@ function apiGetProducts(PDO $pdo): void
 function apiGetProduct(PDO $pdo, int $id): void
 {
     ensureProductPriceColumns($pdo);
+    $reqIncludeInactive = isset($_GET['include_inactive']) && in_array(strtolower((string) $_GET['include_inactive']), ['1', 'true', 'yes'], true);
+    $optionalUser = $reqIncludeInactive ? getAuthenticatedUserOptional($pdo) : null;
+    $isAdminIncludeInactive = $reqIncludeInactive && is_array($optionalUser) && strtolower((string) ($optionalUser['role'] ?? '')) === 'admin';
+    $activeSql = $isAdminIncludeInactive
+        ? "p.id = :id"
+        : "p.id = :id AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
     $stmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
@@ -1203,7 +1234,7 @@ function apiGetProduct(PDO $pdo, int $id): void
                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
         FROM products p
         LEFT JOIN users u ON p.seller_id = u.id
-        WHERE p.id = :id AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
+        WHERE {$activeSql}
         LIMIT 1
     ");
     $stmt->execute([':id' => $id]);
@@ -1649,7 +1680,16 @@ function saveUploadedProductImages(array $input = [], ?string $fallback = null):
             }
         }
 
-        // Multi-URL strings separated by comma, newline, semicolon, pipe, or space
+        // Multi-line or multi-URL strings (also split newline-separated items if mixing URLs and data:image/ URIs)
+        if (str_starts_with(strtolower($trimmed), 'data:image/') && preg_match('/[\r\n]+\s*(?:https?:\/\/|\/uploads\/|data:image\/)/i', $trimmed)) {
+            $lineParts = preg_split('/[\r\n]+/', $trimmed);
+            if (count($lineParts) > 1) {
+                foreach ($lineParts as $p) {
+                    $processCandidate($p);
+                }
+                return;
+            }
+        }
         if (!str_starts_with(strtolower($trimmed), 'data:image/')) {
             if (preg_match('/[,;\n\r|]/', $trimmed)) {
                 $parts = preg_split('/[,;\n\r|]+/', $trimmed);
@@ -1993,7 +2033,7 @@ function apiUploadImage(PDO $pdo): void
         $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
         $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $targetProductId]);
 
-        syncProductImagesRecordPHP($pdo, (int)$user['id'], $targetProductId, $combinedImgs, $res['filesInfo'] ?? []);
+        syncProductImagesRecordPHP($pdo, (int)($prod['seller_id'] ?? $user['id']), $targetProductId, $combinedImgs, $res['filesInfo'] ?? []);
 
         $fetchStmt = $pdo->prepare("
             SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
@@ -2276,7 +2316,7 @@ function apiReplaceProductImage(PDO $pdo, int $productId, mixed $targetIdOrFile 
     $updStmt = $pdo->prepare("UPDATE products SET image_url = :url, images = :imgs, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
     $updStmt->execute([':url' => $primaryUrl, ':imgs' => $imagesJson, ':id' => $productId]);
 
-    syncProductImagesRecordPHP($pdo, (int)$user['id'], $productId, $newImages, $res['filesInfo'] ?? []);
+    syncProductImagesRecordPHP($pdo, (int)($product['seller_id'] ?? $user['id']), $productId, $newImages, $res['filesInfo'] ?? []);
 
     // Safe deletion of old physical file ONLY IF explicitly replaced and not present in newImages
     foreach ($replacedUrls as $repUrl) {
@@ -2492,6 +2532,25 @@ function apiCreateProduct(PDO $pdo): void
         errorResponse('Validation error occurred.', $errors, 422);
     }
 
+    $targetSellerId = (int) $user['id'];
+    $isAdminCaller = strtolower((string) ($user['role'] ?? '')) === 'admin';
+    if ($isAdminCaller && array_key_exists('seller_id', $input) && $input['seller_id'] !== '' && $input['seller_id'] !== null) {
+        if (!is_numeric($input['seller_id']) || (int) $input['seller_id'] <= 0) {
+            errorResponse('Validation error occurred.', ['seller_id' => ['Seller ID must be a valid positive integer.']], 422);
+        }
+        $candSellerId = (int) $input['seller_id'];
+        $sStmt = $pdo->prepare("SELECT id, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = :id LIMIT 1");
+        $sStmt->execute([':id' => $candSellerId]);
+        $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+        if (!$sRow) {
+            errorResponse('Selected seller was not found.', ['seller_id' => ['Selected seller was not found.']], 422);
+        }
+        if (strtoupper((string) ($sRow['account_status'] ?? 'ACTIVE')) === 'DELETED') {
+            errorResponse('Cannot assign product to a deleted seller account.', ['seller_id' => ['Selected seller is permanently deleted.']], 422);
+        }
+        $targetSellerId = $candSellerId;
+    }
+
     // Inline create-and-assign new category during product creation if requested
     $inlineNewCatName = trim((string) (
         is_array($input['create_category'] ?? null)
@@ -2533,7 +2592,7 @@ function apiCreateProduct(PDO $pdo): void
                 ? "SELECT image_url FROM product_images WHERE seller_id = :sid AND product_id IS NULL AND created_at >= datetime('now', '-5 minutes') ORDER BY id ASC LIMIT 4"
                 : "SELECT image_url FROM product_images WHERE seller_id = :sid AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE ORDER BY id ASC LIMIT 4";
             $unStmt = $pdo->prepare($unSql);
-            $unStmt->execute([':sid' => (int)$user['id']]);
+            $unStmt->execute([':sid' => $targetSellerId]);
             $unRows = $unStmt->fetchAll(PDO::FETCH_ASSOC);
             foreach ($unRows as $ur) {
                 if (count($finalImages) < 4 && !str_contains(strtolower($ur['image_url']), 'placeholder') && !str_contains(strtolower($ur['image_url']), 'unsplash.com')) {
@@ -2560,13 +2619,16 @@ function apiCreateProduct(PDO $pdo): void
     $categoryId = $catRes['category_id'];
     $brand = trim((string)($input['brand'] ?? '')) ?: 'Generic';
     $mrp = (float) $pricing['mrp'];
+    $isActiveBit = (array_key_exists('is_active', $input) && $input['is_active'] !== '' && $input['is_active'] !== null)
+        ? parseProductBoolBitPhp($input['is_active'])
+        : 1;
 
     $stmt = $pdo->prepare("
         INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        VALUES (:seller_id, :name, :description, :sku, :category, :category_id, :brand, :mrp, :seller_price, :commission, :delivery_charge, :gst, :other_charges, :price, :stock, :image_url, :images, :is_active, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ");
     $stmt->execute([
-        ':seller_id' => $user['id'],
+        ':seller_id' => $targetSellerId,
         ':name' => $name,
         ':description' => $input['description'] ?? null,
         ':sku' => $sku,
@@ -2583,10 +2645,11 @@ function apiCreateProduct(PDO $pdo): void
         ':stock' => (int) $stock,
         ':image_url' => $finalPrimaryUrl,
         ':images' => $finalImagesJson,
+        ':is_active' => $isActiveBit,
     ]);
 
     $id = (int) $pdo->lastInsertId();
-    syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $finalImages, $imgResult['filesInfo'] ?? []);
+    syncProductImagesRecordPHP($pdo, $targetSellerId, $id, $finalImages, $imgResult['filesInfo'] ?? []);
     $fetchStmt = $pdo->prepare("
         SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
@@ -2746,6 +2809,28 @@ function apiUpdateProduct(PDO $pdo, int $id): void
     $input = array_merge($_POST, getJsonInput());
     $updates = [];
     $params = [':id' => $id];
+    $ownerSellerId = (int) $product['seller_id'];
+    $isAdminCaller = strtolower((string) ($user['role'] ?? '')) === 'admin';
+    if ($isAdminCaller && array_key_exists('seller_id', $input) && $input['seller_id'] !== '' && $input['seller_id'] !== null) {
+        if (!is_numeric($input['seller_id']) || (int) $input['seller_id'] <= 0) {
+            errorResponse('Validation error occurred.', ['seller_id' => ['Seller ID must be a valid positive integer.']], 422);
+        }
+        $candSellerId = (int) $input['seller_id'];
+        $sStmt = $pdo->prepare("SELECT id, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = :id LIMIT 1");
+        $sStmt->execute([':id' => $candSellerId]);
+        $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+        if (!$sRow) {
+            errorResponse('Selected seller was not found.', ['seller_id' => ['Selected seller was not found.']], 422);
+        }
+        if (strtoupper((string) ($sRow['account_status'] ?? 'ACTIVE')) === 'DELETED') {
+            errorResponse('Cannot assign product to a deleted seller account.', ['seller_id' => ['Selected seller is permanently deleted.']], 422);
+        }
+        if ($candSellerId !== $ownerSellerId) {
+            $updates[] = "seller_id = :seller_id";
+            $params[':seller_id'] = $candSellerId;
+            $ownerSellerId = $candSellerId;
+        }
+    }
 
     // Support editing/renaming a category directly through PUT/PATCH/POST /api/products/:id
     $catMutationRes = null;
@@ -2898,12 +2983,17 @@ function apiUpdateProduct(PDO $pdo, int $id): void
         $params[':image_url'] = !empty($finalImages) ? $finalImages[0] : null;
         $updates[] = "images = :images";
         $params[':images'] = !empty($finalImages) ? json_encode($finalImages) : null;
-        syncProductImagesRecordPHP($pdo, (int)$user['id'], $id, $finalImages, $imgResult['filesInfo'] ?? []);
+        syncProductImagesRecordPHP($pdo, $ownerSellerId, $id, $finalImages, $imgResult['filesInfo'] ?? []);
+    } elseif (!empty($input['clear_images']) && parseProductBoolBitPhp($input['clear_images']) === 1) {
+        $updates[] = "image_url = :image_url";
+        $params[':image_url'] = null;
+        $updates[] = "images = :images";
+        $params[':images'] = null;
     }
 
-    if (isset($input['is_active'])) {
+    if (array_key_exists('is_active', $input) && $input['is_active'] !== '' && $input['is_active'] !== null) {
         $updates[] = "is_active = :is_active";
-        $params[':is_active'] = $input['is_active'] ? 1 : 0;
+        $params[':is_active'] = parseProductBoolBitPhp($input['is_active']);
     }
 
     if (!empty($updates)) {
@@ -2961,6 +3051,27 @@ function apiDeleteProduct(PDO $pdo, int $id): void
         errorResponse('Access denied. You do not own this product.', [], 403);
     }
 
+    $orderRefCount = 0;
+    try {
+        $oiStmt = $pdo->prepare("SELECT COUNT(*) FROM order_items WHERE product_id = :id");
+        $oiStmt->execute([':id' => $id]);
+        $orderRefCount = (int) $oiStmt->fetchColumn();
+    } catch (\Throwable $e) {
+        $orderRefCount = 0;
+    }
+
+    if ($orderRefCount > 0) {
+        $archStmt = $pdo->prepare("UPDATE products SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
+        $archStmt->execute([':id' => $id]);
+        jsonResponse([
+            'success' => true,
+            'status' => true,
+            'archived' => true,
+            'order_references' => $orderRefCount,
+            'message' => 'Product has existing order history and was deactivated to preserve order records.'
+        ]);
+    }
+
     $imagesToDelete = [];
     if (!empty($product['images'])) {
         $dec = json_decode($product['images'], true);
@@ -2984,5 +3095,10 @@ function apiDeleteProduct(PDO $pdo, int $id): void
         }
     }
 
-    jsonResponse(['message' => 'Product deleted.']);
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'archived' => false,
+        'message' => 'Product deleted.'
+    ]);
 }

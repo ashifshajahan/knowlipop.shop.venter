@@ -15,6 +15,7 @@ class User
     public string $email;
     public ?string $seller_name = null;
     public ?string $phone = null;
+    public ?string $normalized_phone = null;
     public ?string $address = null;
     public ?string $landmark = null;
     public ?string $state = null;
@@ -43,8 +44,21 @@ class User
 
     public static function findByPhone(PDO $pdo, string $phone): ?self
     {
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone = :phone LIMIT 1");
-        $stmt->execute([':phone' => $phone]);
+        if (function_exists('findUserByPhonePhp')) {
+            $row = findUserByPhonePhp($pdo, $phone);
+            return $row ? new self($row) : null;
+        }
+        $cleaned = preg_replace('/[\s\-\(\)\.]+/u', '', trim($phone));
+        $digitsOnly = preg_replace('/\D+/', '', (string) $cleaned);
+        $ten = (strlen($digitsOnly) === 10) ? ('+91' . $digitsOnly) : (str_starts_with((string) $cleaned, '+') ? $cleaned : ('+' . $cleaned));
+        $localNoPrefix = preg_replace('/^\+?91/', '', (string) $cleaned);
+        $variants = array_values(array_unique(array_filter([$ten, $cleaned, $digitsOnly, $localNoPrefix])));
+        $placeholders = implode(', ', array_map(fn($i) => ':p' . $i, array_keys($variants)));
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE phone IN ({$placeholders}) LIMIT 1");
+        foreach ($variants as $i => $v) {
+            $stmt->bindValue(':p' . $i, $v);
+        }
+        $stmt->execute();
         $row = $stmt->fetch();
         return $row ? new self($row) : null;
     }

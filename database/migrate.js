@@ -4,6 +4,24 @@ const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
+function normalizePhoneMigration(raw) {
+  if (!raw) return '';
+  let cleaned = String(raw).trim().replace(/[\s\-\(\)\.]+/g, '');
+  if (!cleaned || !/^\+?\d+$/.test(cleaned)) return '';
+  if (cleaned.startsWith('00') && cleaned.length > 4) {
+    cleaned = '+' + cleaned.slice(2);
+  }
+  if (cleaned.startsWith('+')) {
+    const m91 = cleaned.match(/^\+910([6-9]\d{9})$/);
+    return m91 ? '+91' + m91[1] : cleaned;
+  }
+  if (/^\d{10}$/.test(cleaned)) return '+91' + cleaned;
+  const m0 = cleaned.match(/^0(\d{10})$/);
+  if (m0) return '+91' + m0[1];
+  if (/^91\d{10}$/.test(cleaned)) return '+' + cleaned;
+  return '+' + cleaned;
+}
+
 async function runMigration() {
   const host = process.env.DB_HOST || '127.0.0.1';
   const port = parseInt(process.env.DB_PORT || '3306', 10);
@@ -76,11 +94,74 @@ async function runMigration() {
     }
   };
 
+  await ensureColumn('users', 'normalized_phone', '`normalized_phone` VARCHAR(30) NULL DEFAULT NULL AFTER `phone`');
   await ensureColumn('users', 'account_status', "`account_status` VARCHAR(40) NOT NULL DEFAULT 'ACTIVE' AFTER `role`");
   await ensureColumn('users', 'deletion_requested_at', '`deletion_requested_at` TIMESTAMP NULL DEFAULT NULL AFTER `account_status`');
   await ensureColumn('users', 'deleted_at', '`deleted_at` TIMESTAMP NULL DEFAULT NULL AFTER `deletion_requested_at`');
   await ensureColumn('users', 'deleted_by', '`deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `deleted_at`');
   await ensureColumn('users', 'token_version', '`token_version` INT NOT NULL DEFAULT 1 AFTER `deleted_by`');
+
+  // Non-destructive backfill & duplicate audit for normalized_phone before adding UNIQUE index
+  try {
+    const [phoneRows] = await conn.query(
+      "SELECT id, phone, normalized_phone, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE phone IS NOT NULL AND TRIM(phone) != '' ORDER BY id ASC"
+    );
+    const groups = new Map();
+    for (const row of phoneRows) {
+      const norm = normalizePhoneMigration(row.phone);
+      if (!norm) continue;
+      if (!groups.has(norm)) groups.set(norm, []);
+      groups.get(norm).push(row);
+    }
+
+    let backfilledCount = 0;
+    const duplicateReports = [];
+    for (const [norm, members] of groups.entries()) {
+      members.sort((a, b) => {
+        const aBlocked = ['LOCKED', 'DELETED'].includes(String(a.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+        const bBlocked = ['LOCKED', 'DELETED'].includes(String(b.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+        if (aBlocked !== bBlocked) return aBlocked - bBlocked;
+        const aHeld = a.normalized_phone === norm ? 0 : 1;
+        const bHeld = b.normalized_phone === norm ? 0 : 1;
+        if (aHeld !== bHeld) return aHeld - bHeld;
+        return Number(a.id) - Number(b.id);
+      });
+
+      const canonical = members[0];
+      if (canonical.normalized_phone !== norm) {
+        await conn.query('UPDATE users SET normalized_phone = NULL WHERE normalized_phone = ? AND id != ?', [norm, canonical.id]);
+        await conn.query('UPDATE users SET normalized_phone = ? WHERE id = ?', [norm, canonical.id]);
+        backfilledCount++;
+      }
+
+      if (members.length > 1) {
+        duplicateReports.push({
+          normalized_phone: norm,
+          canonical_user_id: canonical.id,
+          duplicate_user_ids: members.slice(1).map(m => m.id)
+        });
+        for (const dup of members.slice(1)) {
+          if (dup.normalized_phone) {
+            await conn.query('UPDATE users SET normalized_phone = NULL WHERE id = ?', [dup.id]);
+          }
+        }
+      }
+    }
+    if (backfilledCount > 0) {
+      console.log(`✅ Backfilled normalized_phone for ${backfilledCount} canonical user record(s)`);
+    }
+    if (duplicateReports.length > 0) {
+      console.warn('⚠️ Preserved existing duplicate legacy phone records (normalized_phone cleared on secondary rows):', JSON.stringify(duplicateReports));
+    }
+
+    const [normIdx] = await conn.query("SHOW INDEX FROM users WHERE Column_name = 'normalized_phone' AND Non_unique = 0");
+    if (normIdx.length === 0) {
+      await conn.query('ALTER TABLE users ADD UNIQUE INDEX uniq_users_normalized_phone (normalized_phone)');
+      console.log('✅ Added UNIQUE index uniq_users_normalized_phone on users(normalized_phone)');
+    }
+  } catch (normErr) {
+    console.warn('⚠️ normalized_phone migration notice:', normErr.message);
+  }
 
   try {
     const [uIdx] = await conn.query('SHOW INDEX FROM users WHERE Key_name = "idx_users_account_status"');

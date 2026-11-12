@@ -491,6 +491,10 @@ function handleMulterUpload(req, res, next) {
           try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
         }
 
+        if ((!rawBuf || rawBuf.length === 0) && !String(f.originalname || '').trim()) {
+          continue;
+        }
+
         const hash = crypto.createHash('sha256').update(rawBuf).digest('hex');
         if (seenHashes.has(hash)) {
           // Duplicate file in same request: skip duplicate
@@ -731,7 +735,14 @@ async function resolveProductImages(req) {
         }
       }
 
-      // Handle multi-URL strings separated by comma, newline, semicolon, pipe, or spaces
+      // Handle newline-separated items when mixing data:image/ URIs and URLs, or multi-URL strings
+      if (trimmed.toLowerCase().startsWith('data:image/') && /[\r\n]+\s*(?:https?:\/\/|\/uploads\/|data:image\/)/i.test(trimmed)) {
+        const lineParts = trimmed.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean);
+        if (lineParts.length > 1) {
+          for (const p of lineParts) await processCandidate(p);
+          return;
+        }
+      }
       if (!trimmed.startsWith('data:image/')) {
         if (/[,;\n\r|]/.test(trimmed)) {
           const parts = trimmed.split(/[,;\n\r|]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
@@ -972,33 +983,53 @@ async function safeDeleteLocalImageFile(pPool, fileName, excludeProductId = null
     return false; // Never delete placeholders or sample images!
   }
 
+  const dbActive = pPool
+    ? await checkDbReachable(pPool, typeof deletionCtx !== 'undefined' ? deletionCtx : null)
+    : false;
+
+  if (dbActive) {
+    try {
+      // Check if any other product in products table uses this file
+      const searchPattern = `%${safeName}%`;
+      let query = 'SELECT id FROM products WHERE (image_url LIKE ? OR images LIKE ?)';
+      const params = [searchPattern, searchPattern];
+      if (excludeProductId) {
+        query += ' AND id != ?';
+        params.push(excludeProductId);
+      }
+      const [rows] = await pPool.query(query, params);
+      if (rows.length > 0) {
+        // File is still referenced by another product! Do not delete physical file!
+        return false;
+      }
+
+      // Check if referenced by any other product_images record
+      let piQuery = 'SELECT id FROM product_images WHERE file_name = ?';
+      const piParams = [safeName];
+      if (excludeProductId) {
+        piQuery += ' AND (product_id IS NULL OR product_id != ?)';
+        piParams.push(excludeProductId);
+      }
+      const [piRows] = await pPool.query(piQuery, piParams);
+      if (piRows.length > 0) {
+        return false;
+      }
+    } catch (e) {
+      console.error('Error checking DB refs during safe file delete:', e);
+      return false;
+    }
+  } else if (typeof fallbackProducts !== 'undefined' && Array.isArray(fallbackProducts)) {
+    const referencedInFb = fallbackProducts.some(fp => {
+      if (excludeProductId && Number(fp.id) === Number(excludeProductId)) return false;
+      const imgsStr = JSON.stringify(fp.images || '') + ' ' + String(fp.image_url || '');
+      return imgsStr.includes(safeName);
+    });
+    if (referencedInFb) {
+      return false;
+    }
+  }
+
   try {
-    // Check if any other product in products table uses this file
-    const searchPattern = `%${safeName}%`;
-    let query = 'SELECT id FROM products WHERE (image_url LIKE ? OR images LIKE ?)';
-    const params = [searchPattern, searchPattern];
-    if (excludeProductId) {
-      query += ' AND id != ?';
-      params.push(excludeProductId);
-    }
-    const [rows] = await pPool.query(query, params);
-    if (rows.length > 0) {
-      // File is still referenced by another product! Do not delete physical file!
-      return false;
-    }
-
-    // Check if referenced by any other product_images record
-    let piQuery = 'SELECT id FROM product_images WHERE file_name = ?';
-    const piParams = [safeName];
-    if (excludeProductId) {
-      piQuery += ' AND (product_id IS NULL OR product_id != ?)';
-      piParams.push(excludeProductId);
-    }
-    const [piRows] = await pPool.query(piQuery, piParams);
-    if (piRows.length > 0) {
-      return false;
-    }
-
     // Safe to delete physical file
     const deleteTargets = [
       path.join(uploadDir, safeName),
@@ -1198,7 +1229,8 @@ async function autoMigrateIfEmpty(p) {
       await ensureProductPriceColumns(p);
       await ensureGstTables(p);
       await ensureSellerDeletionSchemaNode(p);
-      console.log('✅ [Vendor DB] Ensured orders, order_items, GST, Seller Deletion tables, and product pricing columns exist');
+      await ensureNormalizedPhoneSchemaNode(p);
+      console.log('✅ [Vendor DB] Ensured orders, order_items, GST, Seller Deletion tables, normalized_phone index, and product pricing columns exist');
     } catch (e) {
       // ignore
     }
@@ -1308,8 +1340,14 @@ function extractTokenFromReq(req) {
   if (req.query && (req.query.token || req.query.api_token || req.query.bearer_token)) {
     return String(req.query.token || req.query.api_token || req.query.bearer_token).trim();
   }
-  if (req.cookies && (req.cookies.token || req.cookies.seller_token || req.cookies.admin_token)) {
-    return String(req.cookies.token || req.cookies.seller_token || req.cookies.admin_token).trim();
+  if (req.cookies) {
+    const reqPath = String((req.originalUrl || req.path || '')).toLowerCase();
+    const isAdminPath = reqPath.startsWith('/admin') || reqPath.startsWith('/api/admin');
+    if (isAdminPath && req.cookies.admin_token) {
+      return String(req.cookies.admin_token).trim();
+    }
+    const cTok = req.cookies.token || req.cookies.seller_token || req.cookies.admin_token;
+    if (cTok) return String(cTok).trim();
   }
   return null;
 }
@@ -1677,22 +1715,37 @@ function extractField(body, candidates, defaultValue = '') {
   return defaultValue;
 }
 
-// Universal phone extractor supporting all frontend naming conventions
-function extractPhone(body) {
+function extractDialCodeNode(body) {
   if (!body || typeof body !== 'object') return '';
-
-  // 1. If phone is an object: { number, country_code }
+  for (const k of ['country_code', 'countryCode', 'dial_code', 'dialCode']) {
+    if (body[k] !== undefined && body[k] !== null && typeof body[k] !== 'object' && String(body[k]).trim() !== '') {
+      return String(body[k]).trim();
+    }
+  }
   for (const k of ['phone', 'mobile', 'contact', 'telephone']) {
     if (body[k] && typeof body[k] === 'object') {
-      const num = body[k].number || body[k].phone || body[k].value || '';
-      const code = body[k].country_code || body[k].countryCode || body[k].dial_code || body[k].dialCode || '+91';
+      const code = body[k].country_code || body[k].countryCode || body[k].dial_code || body[k].dialCode || '';
+      if (String(code).trim() !== '') {
+        return String(code).trim();
+      }
+    }
+  }
+  return '';
+}
+
+function extractPhonePartsNode(body) {
+  if (!body || typeof body !== 'object') return { rawPhone: '', dialCode: '' };
+
+  for (const k of ['phone', 'mobile', 'contact', 'telephone']) {
+    if (body[k] && typeof body[k] === 'object') {
+      const num = String(body[k].number || body[k].phone || body[k].value || '').trim();
+      const code = String(body[k].country_code || body[k].countryCode || body[k].dial_code || body[k].dialCode || '+91').trim();
       if (num) {
-        return (String(num).startsWith('+') ? '' : code) + String(num);
+        return { rawPhone: num, dialCode: num.startsWith('+') ? '' : code };
       }
     }
   }
 
-  // 2. Direct check with comprehensive candidate list
   const candidates = [
     'phone', 'phone_no', 'phoneNo', 'phoneno', 'phone_number', 'phoneNumber', 'phonenumber',
     'mobile', 'mobile_no', 'mobileNo', 'mobileno', 'mobile_number', 'mobileNumber',
@@ -1707,7 +1760,7 @@ function extractPhone(body) {
     for (const key of Object.keys(body)) {
       if (/^(seller|user)?_?(phone|mobile|contact|tel)/i.test(key) && !/^contact_?(id|email|type|name|person)/i.test(key)) {
         const val = body[key];
-        if (val !== undefined && val !== null && String(val).trim() !== '') {
+        if (val !== undefined && val !== null && typeof val !== 'object' && String(val).trim() !== '') {
           raw = String(val).trim();
           break;
         }
@@ -1715,15 +1768,16 @@ function extractPhone(body) {
     }
   }
 
-  if (!raw) return '';
+  if (!raw) return { rawPhone: '', dialCode: '' };
+  return { rawPhone: raw, dialCode: extractDialCodeNode(body) };
+}
 
-  // Attach separate dial/country code if passed
-  const dialCode = body.country_code || body.countryCode || body.dial_code || body.dialCode;
-  if (dialCode && !raw.startsWith('+')) {
-    raw = String(dialCode).trim() + raw;
-  }
-
-  return raw;
+// Universal phone extractor supporting all frontend naming conventions
+function extractPhone(body) {
+  const { rawPhone, dialCode } = extractPhonePartsNode(body);
+  if (!rawPhone) return '';
+  const norm = normalizePhoneNumberNode(rawPhone, dialCode);
+  return norm || rawPhone;
 }
 
 // Universal password extractor
@@ -1741,23 +1795,347 @@ function extractConfirmPassword(body, password) {
   ];
 
   const val = extractField(body, candidates, '').trim();
-  // If not supplied, null, or empty string in payload (e.g. client validated client-side),
-  // fallback to password so it doesn't fail registration!
   if (!val) {
     return password;
   }
   return val;
 }
 
-// Helper to normalize phone number (+91 formatting)
-function normalizePhone(raw) {
-  if (!raw) return '';
-  let str = raw.toString().trim().replace(/[\s\-\(\)]/g, '');
-  if (!str) return '';
-  if (str.startsWith('+')) return str;
-  if (/^\d{10}$/.test(str)) return '+91' + str;
-  if (/^91\d{10}$/.test(str)) return '+' + str;
-  return '+' + str;
+function validatePhoneFormatNode(normalizedPhone, rawPhone = '') {
+  if (rawPhone) {
+    const stripped = String(rawPhone).trim().replace(/[\s\-\(\)\.]+/g, '');
+    if (!stripped || !/^\+?\d+$/.test(stripped)) {
+      return 'The phone number contains invalid characters. Enter digits only with optional country code (e.g. +919876543210).';
+    }
+  }
+
+  if (!normalizedPhone) {
+    return rawPhone
+      ? 'The phone format is invalid (must include country code, e.g. +919876543210).'
+      : null;
+  }
+
+  if (normalizedPhone.startsWith('+91')) {
+    if (!/^\+91[6-9]\d{9}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for India (+91 followed by 10 digits starting with 6-9, e.g. +919876543210).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+1')) {
+    if (!/^\+1[2-9]\d{9}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for US/Canada (+1 followed by 10 digits, e.g. +12025550143).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+44')) {
+    if (!/^\+44[1-9]\d{8,9}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for UK (+44 followed by 9-10 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+971')) {
+    if (!/^\+971[2-9]\d{7,8}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for UAE (+971 followed by 8-9 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+966')) {
+    if (!/^\+966[1-9]\d{8}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Saudi Arabia (+966 followed by 9 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+65')) {
+    if (!/^\+65[689]\d{7}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Singapore (+65 followed by 8 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+61')) {
+    if (!/^\+61[2-478]\d{8}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Australia (+61 followed by 9 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+49')) {
+    if (!/^\+49[1-9]\d{6,11}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Germany (+49 followed by 7-12 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+60')) {
+    if (!/^\+60[1-9]\d{7,9}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Malaysia (+60 followed by 8-10 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+974')) {
+    if (!/^\+974[3-7]\d{7}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Qatar (+974 followed by 8 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+968')) {
+    if (!/^\+968[279]\d{7}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Oman (+968 followed by 8 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+965')) {
+    if (!/^\+965[2569]\d{7}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Kuwait (+965 followed by 8 digits).';
+    }
+    return null;
+  }
+  if (normalizedPhone.startsWith('+973')) {
+    if (!/^\+973[13678]\d{7}$/.test(normalizedPhone)) {
+      return 'The phone format is invalid for Bahrain (+973 followed by 8 digits).';
+    }
+    return null;
+  }
+
+  if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) {
+    return 'The phone format is invalid (must include country code, e.g. +919876543210).';
+  }
+  return null;
+}
+
+function normalizePhoneNumberNode(raw, dialCode = '') {
+  if (!raw && raw !== 0) return '';
+  const trimmed = String(raw).trim();
+  if (!trimmed) return '';
+
+  let cleaned = trimmed.replace(/[\s\-\(\)\.]+/g, '');
+  if (!cleaned || !/^\+?\d+$/.test(cleaned)) return '';
+
+  if (cleaned.startsWith('00') && cleaned.length > 4) {
+    cleaned = '+' + cleaned.slice(2);
+  }
+
+  let cleanDial = '';
+  if (dialCode) {
+    let rawDial = String(dialCode).trim().replace(/[\s\-\(\)]+/g, '');
+    if (rawDial.startsWith('00')) rawDial = '+' + rawDial.slice(2);
+    else if (rawDial && !rawDial.startsWith('+') && /^\d{1,4}$/.test(rawDial)) rawDial = '+' + rawDial;
+    if (/^\+[1-9]\d{0,3}$/.test(rawDial)) cleanDial = rawDial;
+  }
+
+  if (cleaned.startsWith('+')) {
+    const m91 = cleaned.match(/^\+910([6-9]\d{9})$/);
+    return m91 ? '+91' + m91[1] : cleaned;
+  }
+
+  if (cleanDial) {
+    const dialDigits = cleanDial.slice(1);
+    if (dialDigits === '91') {
+      if (/^91\d{10}$/.test(cleaned)) return '+' + cleaned;
+      const m0 = cleaned.match(/^0(\d{10})$/);
+      if (m0) return '+91' + m0[1];
+      return '+91' + cleaned;
+    }
+
+    const m0Intl = cleaned.match(/^0(\d{5,14})$/);
+    if (m0Intl) cleaned = m0Intl[1];
+
+    if (cleaned.startsWith(dialDigits)) {
+      const candAsFull = '+' + cleaned;
+      const candPrefixed = '+' + dialDigits + cleaned;
+      if (validatePhoneFormatNode(candAsFull) === null && validatePhoneFormatNode(candPrefixed) !== null) {
+        return candAsFull;
+      }
+    }
+    return '+' + dialDigits + cleaned;
+  }
+
+  if (/^\d{10}$/.test(cleaned)) return '+91' + cleaned;
+  const m0 = cleaned.match(/^0(\d{10})$/);
+  if (m0) return '+91' + m0[1];
+  if (/^91\d{10}$/.test(cleaned)) return '+' + cleaned;
+
+  return '+' + cleaned;
+}
+
+// Helper to normalize phone number (+91 & international formatting)
+function normalizePhone(raw, dialCode = '') {
+  return normalizePhoneNumberNode(raw, dialCode);
+}
+
+function getPhoneLookupVariantsNode(rawPhone, normalizedPhone = '', dialCode = '') {
+  const norm = normalizedPhone || normalizePhoneNumberNode(rawPhone, dialCode);
+  const variants = new Set();
+
+  if (norm) {
+    variants.add(norm);
+    const m91 = norm.match(/^\+91(\d{10})$/);
+    if (m91) {
+      const ten = m91[1];
+      variants.add('+91' + ten);
+      variants.add('91' + ten);
+      variants.add(ten);
+      variants.add('0' + ten);
+      variants.add('0091' + ten);
+      variants.add('+910' + ten);
+    } else {
+      const mIntl = norm.match(/^\+(\d{7,15})$/);
+      if (mIntl) {
+        const digits = mIntl[1];
+        variants.add(digits);
+        variants.add('00' + digits);
+      }
+    }
+  }
+
+  if (rawPhone) {
+    const cleanedRaw = String(rawPhone).trim().replace(/[\s\-\(\)\.]+/g, '');
+    if (cleanedRaw && /^\+?\d{8,15}$/.test(cleanedRaw)) {
+      variants.add(cleanedRaw);
+    }
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
+let nodeNormalizedPhoneSchemaEnsured = false;
+async function ensureNormalizedPhoneSchemaNode(p, force = false) {
+  if (!p) return { skipped: true };
+  if (!force && nodeNormalizedPhoneSchemaEnsured) return { skipped: true };
+
+  const report = { column_added: false, index_added: false, backfilled_rows: 0, duplicate_groups: [] };
+  try {
+    const [cols] = await p.query("SHOW COLUMNS FROM users LIKE 'normalized_phone'");
+    if (cols.length === 0) {
+      await p.query('ALTER TABLE users ADD COLUMN normalized_phone VARCHAR(30) NULL DEFAULT NULL AFTER phone');
+      report.column_added = true;
+    }
+
+    const [normIdx] = await p.query("SHOW INDEX FROM users WHERE Column_name = 'normalized_phone' AND Non_unique = 0");
+    if (force || normIdx.length === 0 || report.column_added) {
+      const [rows] = await p.query(
+        "SELECT id, phone, normalized_phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE phone IS NOT NULL AND TRIM(phone) != '' ORDER BY id ASC"
+      );
+      const groups = new Map();
+      for (const row of rows) {
+        const norm = normalizePhoneNumberNode(row.phone);
+        if (!norm) continue;
+        if (!groups.has(norm)) groups.set(norm, []);
+        groups.get(norm).push(row);
+      }
+
+      for (const [norm, members] of groups.entries()) {
+        members.sort((a, b) => {
+          const aBlocked = ['LOCKED', 'DELETED'].includes(String(a.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+          const bBlocked = ['LOCKED', 'DELETED'].includes(String(b.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+          if (aBlocked !== bBlocked) return aBlocked - bBlocked;
+          const aHeld = a.normalized_phone === norm ? 0 : 1;
+          const bHeld = b.normalized_phone === norm ? 0 : 1;
+          if (aHeld !== bHeld) return aHeld - bHeld;
+          return Number(a.id) - Number(b.id);
+        });
+
+        const canonical = members[0];
+        if (canonical.normalized_phone !== norm) {
+          await p.query('UPDATE users SET normalized_phone = NULL WHERE normalized_phone = ? AND id != ?', [norm, canonical.id]);
+          await p.query('UPDATE users SET normalized_phone = ? WHERE id = ?', [norm, canonical.id]);
+          report.backfilled_rows++;
+        }
+
+        if (members.length > 1) {
+          report.duplicate_groups.push({
+            normalized_phone: norm,
+            canonical_user_id: Number(canonical.id),
+            duplicate_user_ids: members.slice(1).map(m => Number(m.id))
+          });
+          for (const dup of members.slice(1)) {
+            if (dup.normalized_phone) {
+              await p.query('UPDATE users SET normalized_phone = NULL WHERE id = ?', [dup.id]);
+            }
+          }
+        }
+      }
+
+      if (normIdx.length === 0) {
+        try {
+          await p.query('ALTER TABLE users ADD UNIQUE INDEX uniq_users_normalized_phone (normalized_phone)');
+          report.index_added = true;
+        } catch (idxErr) {
+          if (!/duplicate key name|already exists/i.test(idxErr.message || '')) {
+            // Preserve runtime availability even if altered concurrently
+          }
+        }
+      }
+    }
+    nodeNormalizedPhoneSchemaEnsured = true;
+  } catch (e) {
+    // Offline or restricted permissions: handled by transaction + lookup
+  }
+  return report;
+}
+
+async function findUsersByPhoneDb(connOrPool, rawPhone, normalizedPhone = '', dialCode = '', excludeUserId = null, forUpdate = false) {
+  const norm = normalizedPhone || normalizePhoneNumberNode(rawPhone, dialCode);
+  const variants = getPhoneLookupVariantsNode(rawPhone, norm, dialCode);
+  if (variants.length === 0 && !norm) return [];
+
+  const clauses = [];
+  const params = [];
+
+  let hasNormCol = true;
+  try {
+    const [cols] = await connOrPool.query("SHOW COLUMNS FROM users LIKE 'normalized_phone'");
+    hasNormCol = cols.length > 0;
+  } catch (e) {
+    hasNormCol = false;
+  }
+
+  if (hasNormCol && norm) {
+    clauses.push('normalized_phone = ?');
+    params.push(norm);
+  }
+
+  if (variants.length > 0) {
+    const inMarks = variants.map(() => '?').join(', ');
+    clauses.push(`phone IN (${inMarks})`);
+    params.push(...variants);
+    clauses.push(`REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '') IN (${inMarks})`);
+    params.push(...variants);
+  }
+
+  if (clauses.length === 0) return [];
+
+  let sql = `SELECT * FROM users WHERE (${clauses.join(' OR ')})`;
+  if (excludeUserId !== null && Number(excludeUserId) > 0) {
+    sql += ' AND id != ?';
+    params.push(Number(excludeUserId));
+  }
+  sql += ' ORDER BY id ASC';
+  if (forUpdate) {
+    sql += ' FOR UPDATE';
+  }
+
+  const [rows] = await connOrPool.query(sql, params);
+  const filtered = norm
+    ? rows.filter(r => r.normalized_phone === norm || normalizePhoneNumberNode(r.phone || '', '') === norm)
+    : rows;
+
+  filtered.sort((a, b) => {
+    const aBlocked = ['LOCKED', 'DELETED'].includes(String(a.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+    const bBlocked = ['LOCKED', 'DELETED'].includes(String(b.account_status || 'ACTIVE').toUpperCase()) ? 1 : 0;
+    if (aBlocked !== bBlocked) return aBlocked - bBlocked;
+    const aNormMatch = (norm && a.normalized_phone === norm) ? 0 : 1;
+    const bNormMatch = (norm && b.normalized_phone === norm) ? 0 : 1;
+    if (aNormMatch !== bNormMatch) return aNormMatch - bNormMatch;
+    return Number(a.id) - Number(b.id);
+  });
+
+  return filtered;
+}
+
+function isDuplicateKeyErrorNode(err) {
+  if (!err) return false;
+  return err.code === 'ER_DUP_ENTRY'
+    || Number(err.errno) === 1062
+    || err.sqlState === '23000'
+    || /duplicate entry|unique constraint/i.test(String(err.message || ''));
 }
 
 function isValidEmailAddress(email) {
@@ -1780,14 +2158,23 @@ function getPublicSellerEmail(rawEmail, role = 'seller') {
   return str;
 }
 
-function matchesPhoneRecord(storedPhone, phone, rawPhone, rawNoPrefix) {
+function matchesPhoneRecord(storedPhone, phone, rawPhone = '', dialCode = '') {
   if (!storedPhone) return false;
-  const cleanStored = String(storedPhone).trim();
-  if (!cleanStored) return false;
-  if (phone && cleanStored === phone) return true;
-  if (rawPhone && cleanStored === rawPhone) return true;
-  if (rawNoPrefix && cleanStored.replace(/^\+91/, '').replace(/^\+/, '') === rawNoPrefix) return true;
-  return false;
+  const targetNorm = phone || normalizePhoneNumberNode(rawPhone, dialCode);
+  if (targetNorm) {
+    const storedNorm = normalizePhoneNumberNode(storedPhone, '');
+    if (storedNorm && storedNorm === targetNorm) return true;
+  }
+  const cleanStored = String(storedPhone).trim().replace(/[\s\-\(\)\.]+/g, '');
+  const cleanRaw = String(rawPhone || '').trim().replace(/[\s\-\(\)\.]+/g, '');
+  return Boolean(cleanRaw && cleanStored && cleanStored === cleanRaw);
+}
+
+let fallbackRegisterQueue = Promise.resolve();
+function withFallbackRegLock(fn) {
+  const next = fallbackRegisterQueue.then(fn, fn);
+  fallbackRegisterQueue = next.catch(() => {});
+  return next;
 }
 
 function extractAuthIdentifiers(body, options = {}) {
@@ -1796,7 +2183,9 @@ function extractAuthIdentifiers(body, options = {}) {
     'email', 'email_address', 'emailAddress', 'email_id', 'emailId',
     'user_email', 'seller_email', 'business_email', 'mail'
   ], '');
-  let rawPhone = extractPhone(body);
+  const phoneParts = extractPhonePartsNode(body);
+  let rawPhone = phoneParts.rawPhone;
+  let dialCode = phoneParts.dialCode || extractDialCodeNode(body);
 
   const singleCandidates = [
     'identifier', 'login', 'login_id', 'loginId',
@@ -1814,21 +2203,11 @@ function extractAuthIdentifiers(body, options = {}) {
   const rawIdentifier = extractField(body, singleCandidates, '');
   let identifierError = '';
 
-  const dialCode = body && (body.country_code || body.countryCode || body.dial_code || body.dialCode);
-  const attachDialCode = (val) => {
-    const trimmed = String(val || '').trim();
-    if (!trimmed) return '';
-    if (dialCode && !trimmed.startsWith('+')) {
-      return String(dialCode).trim() + trimmed;
-    }
-    return trimmed;
-  };
-
   if (!rawEmail && !rawPhone && rawIdentifier) {
     if (rawIdentifier.includes('@')) {
       rawEmail = rawIdentifier;
     } else if (/^\+?[\d\s\-().]+$/.test(rawIdentifier)) {
-      rawPhone = attachDialCode(rawIdentifier);
+      rawPhone = rawIdentifier;
     } else {
       identifierError = 'Please provide a valid email address or phone number.';
     }
@@ -1839,14 +2218,14 @@ function extractAuthIdentifiers(body, options = {}) {
     rawEmail = rawPhone;
     rawPhone = '';
   } else if (!rawPhone && rawEmail && !rawEmail.includes('@') && /^\+?[\d\s\-().]{7,20}$/.test(rawEmail)) {
-    rawPhone = attachDialCode(rawEmail);
+    rawPhone = rawEmail;
     rawEmail = '';
   }
 
   const email = rawEmail ? rawEmail.trim().toLowerCase() : '';
-  const phone = rawPhone ? normalizePhone(rawPhone) : '';
+  const phone = rawPhone ? normalizePhoneNumberNode(rawPhone, dialCode) : '';
 
-  return { rawEmail, email, rawPhone, phone, rawIdentifier, identifierError };
+  return { rawEmail, email, rawPhone, dialCode, phone, rawIdentifier, identifierError };
 }
 
 app.get(['/api/register', '/api/auth/register'], (req, res) => {
@@ -1862,7 +2241,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
     'seller', 'shop_name', 'shopName', 'store_name', 'storeName',
     'fullname', 'full_name', 'user_name', 'userName'
   ]);
-  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const { email, rawPhone, dialCode, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
   const address = extractField(body, [
     'address', 'shop_address', 'shopAddress', 'business_address', 'street', 'location'
   ]);
@@ -1885,19 +2264,15 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
 
   if (identifierError) {
     errors.email_or_phone = [identifierError];
-    errors.email = [identifierError];
-    errors.phone = [identifierError];
   } else if (!email && !rawPhone) {
-    const contactMsg = 'Please provide an email address or phone number.';
-    errors.email_or_phone = [contactMsg];
-    errors.email = [contactMsg];
-    errors.phone = [contactMsg];
+    errors.email_or_phone = ['Please provide an email address or phone number.'];
   } else {
     if (email && !isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     }
-    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    if (rawPhone) {
+      const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+      if (phoneErr) errors.phone = [phoneErr];
     }
   }
 
@@ -1907,214 +2282,250 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
   else if (password !== password_confirmation) errors.password = ['The password confirmation does not match.'];
 
   if (Object.keys(errors).length > 0) {
-    return res.status(422).json({ message: 'Validation error occurred.', errors });
+    const firstMsg = Object.values(errors)[0][0] || 'Validation error occurred.';
+    return res.status(422).json({
+      status: false,
+      message: Object.keys(errors).length === 1 ? firstMsg : 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
+      errors
+    });
   }
 
-  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
+  const dbActive = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
 
-  try {
-    let phoneMatch = null;
-    if (phone) {
-      const [phoneRows] = await pool.query(
-        'SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1',
-        [phone, rawPhone, rawNoPrefix]
-      );
-      phoneMatch = phoneRows[0] || null;
-    }
+  if (dbActive) {
+    await ensureNormalizedPhoneSchemaNode(pool);
+    const conn = await pool.getConnection();
+    let lockKey = null;
+    let inTx = false;
+    try {
+      if (phone) {
+        lockKey = 'venter_reg_' + crypto.createHash('sha1').update(phone).digest('hex');
+        await conn.query('SELECT GET_LOCK(?, 5)', [lockKey]);
+      }
 
-    let emailMatch = null;
-    if (email) {
-      const [emailRows] = await pool.query(
-        'SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1',
-        [email]
-      );
-      emailMatch = emailRows[0] || null;
-    }
+      await conn.beginTransaction();
+      inTx = true;
 
-    if (phoneMatch) {
-      const pmStatus = String(phoneMatch.account_status || 'ACTIVE').toUpperCase();
-      if ((phoneMatch.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(pmStatus)) {
-        return res.status(403).json({
-          status: 'error',
-          message: pmStatus === 'DELETED'
-            ? 'This seller account has been permanently deactivated and cannot be registered again.'
-            : 'This seller account is locked during deletion verification.',
-          errors: { account_status: [pmStatus] }
+      const phoneMatches = phone ? await findUsersByPhoneDb(conn, rawPhone, phone, dialCode, null, true) : [];
+      let emailMatch = null;
+      if (email) {
+        const [emailRows] = await conn.query('SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1 FOR UPDATE', [email]);
+        emailMatch = emailRows[0] || null;
+      }
+
+      if (phoneMatches.length > 0) {
+        let activePhoneMatch = null;
+        let blockedPhoneMatch = null;
+        for (const pm of phoneMatches) {
+          const pmStatus = String(pm.account_status || 'ACTIVE').toUpperCase();
+          if ((pm.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(pmStatus)) {
+            if (!blockedPhoneMatch) blockedPhoneMatch = pm;
+          } else {
+            activePhoneMatch = pm;
+            break;
+          }
+        }
+
+        if (activePhoneMatch) {
+          await conn.rollback();
+          inTx = false;
+          return res.status(409).json({
+            status: false,
+            message: 'This phone number is already registered. Please log in.',
+            error_code: 'PHONE_ALREADY_REGISTERED'
+          });
+        }
+
+        if (blockedPhoneMatch) {
+          const pmStatus = String(blockedPhoneMatch.account_status || 'LOCKED').toUpperCase();
+          await conn.rollback();
+          inTx = false;
+          return res.status(403).json({
+            status: false,
+            message: pmStatus === 'DELETED'
+              ? 'This seller account has been permanently deactivated and cannot be registered again.'
+              : 'This seller account is locked during deletion verification.',
+            error_code: 'ACCOUNT_' + pmStatus,
+            errors: { account_status: [pmStatus] }
+          });
+        }
+      }
+
+      if (emailMatch) {
+        const emStatus = String(emailMatch.account_status || 'ACTIVE').toUpperCase();
+        await conn.rollback();
+        inTx = false;
+        if ((emailMatch.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(emStatus)) {
+          return res.status(403).json({
+            status: false,
+            message: emStatus === 'DELETED'
+              ? 'This seller account has been permanently deactivated.'
+              : 'This seller account is locked during deletion verification.',
+            error_code: 'ACCOUNT_' + emStatus,
+            errors: { account_status: [emStatus] }
+          });
+        }
+        return res.status(422).json({
+          status: false,
+          message: 'The email has already been taken.',
+          error_code: 'EMAIL_ALREADY_REGISTERED',
+          errors: { email: ['The email has already been taken.'] }
         });
       }
-      const isSamePassword = await bcrypt.compare(password, phoneMatch.password);
-      if (isSamePassword) {
-        if (emailMatch && Number(emailMatch.id) !== Number(phoneMatch.id)) {
-          return res.status(422).json({
-            message: 'The email has already been taken.',
-            errors: { email: ['The email has already been taken.'] }
-          });
-        }
-        const existingPublicEmail = getPublicSellerEmail(phoneMatch.email, phoneMatch.role || 'seller');
-        if (email && existingPublicEmail && existingPublicEmail.toLowerCase() !== email) {
-          return res.status(422).json({
-            message: 'The phone has already been taken.',
-            errors: { phone: ['The phone has already been taken.'] }
-          });
-        }
-        let resolvedEmail = phoneMatch.email;
-        if (email && (!resolvedEmail || String(resolvedEmail).endsWith('@phone.vendor.local'))) {
-          await pool.query('UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?', [email, phoneMatch.id]);
-          resolvedEmail = email;
-        }
-        const publicEmail = getPublicSellerEmail(resolvedEmail, phoneMatch.role || 'seller');
-        const token = jwt.sign(
-          { id: phoneMatch.id, email: publicEmail, phone: phoneMatch.phone || phone, role: phoneMatch.role || 'seller', seller_name, tv: Number(phoneMatch.token_version || 1) },
-          JWT_SECRET,
-          { expiresIn: '30d' }
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const dbEmail = email || makeSyntheticPhoneEmail(phone);
+      const dbPhone = phone || null;
+
+      let result;
+      try {
+        [result] = await conn.query(
+          `INSERT INTO users (name, email, seller_name, phone, normalized_phone, address, landmark, state, country, password, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
+          [seller_name, dbEmail, seller_name, dbPhone, dbPhone, address, landmark, state, country || 'India', hashedPassword]
         );
-        return res.status(200).json({
-          message: 'Seller account already exists. Successfully signed in.',
-          user: safeSeller({
-            ...phoneMatch,
-            seller_name: seller_name || phoneMatch.seller_name || phoneMatch.name,
-            email: resolvedEmail,
-            phone: phoneMatch.phone || phone,
-            address: address || phoneMatch.address,
-            landmark: landmark || phoneMatch.landmark,
-            state: state || phoneMatch.state,
-            country: country || phoneMatch.country
-          }),
-          token,
-          token_type: 'Bearer'
+      } catch (insErr) {
+        if (insErr && insErr.code === 'ER_BAD_FIELD_ERROR') {
+          [result] = await conn.query(
+            `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
+            [seller_name, dbEmail, seller_name, dbPhone, address, landmark, state, country || 'India', hashedPassword]
+          );
+        } else {
+          throw insErr;
+        }
+      }
+
+      await conn.commit();
+      inTx = false;
+
+      const userId = result.insertId;
+      const publicEmail = email || null;
+      const token = jwt.sign(
+        { id: userId, email: publicEmail, phone: dbPhone, role: 'seller', seller_name, tv: 1 },
+        JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+
+      return res.status(201).json({
+        message: 'Seller registration successful.',
+        user: safeSeller({
+          id: userId,
+          seller_name,
+          email: dbEmail,
+          phone: dbPhone,
+          address,
+          landmark,
+          state,
+          country: country || 'India',
+          role: 'seller',
+          account_status: 'ACTIVE'
+        }),
+        token,
+        token_type: 'Bearer'
+      });
+    } catch (err) {
+      if (inTx) {
+        try { await conn.rollback(); } catch (ignore) {}
+        inTx = false;
+      }
+      if (isDuplicateKeyErrorNode(err)) {
+        const msgLower = String(err.message || '').toLowerCase();
+        let isPhoneDup = false;
+        if (phone) {
+          if (msgLower.includes('normalized_phone') || msgLower.includes('users.phone') || msgLower.includes('phone')) {
+            isPhoneDup = true;
+          } else {
+            try {
+              const dupCheck = await findUsersByPhoneDb(pool, rawPhone, phone, dialCode);
+              isPhoneDup = dupCheck.length > 0;
+            } catch (ignore) {}
+          }
+        }
+        if (isPhoneDup) {
+          return res.status(409).json({
+            status: false,
+            message: 'This phone number is already registered. Please log in.',
+            error_code: 'PHONE_ALREADY_REGISTERED'
+          });
+        }
+        return res.status(422).json({
+          status: false,
+          message: 'The email has already been taken.',
+          error_code: 'EMAIL_ALREADY_REGISTERED',
+          errors: { email: ['The email has already been taken.'] }
         });
       }
-      return res.status(422).json({
-        message: 'The phone has already been taken.',
-        errors: { phone: ['The phone has already been taken.'] }
+      return res.status(500).json({
+        status: false,
+        message: 'Registration failed due to a database error.',
+        error_code: 'SERVER_ERROR'
       });
-    }
-
-    if (emailMatch) {
-      const emStatus = String(emailMatch.account_status || 'ACTIVE').toUpperCase();
-      if ((emailMatch.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(emStatus)) {
-        return res.status(403).json({
-          status: 'error',
-          message: emStatus === 'DELETED'
-            ? 'This seller account has been permanently deactivated.'
-            : 'This seller account is locked during deletion verification.',
-          errors: { account_status: [emStatus] }
-        });
+    } finally {
+      if (inTx) {
+        try { await conn.rollback(); } catch (ignore) {}
       }
-      return res.status(422).json({
-        message: 'The email has already been taken.',
-        errors: { email: ['The email has already been taken.'] }
-      });
+      if (lockKey) {
+        try { await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]); } catch (ignore) {}
+      }
+      conn.release();
     }
+  }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const dbEmail = email || makeSyntheticPhoneEmail(phone);
-    const dbPhone = phone || null;
-
-    const [result] = await pool.query(
-      `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-      [seller_name, dbEmail, seller_name, dbPhone, address, landmark, state, country || 'India', hashedPassword]
-    );
-
-    const userId = result.insertId;
-    const publicEmail = email || null;
-    const token = jwt.sign(
-      { id: userId, email: publicEmail, phone: dbPhone, role: 'seller', seller_name, tv: 1 },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    res.status(201).json({
-      message: 'Seller registration successful.',
-      user: safeSeller({
-        id: userId,
-        seller_name,
-        email: dbEmail,
-        phone: dbPhone,
-        address,
-        landmark,
-        state,
-        country: country || 'India',
-        role: 'seller',
-        account_status: 'ACTIVE'
-      }),
-      token,
-      token_type: 'Bearer'
-    });
-  } catch (err) {
-    const phoneMatchFb = phone
-      ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))
-      : null;
+  // Offline / Fallback execution (serialized via async lock to prevent concurrent duplicates)
+  return withFallbackRegLock(async () => {
+    const phoneMatchesFb = phone
+      ? fallbackSellers.filter(s => matchesPhoneRecord(s.phone, phone, rawPhone, dialCode))
+      : [];
     const emailMatchFb = email
       ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === email)
       : null;
 
-    if (phoneMatchFb) {
-      const pmStatusFb = String(phoneMatchFb.account_status || 'ACTIVE').toUpperCase();
-      if ((phoneMatchFb.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(pmStatusFb)) {
+    if (phoneMatchesFb.length > 0) {
+      const blockedFb = phoneMatchesFb.find(s => (s.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(String(s.account_status || 'ACTIVE').toUpperCase()));
+      const activeFb = phoneMatchesFb.find(s => !blockedFb || Number(s.id) !== Number(blockedFb.id));
+      if (activeFb) {
+        return res.status(409).json({
+          status: false,
+          message: 'This phone number is already registered. Please log in.',
+          error_code: 'PHONE_ALREADY_REGISTERED'
+        });
+      }
+      if (blockedFb) {
+        const pmStatusFb = String(blockedFb.account_status || 'LOCKED').toUpperCase();
         return res.status(403).json({
-          status: 'error',
+          status: false,
           message: pmStatusFb === 'DELETED'
             ? 'This seller account has been permanently deactivated and cannot be registered again.'
             : 'This seller account is locked during deletion verification.',
+          error_code: 'ACCOUNT_' + pmStatusFb,
           errors: { account_status: [pmStatusFb] }
         });
       }
-      const samePass = phoneMatchFb._password !== undefined && phoneMatchFb._password === password;
-      if (samePass) {
-        if (emailMatchFb && Number(emailMatchFb.id) !== Number(phoneMatchFb.id)) {
-          return res.status(422).json({
-            message: 'The email has already been taken.',
-            errors: { email: ['The email has already been taken.'] }
-          });
-        }
-        const existingPublicEmail = getPublicSellerEmail(phoneMatchFb.email, phoneMatchFb.role || 'seller');
-        if (email && existingPublicEmail && existingPublicEmail.toLowerCase() !== email) {
-          return res.status(422).json({
-            message: 'The phone has already been taken.',
-            errors: { phone: ['The phone has already been taken.'] }
-          });
-        }
-        if (email && (!phoneMatchFb.email || String(phoneMatchFb.email).endsWith('@phone.vendor.local'))) {
-          phoneMatchFb.email = email;
-        }
-        const publicEmail = getPublicSellerEmail(phoneMatchFb.email, phoneMatchFb.role || 'seller');
-        const token = jwt.sign(
-          { id: phoneMatchFb.id, email: publicEmail, phone: phoneMatchFb.phone || phone, role: phoneMatchFb.role || 'seller', seller_name: phoneMatchFb.seller_name, tv: Number(phoneMatchFb.token_version || 1) },
-          JWT_SECRET,
-          { expiresIn: '30d' }
-        );
-        return res.status(200).json({
-          message: 'Seller account already exists. Successfully signed in.',
-          user: safeSeller(phoneMatchFb),
-          token,
-          token_type: 'Bearer'
-        });
-      }
-      return res.status(422).json({
-        message: 'The phone has already been taken.',
-        errors: { phone: ['The phone has already been taken.'] }
-      });
     }
 
     if (emailMatchFb) {
       const emStatusFb = String(emailMatchFb.account_status || 'ACTIVE').toUpperCase();
       if ((emailMatchFb.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(emStatusFb)) {
         return res.status(403).json({
-          status: 'error',
+          status: false,
           message: emStatusFb === 'DELETED'
             ? 'This seller account has been permanently deactivated.'
             : 'This seller account is locked during deletion verification.',
+          error_code: 'ACCOUNT_' + emStatusFb,
           errors: { account_status: [emStatusFb] }
         });
       }
       return res.status(422).json({
+        status: false,
         message: 'The email has already been taken.',
+        error_code: 'EMAIL_ALREADY_REGISTERED',
         errors: { email: ['The email has already been taken.'] }
       });
     }
 
+    const hashedPassword = await bcrypt.hash(password, 10);
     const newId = fallbackSellers.length ? Math.max(...fallbackSellers.map(s => s.id)) + 1 : 99;
     const storedEmail = email || makeSyntheticPhoneEmail(phone);
     const storedPhone = phone || null;
@@ -2124,6 +2535,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
       seller_name,
       email: storedEmail,
       phone: storedPhone,
+      normalized_phone: storedPhone,
       address,
       landmark,
       state,
@@ -2131,6 +2543,7 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
       role: 'seller',
       account_status: 'ACTIVE',
       token_version: 1,
+      password: hashedPassword,
       _password: password
     };
     fallbackSellers.push(newSeller);
@@ -2139,13 +2552,13 @@ app.post(['/api/register', '/api/auth/register'], async (req, res) => {
       JWT_SECRET,
       { expiresIn: '30d' }
     );
-    res.status(201).json({
+    return res.status(201).json({
       message: 'Seller registration successful.',
       user: safeSeller(newSeller),
       token,
       token_type: 'Bearer'
     });
-  }
+  });
 });
 
 app.get(['/api/login', '/api/auth/login'], (req, res) => {
@@ -2156,25 +2569,21 @@ app.get(['/api/login', '/api/auth/login'], (req, res) => {
 
 app.post(['/api/login', '/api/auth/login'], async (req, res) => {
   const body = req.body || {};
-  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: true });
+  const { email, rawPhone, dialCode, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: true });
   const password = extractPassword(body);
 
   const errors = {};
   if (identifierError) {
     errors.email_or_phone = [identifierError];
-    errors.email = [identifierError];
-    errors.phone = [identifierError];
   } else if (!email && !rawPhone) {
-    const contactMsg = 'The email or phone field is required.';
-    errors.email_or_phone = [contactMsg];
-    errors.email = [contactMsg];
-    errors.phone = [contactMsg];
+    errors.email_or_phone = ['The email or phone field is required.'];
   } else {
     if (email && !isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     }
-    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    if (rawPhone) {
+      const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+      if (phoneErr) errors.phone = [phoneErr];
     }
   }
 
@@ -2183,167 +2592,177 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
   }
 
   if (Object.keys(errors).length > 0) {
+    const firstMsg = Object.values(errors)[0][0] || 'Validation error occurred.';
     return res.status(422).json({
-      message: 'Validation error occurred.',
+      status: false,
+      message: Object.keys(errors).length === 1 ? firstMsg : 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
       errors
     });
   }
 
-  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
-  const invalidCredsMsg = 'The supplied login credentials (email/phone or password) are incorrect.';
-  const invalidCredsErrors = {
-    email_or_phone: [invalidCredsMsg],
-    email: [invalidCredsMsg],
-    phone: [invalidCredsMsg]
-  };
+  const dbActive = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
 
-  try {
-    let rows = [];
+  let user = null;
+  if (dbActive) {
+    await ensureNormalizedPhoneSchemaNode(pool);
     if (email && rawPhone) {
-      [rows] = await pool.query(
-        'SELECT * FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1',
-        [phone, rawPhone, rawNoPrefix, email]
-      );
+      const [emailRows] = await pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+      let emailUser = emailRows[0] || null;
+      if (!emailUser && email === 'admin@venter.app') {
+        const [adminRows] = await pool.query('SELECT * FROM users WHERE LOWER(email) = "admin@vendor.app" AND role = "admin" LIMIT 1');
+        emailUser = adminRows[0] || null;
+      }
+      const phoneUsers = await findUsersByPhoneDb(pool, rawPhone, phone, dialCode);
+      const phoneUser = phoneUsers[0] || null;
+
+      if (!emailUser && !phoneUser) {
+        return res.status(404).json({
+          status: false,
+          message: 'This phone number is not registered. Please sign up.',
+          error_code: 'PHONE_NOT_REGISTERED'
+        });
+      }
+      if (!emailUser || !phoneUser || Number(emailUser.id) !== Number(phoneUser.id)) {
+        return res.status(422).json({
+          status: false,
+          message: 'The supplied email and phone number do not match the same account.',
+          error_code: 'CREDENTIALS_MISMATCH'
+        });
+      }
+      user = emailUser;
     } else if (email) {
-      [rows] = await pool.query(
-        'SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1',
-        [email]
-      );
-      if (rows.length === 0 && email === 'admin@venter.app') {
-        [rows] = await pool.query(
-          'SELECT * FROM users WHERE LOWER(email) = "admin@vendor.app" AND role = "admin" LIMIT 1'
-        );
+      const [rows] = await pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+      user = rows[0] || null;
+      if (!user && email === 'admin@venter.app') {
+        const [adminRows] = await pool.query('SELECT * FROM users WHERE LOWER(email) = "admin@vendor.app" AND role = "admin" LIMIT 1');
+        user = adminRows[0] || null;
+      }
+      if (!user) {
+        return res.status(404).json({
+          status: false,
+          message: 'This email address is not registered. Please sign up.',
+          error_code: 'EMAIL_NOT_REGISTERED'
+        });
       }
     } else {
-      [rows] = await pool.query(
-        'SELECT * FROM users WHERE (phone = ? OR phone = ? OR phone = ?) LIMIT 1',
-        [phone, rawPhone, rawNoPrefix]
-      );
+      const phoneUsers = await findUsersByPhoneDb(pool, rawPhone, phone, dialCode);
+      user = phoneUsers[0] || null;
+      if (!user) {
+        return res.status(404).json({
+          status: false,
+          message: 'This phone number is not registered. Please sign up.',
+          error_code: 'PHONE_NOT_REGISTERED'
+        });
+      }
     }
 
-    if (rows.length === 0) {
-      return res.status(422).json({
-        message: invalidCredsMsg,
-        errors: invalidCredsErrors
-      });
-    }
-
-    const user = rows[0];
-    const match = await bcrypt.compare(password, user.password);
+    const match = await bcrypt.compare(password, user.password || '');
     if (!match) {
-      return res.status(422).json({
-        message: invalidCredsMsg,
-        errors: invalidCredsErrors
+      return res.status(401).json({
+        status: false,
+        message: 'Incorrect password. Please try again.',
+        error_code: 'INVALID_PASSWORD'
       });
     }
-
-    const accStatus = String(user.account_status || 'ACTIVE').toUpperCase();
-    if ((user.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
-      const statusMsg = accStatus === 'DELETED'
-        ? 'This seller account has been permanently deleted and can no longer sign in.'
-        : 'This seller account is locked pending deletion verification.';
-      return res.status(403).json({
-        status: 'error',
-        message: statusMsg,
-        errors: { account_status: [accStatus] }
-      });
-    }
-
-    const publicEmail = getPublicSellerEmail(user.email, user.role || 'seller');
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: publicEmail,
-        phone: user.phone || null,
-        role: user.role || 'seller',
-        seller_name: user.seller_name || user.name || '',
-        tv: Math.max(1, Number(user.token_version || 1))
-      },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    res.json({
-      message: 'Login successful.',
-      user: safeSeller(user),
-      token,
-      token_type: 'Bearer'
-    });
-  } catch (err) {
+  } else {
     const normalizedEmailLookup = email === 'admin@venter.app' ? 'admin@vendor.app' : email;
     const emailMatchFb = email
       ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === normalizedEmailLookup || String(s.email || '').toLowerCase() === email)
       : null;
     const phoneMatchFb = rawPhone
-      ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))
+      ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone, dialCode))
       : null;
 
-    let matchedUser = null;
     if (email && rawPhone) {
-      if (emailMatchFb && phoneMatchFb && Number(emailMatchFb.id) === Number(phoneMatchFb.id)) {
-        matchedUser = emailMatchFb;
+      if (!emailMatchFb && !phoneMatchFb) {
+        return res.status(404).json({
+          status: false,
+          message: 'This phone number is not registered. Please sign up.',
+          error_code: 'PHONE_NOT_REGISTERED'
+        });
       }
+      if (!emailMatchFb || !phoneMatchFb || Number(emailMatchFb.id) !== Number(phoneMatchFb.id)) {
+        return res.status(422).json({
+          status: false,
+          message: 'The supplied email and phone number do not match the same account.',
+          error_code: 'CREDENTIALS_MISMATCH'
+        });
+      }
+      user = emailMatchFb;
     } else if (email) {
-      matchedUser = emailMatchFb;
-    } else if (rawPhone) {
-      matchedUser = phoneMatchFb;
-    }
-
-    if (!matchedUser) {
-      return res.status(422).json({
-        message: invalidCredsMsg,
-        errors: invalidCredsErrors
-      });
+      if (!emailMatchFb) {
+        return res.status(404).json({
+          status: false,
+          message: 'This email address is not registered. Please sign up.',
+          error_code: 'EMAIL_NOT_REGISTERED'
+        });
+      }
+      user = emailMatchFb;
+    } else {
+      if (!phoneMatchFb) {
+        return res.status(404).json({
+          status: false,
+          message: 'This phone number is not registered. Please sign up.',
+          error_code: 'PHONE_NOT_REGISTERED'
+        });
+      }
+      user = phoneMatchFb;
     }
 
     let passwordValid = false;
-    if (matchedUser._password !== undefined) {
-      passwordValid = matchedUser._password === password;
-    } else if (matchedUser.role === 'admin') {
+    if (user._password !== undefined) {
+      passwordValid = user._password === password;
+    } else if (user.password) {
+      passwordValid = await bcrypt.compare(password, user.password);
+    } else if (user.role === 'admin') {
       passwordValid = password === 'Admin123!';
     } else {
       passwordValid = password === 'Password123!';
     }
 
     if (!passwordValid) {
-      return res.status(422).json({
-        message: invalidCredsMsg,
-        errors: invalidCredsErrors
+      return res.status(401).json({
+        status: false,
+        message: 'Incorrect password. Please try again.',
+        error_code: 'INVALID_PASSWORD'
       });
     }
+  }
 
-    const accStatusFb = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
-    if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatusFb)) {
-      const statusMsg = accStatusFb === 'DELETED'
-        ? 'This seller account has been permanently deleted and can no longer sign in.'
-        : 'This seller account is locked pending deletion verification.';
-      return res.status(403).json({
-        status: 'error',
-        message: statusMsg,
-        errors: { account_status: [accStatusFb] }
-      });
-    }
-
-    const publicEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller');
-    const token = jwt.sign(
-      {
-        id: matchedUser.id,
-        email: publicEmail,
-        phone: matchedUser.phone || null,
-        role: matchedUser.role || 'seller',
-        seller_name: matchedUser.seller_name || matchedUser.name || '',
-        tv: Math.max(1, Number(matchedUser.token_version || 1))
-      },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-    return res.json({
-      message: 'Login successful.',
-      user: safeSeller(matchedUser),
-      token,
-      token_type: 'Bearer'
+  const accStatus = String(user.account_status || 'ACTIVE').toUpperCase();
+  if ((user.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStatus)) {
+    const statusMsg = accStatus === 'DELETED'
+      ? 'This seller account has been permanently deleted and can no longer sign in.'
+      : 'This seller account is locked pending deletion verification.';
+    return res.status(403).json({
+      status: false,
+      message: statusMsg,
+      error_code: 'ACCOUNT_' + accStatus,
+      errors: { account_status: [accStatus] }
     });
   }
+
+  const publicEmail = getPublicSellerEmail(user.email, user.role || 'seller');
+  const token = jwt.sign(
+    {
+      id: user.id,
+      email: publicEmail,
+      phone: user.phone || null,
+      role: user.role || 'seller',
+      seller_name: user.seller_name || user.name || '',
+      tv: Math.max(1, Number(user.token_version || 1))
+    },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+
+  return res.json({
+    message: 'Login successful.',
+    user: safeSeller(user),
+    token,
+    token_type: 'Bearer'
+  });
 });
 
 // Profile Update Logic
@@ -2355,12 +2774,14 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     return res.status(403).json({ message: 'Unauthorized. You can only edit your own seller profile.' });
   }
 
+  const dbActive = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
   let existing = null;
-  try {
+  if (dbActive) {
+    await ensureNormalizedPhoneSchemaNode(pool);
     const [existingRows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
     if (existingRows.length > 0) existing = existingRows[0];
-  } catch (e) {
-    existing = fallbackSellers.find(s => s.id === sellerId) || currentUser;
+  } else {
+    existing = fallbackSellers.find(s => Number(s.id) === Number(sellerId)) || currentUser;
   }
   if (!existing) {
     return res.status(404).json({ message: 'Seller not found.' });
@@ -2369,67 +2790,56 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   const body = req.body || {};
   const isAdmin = req.user && req.user.role === 'admin';
 
-  // Fields to update (id is strictly immutable)
   const sellerName = extractField(body, ['seller_name', 'sellerName', 'business_name', 'shop_name', 'store_name']);
   const name = extractField(body, ['name', 'fullname', 'full_name', 'owner_name']);
   const address = extractField(body, ['address', 'shop_address', 'business_address', 'street', 'location']);
   const landmark = extractField(body, ['landmark', 'land_mark', 'nearby']);
   const state = extractField(body, ['state', 'province', 'region']);
   const country = extractField(body, ['country', 'nation']);
-  const rawPhone = extractPhone(body);
+  const phoneParts = extractPhonePartsNode(body);
+  const rawPhone = phoneParts.rawPhone;
+  const dialCode = phoneParts.dialCode;
   const email = (extractField(body, ['email', 'email_address']) || '').trim();
 
-  // Separate password fields: current_password, new_password, confirm_password
   const currentPassword = extractField(body, ['current_password', 'currentPassword', 'old_password', 'oldPassword']);
   const newPassword = extractField(body, ['new_password', 'newPassword', 'password']);
   const confirmPassword = extractConfirmPassword(body, newPassword);
 
   const errors = {};
-
   let phone = '';
+  let phoneConflict = false;
   if (rawPhone) {
-    phone = normalizePhone(rawPhone);
-    if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
-    } else {
-      const rawNoPrefix = rawPhone.replace(/^\+91|^\+/, '');
-      try {
-        const [chkPhone] = await pool.query(
-          'SELECT id FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND id != ? LIMIT 1',
-          [phone, rawPhone, rawNoPrefix, sellerId]
-        );
-        if (chkPhone.length > 0) {
-          errors.phone = ['This phone number is already registered to another account.'];
-        }
-      } catch (e) {
-        if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && matchesPhoneRecord(s.phone, phone, rawPhone, rawNoPrefix))) {
-          errors.phone = ['This phone number is already registered to another account.'];
-        }
+    phone = normalizePhoneNumberNode(rawPhone, dialCode);
+    const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+    if (phoneErr) {
+      errors.phone = [phoneErr];
+    } else if (dbActive) {
+      const dupPhones = await findUsersByPhoneDb(pool, rawPhone, phone, dialCode, sellerId);
+      if (dupPhones.length > 0) {
+        errors.phone = ['This phone number is already registered to another account.'];
+        phoneConflict = true;
       }
+    } else if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && matchesPhoneRecord(s.phone, phone, rawPhone, dialCode))) {
+      errors.phone = ['This phone number is already registered to another account.'];
+      phoneConflict = true;
     }
   }
 
-  // Validate email if provided
   if (email) {
     if (!isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
-    } else {
-      try {
-        const [chkEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email.toLowerCase(), sellerId]);
-        if (chkEmail.length > 0) {
-          errors.email = ['This email address is already in use by another account.'];
-        }
-      } catch (e) {
-        if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && String(s.email || '').toLowerCase() === email.toLowerCase())) {
-          errors.email = ['This email address is already in use by another account.'];
-        }
+    } else if (dbActive) {
+      const [chkEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ? LIMIT 1', [email, sellerId]);
+      if (chkEmail.length > 0) {
+        errors.email = ['This email address is already in use by another account.'];
       }
+    } else if (fallbackSellers.some(s => Number(s.id) !== Number(sellerId) && String(s.email || '').toLowerCase() === email.toLowerCase())) {
+      errors.email = ['This email address is already in use by another account.'];
     }
   }
 
-  // Password validation with (current_password, new_password, confirm_password)
   if (newPassword) {
-    if (!isAdmin || req.user.id === sellerId) {
+    if (!isAdmin || Number(req.user.id) === sellerId) {
       if (!currentPassword) {
         errors.current_password = ['The current password field is required to change password.'];
       } else {
@@ -2454,7 +2864,21 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   }
 
   if (Object.keys(errors).length > 0) {
-    return res.status(422).json({ message: 'Validation error occurred.', errors });
+    if (phoneConflict && Object.keys(errors).length === 1) {
+      return res.status(409).json({
+        status: false,
+        message: 'This phone number is already registered to another account.',
+        error_code: 'PHONE_ALREADY_REGISTERED',
+        errors
+      });
+    }
+    const firstMsg = Object.values(errors)[0][0] || 'Validation error occurred.';
+    return res.status(422).json({
+      status: false,
+      message: Object.keys(errors).length === 1 ? firstMsg : 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
+      errors
+    });
   }
 
   const avatarUrl = resolveAvatarImage(req) || (body.avatar_url !== undefined ? body.avatar_url : null);
@@ -2497,6 +2921,15 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   if (phone) {
     updates.push('phone = ?');
     params.push(phone);
+    if (dbActive) {
+      try {
+        const [nCols] = await pool.query("SHOW COLUMNS FROM users LIKE 'normalized_phone'");
+        if (nCols.length > 0) {
+          updates.push('normalized_phone = ?');
+          params.push(phone);
+        }
+      } catch (ignore) {}
+    }
   }
   if (email) {
     updates.push('email = ?');
@@ -2508,7 +2941,7 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     updates.push('password = ?');
     params.push(hashedNewPassword);
   }
-  if (avatarUrl) {
+  if (avatarUrl && dbActive) {
     try {
       await ensureUserAvatarColumn(pool);
       const [cols] = await pool.query('SHOW COLUMNS FROM users LIKE "avatar_url"');
@@ -2520,16 +2953,36 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   }
 
   let sellerData;
-  try {
-    if (updates.length > 0) {
-      updates.push('updated_at = NOW()');
-      params.push(sellerId);
-      await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+  if (dbActive) {
+    try {
+      if (updates.length > 0) {
+        updates.push('updated_at = NOW()');
+        params.push(sellerId);
+        await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+      }
+      const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
+      sellerData = safeSeller(refreshed[0]);
+    } catch (err) {
+      if (isDuplicateKeyErrorNode(err)) {
+        const msgLower = String(err.message || '').toLowerCase();
+        if (phone && (msgLower.includes('phone') || !msgLower.includes('email'))) {
+          return res.status(409).json({
+            status: false,
+            message: 'This phone number is already registered to another account.',
+            error_code: 'PHONE_ALREADY_REGISTERED',
+            errors: { phone: ['This phone number is already registered to another account.'] }
+          });
+        }
+        return res.status(422).json({
+          status: false,
+          message: 'This email address is already in use by another account.',
+          error_code: 'EMAIL_ALREADY_REGISTERED',
+          errors: { email: ['This email address is already in use by another account.'] }
+        });
+      }
+      throw err;
     }
-
-    const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
-    sellerData = safeSeller(refreshed[0]);
-  } catch (err) {
+  } else {
     Object.assign(existing, {
       ...(sellerName ? { seller_name: sellerName } : {}),
       ...(name ? { name } : {}),
@@ -2537,14 +2990,14 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       ...(landmark ? { landmark } : {}),
       ...(state ? { state } : {}),
       ...(country ? { country } : {}),
-      ...(phone ? { phone } : {}),
+      ...(phone ? { phone, normalized_phone: phone } : {}),
       ...(email ? { email: email.toLowerCase() } : {}),
       ...(newPassword ? { _password: newPassword, password: hashedNewPassword } : {})
     });
     sellerData = safeSeller(existing);
   }
 
-  res.json({
+  return res.json({
     message: 'Seller profile updated successfully.',
     seller: sellerData,
     user: sellerData
@@ -2777,15 +3230,24 @@ app.get(['/api/sellers/:id', '/api/seller/:id', '/api/seller/profile/:id'], asyn
 });
 
 // PUT / PATCH / POST /api/sellers/:id and /api/seller/:id (edit seller by ID)
-app.all(['/api/sellers/:id', '/api/seller/:id'], authenticateToken, requireActiveSellerForMutation, avatarUpload.any(), (req, res, next) => {
-  if (!/^\d+$/.test(req.params.id)) {
+app.all(
+  ['/api/sellers/:id', '/api/seller/:id'],
+  (req, res, next) => {
+    if (!/^\d+$/.test(req.params.id)) {
+      return next('route');
+    }
     return next();
+  },
+  authenticateToken,
+  requireActiveSellerForMutation,
+  avatarUpload.any(),
+  (req, res) => {
+    if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
+      return handleSellerProfileUpdate(req, res, req.params.id);
+    }
+    res.status(405).json({ message: 'Method Not Allowed' });
   }
-  if (['PUT', 'PATCH', 'POST'].includes(req.method)) {
-    return handleSellerProfileUpdate(req, res, req.params.id);
-  }
-  res.status(405).json({ message: 'Method Not Allowed' });
-});
+);
 
 app.post('/api/logout', authenticateToken, async (req, res) => {
   const uid = Number(req.user.id);
@@ -2882,9 +3344,10 @@ function httpJsonPostNode(hostname, apiPath, payloadObj = {}) {
 
 function isFirebaseTestPhoneNode(phone) {
   if (!phone) return false;
-  const testPhone = (process.env.FIREBASE_TEST_PHONE || '+919633426254').replace(/\D+/g, '');
-  const clean = String(phone).replace(/\D+/g, '');
-  return clean.length >= 10 && testPhone.length >= 10 && clean.endsWith(testPhone.slice(-10));
+  const testPhoneRaw = process.env.FIREBASE_TEST_PHONE || '+919633426254';
+  const normTest = normalizePhoneNumberNode(testPhoneRaw);
+  const normInput = normalizePhoneNumberNode(String(phone));
+  return Boolean(normTest && normInput && normInput === normTest);
 }
 
 function isFirebaseTestEmailNode(email) {
@@ -3085,7 +3548,7 @@ async function verifyFirebaseIdentityNode({ phone = '', email = '', code = '', s
   const firebaseApiKey = process.env.FIREBASE_API_KEY;
   if (!firebaseApiKey) return { approved: false };
 
-  const cleanPhone = String(phone || '').replace(/\D+/g, '');
+  const reqNormPhone = phone ? normalizePhoneNumberNode(String(phone)) : '';
   const cleanEmail = String(email || '').trim().toLowerCase();
 
   // Flow A: Client-side Firebase Auth ID Token (Phone Auth, Email Link Sign-In, or Email Auth)
@@ -3098,21 +3561,21 @@ async function verifyFirebaseIdentityNode({ phone = '', email = '', code = '', s
     if (res.ok && res.data && res.data.users && res.data.users[0]) {
       const fbUser = res.data.users[0];
       const fbPhoneRaw = fbUser.phoneNumber ? String(fbUser.phoneNumber) : '';
-      const fbPhoneDigits = fbPhoneRaw.replace(/\D+/g, '');
+      const fbNormPhone = fbPhoneRaw ? normalizePhoneNumberNode(fbPhoneRaw) : '';
       const fbEmail = fbUser.email ? String(fbUser.email).trim().toLowerCase() : '';
 
-      const phoneMatched = Boolean(fbPhoneDigits && (!cleanPhone || (cleanPhone.length >= 10 && fbPhoneDigits.endsWith(cleanPhone.slice(-10)))));
+      const phoneMatched = Boolean(fbNormPhone && (!reqNormPhone || fbNormPhone === reqNormPhone));
       const emailMatched = Boolean(fbEmail && isValidEmailAddress(fbEmail) && (!cleanEmail || fbEmail === cleanEmail));
 
-      if ((cleanPhone && cleanEmail && phoneMatched && emailMatched) ||
-          (cleanPhone && !cleanEmail && phoneMatched) ||
-          (!cleanPhone && cleanEmail && emailMatched) ||
-          (!cleanPhone && !cleanEmail && (phoneMatched || emailMatched))) {
+      if ((reqNormPhone && cleanEmail && phoneMatched && emailMatched) ||
+          (reqNormPhone && !cleanEmail && phoneMatched) ||
+          (!reqNormPhone && cleanEmail && emailMatched) ||
+          (!reqNormPhone && !cleanEmail && (phoneMatched || emailMatched))) {
         return {
           approved: true,
           provider: 'firebase',
           method: 'id_token',
-          resolvedPhone: phone || (fbPhoneRaw ? normalizePhone(fbPhoneRaw) : null),
+          resolvedPhone: reqNormPhone || fbNormPhone || null,
           resolvedEmail: email || (isValidEmailAddress(fbEmail) ? fbEmail : null)
         };
       }
@@ -3127,13 +3590,13 @@ async function verifyFirebaseIdentityNode({ phone = '', email = '', code = '', s
       { sessionInfo, code }
     );
     if (res.ok && res.data && res.data.phoneNumber) {
-      const fbPhoneDigits = String(res.data.phoneNumber).replace(/\D+/g, '');
-      if (!cleanPhone || (cleanPhone.length >= 10 && fbPhoneDigits.endsWith(cleanPhone.slice(-10)))) {
+      const fbNormPhone = normalizePhoneNumberNode(String(res.data.phoneNumber));
+      if (!reqNormPhone || (fbNormPhone && fbNormPhone === reqNormPhone)) {
         return {
           approved: true,
           provider: 'firebase',
           method: 'session_info',
-          resolvedPhone: phone || normalizePhone(res.data.phoneNumber),
+          resolvedPhone: reqNormPhone || fbNormPhone || null,
           resolvedEmail: email || null
         };
       }
@@ -3184,34 +3647,34 @@ async function verifyFirebaseOtpNode(phone, code = '', sessionInfo = '', idToken
   return Boolean(res && res.approved);
 }
 
-async function findPasswordResetUserDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
-  if (email && rawPhone) {
-    const [rows] = await p.query(
-      "SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE (phone = ? OR phone = ? OR phone = ?) AND LOWER(email) = ? LIMIT 1",
-      [phone, rawPhone, rawNoPrefix, email]
-    );
-    return rows[0] || null;
+async function findPasswordResetUserDb(p, { email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
+  await ensureNormalizedPhoneSchemaNode(p);
+  if (email && (rawPhone || phone)) {
+    const matches = await findUsersByPhoneDb(p, rawPhone, phone, dialCode);
+    return matches.find(m => String(m.email || '').trim().toLowerCase() === String(email).trim().toLowerCase()) || null;
   }
   if (email) {
-    const [rows] = await p.query("SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE LOWER(email) = ? LIMIT 1", [email]);
-    return rows[0] || null;
+    const [rows] = await p.query("SELECT id, email, phone, normalized_phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1", [email]);
+    if (rows[0]) return rows[0];
+    if (String(email).trim().toLowerCase() === 'admin@venter.app') {
+      const [aRows] = await p.query("SELECT id, email, phone, normalized_phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE LOWER(email) = 'admin@vendor.app' AND role = 'admin' LIMIT 1");
+      return aRows[0] || null;
+    }
+    return null;
   }
   if (rawPhone || phone) {
-    const [rows] = await p.query(
-      "SELECT id, email, phone, role, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE phone = ? OR phone = ? OR phone = ? LIMIT 1",
-      [phone, rawPhone || phone, rawNoPrefix || String(phone).replace(/^\+91/, '').replace(/^\+/, '')]
-    );
-    return rows[0] || null;
+    const matches = await findUsersByPhoneDb(p, rawPhone, phone, dialCode);
+    return matches[0] || null;
   }
   return null;
 }
 
-function findPasswordResetUserFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
+function findPasswordResetUserFallback({ email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
   const emailMatch = email
     ? fallbackSellers.find(s => String(s.email || '').toLowerCase() === email)
     : null;
   const phoneMatch = (rawPhone || phone)
-    ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone || phone, rawNoPrefix || String(phone).replace(/^\+91/, '').replace(/^\+/, '')))
+    ? fallbackSellers.find(s => matchesPhoneRecord(s.phone, phone, rawPhone || phone, dialCode))
     : null;
   if (email && (rawPhone || phone)) {
     return (emailMatch && phoneMatch && Number(emailMatch.id) === Number(phoneMatch.id)) ? emailMatch : null;
@@ -3219,43 +3682,45 @@ function findPasswordResetUserFallback({ email = '', rawPhone = '', phone = '', 
   return emailMatch || phoneMatch || null;
 }
 
-async function findLatestOtpRecordDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
-  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
-  if (email && (rawPhone || phone)) {
+async function findLatestOtpRecordDb(p, { email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
+  const variants = (rawPhone || phone) ? getPhoneLookupVariantsNode(rawPhone, phone, dialCode) : [];
+  const normExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '')";
+  if (email && variants.length > 0) {
+    const inMarks = variants.map(() => '?').join(', ');
     const [rows] = await p.query(
       `SELECT * FROM password_reset_otps
-       WHERE (LOWER(email) = ? AND (phone IS NULL OR phone = ? OR phone = ? OR phone = ?))
-          OR ((email IS NULL OR LOWER(email) = ?) AND (phone = ? OR phone = ? OR phone = ?))
+       WHERE (LOWER(email) = LOWER(?) AND (phone IS NULL OR ${normExpr} IN (${inMarks})))
+          OR ((email IS NULL OR LOWER(email) = LOWER(?)) AND ${normExpr} IN (${inMarks}))
        ORDER BY id DESC LIMIT 1`,
-      [email, phone, rawPhone || phone, cleanNoPrefix, email, phone, rawPhone || phone, cleanNoPrefix]
+      [email, ...variants, email, ...variants]
     );
     return rows[0] || null;
   }
   if (email) {
     const [rows] = await p.query(
-      'SELECT * FROM password_reset_otps WHERE LOWER(email) = ? ORDER BY id DESC LIMIT 1',
+      'SELECT * FROM password_reset_otps WHERE LOWER(email) = LOWER(?) ORDER BY id DESC LIMIT 1',
       [email]
     );
     return rows[0] || null;
   }
-  if (rawPhone || phone) {
+  if (variants.length > 0) {
+    const inMarks = variants.map(() => '?').join(', ');
     const [rows] = await p.query(
-      'SELECT * FROM password_reset_otps WHERE phone = ? OR phone = ? OR phone = ? ORDER BY id DESC LIMIT 1',
-      [phone, rawPhone || phone, cleanNoPrefix]
+      `SELECT * FROM password_reset_otps WHERE ${normExpr} IN (${inMarks}) ORDER BY id DESC LIMIT 1`,
+      variants
     );
     return rows[0] || null;
   }
   return null;
 }
 
-function findLatestOtpRecordFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
-  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+function findLatestOtpRecordFallback({ email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
   for (let i = fallbackPasswordResetOtps.length - 1; i >= 0; i--) {
     const row = fallbackPasswordResetOtps[i];
     const rowEmail = row.email ? String(row.email).toLowerCase() : '';
     const emailOk = email ? rowEmail === email : true;
     const phoneOk = (rawPhone || phone)
-      ? matchesPhoneRecord(row.phone, phone, rawPhone || phone, cleanNoPrefix)
+      ? matchesPhoneRecord(row.phone, phone, rawPhone || phone, dialCode)
       : true;
     if (email && (rawPhone || phone)) {
       if ((rowEmail === email && (!row.phone || phoneOk)) || (phoneOk && (!rowEmail || emailOk))) {
@@ -3270,29 +3735,30 @@ function findLatestOtpRecordFallback({ email = '', rawPhone = '', phone = '', ra
   return null;
 }
 
-async function clearOtpRecordsDb(p, { email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
-  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+async function clearOtpRecordsDb(p, { email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
+  const variants = (rawPhone || phone) ? getPhoneLookupVariantsNode(rawPhone, phone, dialCode) : [];
+  const normExpr = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '')";
   const clauses = [];
   const params = [];
   if (email) {
-    clauses.push('LOWER(email) = ?');
+    clauses.push('LOWER(email) = LOWER(?)');
     params.push(email.toLowerCase());
   }
-  if (phone || rawPhone) {
-    clauses.push('phone = ? OR phone = ? OR phone = ?');
-    params.push(phone || rawPhone, rawPhone || phone, cleanNoPrefix);
+  if (variants.length > 0) {
+    const inMarks = variants.map(() => '?').join(', ');
+    clauses.push(`${normExpr} IN (${inMarks})`);
+    params.push(...variants);
   }
   if (clauses.length > 0) {
     await p.query(`DELETE FROM password_reset_otps WHERE ${clauses.join(' OR ')}`, params);
   }
 }
 
-function clearOtpRecordsFallback({ email = '', rawPhone = '', phone = '', rawNoPrefix = '' } = {}) {
-  const cleanNoPrefix = rawNoPrefix || String(phone || rawPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+function clearOtpRecordsFallback({ email = '', rawPhone = '', phone = '', dialCode = '' } = {}) {
   fallbackPasswordResetOtps = fallbackPasswordResetOtps.filter(row => {
     const rowEmail = row.email ? String(row.email).toLowerCase() : '';
     const matchesEmail = Boolean(email && rowEmail === email.toLowerCase());
-    const matchesPhone = Boolean((phone || rawPhone) && matchesPhoneRecord(row.phone, phone, rawPhone || phone, cleanNoPrefix));
+    const matchesPhone = Boolean((phone || rawPhone) && matchesPhoneRecord(row.phone, phone, rawPhone || phone, dialCode));
     return !matchesEmail && !matchesPhone;
   });
 }
@@ -3305,7 +3771,7 @@ app.get(['/api/forgot-password', '/api/auth/forgot-password'], (req, res) => {
 
 app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res) => {
   const body = req.body || {};
-  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const { email, rawPhone, dialCode, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
   const recaptchaToken = extractField(body, ['recaptcha_token', 'recaptchaToken', 'recaptcha'], '');
   const continueUrl = extractField(body, ['continue_url', 'continueUrl', 'redirect_url', 'redirectUrl'], '');
   const authMode = extractField(body, ['auth_mode', 'authMode', 'flow'], 'password_reset').toLowerCase();
@@ -3314,37 +3780,42 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
   const errors = {};
   if (identifierError) {
     errors.email_or_phone = [identifierError];
-    errors.email = [identifierError];
-    errors.phone = [identifierError];
   } else if (!email && !rawPhone) {
-    const msg = 'Please provide an email address or phone number.';
-    errors.email_or_phone = [msg];
-    errors.email = [msg];
-    errors.phone = [msg];
+    errors.email_or_phone = ['Please provide an email address or phone number.'];
   } else {
     if (email && !isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     }
-    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    if (rawPhone) {
+      const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+      if (phoneErr) errors.phone = [phoneErr];
     }
   }
 
   if (Object.keys(errors).length > 0) {
-    return res.status(422).json({ message: 'Validation error occurred.', errors });
+    const firstMsg = Object.values(errors)[0][0] || 'Validation error occurred.';
+    return res.status(422).json({
+      status: false,
+      message: Object.keys(errors).length === 1 ? firstMsg : 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
+      errors
+    });
   }
 
-  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
   let activeChannel = (requestedChannel === 'email' || (!rawPhone && email)) ? 'email' : 'phone';
   let matchedUser = null;
-  let usingFallback = false;
+  let usingFallback = !(typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false));
 
-  try {
-    await ensurePasswordResetSchema(pool);
-    matchedUser = await findPasswordResetUserDb(pool, { email, rawPhone, phone, rawNoPrefix });
-  } catch (err) {
-    usingFallback = true;
-    matchedUser = findPasswordResetUserFallback({ email, rawPhone, phone, rawNoPrefix });
+  if (!usingFallback) {
+    try {
+      await ensurePasswordResetSchema(pool);
+      matchedUser = await findPasswordResetUserDb(pool, { email, rawPhone, phone, dialCode });
+    } catch (err) {
+      usingFallback = true;
+    }
+  }
+  if (usingFallback && !matchedUser) {
+    matchedUser = findPasswordResetUserFallback({ email, rawPhone, phone, dialCode });
   }
 
   let otp = null;
@@ -3354,12 +3825,16 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
     const accSt = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
     if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accSt)) {
       return res.status(403).json({
-        status: 'error',
+        status: false,
         message: `Password reset is disabled: seller account status is ${accSt}.`,
+        error_code: 'ACCOUNT_' + accSt,
         errors: { account_status: [accSt] }
       });
     }
-    const targetPhone = matchedUser.phone ? String(matchedUser.phone).trim() : (phone || null);
+    const userPhoneNorm = matchedUser.normalized_phone
+      ? String(matchedUser.normalized_phone).trim()
+      : (matchedUser.phone ? normalizePhoneNumberNode(matchedUser.phone) : '');
+    const targetPhone = userPhoneNorm || (phone || null);
     const targetEmail = getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller') || (email || null);
     if (activeChannel === 'email' && !targetEmail && targetPhone) {
       activeChannel = 'phone';
@@ -3376,7 +3851,7 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
 
     if (!usingFallback) {
       try {
-        await clearOtpRecordsDb(pool, { email: targetEmail || email, rawPhone, phone: targetPhone || phone, rawNoPrefix });
+        await clearOtpRecordsDb(pool, { email: targetEmail || email, rawPhone, phone: targetPhone || phone, dialCode });
         await pool.query(
           'INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (?, ?, ?, ?, NOW())',
           [targetPhone, targetEmail, activeChannel, hash]
@@ -3387,7 +3862,7 @@ app.post(['/api/forgot-password', '/api/auth/forgot-password'], async (req, res)
     }
 
     if (usingFallback) {
-      clearOtpRecordsFallback({ email: targetEmail || email, rawPhone, phone: targetPhone || phone, rawNoPrefix });
+      clearOtpRecordsFallback({ email: targetEmail || email, rawPhone, phone: targetPhone || phone, dialCode });
       fallbackPasswordResetOtps.push({
         phone: targetPhone,
         email: targetEmail,
@@ -3444,7 +3919,7 @@ app.get(['/api/verify-otp', '/api/auth/verify-otp'], (req, res) => {
 
 app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
   const body = req.body || {};
-  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const { email, rawPhone, dialCode, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
   const code = extractField(body, ['code', 'otp', 'otp_code', 'verification_code'], '');
   const sessionInfo = extractField(body, ['session_info', 'sessionInfo', 'session'], '');
   const idToken = extractField(body, ['id_token', 'idToken', 'firebase_token'], '');
@@ -3453,18 +3928,16 @@ app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
   const errors = {};
   if (identifierError) {
     errors.email_or_phone = [identifierError];
-    errors.email = [identifierError];
-    errors.phone = [identifierError];
   } else {
     if (email && !isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     }
-    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    if (rawPhone) {
+      const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+      if (phoneErr) errors.phone = [phoneErr];
     }
     if (!email && !rawPhone && !idToken && !oobCode) {
-      const msg = 'Email or phone number (or Firebase ID Token / OOB code) is required.';
-      errors.email_or_phone = [msg];
+      errors.email_or_phone = ['Email or phone number (or Firebase ID Token / OOB code) is required.'];
     }
     if (!code && !idToken && !oobCode) {
       errors.code = ['Verification OTP code, Firebase OOB code, or Firebase ID Token is required.'];
@@ -3473,56 +3946,53 @@ app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
 
   if (Object.keys(errors).length > 0) {
     return res.status(422).json({
+      status: false,
       message: Object.values(errors)[0][0] || 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
       errors
     });
   }
 
-  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
   const firebaseRes = await verifyFirebaseIdentityNode({ phone, email, code, sessionInfo, idToken, oobCode });
 
-  const resolvedEmail = email || firebaseRes.resolvedEmail || '';
-  const resolvedPhone = phone || firebaseRes.resolvedPhone || '';
-  const resolvedRawNoPrefix = rawNoPrefix || String(resolvedPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
+  const resolvedEmail = email || String(firebaseRes.resolvedEmail || '').trim().toLowerCase();
+  const resolvedPhoneRaw = phone || String(firebaseRes.resolvedPhone || '').trim();
+  const resolvedPhone = resolvedPhoneRaw ? (normalizePhoneNumberNode(resolvedPhoneRaw, dialCode) || resolvedPhoneRaw) : '';
 
   if (resolvedEmail && !isValidEmailAddress(resolvedEmail)) {
     return res.status(422).json({
+      status: false,
       message: 'The email address format is invalid.',
+      error_code: 'VALIDATION_ERROR',
       errors: { email: ['The email address format is invalid.'] }
     });
   }
 
   let latestRow = null;
   let matchedUser = null;
-  let usingFallback = false;
+  let usingFallback = !(typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false));
 
-  try {
-    await ensurePasswordResetSchema(pool);
-    latestRow = await findLatestOtpRecordDb(pool, {
-      email: resolvedEmail,
-      rawPhone,
-      phone: resolvedPhone,
-      rawNoPrefix: resolvedRawNoPrefix
-    });
-    matchedUser = await findPasswordResetUserDb(pool, {
-      email: resolvedEmail,
-      rawPhone,
-      phone: resolvedPhone,
-      rawNoPrefix: resolvedRawNoPrefix
-    });
-  } catch (err) {
-    usingFallback = true;
-    latestRow = findLatestOtpRecordFallback({
-      email: resolvedEmail,
-      rawPhone,
-      phone: resolvedPhone,
-      rawNoPrefix: resolvedRawNoPrefix
-    });
-    matchedUser = findPasswordResetUserFallback({
-      email: resolvedEmail,
-      rawPhone,
-      phone: resolvedPhone,
-      rawNoPrefix: resolvedRawNoPrefix
+  if (!usingFallback) {
+    try {
+      await ensurePasswordResetSchema(pool);
+      latestRow = await findLatestOtpRecordDb(pool, { email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
+      matchedUser = await findPasswordResetUserDb(pool, { email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
+    } catch (err) {
+      usingFallback = true;
+    }
+  }
+  if (usingFallback) {
+    latestRow = findLatestOtpRecordFallback({ email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
+    matchedUser = findPasswordResetUserFallback({ email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
+  }
+
+  if (matchedUser && (matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(String(matchedUser.account_status || 'ACTIVE').toUpperCase())) {
+    const accSt = String(matchedUser.account_status || 'LOCKED').toUpperCase();
+    return res.status(403).json({
+      status: false,
+      message: 'Password reset is disabled because this seller account is locked or deleted.',
+      error_code: 'ACCOUNT_' + accSt,
+      errors: { account_status: [matchedUser.account_status] }
     });
   }
 
@@ -3530,22 +4000,28 @@ app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
 
   if (!firebaseRes.approved && !localValid) {
     return res.status(422).json({
+      status: false,
       message: 'Invalid or expired OTP code.',
+      error_code: 'INVALID_OTP',
       errors: { code: ['Invalid or expired OTP code.'] }
     });
   }
 
-  // If authenticated purely via Firebase OOB/ID token without prior local row, verify an account exists
   if (firebaseRes.approved && !localValid && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail) && !matchedUser) {
     return res.status(422).json({
-      message: 'No seller account matches this verified Firebase email or phone number.'
+      status: false,
+      message: 'No seller account matches this verified Firebase email or phone number.',
+      error_code: 'ACCOUNT_NOT_FOUND'
     });
   }
 
   const resetToken = crypto.randomBytes(32).toString('hex');
   const hashedReset = await bcrypt.hash(resetToken, 10);
 
-  const targetPhone = (matchedUser && matchedUser.phone) || (latestRow && latestRow.phone) || (resolvedPhone || null);
+  const userNormPhone = (matchedUser && matchedUser.normalized_phone)
+    ? String(matchedUser.normalized_phone).trim()
+    : ((matchedUser && matchedUser.phone) ? normalizePhoneNumberNode(matchedUser.phone) : '');
+  const targetPhone = userNormPhone || (latestRow && latestRow.phone) || (resolvedPhone || null);
   const targetEmail = (matchedUser ? getPublicSellerEmail(matchedUser.email, matchedUser.role || 'seller') : null)
     || (latestRow && latestRow.email)
     || (resolvedEmail || null);
@@ -3554,12 +4030,7 @@ app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
 
   if (!usingFallback) {
     try {
-      await clearOtpRecordsDb(pool, {
-        email: targetEmail || resolvedEmail,
-        rawPhone,
-        phone: targetPhone || resolvedPhone,
-        rawNoPrefix: resolvedRawNoPrefix
-      });
+      await clearOtpRecordsDb(pool, { email: targetEmail || resolvedEmail, rawPhone, phone: targetPhone || resolvedPhone, dialCode });
       await pool.query(
         'INSERT INTO password_reset_otps (phone, email, channel, token, created_at) VALUES (?, ?, ?, ?, NOW())',
         [targetPhone, targetEmail, resolvedChannel, hashedReset]
@@ -3570,12 +4041,7 @@ app.post(['/api/verify-otp', '/api/auth/verify-otp'], async (req, res) => {
   }
 
   if (usingFallback) {
-    clearOtpRecordsFallback({
-      email: targetEmail || resolvedEmail,
-      rawPhone,
-      phone: targetPhone || resolvedPhone,
-      rawNoPrefix: resolvedRawNoPrefix
-    });
+    clearOtpRecordsFallback({ email: targetEmail || resolvedEmail, rawPhone, phone: targetPhone || resolvedPhone, dialCode });
     fallbackPasswordResetOtps.push({
       phone: targetPhone,
       email: targetEmail,
@@ -3601,7 +4067,7 @@ app.get(['/api/reset-password', '/api/auth/reset-password'], (req, res) => {
 
 app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) => {
   const body = req.body || {};
-  const { email, rawPhone, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
+  const { email, rawPhone, dialCode, phone, identifierError } = extractAuthIdentifiers(body, { allowUsername: false });
   const reset_token = extractField(body, ['reset_token', 'resetToken', 'token'], '');
   const oobCode = extractField(body, ['oob_code', 'oobCode'], '');
   const idToken = extractField(body, ['id_token', 'idToken', 'firebase_token'], '');
@@ -3611,14 +4077,13 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
   const errors = {};
   if (identifierError) {
     errors.email_or_phone = [identifierError];
-    errors.email = [identifierError];
-    errors.phone = [identifierError];
   } else {
     if (email && !isValidEmailAddress(email)) {
       errors.email = ['The email address format is invalid.'];
     }
-    if (rawPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-      errors.phone = ['The phone format is invalid (must include country code, e.g. +919876543210).'];
+    if (rawPhone) {
+      const phoneErr = validatePhoneFormatNode(phone, rawPhone);
+      if (phoneErr) errors.phone = [phoneErr];
     }
     if (!email && !rawPhone && !idToken && !oobCode) {
       errors.email_or_phone = ['Please provide an email address or phone number.'];
@@ -3637,87 +4102,96 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
 
   if (Object.keys(errors).length > 0) {
     return res.status(422).json({
+      status: false,
       message: Object.values(errors)[0][0] || 'Validation error occurred.',
+      error_code: 'VALIDATION_ERROR',
       errors
     });
   }
 
-  const rawNoPrefix = rawPhone ? rawPhone.replace(/^\+91/, '').replace(/^\+/, '') : '';
   let resolvedEmail = email;
   let resolvedPhone = phone;
   let resolvedChannel = email && !rawPhone ? 'email' : 'phone';
   let firebaseResetDone = false;
 
-  // Verify proof (reset_token OR direct Firebase id_token / oob_code)
   let latestRow = null;
   let matchedUser = null;
-  let usingFallback = false;
+  let usingFallback = !(typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false));
 
-  try {
-    await ensurePasswordResetSchema(pool);
-    if (reset_token) {
-      latestRow = await findLatestOtpRecordDb(pool, { email: resolvedEmail, rawPhone, phone: resolvedPhone, rawNoPrefix });
+  if (!usingFallback) {
+    try {
+      await ensurePasswordResetSchema(pool);
+      if (reset_token) {
+        latestRow = await findLatestOtpRecordDb(pool, { email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
+      }
+    } catch (err) {
+      usingFallback = true;
     }
-  } catch (err) {
-    usingFallback = true;
-    if (reset_token) {
-      latestRow = findLatestOtpRecordFallback({ email: resolvedEmail, rawPhone, phone: resolvedPhone, rawNoPrefix });
-    }
+  }
+  if (usingFallback && reset_token) {
+    latestRow = findLatestOtpRecordFallback({ email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode });
   }
 
   if (reset_token) {
     if (!latestRow || !(await bcrypt.compare(reset_token, latestRow.token))) {
       return res.status(422).json({
+        status: false,
         message: 'Invalid or expired reset token.',
+        error_code: 'INVALID_RESET_TOKEN',
         errors: { reset_token: ['Invalid or expired reset token.'] }
       });
     }
-    resolvedEmail = resolvedEmail || latestRow.email || '';
-    resolvedPhone = resolvedPhone || latestRow.phone || '';
+    resolvedEmail = resolvedEmail || String(latestRow.email || '').trim().toLowerCase();
+    const rowPhone = String(latestRow.phone || '').trim();
+    resolvedPhone = resolvedPhone || (rowPhone ? (normalizePhoneNumberNode(rowPhone, dialCode) || rowPhone) : '');
     resolvedChannel = latestRow.channel || (resolvedEmail && !resolvedPhone ? 'email' : 'phone');
   } else if (idToken) {
     const fbCheck = await verifyFirebaseIdentityNode({ phone: resolvedPhone, email: resolvedEmail, idToken });
     if (!fbCheck.approved) {
       return res.status(422).json({
+        status: false,
         message: 'Invalid or expired Firebase ID token.',
+        error_code: 'INVALID_FIREBASE_TOKEN',
         errors: { id_token: ['Invalid or expired Firebase ID token.'] }
       });
     }
-    resolvedEmail = resolvedEmail || fbCheck.resolvedEmail || '';
-    resolvedPhone = resolvedPhone || fbCheck.resolvedPhone || '';
+    resolvedEmail = resolvedEmail || String(fbCheck.resolvedEmail || '').trim().toLowerCase();
+    const fbPhone = String(fbCheck.resolvedPhone || '').trim();
+    resolvedPhone = resolvedPhone || (fbPhone ? (normalizePhoneNumberNode(fbPhone, dialCode) || fbPhone) : '');
     resolvedChannel = resolvedEmail && !resolvedPhone ? 'email' : 'phone';
   } else if (oobCode) {
     const fbCheck = await verifyFirebaseIdentityNode({ email: resolvedEmail, oobCode });
     if (!fbCheck.approved) {
       return res.status(422).json({
+        status: false,
         message: 'Invalid or expired Firebase OOB reset code.',
+        error_code: 'INVALID_OOB_CODE',
         errors: { oob_code: ['Invalid or expired Firebase OOB reset code.'] }
       });
     }
-    resolvedEmail = resolvedEmail || fbCheck.resolvedEmail || '';
+    resolvedEmail = resolvedEmail || String(fbCheck.resolvedEmail || '').trim().toLowerCase();
     resolvedChannel = 'email';
   }
 
-  const resolvedRawNoPrefix = rawNoPrefix || String(resolvedPhone || '').replace(/^\+91/, '').replace(/^\+/, '');
-  const lookupCriteria = {
-    email: resolvedEmail,
-    rawPhone,
-    phone: resolvedPhone,
-    rawNoPrefix: resolvedRawNoPrefix
-  };
+  const lookupCriteria = { email: resolvedEmail, rawPhone, phone: resolvedPhone, dialCode };
 
   if (!usingFallback) {
     try {
       matchedUser = await findPasswordResetUserDb(pool, lookupCriteria);
       if (!matchedUser && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail)) {
-        return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
+        return res.status(404).json({
+          status: false,
+          message: 'No seller account matches the supplied email or phone number.',
+          error_code: 'ACCOUNT_NOT_FOUND'
+        });
       }
       if (matchedUser) {
         const accSt = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
         if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accSt)) {
           return res.status(403).json({
-            status: 'error',
+            status: false,
             message: `Password reset is disabled: seller account status is ${accSt}.`,
+            error_code: 'ACCOUNT_' + accSt,
             errors: { account_status: [accSt] }
           });
         }
@@ -3725,7 +4199,11 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
       if (oobCode && !reset_token) {
         const applied = await applyFirebaseOobPasswordResetNode(oobCode, password);
         if (!applied.ok) {
-          return res.status(422).json({ message: applied.error || 'Invalid or expired Firebase OOB reset code.' });
+          return res.status(422).json({
+            status: false,
+            message: applied.error || 'Invalid or expired Firebase OOB reset code.',
+            error_code: 'INVALID_OOB_CODE'
+          });
         }
         firebaseResetDone = true;
       }
@@ -3734,12 +4212,12 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
         await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = ?', [hashed, matchedUser.id]);
         try { await pool.query('DELETE FROM personal_access_tokens WHERE tokenable_id = ?', [matchedUser.id]); } catch (e) {}
       } else if (resolvedEmail && !resolvedPhone) {
-        await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE LOWER(email) = ?', [hashed, resolvedEmail]);
+        await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE LOWER(email) = LOWER(?)', [hashed, resolvedEmail]);
       } else if (resolvedPhone) {
-        await pool.query(
-          'UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE phone = ? OR phone = ? OR phone = ?',
-          [hashed, resolvedPhone, rawPhone || resolvedPhone, resolvedRawNoPrefix]
-        );
+        const phoneTargets = await findUsersByPhoneDb(pool, rawPhone, resolvedPhone, dialCode);
+        if (phoneTargets.length > 0) {
+          await pool.query('UPDATE users SET password = ?, token_version = COALESCE(token_version, 1) + 1, updated_at = NOW() WHERE id = ?', [hashed, phoneTargets[0].id]);
+        }
       }
       await clearOtpRecordsDb(pool, lookupCriteria);
       return res.json({
@@ -3755,18 +4233,24 @@ app.post(['/api/reset-password', '/api/auth/reset-password'], async (req, res) =
   // Offline fallback execution
   matchedUser = findPasswordResetUserFallback(lookupCriteria);
   if (!matchedUser && !isFirebaseTestPhoneNode(resolvedPhone) && !isFirebaseTestEmailNode(resolvedEmail)) {
-    return res.status(422).json({ message: 'No seller account matches the supplied email or phone number.' });
+    return res.status(404).json({
+      status: false,
+      message: 'No seller account matches the supplied email or phone number.',
+      error_code: 'ACCOUNT_NOT_FOUND'
+    });
   }
   if (matchedUser) {
     const accStFb = String(matchedUser.account_status || 'ACTIVE').toUpperCase();
     if ((matchedUser.role || 'seller') !== 'admin' && ['LOCKED', 'DELETED'].includes(accStFb)) {
       return res.status(403).json({
-        status: 'error',
+        status: false,
         message: `Password reset is disabled: seller account status is ${accStFb}.`,
+        error_code: 'ACCOUNT_' + accStFb,
         errors: { account_status: [accStFb] }
       });
     }
     matchedUser._password = password;
+    matchedUser.password = await bcrypt.hash(password, 10);
     matchedUser.token_version = Number(matchedUser.token_version || 1) + 1;
   }
   clearOtpRecordsFallback(lookupCriteria);
@@ -4273,6 +4757,15 @@ function formatCategoryRecord(row, overrideCount = null) {
 async function findCategoryByIdOrSlug(p, idOrSlug) {
   const trimmed = String(idOrSlug || '').trim();
   if (!trimmed) return null;
+  const dbActive = p ? await checkDbReachable(p, typeof deletionCtx !== 'undefined' ? deletionCtx : null) : false;
+  if (!dbActive) {
+    const low = trimmed.toLowerCase();
+    if (/^\d+$/.test(trimmed)) {
+      const byId = fallbackCategories.find(c => Number(c.id) === parseInt(trimmed, 10));
+      if (byId) return byId;
+    }
+    return fallbackCategories.find(c => String(c.slug || '').toLowerCase() === low || String(c.name || '').toLowerCase() === low) || null;
+  }
   if (/^\d+$/.test(trimmed)) {
     const [byId] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [parseInt(trimmed, 10)]);
     if (byId.length > 0) return byId[0];
@@ -4282,7 +4775,10 @@ async function findCategoryByIdOrSlug(p, idOrSlug) {
 }
 
 async function resolveProductCategoryInput(p, body, isCreate = false) {
-  await ensureProductCategoriesTable(p);
+  const dbActive = p ? await checkDbReachable(p, typeof deletionCtx !== 'undefined' ? deletionCtx : null) : false;
+  if (dbActive) {
+    await ensureProductCategoriesTable(p);
+  }
   const hasCatId = body && body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '';
   const hasCatName = body && (body.category !== undefined || body.category_name !== undefined || body.category_slug !== undefined);
 
@@ -4290,6 +4786,13 @@ async function resolveProductCategoryInput(p, body, isCreate = false) {
     const numId = parseInt(body.category_id, 10);
     if (isNaN(numId) || numId <= 0) {
       return { provided: true, error: 'Category ID must be a positive integer.' };
+    }
+    if (!dbActive) {
+      const fbCat = fallbackCategories.find(c => Number(c.id) === numId);
+      if (!fbCat) {
+        return { provided: true, error: 'Selected category was not found.' };
+      }
+      return { provided: true, category: String(fbCat.name), category_id: Number(fbCat.id), error: null };
     }
     const [rows] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [numId]);
     if (rows.length === 0) {
@@ -4302,6 +4805,15 @@ async function resolveProductCategoryInput(p, body, isCreate = false) {
     const raw = String(body.category !== undefined ? body.category : (body.category_name !== undefined ? body.category_name : body.category_slug)).trim();
     if (!raw) {
       return { provided: true, category: 'General', category_id: null, error: null };
+    }
+    if (!dbActive) {
+      const low = raw.toLowerCase();
+      const matched = (/^\d+$/.test(raw) ? fallbackCategories.find(c => Number(c.id) === parseInt(raw, 10)) : null)
+        || fallbackCategories.find(c => String(c.name || '').toLowerCase() === low || String(c.slug || '').toLowerCase() === low);
+      if (matched) {
+        return { provided: true, category: String(matched.name), category_id: Number(matched.id), error: null };
+      }
+      return { provided: true, category: raw, category_id: null, error: null };
     }
     if (/^\d+$/.test(raw)) {
       const [rows] = await p.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [parseInt(raw, 10)]);
@@ -4323,43 +4835,47 @@ async function resolveProductCategoryInput(p, body, isCreate = false) {
 }
 
 async function getCategoriesListWithCounts(p, includeInactive = false, search = '') {
-  try {
-    await ensureProductCategoriesTable(p);
-    let where = 'WHERE 1=1';
-    const params = [];
-    if (!includeInactive) {
-      where += ' AND c.is_active = 1';
-    }
-    if (search) {
-      where += ' AND (c.name LIKE ? OR c.description LIKE ? OR c.slug LIKE ?)';
-      const s = `%${search}%`;
-      params.push(s, s, s);
-    }
-    const [rows] = await p.query(
-      `SELECT c.*,
-              (SELECT COUNT(*) FROM products pr WHERE pr.is_active = 1 AND (pr.category_id = c.id OR LOWER(pr.category) = LOWER(c.name))) AS products_count
-       FROM categories c
-       ${where}
-       ORDER BY c.sort_order ASC, c.id ASC`,
-      params
-    );
-    return rows.map(r => formatCategoryRecord(r));
-  } catch (err) {
-    const searchLower = String(search || '').toLowerCase();
-    return fallbackCategories
-      .filter(c => {
-        if (!includeInactive && c.is_active === false) return false;
-        if (searchLower && !c.name.toLowerCase().includes(searchLower) && !String(c.description || '').toLowerCase().includes(searchLower)) return false;
-        return true;
-      })
-      .sort((a, b) => (Number(a.sort_order || 0) - Number(b.sort_order || 0)) || (Number(a.id) - Number(b.id)))
-      .map(c => formatCategoryRecord(c, fallbackProducts.filter(pr => Number(pr.is_active ?? 1) === 1 && (Number(pr.category_id) === Number(c.id) || String(pr.category || '').toLowerCase() === c.name.toLowerCase())).length));
+  const dbActive = p ? await checkDbReachable(p, typeof deletionCtx !== 'undefined' ? deletionCtx : null) : false;
+  if (dbActive) {
+    try {
+      await ensureProductCategoriesTable(p);
+      let where = 'WHERE 1=1';
+      const params = [];
+      if (!includeInactive) {
+        where += ' AND c.is_active = 1';
+      }
+      if (search) {
+        where += ' AND (c.name LIKE ? OR c.description LIKE ? OR c.slug LIKE ?)';
+        const s = `%${search}%`;
+        params.push(s, s, s);
+      }
+      const [rows] = await p.query(
+        `SELECT c.*,
+                (SELECT COUNT(*) FROM products pr WHERE pr.is_active = 1 AND (pr.category_id = c.id OR LOWER(pr.category) = LOWER(c.name))) AS products_count
+         FROM categories c
+         ${where}
+         ORDER BY c.sort_order ASC, c.id ASC`,
+        params
+      );
+      return rows.map(r => formatCategoryRecord(r));
+    } catch (err) {}
   }
+
+  const searchLower = String(search || '').toLowerCase();
+  return fallbackCategories
+    .filter(c => {
+      if (!includeInactive && c.is_active === false) return false;
+      if (searchLower && !c.name.toLowerCase().includes(searchLower) && !String(c.description || '').toLowerCase().includes(searchLower)) return false;
+      return true;
+    })
+    .sort((a, b) => (Number(a.sort_order || 0) - Number(b.sort_order || 0)) || (Number(a.id) - Number(b.id)))
+    .map(c => formatCategoryRecord(c, fallbackProducts.filter(pr => Number(pr.is_active === false ? 0 : (pr.is_active ?? 1)) === 1 && (Number(pr.category_id) === Number(c.id) || String(pr.category || '').toLowerCase() === c.name.toLowerCase())).length));
 }
 
 async function performCategoryMutationNode(p, action, body = {}, allowUnprefixedFields = true, fallbackCatId = null) {
   const normAction = String(action || '').trim().toLowerCase();
   const includeInactive = ['1', 'true', 'yes'].includes(String(body.include_inactive_categories || body.include_inactive || '').toLowerCase());
+  const dbActive = p ? await checkDbReachable(p, typeof deletionCtx !== 'undefined' ? deletionCtx : null) : false;
 
   if (['create', 'create_category', 'add_category', 'add'].includes(normAction)) {
     const catData = (body.create_category && typeof body.create_category === 'object')
@@ -4380,65 +4896,76 @@ async function performCategoryMutationNode(p, action, body = {}, allowUnprefixed
       return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['The category name may not exceed 100 characters.'] } } };
     }
 
-    try {
-      await ensureProductCategoriesTable(p);
-      const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [name]);
-      if (dup.length > 0) {
-        return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
-      }
-      const rawSlug = String(catData.slug ?? body.category_slug ?? (allowUnprefixedFields ? (body.slug ?? '') : '')).trim();
-      const slug = await ensureUniqueCategorySlug(p, rawSlug ? toCategorySlug(rawSlug) : toCategorySlug(name));
-      const description = String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null;
-      const icon = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || null;
-      const imageUrl = String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null;
-      const rawSort = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
-      let sortOrder = 0;
-      if (rawSort !== undefined && !isNaN(parseInt(rawSort, 10))) {
-        sortOrder = parseInt(rawSort, 10);
-      } else {
-        const [[{ maxSort }]] = await p.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
-        sortOrder = Number(maxSort || 0) + 1;
-      }
-      const rawActive = catData.is_active !== undefined ? catData.is_active
-        : (body.category_is_active !== undefined ? body.category_is_active : (allowUnprefixedFields ? body.is_active : undefined));
-      const isActive = rawActive === undefined ? 1 : (['0', 'false', 'no', 'off'].includes(String(rawActive).toLowerCase()) ? 0 : 1);
+    if (dbActive) {
+      try {
+        await ensureProductCategoriesTable(p);
+        const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [name]);
+        if (dup.length > 0) {
+          return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+        }
+        const rawSlug = String(catData.slug ?? body.category_slug ?? (allowUnprefixedFields ? (body.slug ?? '') : '')).trim();
+        const slug = await ensureUniqueCategorySlug(p, rawSlug ? toCategorySlug(rawSlug) : toCategorySlug(name));
+        const description = String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null;
+        const icon = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || null;
+        const imageUrl = String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null;
+        const rawSort = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+        let sortOrder = 0;
+        if (rawSort !== undefined && !isNaN(parseInt(rawSort, 10))) {
+          sortOrder = parseInt(rawSort, 10);
+        } else {
+          const [[{ maxSort }]] = await p.query('SELECT COALESCE(MAX(sort_order), 0) as maxSort FROM categories');
+          sortOrder = Number(maxSort || 0) + 1;
+        }
+        const rawActive = catData.is_active !== undefined ? catData.is_active
+          : (body.category_is_active !== undefined ? body.category_is_active : (allowUnprefixedFields ? body.is_active : undefined));
+        const isActive = rawActive === undefined ? 1 : (['0', 'false', 'no', 'off'].includes(String(rawActive).toLowerCase()) ? 0 : 1);
 
-      const [ins] = await p.query(
-        `INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [name, slug, description, icon, imageUrl, sortOrder, isActive]
-      );
-      const cat = await findCategoryByIdOrSlug(p, String(ins.insertId));
-      const formatted = formatCategoryRecord(cat, 0);
-      const categories = await getCategoriesListWithCounts(p, includeInactive);
-      return {
-        ok: true,
-        statusCode: 201,
-        payload: { success: true, status: true, message: 'Category created.', category: formatted, data: formatted, categories }
-      };
-    } catch (dbErr) {
-      if (fallbackCategories.some(c => c.name.toLowerCase() === name.toLowerCase())) {
-        return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
-      }
-      const newId = fallbackCategories.length ? Math.max(...fallbackCategories.map(c => Number(c.id))) + 1 : 6;
-      const created = formatCategoryRecord({
-        id: newId,
-        name,
-        slug: toCategorySlug(name),
-        description: String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null,
-        icon: String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || '🏷️',
-        image_url: String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null,
-        sort_order: fallbackCategories.length + 1,
-        is_active: true
-      }, 0);
-      fallbackCategories.push(created);
-      const categories = await getCategoriesListWithCounts(null, includeInactive);
-      return {
-        ok: true,
-        statusCode: 201,
-        payload: { success: true, status: true, message: 'Category created.', category: created, data: created, categories }
-      };
+        const [ins] = await p.query(
+          `INSERT INTO categories (name, slug, description, icon, image_url, sort_order, is_active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [name, slug, description, icon, imageUrl, sortOrder, isActive]
+        );
+        const cat = await findCategoryByIdOrSlug(p, String(ins.insertId));
+        const formatted = formatCategoryRecord(cat, 0);
+        const categories = await getCategoriesListWithCounts(p, includeInactive);
+        return {
+          ok: true,
+          statusCode: 201,
+          payload: { success: true, status: true, message: 'Category created.', category: formatted, data: formatted, categories }
+        };
+      } catch (dbErr) {}
     }
+
+    if (fallbackCategories.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+      return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+    }
+    const newId = fallbackCategories.length ? Math.max(...fallbackCategories.map(c => Number(c.id))) + 1 : 6;
+    const rawSlugFb = String(catData.slug ?? body.category_slug ?? (allowUnprefixedFields ? (body.slug ?? '') : '')).trim();
+    const rawSortFb = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+    const sortOrderFb = (rawSortFb !== undefined && !isNaN(parseInt(rawSortFb, 10))) ? parseInt(rawSortFb, 10) : (fallbackCategories.length + 1);
+    const rawActiveFb = catData.is_active !== undefined ? catData.is_active
+      : (body.category_is_active !== undefined ? body.category_is_active : (allowUnprefixedFields ? body.is_active : undefined));
+    const isActiveFb = rawActiveFb === undefined ? true : !['0', 'false', 'no', 'off'].includes(String(rawActiveFb).toLowerCase());
+    const nowIso = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const created = formatCategoryRecord({
+      id: newId,
+      name,
+      slug: rawSlugFb ? toCategorySlug(rawSlugFb) : toCategorySlug(name),
+      description: String(catData.description ?? body.category_description ?? (allowUnprefixedFields ? (body.description ?? '') : '')).trim() || null,
+      icon: String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || '🏷️',
+      image_url: String(catData.image_url ?? body.category_image_url ?? (allowUnprefixedFields ? (body.image_url ?? '') : '')).trim() || null,
+      sort_order: sortOrderFb,
+      is_active: isActiveFb ? 1 : 0,
+      created_at: nowIso,
+      updated_at: nowIso
+    }, 0);
+    fallbackCategories.push(created);
+    const categories = await getCategoriesListWithCounts(null, includeInactive);
+    return {
+      ok: true,
+      statusCode: 201,
+      payload: { success: true, status: true, message: 'Category created.', category: created, data: created, categories }
+    };
   }
 
   if (['update', 'edit', 'edit_category', 'update_category', 'rename', 'rename_category'].includes(normAction)) {
@@ -4468,165 +4995,182 @@ async function performCategoryMutationNode(p, action, body = {}, allowUnprefixed
     else if (body.new_name !== undefined) { hasIncomingName = true; incomingName = body.new_name; }
     else if (allowUnprefixedFields && body.name !== undefined) { hasIncomingName = true; incomingName = body.name; }
 
-    try {
-      await ensureProductCategoriesTable(p);
-      const existing = await findCategoryByIdOrSlug(p, String(target || ''));
-      if (!existing) {
-        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
-      }
-
-      const catId = Number(existing.id);
-      const oldName = String(existing.name);
-      const updates = [];
-      const params = [];
-      let newName = oldName;
-      let nameChanged = false;
-
-      if (hasIncomingName) {
-        const trimmed = String(incomingName || '').trim();
-        if (!trimmed) {
-          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
+    if (dbActive) {
+      try {
+        await ensureProductCategoriesTable(p);
+        const existing = await findCategoryByIdOrSlug(p, String(target || ''));
+        if (!existing) {
+          return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
         }
-        if (trimmed.length > 100) {
-          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } } };
-        }
-        const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [trimmed, catId]);
-        if (dup.length > 0) {
-          return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
-        }
-        updates.push('name = ?');
-        params.push(trimmed);
-        newName = trimmed;
-        nameChanged = (oldName !== newName);
-      }
 
-      const rawSlug = catData.slug !== undefined ? catData.slug : (body.category_slug !== undefined ? body.category_slug : (allowUnprefixedFields ? body.slug : undefined));
-      if (rawSlug !== undefined && String(rawSlug).trim() !== '') {
-        const slug = await ensureUniqueCategorySlug(p, toCategorySlug(rawSlug), catId);
-        updates.push('slug = ?');
-        params.push(slug);
-      } else if (nameChanged) {
-        const slug = await ensureUniqueCategorySlug(p, toCategorySlug(newName), catId);
-        updates.push('slug = ?');
-        params.push(slug);
-      }
+        const catId = Number(existing.id);
+        const oldName = String(existing.name);
+        const updates = [];
+        const params = [];
+        let newName = oldName;
+        let nameChanged = false;
 
-      if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
-        const d = String(catData.description ?? body.category_description ?? body.description ?? '').trim();
-        updates.push('description = ?');
-        params.push(d || null);
-      }
-      if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
-        const ic = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim();
-        updates.push('icon = ?');
-        params.push(ic || null);
-      }
-      if (catData.image_url !== undefined || body.category_image_url !== undefined || (allowUnprefixedFields && body.image_url !== undefined)) {
-        const im = String(catData.image_url ?? body.category_image_url ?? body.image_url ?? '').trim();
-        updates.push('image_url = ?');
-        params.push(im || null);
-      }
-      const sortVal = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
-      if (sortVal !== undefined && !isNaN(parseInt(sortVal, 10))) {
-        updates.push('sort_order = ?');
-        params.push(parseInt(sortVal, 10));
-      }
-      if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
-        const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
-        const activeBit = ['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase()) ? 0 : 1;
-        updates.push('is_active = ?');
-        params.push(activeBit);
-      }
-
-      if (updates.length > 0) {
-        updates.push('updated_at = NOW()');
-        params.push(catId);
-        await p.query(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`, params);
-      }
-
-      let updatedProductsCount = 0;
-      if (nameChanged) {
-        try {
-          const [syncRes] = await p.query(
-            'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
-            [newName, catId, catId, oldName]
-          );
-          updatedProductsCount = Number(syncRes.affectedRows || 0);
-        } catch (e) {}
-      }
-
-      const fresh = await findCategoryByIdOrSlug(p, String(catId));
-      const [[{ cnt }]] = await p.query(
-        'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
-        [catId, fresh.name]
-      );
-      const formatted = formatCategoryRecord(fresh, cnt);
-      const categories = await getCategoriesListWithCounts(p, includeInactive);
-      return {
-        ok: true,
-        statusCode: 200,
-        payload: {
-          success: true,
-          status: true,
-          message: 'Category updated.',
-          updated_products_count: updatedProductsCount,
-          category: formatted,
-          data: formatted,
-          categories
-        }
-      };
-    } catch (dbErr) {
-      const targetStr = String(target || '').trim().toLowerCase();
-      const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
-      if (idx === -1) {
-        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
-      }
-      const oldName = fallbackCategories[idx].name;
-      let updatedProductsCount = 0;
-      if (hasIncomingName) {
-        const trimmed = String(incomingName || '').trim();
-        if (!trimmed) {
-          return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
-        }
-        if (fallbackCategories.some((c, i) => i !== idx && c.name.toLowerCase() === trimmed.toLowerCase())) {
-          return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
-        }
-        fallbackCategories[idx].name = trimmed;
-        fallbackCategories[idx].slug = toCategorySlug(trimmed);
-        for (const pr of fallbackProducts) {
-          if (String(pr.category || '').toLowerCase() === oldName.toLowerCase() || Number(pr.category_id) === fallbackCategories[idx].id) {
-            pr.category = trimmed;
-            pr.category_id = fallbackCategories[idx].id;
-            updatedProductsCount++;
+        if (hasIncomingName) {
+          const trimmed = String(incomingName || '').trim();
+          if (!trimmed) {
+            return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
           }
+          if (trimmed.length > 100) {
+            return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } } };
+          }
+          const [dup] = await p.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1', [trimmed, catId]);
+          if (dup.length > 0) {
+            return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+          }
+          updates.push('name = ?');
+          params.push(trimmed);
+          newName = trimmed;
+          nameChanged = (oldName !== newName);
         }
-      }
-      if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
-        fallbackCategories[idx].description = catData.description ?? body.category_description ?? body.description;
-      }
-      if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
-        fallbackCategories[idx].icon = catData.icon ?? body.category_icon ?? body.icon;
-      }
-      if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
-        const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
-        fallbackCategories[idx].is_active = !['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase());
-      }
-      const formatted = formatCategoryRecord(fallbackCategories[idx]);
-      const categories = await getCategoriesListWithCounts(null, includeInactive);
-      return {
-        ok: true,
-        statusCode: 200,
-        payload: {
-          success: true,
-          status: true,
-          message: 'Category updated.',
-          updated_products_count: updatedProductsCount,
-          category: formatted,
-          data: formatted,
-          categories
+
+        const rawSlug = catData.slug !== undefined ? catData.slug : (body.category_slug !== undefined ? body.category_slug : (allowUnprefixedFields ? body.slug : undefined));
+        if (rawSlug !== undefined && String(rawSlug).trim() !== '') {
+          const slug = await ensureUniqueCategorySlug(p, toCategorySlug(rawSlug), catId);
+          updates.push('slug = ?');
+          params.push(slug);
+        } else if (nameChanged) {
+          const slug = await ensureUniqueCategorySlug(p, toCategorySlug(newName), catId);
+          updates.push('slug = ?');
+          params.push(slug);
         }
-      };
+
+        if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
+          const d = String(catData.description ?? body.category_description ?? body.description ?? '').trim();
+          updates.push('description = ?');
+          params.push(d || null);
+        }
+        if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
+          const ic = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim();
+          updates.push('icon = ?');
+          params.push(ic || null);
+        }
+        if (catData.image_url !== undefined || body.category_image_url !== undefined || (allowUnprefixedFields && body.image_url !== undefined)) {
+          const im = String(catData.image_url ?? body.category_image_url ?? body.image_url ?? '').trim();
+          updates.push('image_url = ?');
+          params.push(im || null);
+        }
+        const sortVal = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+        if (sortVal !== undefined && !isNaN(parseInt(sortVal, 10))) {
+          updates.push('sort_order = ?');
+          params.push(parseInt(sortVal, 10));
+        }
+        if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
+          const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
+          const activeBit = ['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase()) ? 0 : 1;
+          updates.push('is_active = ?');
+          params.push(activeBit);
+        }
+
+        if (updates.length > 0) {
+          updates.push('updated_at = NOW()');
+          params.push(catId);
+          await p.query(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`, params);
+        }
+
+        let updatedProductsCount = 0;
+        if (nameChanged) {
+          try {
+            const [syncRes] = await p.query(
+              'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)',
+              [newName, catId, catId, oldName]
+            );
+            updatedProductsCount = Number(syncRes.affectedRows || 0);
+          } catch (e) {}
+        }
+
+        const fresh = await findCategoryByIdOrSlug(p, String(catId));
+        const [[{ cnt }]] = await p.query(
+          'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
+          [catId, fresh.name]
+        );
+        const formatted = formatCategoryRecord(fresh, cnt);
+        const categories = await getCategoriesListWithCounts(p, includeInactive);
+        return {
+          ok: true,
+          statusCode: 200,
+          payload: {
+            success: true,
+            status: true,
+            message: 'Category updated.',
+            updated_products_count: updatedProductsCount,
+            category: formatted,
+            data: formatted,
+            categories
+          }
+        };
+      } catch (dbErr) {}
     }
+
+    const targetStr = String(target || '').trim().toLowerCase();
+    const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
+    if (idx === -1) {
+      return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+    }
+    const oldName = fallbackCategories[idx].name;
+    let updatedProductsCount = 0;
+    if (hasIncomingName) {
+      const trimmed = String(incomingName || '').trim();
+      if (!trimmed) {
+        return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name cannot be empty.'] } } };
+      }
+      if (trimmed.length > 100) {
+        return { ok: false, statusCode: 422, errorBody: { message: 'Validation error occurred.', errors: { name: ['Category name may not exceed 100 characters.'] } } };
+      }
+      if (fallbackCategories.some((c, i) => i !== idx && c.name.toLowerCase() === trimmed.toLowerCase())) {
+        return { ok: false, statusCode: 422, errorBody: { message: 'A category with this name already exists.', errors: { name: ['A category with this name already exists.'] } } };
+      }
+      fallbackCategories[idx].name = trimmed;
+      fallbackCategories[idx].slug = toCategorySlug(trimmed);
+      for (const pr of fallbackProducts) {
+        if (String(pr.category || '').toLowerCase() === oldName.toLowerCase() || Number(pr.category_id) === Number(fallbackCategories[idx].id)) {
+          pr.category = trimmed;
+          pr.category_id = Number(fallbackCategories[idx].id);
+          updatedProductsCount++;
+        }
+      }
+    }
+    const rawSlugFb = catData.slug !== undefined ? catData.slug : (body.category_slug !== undefined ? body.category_slug : (allowUnprefixedFields ? body.slug : undefined));
+    if (rawSlugFb !== undefined && String(rawSlugFb).trim() !== '') {
+      fallbackCategories[idx].slug = toCategorySlug(rawSlugFb);
+    }
+    if (catData.description !== undefined || body.category_description !== undefined || (allowUnprefixedFields && body.description !== undefined)) {
+      fallbackCategories[idx].description = String(catData.description ?? body.category_description ?? body.description ?? '').trim() || null;
+    }
+    if (catData.icon !== undefined || body.category_icon !== undefined || body.icon !== undefined) {
+      fallbackCategories[idx].icon = String(catData.icon ?? body.category_icon ?? body.icon ?? '').trim() || null;
+    }
+    if (catData.image_url !== undefined || body.category_image_url !== undefined || (allowUnprefixedFields && body.image_url !== undefined)) {
+      fallbackCategories[idx].image_url = String(catData.image_url ?? body.category_image_url ?? body.image_url ?? '').trim() || null;
+    }
+    const sortValFb = catData.sort_order ?? body.category_sort_order ?? (allowUnprefixedFields ? body.sort_order : undefined);
+    if (sortValFb !== undefined && !isNaN(parseInt(sortValFb, 10))) {
+      fallbackCategories[idx].sort_order = parseInt(sortValFb, 10);
+    }
+    if (catData.is_active !== undefined || body.category_is_active !== undefined || (allowUnprefixedFields && body.is_active !== undefined)) {
+      const rawAct = catData.is_active !== undefined ? catData.is_active : (body.category_is_active !== undefined ? body.category_is_active : body.is_active);
+      fallbackCategories[idx].is_active = !['0', 'false', 'no', 'off'].includes(String(rawAct).toLowerCase());
+    }
+    const activeProdCountFb = fallbackProducts.filter(pr => Number(pr.is_active === false ? 0 : (pr.is_active ?? 1)) === 1 && (Number(pr.category_id) === Number(fallbackCategories[idx].id) || String(pr.category || '').toLowerCase() === fallbackCategories[idx].name.toLowerCase())).length;
+    const formatted = formatCategoryRecord(fallbackCategories[idx], activeProdCountFb);
+    const categories = await getCategoriesListWithCounts(null, includeInactive);
+    return {
+      ok: true,
+      statusCode: 200,
+      payload: {
+        success: true,
+        status: true,
+        message: 'Category updated.',
+        updated_products_count: updatedProductsCount,
+        category: formatted,
+        data: formatted,
+        categories
+      }
+    };
   }
 
   if (['delete', 'delete_category', 'remove', 'remove_category'].includes(normAction)) {
@@ -4635,47 +5179,49 @@ async function performCategoryMutationNode(p, action, body = {}, allowUnprefixed
       target = String(fallbackCatId);
     }
 
-    try {
-      await ensureProductCategoriesTable(p);
-      const existing = await findCategoryByIdOrSlug(p, String(target || ''));
-      if (!existing) {
-        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
-      }
-      const catId = Number(existing.id);
+    if (dbActive) {
       try {
-        await p.query(
-          "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
-          [catId, existing.name]
-        );
-      } catch (e) {}
-      await p.query('DELETE FROM categories WHERE id = ?', [catId]);
-      const categories = await getCategoriesListWithCounts(p, includeInactive);
-      return {
-        ok: true,
-        statusCode: 200,
-        payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: catId, categories }
-      };
-    } catch (dbErr) {
-      const targetStr = String(target || '').trim().toLowerCase();
-      const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
-      if (idx === -1) {
-        return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
-      }
-      const removed = fallbackCategories[idx];
-      fallbackCategories.splice(idx, 1);
-      for (const pr of fallbackProducts) {
-        if (Number(pr.category_id) === Number(removed.id) || String(pr.category || '').toLowerCase() === removed.name.toLowerCase()) {
-          pr.category = 'General';
-          pr.category_id = null;
+        await ensureProductCategoriesTable(p);
+        const existing = await findCategoryByIdOrSlug(p, String(target || ''));
+        if (!existing) {
+          return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
         }
-      }
-      const categories = await getCategoriesListWithCounts(null, includeInactive);
-      return {
-        ok: true,
-        statusCode: 200,
-        payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: Number(removed.id), categories }
-      };
+        const catId = Number(existing.id);
+        try {
+          await p.query(
+            "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
+            [catId, existing.name]
+          );
+        } catch (e) {}
+        await p.query('DELETE FROM categories WHERE id = ?', [catId]);
+        const categories = await getCategoriesListWithCounts(p, includeInactive);
+        return {
+          ok: true,
+          statusCode: 200,
+          payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: catId, categories }
+        };
+      } catch (dbErr) {}
     }
+
+    const targetStr = String(target || '').trim().toLowerCase();
+    const idx = fallbackCategories.findIndex(c => String(c.id) === targetStr || c.slug.toLowerCase() === targetStr || c.name.toLowerCase() === targetStr);
+    if (idx === -1) {
+      return { ok: false, statusCode: 404, errorBody: { message: 'Category not found.' } };
+    }
+    const removed = fallbackCategories[idx];
+    fallbackCategories.splice(idx, 1);
+    for (const pr of fallbackProducts) {
+      if (Number(pr.category_id) === Number(removed.id) || String(pr.category || '').toLowerCase() === removed.name.toLowerCase()) {
+        pr.category = 'General';
+        pr.category_id = null;
+      }
+    }
+    const categories = await getCategoriesListWithCounts(null, includeInactive);
+    return {
+      ok: true,
+      statusCode: 200,
+      payload: { success: true, status: true, message: 'Category deleted.', deleted_category_id: Number(removed.id), categories }
+    };
   }
 
   return { ok: false, statusCode: 422, errorBody: { message: 'Unsupported category_action. Use create, update, or delete.' } };
@@ -4725,6 +5271,15 @@ app.put('/api/products', authenticateToken, requireActiveSellerForMutation, uplo
 app.patch('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
 app.delete('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
 
+function parseBoolBitNode(val, defaultVal = 1) {
+  if (val === undefined || val === null) return defaultVal;
+  if (typeof val === 'boolean') return val ? 1 : 0;
+  if (typeof val === 'number') return val !== 0 ? 1 : 0;
+  const s = String(val).trim().toLowerCase();
+  if (s === '') return defaultVal;
+  return ['0', 'false', 'no', 'off'].includes(s) ? 0 : 1;
+}
+
 app.get('/api/products', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
@@ -4734,129 +5289,165 @@ app.get('/api/products', async (req, res) => {
   const category = (req.query.category || '').toString().trim();
   const categoryIdParam = (req.query.category_id || '').toString().trim();
   const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
+  const reqIncludeInactive = ['1', 'true', 'yes'].includes(String(req.query.include_inactive || '').toLowerCase());
+  const optionalUser = reqIncludeInactive ? await resolveOptionalUserAsync(req) : null;
+  const isAdminIncludeInactive = Boolean(reqIncludeInactive && optionalUser && String(optionalUser.role || '').toLowerCase() === 'admin');
+  const filterActiveParam = (isAdminIncludeInactive && req.query.is_active !== undefined && req.query.is_active !== '')
+    ? parseBoolBitNode(req.query.is_active, 1)
+    : null;
+  const dbActive = await checkDbReachable(pool, deletionCtx);
 
-  try {
-    await ensureProductPriceColumns(pool);
-    let whereSql = "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
-    const whereParams = [];
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      let whereSql = isAdminIncludeInactive
+        ? 'WHERE 1=1'
+        : "WHERE p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
+      const whereParams = [];
 
-    if (sellerId !== null && !isNaN(sellerId)) {
-      whereSql += ' AND p.seller_id = ?';
-      whereParams.push(sellerId);
-    }
-    if (search) {
-      whereSql += ' AND (p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ?)';
-      const s = `%${search}%`;
-      whereParams.push(s, s, s);
-    }
-    if (categoryIdParam && /^\d+$/.test(categoryIdParam)) {
-      const catRow = await findCategoryByIdOrSlug(pool, categoryIdParam);
-      if (catRow) {
-        whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
-        whereParams.push(Number(catRow.id), catRow.name);
-      } else {
-        whereSql += ' AND p.category_id = ?';
-        whereParams.push(parseInt(categoryIdParam, 10));
+      if (filterActiveParam !== null) {
+        whereSql += ' AND p.is_active = ?';
+        whereParams.push(filterActiveParam);
       }
-    } else if (category) {
-      const catRow = await findCategoryByIdOrSlug(pool, category);
-      if (catRow) {
-        whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
-        whereParams.push(Number(catRow.id), catRow.name);
-      } else {
-        whereSql += ' AND LOWER(p.category) = LOWER(?)';
-        whereParams.push(category);
+      if (sellerId !== null && !isNaN(sellerId)) {
+        whereSql += ' AND p.seller_id = ?';
+        whereParams.push(sellerId);
       }
-    }
+      if (search) {
+        whereSql += " AND (p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ? OR COALESCE(p.sku, '') LIKE ? OR COALESCE(p.brand, '') LIKE ? OR COALESCE(u.seller_name, u.name, '') LIKE ?)";
+        const s = `%${search}%`;
+        whereParams.push(s, s, s, s, s, s);
+      }
+      if (categoryIdParam && /^\d+$/.test(categoryIdParam)) {
+        const catRow = await findCategoryByIdOrSlug(pool, categoryIdParam);
+        if (catRow) {
+          whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+          whereParams.push(Number(catRow.id), catRow.name);
+        } else {
+          whereSql += ' AND p.category_id = ?';
+          whereParams.push(parseInt(categoryIdParam, 10));
+        }
+      } else if (category) {
+        const catRow = await findCategoryByIdOrSlug(pool, category);
+        if (catRow) {
+          whereSql += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+          whereParams.push(Number(catRow.id), catRow.name);
+        } else {
+          whereSql += ' AND LOWER(p.category) = LOWER(?)';
+          whereParams.push(category);
+        }
+      }
 
-    const countSql = `SELECT COUNT(*) as total FROM products p LEFT JOIN users u ON p.seller_id = u.id ${whereSql}`;
-    const querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       ${whereSql}
-       ORDER BY p.id DESC LIMIT ? OFFSET ?`;
+      const countSql = `SELECT COUNT(*) as total FROM products p LEFT JOIN users u ON p.seller_id = u.id ${whereSql}`;
+      const querySql = `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         ${whereSql}
+         ORDER BY p.id DESC LIMIT ? OFFSET ?`;
 
-    const [[{ total }]] = await pool.query(countSql, whereParams);
-    const [products] = await pool.query(querySql, [...whereParams, limit, offset]);
-    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
+      const [[{ total }]] = await pool.query(countSql, whereParams);
+      const [products] = await pool.query(querySql, [...whereParams, limit, offset]);
+      const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
 
-    // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
-    const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
+      // Public / Buyer field: Buyers see presentation price, MRP, discount badge, delivery badge, multiple images
+      const formatted = products.map(p => formatProductRecord(p, { isSellerView: false, req }));
 
-    const lastPage = Math.ceil(total / limit) || 1;
-    res.json({
-      success: true,
-      status: true,
-      data: formatted,
-      products: {
-        current_page: page,
+      const lastPage = Math.ceil(total / limit) || 1;
+      return res.json({
+        success: true,
+        status: true,
         data: formatted,
+        products: {
+          current_page: page,
+          data: formatted,
+          total,
+          per_page: limit,
+          last_page: lastPage
+        },
+        categories: categoriesList,
         total,
+        current_page: page,
         per_page: limit,
-        last_page: lastPage
-      },
-      categories: categoriesList,
+        last_page: lastPage,
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total,
+          last_page: lastPage
+        }
+      });
+    } catch (err) {}
+  }
+
+  const searchLower = search.toLowerCase();
+  const matchedCatObj = categoryIdParam
+    ? fallbackCategories.find(c => String(c.id) === categoryIdParam)
+    : (category ? fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase() || String(c.id) === category) : null);
+  const filteredAll = fallbackProducts.filter(p => {
+    const activeNum = Number(p.is_active === false ? 0 : (p.is_active ?? 1)) !== 0 ? 1 : 0;
+    const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
+    if (!isAdminIncludeInactive) {
+      if (activeNum !== 1) return false;
+      if (sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase())) return false;
+    } else if (filterActiveParam !== null && activeNum !== filterActiveParam) {
+      return false;
+    }
+    if (sellerId !== null && !isNaN(sellerId) && Number(p.seller_id) !== sellerId) return false;
+    if (categoryIdParam) {
+      const matchesId = Number(p.category_id) === Number(categoryIdParam);
+      const matchesName = matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase();
+      if (!matchesId && !matchesName) return false;
+    } else if (category) {
+      const matchesDirect = String(p.category || '').toLowerCase() === category.toLowerCase();
+      const matchesObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
+      if (!matchesDirect && !matchesObj) return false;
+    }
+    if (searchLower) {
+      const sName = String((sellerRec && (sellerRec.seller_name || sellerRec.name)) || p.seller_name || '').toLowerCase();
+      const hit = String(p.name || '').toLowerCase().includes(searchLower)
+        || String(p.description || '').toLowerCase().includes(searchLower)
+        || String(p.category || '').toLowerCase().includes(searchLower)
+        || String(p.sku || '').toLowerCase().includes(searchLower)
+        || String(p.brand || '').toLowerCase().includes(searchLower)
+        || sName.includes(searchLower);
+      if (!hit) return false;
+    }
+    return true;
+  }).map(p => {
+    const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
+    const hydrated = sellerRec ? { ...p, seller_name: sellerRec.seller_name || sellerRec.name || p.seller_name } : p;
+    return formatProductRecord(hydrated, { isSellerView: false, req });
+  });
+  const total = filteredAll.length;
+  const lastPage = Math.ceil(total / limit) || 1;
+  const paged = filteredAll.slice(offset, offset + limit);
+  const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
+  return res.json({
+    success: true,
+    status: true,
+    data: paged,
+    products: {
+      current_page: page,
+      data: paged,
       total,
+      per_page: limit,
+      last_page: lastPage
+    },
+    categories: categoriesList,
+    total,
+    current_page: page,
+    per_page: limit,
+    last_page: lastPage,
+    pagination: {
       current_page: page,
       per_page: limit,
-      last_page: lastPage,
-      pagination: {
-        current_page: page,
-        per_page: limit,
-        total,
-        last_page: lastPage
-      }
-    });
-  } catch (err) {
-    const searchLower = search.toLowerCase();
-    const matchedCatObj = categoryIdParam
-      ? fallbackCategories.find(c => String(c.id) === categoryIdParam)
-      : (category ? fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase() || String(c.id) === category) : null);
-    const filtered = fallbackProducts.filter(p => {
-      if (Number(p.is_active === false ? 0 : (p.is_active ?? 1)) !== 1) return false;
-      const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
-      if (sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase())) return false;
-      if (sellerId && p.seller_id !== sellerId) return false;
-      if (categoryIdParam) {
-        const matchesId = Number(p.category_id) === Number(categoryIdParam);
-        const matchesName = matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase();
-        if (!matchesId && !matchesName) return false;
-      } else if (category) {
-        const matchesDirect = String(p.category || '').toLowerCase() === category.toLowerCase();
-        const matchesObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
-        if (!matchesDirect && !matchesObj) return false;
-      }
-      if (searchLower && !String(p.name || '').toLowerCase().includes(searchLower) && !String(p.description || '').toLowerCase().includes(searchLower)) return false;
-      return true;
-    }).map(p => formatProductRecord(p, { isSellerView: false, req }));
-    const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
-    res.json({
-      success: true,
-      status: true,
-      data: filtered,
-      products: {
-        current_page: 1,
-        data: filtered,
-        total: filtered.length,
-        per_page: limit,
-        last_page: 1
-      },
-      categories: categoriesList,
-      total: filtered.length,
-      current_page: 1,
-      per_page: limit,
-      last_page: 1,
-      pagination: {
-        current_page: 1,
-        per_page: limit,
-        total: filtered.length,
-        last_page: 1
-      }
-    });
-  }
+      total,
+      last_page: lastPage
+    }
+  });
 });
 
 app.get([
@@ -4867,42 +5458,34 @@ app.get([
   '/api/sellers/:seller_id/products/:id'
 ], async (req, res) => {
   const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ? AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
-       LIMIT 1`,
-      [req.params.id]
-    );
-    if (rows.length === 0) {
-      return res.status(404).json({ message: 'Product not found.' });
-    }
-    const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
-    const product = formatProductRecord(rows[0], { isSellerView, req });
-    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
-    res.json({
-      success: true,
-      status: true,
-      data: product,
-      product,
-      categories: categoriesList
-    });
-  } catch (err) {
-    const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
-    if (found && Number(found.is_active === false ? 0 : (found.is_active ?? 1)) === 1) {
-      const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(found.seller_id));
-      if (sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase())) {
+  const reqIncludeInactive = ['1', 'true', 'yes'].includes(String(req.query.include_inactive || '').toLowerCase());
+  const optionalUser = reqIncludeInactive ? await resolveOptionalUserAsync(req) : null;
+  const isAdminIncludeInactive = Boolean(reqIncludeInactive && optionalUser && String(optionalUser.role || '').toLowerCase() === 'admin');
+  const isSellerView = req.query.seller_view === 'true' || req.query.seller_view === '1' || req.query.is_seller === 'true';
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const activeWhere = isAdminIncludeInactive
+        ? 'p.id = ?'
+        : "p.id = ? AND p.is_active = 1 AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')";
+      const [rows] = await pool.query(
+        `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE ${activeWhere}
+         LIMIT 1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) {
         return res.status(404).json({ message: 'Product not found.' });
       }
-      const isSellerView = req.query.seller_view === 'true' || req.query.is_seller === 'true';
-      const product = formatProductRecord(found, { isSellerView, req });
-      const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
+      const product = formatProductRecord(rows[0], { isSellerView, req });
+      const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
       return res.json({
         success: true,
         status: true,
@@ -4910,9 +5493,29 @@ app.get([
         product,
         categories: categoriesList
       });
-    }
-    res.status(404).json({ message: 'Product not found.' });
+    } catch (err) {}
   }
+
+  const found = fallbackProducts.find(p => String(p.id) === String(req.params.id));
+  if (found) {
+    const activeOk = Number(found.is_active === false ? 0 : (found.is_active ?? 1)) === 1;
+    const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(found.seller_id));
+    const sellerBlocked = Boolean(sellerRec && ['LOCKED', 'DELETED'].includes(String(sellerRec.account_status || 'ACTIVE').toUpperCase()));
+    if (!isAdminIncludeInactive && (!activeOk || sellerBlocked)) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+    const hydrated = sellerRec ? { ...found, seller_name: sellerRec.seller_name || sellerRec.name || found.seller_name } : found;
+    const product = formatProductRecord(hydrated, { isSellerView, req });
+    const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
+    return res.json({
+      success: true,
+      status: true,
+      data: product,
+      product,
+      categories: categoriesList
+    });
+  }
+  return res.status(404).json({ message: 'Product not found.' });
 });
 
 // Dedicated Image Upload Endpoint (Supports single or multiple images, base64, multipart)
@@ -4968,7 +5571,7 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
         );
 
         // Sync permanent records in product_images table in MySQL
-        await syncProductImagesRecord(pool, sellerId, targetProductId, combinedImgs, imgResult.filesInfo);
+        await syncProductImagesRecord(pool, Number(pRows[0].seller_id || sellerId), targetProductId, combinedImgs, imgResult.filesInfo);
 
         const [updatedRows] = await pool.query(
           `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
@@ -5011,7 +5614,10 @@ app.post(['/api/upload', '/api/products/upload'], authenticateToken, requireActi
     }
   } else if (dbActive) {
     try {
-      await syncProductImagesRecord(pool, sellerId, null, imgResult.images, imgResult.filesInfo);
+      const targetOwnerId = (req.user.role === 'admin' && req.body.seller_id && /^\d+$/.test(String(req.body.seller_id)))
+        ? parseInt(req.body.seller_id, 10)
+        : sellerId;
+      await syncProductImagesRecord(pool, targetOwnerId, null, imgResult.images, imgResult.filesInfo);
     } catch (dbErr) {
       console.error('[Upload Sync Error]:', dbErr.message);
     }
@@ -5162,12 +5768,17 @@ app.get('/api/products/:id/images/:image_id', async (req, res) => {
 // Dedicated Image Replacement & Attachment Endpoint
 const handleProductImageReplacement = async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
+  const dbActive = await checkDbReachable(pool, deletionCtx);
   let existing = [];
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
-    existing = rows;
-  } catch (e) {
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+      existing = rows;
+    } catch (e) {
+      existing = fallbackProducts.filter(p => Number(p.id) === prodId);
+    }
+  } else {
     existing = fallbackProducts.filter(p => Number(p.id) === prodId);
   }
 
@@ -5184,9 +5795,8 @@ const handleProductImageReplacement = async (req, res) => {
     });
   }
 
-  const oldImageUrl = existing[0].image_url;
   let currentImgs = parseImagesJson(existing[0].images || existing[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
-  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.query.replace_all === 'true';
+  const isReplaceAll = req.body.replace_all === true || req.body.replace_all === 'true' || req.body.replace_images === true || req.body.replace_images === 'true' || req.query.replace_all === 'true';
   const isExplicitReplace = req.body.mode === 'replace' || req.query.mode === 'replace' || req.body.action === 'replace';
 
   let hasExplicitIndex = false;
@@ -5196,14 +5806,16 @@ const handleProductImageReplacement = async (req, res) => {
     hasExplicitIndex = true;
     const targetIdOrFile = req.params.image_id;
     if (/^\d+$/.test(targetIdOrFile)) {
-      try {
-        const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetIdOrFile, 10), prodId]);
-        if (piRow.length > 0) {
-          const fn = piRow[0].file_name;
-          const foundIdx = currentImgs.findIndex(u => u.includes(fn));
-          if (foundIdx !== -1) imgIndex = foundIdx;
-        }
-      } catch (e) {}
+      if (dbActive) {
+        try {
+          const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetIdOrFile, 10), prodId]);
+          if (piRow.length > 0) {
+            const fn = piRow[0].file_name;
+            const foundIdx = currentImgs.findIndex(u => u.includes(fn));
+            if (foundIdx !== -1) imgIndex = foundIdx;
+          }
+        } catch (e) {}
+      }
     } else {
       const safeFn = path.basename(targetIdOrFile.split('?')[0]);
       const foundIdx = currentImgs.findIndex(u => u.includes(safeFn));
@@ -5285,49 +5897,34 @@ const handleProductImageReplacement = async (req, res) => {
   const primaryUrl = newImages[0] || null;
   const imagesJson = newImages.length > 0 ? JSON.stringify(newImages) : null;
 
-  try {
-    await pool.query(
-      'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
-      [primaryUrl, imagesJson, prodId]
-    );
+  if (dbActive) {
+    try {
+      await pool.query(
+        'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+        [primaryUrl, imagesJson, prodId]
+      );
 
-    // Sync product_images table in MySQL
-    await syncProductImagesRecord(pool, req.user.id, prodId, newImages, imgResult.filesInfo);
+      // Sync product_images table in MySQL
+      await syncProductImagesRecord(pool, Number(existing[0].seller_id || req.user.id), prodId, newImages, imgResult.filesInfo);
 
-    // Safe deletion of old physical file ONLY IF oldImageUrl was explicitly replaced and is not used anywhere else
-    for (const repUrl of replacedUrls) {
-      if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
-        const repFn = path.basename(repUrl.split('?')[0]);
-        await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, repFn]);
-        await safeDeleteLocalImageFile(pool, repFn, prodId);
+      // Safe deletion of old physical file ONLY IF oldImageUrl was explicitly replaced and is not used anywhere else
+      for (const repUrl of replacedUrls) {
+        if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
+          const repFn = path.basename(repUrl.split('?')[0]);
+          await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, repFn]);
+          await safeDeleteLocalImageFile(pool, repFn, prodId);
+        }
       }
-    }
 
-    const [updated] = await pool.query(
-      `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ? LIMIT 1`,
-      [prodId]
-    );
-    const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
+      const [updated] = await pool.query(
+        `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE p.id = ? LIMIT 1`,
+        [prodId]
+      );
+      const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
 
-    res.json({
-      success: true,
-      status: true,
-      message: 'Product image updated successfully.',
-      image_url: primaryUrl,
-      image: primaryUrl,
-      images: newImages,
-      product: formatted,
-      data: formatted
-    });
-  } catch (err) {
-    const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
-    if (fbIdx !== -1) {
-      fallbackProducts[fbIdx].images = newImages;
-      fallbackProducts[fbIdx].image_url = primaryUrl;
-      const formattedFb = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
       return res.json({
         success: true,
         status: true,
@@ -5335,12 +5932,35 @@ const handleProductImageReplacement = async (req, res) => {
         image_url: primaryUrl,
         image: primaryUrl,
         images: newImages,
-        product: formattedFb,
-        data: formattedFb
+        product: formatted,
+        data: formatted
       });
-    }
-    res.status(500).json({ message: 'Failed to update product image.' });
+    } catch (err) {}
   }
+
+  const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+  if (fbIdx !== -1) {
+    fallbackProducts[fbIdx].images = newImages;
+    fallbackProducts[fbIdx].image_url = primaryUrl;
+    for (const repUrl of replacedUrls) {
+      if (repUrl && !newImages.includes(repUrl) && repUrl.includes('/uploads/products/')) {
+        const repFn = path.basename(repUrl.split('?')[0]);
+        await safeDeleteLocalImageFile(pool, repFn, prodId);
+      }
+    }
+    const formattedFb = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
+    return res.json({
+      success: true,
+      status: true,
+      message: 'Product image updated successfully.',
+      image_url: primaryUrl,
+      image: primaryUrl,
+      images: newImages,
+      product: formattedFb,
+      data: formattedFb
+    });
+  }
+  return res.status(500).json({ message: 'Failed to update product image.' });
 };
 
 app.put(['/api/products/:id/image', '/api/products/:id/upload', '/api/products/:id/images', '/api/products/:id/images/:image_id'], authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductImageReplacement);
@@ -5350,12 +5970,17 @@ app.patch(['/api/products/:id/image', '/api/products/:id/upload', '/api/products
 // Dedicated Image Deletion Endpoint
 app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/products/:id/images/:image_id', '/api/products/:id/images/:filename?'], authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   const prodId = parseInt(req.params.id, 10);
+  const dbActive = await checkDbReachable(pool, deletionCtx);
   let existing = [];
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
-    existing = rows;
-  } catch (e) {
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+      existing = rows;
+    } catch (e) {
+      existing = fallbackProducts.filter(p => Number(p.id) === prodId);
+    }
+  } else {
     existing = fallbackProducts.filter(p => Number(p.id) === prodId);
   }
 
@@ -5370,7 +5995,7 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
   let targetFilename = null;
 
   if (targetParam) {
-    if (/^\d+$/.test(targetParam)) {
+    if (/^\d+$/.test(targetParam) && dbActive) {
       try {
         const [piRow] = await pool.query('SELECT file_name FROM product_images WHERE id = ? AND product_id = ? LIMIT 1', [parseInt(targetParam, 10), prodId]);
         if (piRow.length > 0) targetFilename = piRow[0].file_name;
@@ -5398,65 +6023,113 @@ app.delete(['/api/products/:id/image', '/api/products/:id/images', '/api/product
   const primaryUrl = currentImgs.length > 0 ? currentImgs[0] : null;
   const imagesJson = currentImgs.length > 0 ? JSON.stringify(currentImgs) : null;
 
-  try {
-    await pool.query(
-      'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
-      [primaryUrl, imagesJson, prodId]
-    );
+  if (dbActive) {
+    try {
+      await pool.query(
+        'UPDATE products SET image_url = ?, images = ?, updated_at = NOW() WHERE id = ?',
+        [primaryUrl, imagesJson, prodId]
+      );
 
+      if (removedUrl) {
+        const removedFn = path.basename(removedUrl.split('?')[0]);
+        await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, removedFn]);
+        await safeDeleteLocalImageFile(pool, removedFn, prodId);
+      }
+
+      const [updated] = await pool.query(
+        `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE p.id = ? LIMIT 1`,
+        [prodId]
+      );
+      const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
+
+      return res.json({
+        success: true,
+        status: true,
+        message: 'Product image deleted successfully.',
+        image_url: primaryUrl,
+        image: primaryUrl,
+        images: currentImgs,
+        product: formatted,
+        data: formatted
+      });
+    } catch (err) {}
+  }
+
+  const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+  if (fbIdx !== -1) {
+    fallbackProducts[fbIdx].images = currentImgs;
+    fallbackProducts[fbIdx].image_url = primaryUrl;
     if (removedUrl) {
       const removedFn = path.basename(removedUrl.split('?')[0]);
-      await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, removedFn]);
       await safeDeleteLocalImageFile(pool, removedFn, prodId);
     }
-
-    const [updated] = await pool.query(
-      `SELECT p.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ? LIMIT 1`,
-      [prodId]
-    );
-    const formatted = formatProductRecord(updated[0], { isSellerView: true, req });
-
-    res.json({
+    const formattedFb = formatProductRecord(fallbackProducts[fbIdx], { isSellerView: true, req });
+    return res.json({
       success: true,
       status: true,
       message: 'Product image deleted successfully.',
       image_url: primaryUrl,
       image: primaryUrl,
       images: currentImgs,
-      product: formatted,
-      data: formatted
+      product: formattedFb,
+      data: formattedFb
     });
-  } catch (err) {
-    res.status(500).json({ message: 'Failed to delete product image.' });
   }
+  return res.status(500).json({ message: 'Failed to delete product image.' });
 });
 
 // Standalone Physical Image Deletion API: DELETE /api/images/:filename
 app.delete('/api/images/:filename', authenticateToken, requireActiveSellerForMutation, async (req, res) => {
   const safeFilename = path.basename(req.params.filename || '');
   if (!safeFilename) return res.status(400).json({ message: 'Filename required.' });
+  const dbActive = await checkDbReachable(pool, deletionCtx);
 
-  try {
-    await ensureProductPriceColumns(pool);
-    if (req.user.role !== 'admin') {
-      const [rows] = await pool.query(
-        'SELECT id FROM product_images WHERE file_name = ? AND seller_id = ? LIMIT 1',
-        [safeFilename, req.user.id]
-      );
-      if (rows.length === 0) {
-        return res.status(403).json({ message: 'Access denied. You do not own this image.' });
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      if (req.user.role !== 'admin') {
+        const [rows] = await pool.query(
+          'SELECT id FROM product_images WHERE file_name = ? AND seller_id = ? LIMIT 1',
+          [safeFilename, req.user.id]
+        );
+        if (rows.length === 0) {
+          return res.status(403).json({ message: 'Access denied. You do not own this image.' });
+        }
       }
+      await pool.query('DELETE FROM product_images WHERE file_name = ?', [safeFilename]);
+      await safeDeleteLocalImageFile(pool, safeFilename);
+      return res.json({ success: true, status: true, message: 'Image deleted successfully.' });
+    } catch (e) {
+      return res.status(500).json({ message: 'Failed to delete image.' });
     }
-    await pool.query('DELETE FROM product_images WHERE file_name = ?', [safeFilename]);
-    await safeDeleteLocalImageFile(pool, safeFilename);
-    res.json({ success: true, status: true, message: 'Image deleted successfully.' });
-  } catch (e) {
-    res.status(500).json({ message: 'Failed to delete image.' });
   }
+
+  if (req.user.role !== 'admin') {
+    const ownedBySeller = fallbackProducts.some(fp => {
+      if (Number(fp.seller_id) !== Number(req.user.id)) return false;
+      const imgsStr = JSON.stringify(fp.images || '') + ' ' + String(fp.image_url || '');
+      return imgsStr.includes(safeFilename);
+    });
+    if (!ownedBySeller) {
+      return res.status(403).json({ message: 'Access denied. You do not own this image.' });
+    }
+  }
+  await safeDeleteLocalImageFile(pool, safeFilename);
+  return res.json({ success: true, status: true, message: 'Image deleted successfully.' });
 });
+
+function cleanupTempReqFiles(req) {
+  if (!req || !req.files) return;
+  const list = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+  for (const f of list) {
+    if (f && f.path && fs.existsSync(f.path)) {
+      try { fs.unlinkSync(f.path); } catch (e) {}
+    }
+  }
+}
 
 app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), async (req, res) => {
   const body = req.body || {};
@@ -5472,18 +6145,69 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
   const description = body.description || null;
   const rawPrice = body.seller_price !== undefined ? body.seller_price : body.price;
   const stock = body.stock;
-  const imgResult = await resolveProductImages(req);
 
-  if (!name || rawPrice === undefined || stock === undefined) {
+  if (!name || rawPrice === undefined || rawPrice === '' || stock === undefined || stock === '') {
+    cleanupTempReqFiles(req);
     return res.status(422).json({ message: 'Name, price and stock are required.' });
   }
 
+  const dbActive = await checkDbReachable(pool, deletionCtx);
+  let ownerSellerId = Number(req.user.id);
+  let ownerSellerName = req.user.seller_name || req.user.name || 'Verified Seller';
+  const isAdminCaller = String(req.user.role || '').toLowerCase() === 'admin';
+  if (isAdminCaller && body.seller_id !== undefined && body.seller_id !== '' && body.seller_id !== null) {
+    const rawSid = String(body.seller_id).trim();
+    const candSid = /^\d+$/.test(rawSid) ? parseInt(rawSid, 10) : 0;
+    if (candSid <= 0) {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Validation error occurred.',
+        errors: { seller_id: ['Seller ID must be a valid positive integer.'] }
+      });
+    }
+    let sRow = null;
+    let lookedUpInDb = false;
+    if (dbActive) {
+      try {
+        const [sRows] = await pool.query(
+          "SELECT id, name, seller_name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = ? LIMIT 1",
+          [candSid]
+        );
+        sRow = sRows[0] || null;
+        lookedUpInDb = true;
+      } catch (e) {}
+    }
+    if (!lookedUpInDb) {
+      sRow = fallbackSellers.find(s => Number(s.id) === candSid) || null;
+    }
+    if (!sRow) {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Selected seller was not found.',
+        errors: { seller_id: ['Selected seller was not found.'] }
+      });
+    }
+    if (String(sRow.account_status || 'ACTIVE').toUpperCase() === 'DELETED') {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Cannot assign product to a deleted seller account.',
+        errors: { seller_id: ['Selected seller is permanently deleted.'] }
+      });
+    }
+    ownerSellerId = Number(sRow.id);
+    ownerSellerName = sRow.seller_name || sRow.name || ownerSellerName;
+  }
+
+  const imgResult = await resolveProductImages(req);
   const pricing = resolveProductPricing(body);
   const sku = (body.sku || '').toString().trim() || null;
   let category = (body.category || '').toString().trim() || 'General';
   let categoryId = null;
   const brand = (body.brand || '').toString().trim() || 'Generic';
   const mrp = pricing.mrp;
+  const isActiveBit = (body.is_active !== undefined && body.is_active !== '' && body.is_active !== null)
+    ? parseBoolBitNode(body.is_active, 1)
+    : 1;
 
   // Inline create-and-assign category during product creation
   let createdCategoryObj = null;
@@ -5494,12 +6218,14 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
   ).trim();
   if (inlineNewCatName || catAction === 'create_and_assign') {
     let existingInline = null;
-    try {
-      if (inlineNewCatName) {
-        await ensureProductCategoriesTable(pool);
-        existingInline = await findCategoryByIdOrSlug(pool, inlineNewCatName);
-      }
-    } catch (e) {}
+    if (dbActive) {
+      try {
+        if (inlineNewCatName) {
+          await ensureProductCategoriesTable(pool);
+          existingInline = await findCategoryByIdOrSlug(pool, inlineNewCatName);
+        }
+      } catch (e) {}
+    }
     if (!existingInline && inlineNewCatName) {
       existingInline = fallbackCategories.find(c => c.name.toLowerCase() === inlineNewCatName.toLowerCase() || c.slug.toLowerCase() === inlineNewCatName.toLowerCase()) || null;
     }
@@ -5509,6 +6235,7 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
     } else {
       const mutRes = await performCategoryMutationNode(pool, 'create_category', body, false, null);
       if (!mutRes.ok) {
+        cleanupTempReqFiles(req);
         return res.status(mutRes.statusCode).json(mutRes.errorBody);
       }
       createdCategoryObj = mutRes.payload.category;
@@ -5523,11 +6250,11 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
   let finalImages = imgResult.hasImages ? dedupeImagesByFilename(imgResult.images.filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'))).slice(0, 4) : [];
 
   // ONLY if client provided ZERO images in body or files, check if the seller uploaded unattached images in the last 5 minutes
-  if (finalImages.length === 0) {
+  if (finalImages.length === 0 && dbActive) {
     try {
       const [unattached] = await pool.query(
         'SELECT id, image_url, file_name FROM product_images WHERE seller_id = ? AND product_id IS NULL AND created_at >= NOW() - INTERVAL 5 MINUTE ORDER BY id ASC LIMIT 4',
-        [req.user.id]
+        [ownerSellerId]
       );
       for (const u of unattached) {
         if (finalImages.length >= 4) break;
@@ -5547,94 +6274,101 @@ app.post('/api/products', authenticateToken, requireActiveSellerForMutation, upl
   const finalPrimaryUrl = finalImages.length > 0 ? finalImages[0] : null;
   const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
 
-  try {
-    await ensureProductPriceColumns(pool);
-    const catRes = await resolveProductCategoryInput(pool, body, true);
-    if (catRes.error) {
-      return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
-    }
-    category = catRes.category;
-    categoryId = catRes.category_id;
-    const [result] = await pool.query(
-      `INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())`,
-      [req.user.id, name, description, sku, category, categoryId, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson]
-    );
-
-    // Sync permanent records in product_images table in MySQL
-    await syncProductImagesRecord(pool, req.user.id, result.insertId, finalImages, imgResult.filesInfo);
-
-    // Link any previously unattached images for this seller to this newly created product
+  if (dbActive) {
     try {
-      for (const imgUrl of finalImages) {
-        await pool.query(
-          'UPDATE product_images SET product_id = ? WHERE seller_id = ? AND product_id IS NULL AND image_url = ?',
-          [result.insertId, req.user.id, imgUrl]
-        );
+      await ensureProductPriceColumns(pool);
+      const catRes = await resolveProductCategoryInput(pool, body, true);
+      if (catRes.error) {
+        cleanupTempReqFiles(req);
+        return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
       }
-    } catch (e) {}
+      category = catRes.category;
+      categoryId = catRes.category_id;
+      const [result] = await pool.query(
+        `INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [ownerSellerId, name, description, sku, category, categoryId, brand, mrp, pricing.seller_price, pricing.commission, pricing.delivery_charge, pricing.gst, pricing.other_charges, pricing.price, parseInt(stock, 10), finalPrimaryUrl, finalImagesJson, isActiveBit]
+      );
 
-    const [rows] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ?`,
-      [result.insertId]
-    );
-    // Seller created product: Seller view has NO commission feature!
-    const product = formatProductRecord(rows[0], { isSellerView: true, req });
-    const categoriesList = await getCategoriesListWithCounts(pool, false);
-    const resp = {
-      success: true,
-      status: true,
-      message: 'Product created.',
-      product,
-      data: product,
-      categories: categoriesList
-    };
-    if (createdCategoryObj) resp.category = createdCategoryObj;
-    res.status(201).json(resp);
-  } catch (err) {
-    const fbCatMatch = (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '')
-      ? fallbackCategories.find(c => String(c.id) === String(body.category_id).trim())
-      : fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase());
-    if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '' && !fbCatMatch) {
-      return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
-    }
-    const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => p.id)) + 1 : 9;
-    const newProduct = formatProductRecord({
-      id: newId,
-      seller_id: Number(req.user.id),
-      seller_name: req.user.seller_name || 'Verified Seller',
-      name,
-      description,
-      sku,
-      category: fbCatMatch ? fbCatMatch.name : category,
-      category_id: fbCatMatch ? fbCatMatch.id : categoryId,
-      brand,
-      mrp,
-      seller_price: pricing.seller_price,
-      price: pricing.price,
-      stock: parseInt(stock, 10),
-      images: finalImages,
-      is_active: true
-    }, { isSellerView: true, req });
-    fallbackProducts.unshift(newProduct);
-    const categoriesList = await getCategoriesListWithCounts(null, false);
-    const resp = {
-      success: true,
-      status: true,
-      message: 'Product created.',
-      product: newProduct,
-      data: newProduct,
-      categories: categoriesList
-    };
-    if (createdCategoryObj) resp.category = createdCategoryObj;
-    return res.status(201).json(resp);
+      // Sync permanent records in product_images table in MySQL
+      await syncProductImagesRecord(pool, ownerSellerId, result.insertId, finalImages, imgResult.filesInfo);
+
+      // Link any previously unattached images for this seller to this newly created product
+      try {
+        for (const imgUrl of finalImages) {
+          await pool.query(
+            'UPDATE product_images SET product_id = ? WHERE seller_id = ? AND product_id IS NULL AND image_url = ?',
+            [result.insertId, ownerSellerId, imgUrl]
+          );
+        }
+      } catch (e) {}
+
+      const [rows] = await pool.query(
+        `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE p.id = ?`,
+        [result.insertId]
+      );
+      // Seller created product: Seller view has NO commission feature!
+      const product = formatProductRecord(rows[0], { isSellerView: true, req });
+      const categoriesList = await getCategoriesListWithCounts(pool, false);
+      const resp = {
+        success: true,
+        status: true,
+        message: 'Product created.',
+        product,
+        data: product,
+        categories: categoriesList
+      };
+      if (createdCategoryObj) resp.category = createdCategoryObj;
+      return res.status(201).json(resp);
+    } catch (err) {}
   }
+
+  const fbCatMatch = (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '')
+    ? fallbackCategories.find(c => String(c.id) === String(body.category_id).trim())
+    : fallbackCategories.find(c => c.name.toLowerCase() === category.toLowerCase() || c.slug.toLowerCase() === category.toLowerCase());
+  if (body.category_id !== undefined && body.category_id !== null && String(body.category_id).trim() !== '' && !fbCatMatch) {
+    cleanupTempReqFiles(req);
+    return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+  }
+  const nowIso = new Date().toISOString();
+  const newId = fallbackProducts.length ? Math.max(...fallbackProducts.map(p => Number(p.id) || 0)) + 1 : 9;
+  const newProduct = formatProductRecord({
+    id: newId,
+    seller_id: ownerSellerId,
+    seller_name: ownerSellerName,
+    name,
+    description,
+    sku,
+    category: fbCatMatch ? fbCatMatch.name : category,
+    category_id: fbCatMatch ? Number(fbCatMatch.id) : (categoryId || (fallbackCategories[0] ? Number(fallbackCategories[0].id) : null)),
+    brand,
+    mrp,
+    seller_price: pricing.seller_price,
+    price: pricing.price,
+    stock: parseInt(stock, 10),
+    images: finalImages,
+    is_active: Boolean(isActiveBit),
+    created_at: nowIso,
+    updated_at: nowIso
+  }, { isSellerView: true, req });
+  fallbackProducts.unshift(newProduct);
+  const categoriesList = await getCategoriesListWithCounts(null, false);
+  const resp = {
+    success: true,
+    status: true,
+    message: 'Product created.',
+    product: newProduct,
+    data: newProduct,
+    categories: categoriesList
+  };
+  if (createdCategoryObj) resp.category = createdCategoryObj;
+  return res.status(201).json(resp);
 });
 
 app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_id/products', '/api/seller/:seller_id/products'], authenticateToken, async (req, res) => {
@@ -5645,134 +6379,160 @@ app.get(['/api/seller/products', '/api/sellers/products', '/api/sellers/:seller_
   }
 
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10) || 20));
   const offset = (page - 1) * limit;
   const includeInactiveCats = ['1', 'true', 'yes'].includes(String(req.query.include_inactive_categories || '').toLowerCase());
+  const dbActive = await checkDbReachable(pool, deletionCtx);
 
-  try {
-    await ensureProductPriceColumns(pool);
-    let where = 'WHERE p.seller_id = ?';
-    const params = [targetSellerId];
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      let where = 'WHERE p.seller_id = ?';
+      const params = [targetSellerId];
 
-    if (req.query.is_active !== undefined && req.query.is_active !== '') {
-      where += ' AND p.is_active = ?';
-      params.push(parseInt(req.query.is_active, 10));
-    }
-
-    if (req.query.search) {
-      where += ' AND (p.name LIKE ? OR p.description LIKE ?)';
-      const s = `%${req.query.search.trim()}%`;
-      params.push(s, s);
-    }
-
-    const sCat = String(req.query.category || '').trim();
-    const sCatId = String(req.query.category_id || '').trim();
-    if (sCatId && /^\d+$/.test(sCatId)) {
-      const catRow = await findCategoryByIdOrSlug(pool, sCatId);
-      if (catRow) {
-        where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
-        params.push(Number(catRow.id), catRow.name);
-      } else {
-        where += ' AND p.category_id = ?';
-        params.push(parseInt(sCatId, 10));
+      if (req.query.is_active !== undefined && req.query.is_active !== '') {
+        where += ' AND p.is_active = ?';
+        params.push(parseBoolBitNode(req.query.is_active, 1));
       }
-    } else if (sCat) {
-      const catRow = await findCategoryByIdOrSlug(pool, sCat);
-      if (catRow) {
-        where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
-        params.push(Number(catRow.id), catRow.name);
-      } else {
-        where += ' AND LOWER(p.category) = LOWER(?)';
-        params.push(sCat);
+
+      if (req.query.search) {
+        where += " AND (p.name LIKE ? OR COALESCE(p.description, '') LIKE ? OR COALESCE(p.sku, '') LIKE ? OR COALESCE(p.brand, '') LIKE ?)";
+        const s = `%${String(req.query.search).trim()}%`;
+        params.push(s, s, s, s);
       }
-    }
 
-    const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
-    const [rows] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       ${where}
-       ORDER BY p.id DESC
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+      const sCat = String(req.query.category || '').trim();
+      const sCatId = String(req.query.category_id || '').trim();
+      if (sCatId && /^\d+$/.test(sCatId)) {
+        const catRow = await findCategoryByIdOrSlug(pool, sCatId);
+        if (catRow) {
+          where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+          params.push(Number(catRow.id), catRow.name);
+        } else {
+          where += ' AND p.category_id = ?';
+          params.push(parseInt(sCatId, 10));
+        }
+      } else if (sCat) {
+        const catRow = await findCategoryByIdOrSlug(pool, sCat);
+        if (catRow) {
+          where += ' AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))';
+          params.push(Number(catRow.id), catRow.name);
+        } else {
+          where += ' AND LOWER(p.category) = LOWER(?)';
+          params.push(sCat);
+        }
+      }
 
-    // Seller view: Commission feature is deleted from seller field!
-    const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true, req }));
-    const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
+      const [[{ total }]] = await pool.query(`SELECT COUNT(*) as total FROM products p ${where}`, params);
+      const [rows] = await pool.query(
+        `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         ${where}
+         ORDER BY p.id DESC
+         LIMIT ? OFFSET ?`,
+        [...params, limit, offset]
+      );
 
-    const lastPage = Math.ceil(total / limit) || 1;
-    res.json({
-      success: true,
-      status: true,
-      seller_id: targetSellerId,
-      data: formatted,
-      products: {
-        current_page: page,
+      // Seller view: Commission feature is deleted from seller field!
+      const formatted = rows.map(p => formatProductRecord(p, { isSellerView: true, req }));
+      const categoriesList = await getCategoriesListWithCounts(pool, includeInactiveCats);
+
+      const lastPage = Math.ceil(total / limit) || 1;
+      return res.json({
+        success: true,
+        status: true,
+        seller_id: targetSellerId,
         data: formatted,
+        products: {
+          current_page: page,
+          data: formatted,
+          total,
+          per_page: limit,
+          last_page: lastPage
+        },
+        categories: categoriesList,
         total,
+        current_page: page,
         per_page: limit,
-        last_page: lastPage
-      },
-      categories: categoriesList,
+        last_page: lastPage,
+        pagination: {
+          current_page: page,
+          per_page: limit,
+          total,
+          last_page: lastPage
+        }
+      });
+    } catch (err) {}
+  }
+
+  const sCat = String(req.query.category || '').trim();
+  const sCatId = String(req.query.category_id || '').trim();
+  const searchLower = String(req.query.search || '').trim().toLowerCase();
+  const hasActiveFilter = req.query.is_active !== undefined && req.query.is_active !== '';
+  const wantActiveBit = hasActiveFilter ? parseBoolBitNode(req.query.is_active, 1) : null;
+  const matchedCatObj = sCatId
+    ? fallbackCategories.find(c => String(c.id) === sCatId)
+    : (sCat ? fallbackCategories.find(c => c.name.toLowerCase() === sCat.toLowerCase() || c.slug.toLowerCase() === sCat.toLowerCase() || String(c.id) === sCat) : null);
+
+  const filteredAll = fallbackProducts.filter(p => {
+    if (Number(p.seller_id) !== Number(targetSellerId)) return false;
+    if (wantActiveBit !== null) {
+      const actNum = Number(p.is_active === false ? 0 : (p.is_active ?? 1)) !== 0 ? 1 : 0;
+      if (actNum !== wantActiveBit) return false;
+    }
+    if (searchLower) {
+      const hit = String(p.name || '').toLowerCase().includes(searchLower)
+        || String(p.description || '').toLowerCase().includes(searchLower)
+        || String(p.sku || '').toLowerCase().includes(searchLower)
+        || String(p.brand || '').toLowerCase().includes(searchLower);
+      if (!hit) return false;
+    }
+    if (sCatId) {
+      if (Number(p.category_id) !== Number(sCatId) && !(matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase())) return false;
+    } else if (sCat) {
+      const direct = String(p.category || '').toLowerCase() === sCat.toLowerCase();
+      const byObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
+      if (!direct && !byObj) return false;
+    }
+    return true;
+  }).map(p => {
+    const sellerRec = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
+    const hydrated = sellerRec ? { ...p, seller_name: sellerRec.seller_name || sellerRec.name || p.seller_name } : p;
+    return formatProductRecord(hydrated, { isSellerView: true, req });
+  });
+
+  const total = filteredAll.length;
+  const lastPage = Math.ceil(total / limit) || 1;
+  const paged = filteredAll.slice(offset, offset + limit);
+  const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
+  return res.json({
+    success: true,
+    status: true,
+    seller_id: targetSellerId,
+    data: paged,
+    products: {
+      current_page: page,
+      data: paged,
       total,
+      per_page: limit,
+      last_page: lastPage
+    },
+    categories: categoriesList,
+    total,
+    current_page: page,
+    per_page: limit,
+    last_page: lastPage,
+    pagination: {
       current_page: page,
       per_page: limit,
-      last_page: lastPage,
-      pagination: {
-        current_page: page,
-        per_page: limit,
-        total,
-        last_page: lastPage
-      }
-    });
-  } catch (err) {
-    const sCat = String(req.query.category || '').trim();
-    const sCatId = String(req.query.category_id || '').trim();
-    const matchedCatObj = sCatId
-      ? fallbackCategories.find(c => String(c.id) === sCatId)
-      : (sCat ? fallbackCategories.find(c => c.name.toLowerCase() === sCat.toLowerCase() || c.slug.toLowerCase() === sCat.toLowerCase() || String(c.id) === sCat) : null);
-    const filtered = fallbackProducts.filter(p => {
-      if (p.seller_id !== targetSellerId) return false;
-      if (sCatId) {
-        if (Number(p.category_id) !== Number(sCatId) && !(matchedCatObj && String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase())) return false;
-      } else if (sCat) {
-        const direct = String(p.category || '').toLowerCase() === sCat.toLowerCase();
-        const byObj = matchedCatObj && (Number(p.category_id) === Number(matchedCatObj.id) || String(p.category || '').toLowerCase() === matchedCatObj.name.toLowerCase());
-        if (!direct && !byObj) return false;
-      }
-      return true;
-    }).map(p => formatProductRecord(p, { isSellerView: true, req }));
-    const categoriesList = await getCategoriesListWithCounts(null, includeInactiveCats);
-    res.json({
-      success: true,
-      status: true,
-      seller_id: targetSellerId,
-      data: filtered,
-      products: {
-        current_page: 1,
-        data: filtered,
-        total: filtered.length,
-        per_page: limit,
-        last_page: 1
-      },
-      categories: categoriesList,
-      total: filtered.length,
-      current_page: 1,
-      per_page: limit,
-      last_page: 1,
-      pagination: {
-        current_page: 1,
-        per_page: limit,
-        total: filtered.length,
-        last_page: 1
-      }
-    });
-  }
+      total,
+      last_page: lastPage
+    }
+  });
 });
 
 const productUpdatePaths = [
@@ -5783,24 +6543,84 @@ const productUpdatePaths = [
   '/api/seller/product/:id'
 ];
 async function handleProductUpdateRoute(req, res) {
+  const dbActive = await checkDbReachable(pool, deletionCtx);
   let existing = [];
-  try {
-    await ensureProductPriceColumns(pool);
-    const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [req.params.id]);
-    existing = rows;
-  } catch (err) {
+  if (dbActive) {
+    try {
+      await ensureProductPriceColumns(pool);
+      const [rows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+      existing = rows;
+    } catch (err) {
+      existing = fallbackProducts.filter(p => String(p.id) === String(req.params.id));
+    }
+  } else {
     existing = fallbackProducts.filter(p => String(p.id) === String(req.params.id));
   }
 
-  if (existing.length === 0) return res.status(404).json({ message: 'Product not found.' });
+  if (existing.length === 0) {
+    cleanupTempReqFiles(req);
+    return res.status(404).json({ message: 'Product not found.' });
+  }
 
   if (req.user.role !== 'admin' && Number(existing[0].seller_id) !== Number(req.user.id)) {
+    cleanupTempReqFiles(req);
     return res.status(403).json({ message: 'Access denied. You do not own this product.' });
   }
 
   const body = req.body || {};
   const updates = [];
   const params = [];
+
+  let ownerSellerId = Number(existing[0].seller_id);
+  let ownerSellerName = existing[0].seller_name || 'Verified Seller';
+  let sellerReassigned = false;
+  if (String(req.user.role || '').toLowerCase() === 'admin' && body.seller_id !== undefined && body.seller_id !== '' && body.seller_id !== null) {
+    const rawSid = String(body.seller_id).trim();
+    const candSid = /^\d+$/.test(rawSid) ? parseInt(rawSid, 10) : 0;
+    if (candSid <= 0) {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Validation error occurred.',
+        errors: { seller_id: ['Seller ID must be a valid positive integer.'] }
+      });
+    }
+    let sRow = null;
+    let lookedUpInDb = false;
+    if (dbActive) {
+      try {
+        const [sRows] = await pool.query(
+          "SELECT id, name, seller_name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = ? LIMIT 1",
+          [candSid]
+        );
+        sRow = sRows[0] || null;
+        lookedUpInDb = true;
+      } catch (e) {}
+    }
+    if (!lookedUpInDb) {
+      sRow = fallbackSellers.find(s => Number(s.id) === candSid) || null;
+    }
+    if (!sRow) {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Selected seller was not found.',
+        errors: { seller_id: ['Selected seller was not found.'] }
+      });
+    }
+    if (String(sRow.account_status || 'ACTIVE').toUpperCase() === 'DELETED') {
+      cleanupTempReqFiles(req);
+      return res.status(422).json({
+        message: 'Cannot assign product to a deleted seller account.',
+        errors: { seller_id: ['Selected seller is permanently deleted.'] }
+      });
+    }
+    if (candSid !== ownerSellerId) {
+      updates.push('seller_id = ?');
+      params.push(candSid);
+      ownerSellerId = candSid;
+      ownerSellerName = sRow.seller_name || sRow.name || ownerSellerName;
+      sellerReassigned = true;
+    }
+  }
 
   // Optional inline category edit / rename / create directly via /api/products/:id
   let catMutationRes = null;
@@ -5812,6 +6632,7 @@ async function handleProductUpdateRoute(req, res) {
     const fallbackCatId = existing[0].category_id ? Number(existing[0].category_id) : null;
     catMutationRes = await performCategoryMutationNode(pool, actionToRun, body, false, fallbackCatId);
     if (!catMutationRes.ok) {
+      cleanupTempReqFiles(req);
       return res.status(catMutationRes.statusCode).json(catMutationRes.errorBody);
     }
   }
@@ -5856,26 +6677,31 @@ async function handleProductUpdateRoute(req, res) {
     params.push(body.brand.toString().trim());
   }
 
-  if (body.stock !== undefined && !isNaN(body.stock)) {
+  if (body.stock !== undefined && body.stock !== '' && !isNaN(body.stock)) {
     updates.push('stock = ?');
     params.push(parseInt(body.stock, 10));
   }
 
-  // Resolve newly uploaded image files, base64, or image URLs if provided (limit 4)
-  const imgResult = await resolveProductImages(req);
-  if (imgResult.hasImages && imgResult.images.length > 0) {
-    const isReplaceAll = body.replace_all === true || body.replace_all === 'true' || body.replace_images === true || body.replace_images === 'true' || body.mode === 'replace';
-    let currentImgs = [];
-    try {
-      const [prodRows] = await pool.query('SELECT image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
-      if (prodRows.length > 0) {
-        currentImgs = parseImagesJson(prodRows[0].images || prodRows[0].image_url).filter(u => !u.includes('placeholder') && !u.includes('unsplash.com'));
-      }
-    } catch (e) {}
+  const oldImgs = parseImagesJson(existing[0].images || existing[0].image_url).filter(u => u && !u.includes('placeholder') && !u.includes('unsplash.com'));
+  const clearImagesRequested = body.clear_images !== undefined && body.clear_images !== '' && parseBoolBitNode(body.clear_images, 0) === 1;
+  const imgResult = clearImagesRequested
+    ? { hasImages: false, images: [], filesInfo: [] }
+    : await resolveProductImages(req);
+  let newFinalImages = null;
+
+  if (clearImagesRequested) {
+    cleanupTempReqFiles(req);
+    newFinalImages = [];
+    updates.push('image_url = ?', 'images = ?');
+    params.push(null, null);
+  } else if (imgResult.hasImages && imgResult.images.length > 0) {
+    const isReplaceAll = body.replace_all === true || body.replace_all === 'true' || body.replace_all === '1' || body.replace_images === true || body.replace_images === 'true' || body.replace_images === '1' || body.mode === 'replace';
+    const currentImgs = [...oldImgs];
 
     let finalImages = [];
     if (isReplaceAll || currentImgs.length === 0) {
       if (imgResult.images.length > 4) {
+        cleanupTempReqFiles(req);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.' });
       }
       finalImages = dedupeImagesByFilename(imgResult.images).slice(0, 4);
@@ -5888,6 +6714,7 @@ async function handleProductUpdateRoute(req, res) {
       }
       const dedupedIndexed = dedupeImagesByFilename(currentImgs);
       if (dedupedIndexed.length > 4) {
+        cleanupTempReqFiles(req);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
       finalImages = dedupedIndexed;
@@ -5895,6 +6722,7 @@ async function handleProductUpdateRoute(req, res) {
       // Client explicitly passed the full list of images to retain
       const dedupedExplicit = dedupeImagesByFilename(imgResult.images);
       if (dedupedExplicit.length > 4) {
+        cleanupTempReqFiles(req);
         return res.status(422).json({ message: 'Maximum 4 images allowed per product.', limit: 4 });
       }
       finalImages = dedupedExplicit;
@@ -5902,6 +6730,7 @@ async function handleProductUpdateRoute(req, res) {
       // Files uploaded without explicit replacement array: preserve existing images and append newly uploaded files up to 4
       const combined = dedupeImagesByFilename([...currentImgs, ...imgResult.images]);
       if (combined.length > 4) {
+        cleanupTempReqFiles(req);
         return res.status(422).json({
           message: `Maximum 4 images allowed per product. Currently has ${currentImgs.length}, cannot add ${imgResult.images.length} more.`,
           current_count: currentImgs.length,
@@ -5912,15 +6741,20 @@ async function handleProductUpdateRoute(req, res) {
       finalImages = combined;
     }
 
+    newFinalImages = finalImages;
     const primaryUrl = finalImages[0] || null;
     const imagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
     updates.push('image_url = ?', 'images = ?');
     params.push(primaryUrl, imagesJson);
   }
 
-  if (body.is_active !== undefined) {
+  let isActiveModified = false;
+  let newIsActiveBit = 1;
+  if (body.is_active !== undefined && body.is_active !== '' && body.is_active !== null) {
+    isActiveModified = true;
+    newIsActiveBit = parseBoolBitNode(body.is_active, 1);
     updates.push('is_active = ?');
-    params.push(body.is_active ? 1 : 0);
+    params.push(newIsActiveBit);
   }
 
   const isCreateCatAction = ['create', 'create_category', 'add_category', 'add'].includes(catAction);
@@ -5944,49 +6778,140 @@ async function handleProductUpdateRoute(req, res) {
     return filtered;
   };
 
-  try {
+  if (dbActive) {
+    try {
+      if (shouldAssignCategory) {
+        const catRes = await resolveProductCategoryInput(pool, buildAssignBody(), false);
+        if (catRes.error) {
+          cleanupTempReqFiles(req);
+          return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
+        }
+        if (catRes.provided) {
+          updates.push('category = ?', 'category_id = ?');
+          params.push(catRes.category, catRes.category_id);
+        }
+      }
+
+      if (updates.length > 0) {
+        updates.push('updated_at = NOW()');
+        params.push(req.params.id);
+        await pool.query(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`, params);
+
+        if (newFinalImages !== null) {
+          const keptBasenames = new Set(newFinalImages.map(u => getImageBasename(u)).filter(Boolean));
+          for (const oldU of oldImgs) {
+            const oldBn = getImageBasename(oldU);
+            if (oldBn && !keptBasenames.has(oldBn)) {
+              try {
+                await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [req.params.id, oldBn]);
+              } catch (e) {}
+              await safeDeleteLocalImageFile(pool, oldBn, Number(req.params.id));
+            }
+          }
+          if (newFinalImages.length > 0) {
+            await syncProductImagesRecord(pool, ownerSellerId, req.params.id, newFinalImages, imgResult.filesInfo);
+          }
+        }
+      }
+
+      const [updated] = await pool.query(
+        `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
+                p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
+                p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
+         FROM products p
+         LEFT JOIN users u ON p.seller_id = u.id
+         WHERE p.id = ?`,
+        [req.params.id]
+      );
+      // Seller updated product: Seller view has NO commission feature!
+      const product = formatProductRecord(updated[0], { isSellerView: true, req });
+      const categoriesList = await getCategoriesListWithCounts(pool, false);
+      const resp = {
+        success: true,
+        status: true,
+        message: (catMutationRes && updates.length === 0) ? catMutationRes.payload.message : 'Product updated.',
+        product,
+        data: product,
+        categories: categoriesList
+      };
+      if (catMutationRes && catMutationRes.payload && catMutationRes.payload.category) {
+        resp.category = catMutationRes.payload.category;
+      }
+      if (catMutationRes && catMutationRes.payload && catMutationRes.payload.updated_products_count !== undefined) {
+        resp.updated_products_count = catMutationRes.payload.updated_products_count;
+      }
+      return res.json(resp);
+    } catch (err) {}
+  }
+
+  const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
+  if (idx !== -1) {
     if (shouldAssignCategory) {
-      const catRes = await resolveProductCategoryInput(pool, buildAssignBody(), false);
-      if (catRes.error) {
-        return res.status(422).json({ message: catRes.error, errors: { category_id: [catRes.error] } });
-      }
-      if (catRes.provided) {
-        updates.push('category = ?', 'category_id = ?');
-        params.push(catRes.category, catRes.category_id);
-      }
-    }
-
-    if (updates.length > 0) {
-      updates.push('updated_at = NOW()');
-      params.push(req.params.id);
-      await pool.query(`UPDATE products SET ${updates.join(', ')} WHERE id = ?`, params);
-
-      if (imgResult.hasImages && imgResult.images.length > 0) {
-        const [freshRows] = await pool.query('SELECT images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
-        const freshImgs = freshRows.length > 0 ? parseImagesJson(freshRows[0].images) : [];
-        await syncProductImagesRecord(pool, req.user.id, req.params.id, freshImgs, imgResult.filesInfo);
+      const assignSrc = buildAssignBody();
+      if (assignSrc.category_id !== undefined && assignSrc.category_id !== null && String(assignSrc.category_id).trim() !== '') {
+        const matchedCat = fallbackCategories.find(c => String(c.id) === String(assignSrc.category_id).trim());
+        if (!matchedCat) {
+          cleanupTempReqFiles(req);
+          return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
+        }
+        fallbackProducts[idx].category_id = Number(matchedCat.id);
+        fallbackProducts[idx].category = matchedCat.name;
+      } else if (assignSrc.category !== undefined) {
+        const rawC = assignSrc.category.toString().trim();
+        const matchedCat = fallbackCategories.find(c => String(c.id) === rawC || c.name.toLowerCase() === rawC.toLowerCase() || c.slug.toLowerCase() === rawC.toLowerCase());
+        fallbackProducts[idx].category = matchedCat ? matchedCat.name : (rawC || 'General');
+        fallbackProducts[idx].category_id = matchedCat ? Number(matchedCat.id) : null;
       }
     }
+    if (sellerReassigned) {
+      fallbackProducts[idx].seller_id = ownerSellerId;
+      fallbackProducts[idx].seller_name = ownerSellerName;
+    }
+    if (body.name !== undefined && body.name.toString().trim() !== '') {
+      fallbackProducts[idx].name = body.name.toString().trim();
+    }
+    if (body.description !== undefined) fallbackProducts[idx].description = body.description;
+    if (pricingModified && newCleanPrice !== null) {
+      fallbackProducts[idx].price = newCleanPrice.toFixed(2);
+      fallbackProducts[idx].seller_price = newCleanPrice.toFixed(2);
+      fallbackProducts[idx].selling_price = newCleanPrice.toFixed(2);
+      fallbackProducts[idx].presentation_price = newCleanPrice.toFixed(2);
+    }
+    if (body.mrp !== undefined && body.mrp !== null && body.mrp !== '' && !isNaN(parseFloat(body.mrp))) {
+      fallbackProducts[idx].mrp = Math.max(0, Math.round(parseFloat(body.mrp) * 100) / 100).toFixed(2);
+    }
+    if (body.sku !== undefined) fallbackProducts[idx].sku = body.sku.toString().trim();
+    if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
+    if (body.stock !== undefined && body.stock !== '' && !isNaN(body.stock)) {
+      fallbackProducts[idx].stock = parseInt(body.stock, 10);
+    }
+    if (isActiveModified) {
+      fallbackProducts[idx].is_active = Boolean(newIsActiveBit);
+    }
+    if (newFinalImages !== null) {
+      fallbackProducts[idx].images = newFinalImages;
+      fallbackProducts[idx].image_url = newFinalImages[0] || null;
+      fallbackProducts[idx].image = newFinalImages[0] || null;
+      const keptBasenames = new Set(newFinalImages.map(u => getImageBasename(u)).filter(Boolean));
+      for (const oldU of oldImgs) {
+        const oldBn = getImageBasename(oldU);
+        if (oldBn && !keptBasenames.has(oldBn)) {
+          await safeDeleteLocalImageFile(pool, oldBn, Number(req.params.id));
+        }
+      }
+    }
+    fallbackProducts[idx].updated_at = new Date().toISOString();
 
-    const [updated] = await pool.query(
-      `SELECT p.id, p.seller_id, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
-              p.name, p.description, p.sku, p.category, p.category_id, p.brand, p.mrp, p.rating, p.ratings_count,
-              p.seller_price, p.commission, p.delivery_charge, p.gst, p.other_charges, p.price,
-              p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at
-       FROM products p
-       LEFT JOIN users u ON p.seller_id = u.id
-       WHERE p.id = ?`,
-      [req.params.id]
-    );
-    // Seller updated product: Seller view has NO commission feature!
-    const product = formatProductRecord(updated[0], { isSellerView: true, req });
-    const categoriesList = await getCategoriesListWithCounts(pool, false);
+    const updatedFallback = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
+    fallbackProducts[idx] = { ...fallbackProducts[idx], ...updatedFallback };
+    const categoriesList = await getCategoriesListWithCounts(null, false);
     const resp = {
       success: true,
       status: true,
       message: (catMutationRes && updates.length === 0) ? catMutationRes.payload.message : 'Product updated.',
-      product,
-      data: product,
+      product: updatedFallback,
+      data: updatedFallback,
       categories: categoriesList
     };
     if (catMutationRes && catMutationRes.payload && catMutationRes.payload.category) {
@@ -5995,60 +6920,10 @@ async function handleProductUpdateRoute(req, res) {
     if (catMutationRes && catMutationRes.payload && catMutationRes.payload.updated_products_count !== undefined) {
       resp.updated_products_count = catMutationRes.payload.updated_products_count;
     }
-    res.json(resp);
-  } catch (err) {
-    const idx = fallbackProducts.findIndex(p => String(p.id) === String(req.params.id));
-    if (idx !== -1) {
-      if (body.name) fallbackProducts[idx].name = body.name.toString().trim();
-      if (body.description !== undefined) fallbackProducts[idx].description = body.description;
-      if (pricingModified && newCleanPrice !== null) {
-        fallbackProducts[idx].price = newCleanPrice.toFixed(2);
-        fallbackProducts[idx].seller_price = newCleanPrice.toFixed(2);
-        fallbackProducts[idx].selling_price = newCleanPrice.toFixed(2);
-        fallbackProducts[idx].presentation_price = newCleanPrice.toFixed(2);
-      }
-      if (body.mrp !== undefined && !isNaN(parseFloat(body.mrp))) {
-        fallbackProducts[idx].mrp = parseFloat(body.mrp).toFixed(2);
-      }
-      if (body.sku !== undefined) fallbackProducts[idx].sku = body.sku.toString().trim();
-      if (shouldAssignCategory) {
-        const assignSrc = buildAssignBody();
-        if (assignSrc.category_id !== undefined && assignSrc.category_id !== null && String(assignSrc.category_id).trim() !== '') {
-          const matchedCat = fallbackCategories.find(c => String(c.id) === String(assignSrc.category_id).trim());
-          if (!matchedCat) {
-            return res.status(422).json({ message: 'Selected category was not found.', errors: { category_id: ['Selected category was not found.'] } });
-          }
-          fallbackProducts[idx].category_id = matchedCat.id;
-          fallbackProducts[idx].category = matchedCat.name;
-        } else if (assignSrc.category !== undefined) {
-          const rawC = assignSrc.category.toString().trim();
-          const matchedCat = fallbackCategories.find(c => String(c.id) === rawC || c.name.toLowerCase() === rawC.toLowerCase() || c.slug.toLowerCase() === rawC.toLowerCase());
-          fallbackProducts[idx].category = matchedCat ? matchedCat.name : (rawC || 'General');
-          fallbackProducts[idx].category_id = matchedCat ? matchedCat.id : null;
-        }
-      }
-      if (body.brand !== undefined) fallbackProducts[idx].brand = body.brand.toString().trim();
-      if (body.stock !== undefined && !isNaN(body.stock)) fallbackProducts[idx].stock = parseInt(body.stock, 10);
-      if (imgResult.hasImages && imgResult.images.length > 0) {
-        fallbackProducts[idx].images = imgResult.images;
-      }
-      const updatedFallback = formatProductRecord(fallbackProducts[idx], { isSellerView: true, req });
-      const categoriesList = await getCategoriesListWithCounts(null, false);
-      const resp = {
-        success: true,
-        status: true,
-        message: (catMutationRes && updates.length === 0) ? catMutationRes.payload.message : 'Product updated.',
-        product: updatedFallback,
-        data: updatedFallback,
-        categories: categoriesList
-      };
-      if (catMutationRes && catMutationRes.payload && catMutationRes.payload.category) {
-        resp.category = catMutationRes.payload.category;
-      }
-      return res.json(resp);
-    }
-    res.status(500).json({ message: 'Update failed.' });
+    return res.json(resp);
   }
+  cleanupTempReqFiles(req);
+  return res.status(500).json({ message: 'Update failed.' });
 }
 
 app.put(productUpdatePaths, authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductUpdateRoute);
@@ -6056,11 +6931,16 @@ app.patch(productUpdatePaths, authenticateToken, requireActiveSellerForMutation,
 app.post(productUpdatePaths, authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductUpdateRoute);
 
 app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutation, async (req, res) => {
+  const dbActive = await checkDbReachable(pool, deletionCtx);
   let existing = [];
-  try {
-    const [rows] = await pool.query('SELECT id, seller_id, image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
-    existing = rows;
-  } catch (err) {
+  if (dbActive) {
+    try {
+      const [rows] = await pool.query('SELECT id, seller_id, image_url, images FROM products WHERE id = ? LIMIT 1', [req.params.id]);
+      existing = rows;
+    } catch (err) {
+      existing = fallbackProducts.filter(p => String(p.id) === String(req.params.id));
+    }
+  } else {
     existing = fallbackProducts.filter(p => String(p.id) === String(req.params.id));
   }
 
@@ -6073,22 +6953,69 @@ app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutatio
   const prodId = Number(existing[0].id);
   const imagesToDelete = parseImagesJson(existing[0].images || existing[0].image_url);
 
-  try {
-    await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
-    await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
+  if (dbActive) {
+    try {
+      let orderRefCount = 0;
+      try {
+        const [[oiRow]] = await pool.query('SELECT COUNT(*) AS cnt FROM order_items WHERE product_id = ?', [prodId]);
+        orderRefCount = Number((oiRow && oiRow.cnt) || 0);
+      } catch (e) { orderRefCount = 0; }
 
-    // Safely delete associated physical image files ONLY IF no other product is referencing them
-    for (const imgUrl of imagesToDelete) {
-      if (imgUrl && imgUrl.includes('/uploads/products/')) {
-        const fn = path.basename(imgUrl.split('?')[0]);
-        await safeDeleteLocalImageFile(pool, fn, prodId);
+      if (orderRefCount > 0) {
+        await pool.query('UPDATE products SET is_active = 0, updated_at = NOW() WHERE id = ?', [prodId]);
+        return res.json({
+          success: true,
+          status: true,
+          archived: true,
+          order_references: orderRefCount,
+          message: 'Product has existing order history and was deactivated to preserve order records.'
+        });
       }
-    }
-  } catch (err) {
-    fallbackProducts = fallbackProducts.filter(p => String(p.id) !== String(req.params.id));
+
+      await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
+      await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
+
+      // Safely delete associated physical image files ONLY IF no other product is referencing them
+      for (const imgUrl of imagesToDelete) {
+        if (imgUrl && imgUrl.includes('/uploads/products/')) {
+          const fn = path.basename(imgUrl.split('?')[0]);
+          await safeDeleteLocalImageFile(pool, fn, prodId);
+        }
+      }
+      return res.json({ success: true, status: true, archived: false, message: 'Product deleted.' });
+    } catch (err) {}
   }
 
-  res.json({ message: 'Product deleted.' });
+  let orderRefCount = 0;
+  for (const o of fallbackOrders) {
+    const items = Array.isArray(o.items) ? o.items : [];
+    for (const it of items) {
+      if (Number(it.product_id || it.id) === prodId) orderRefCount++;
+    }
+  }
+  if (orderRefCount > 0) {
+    const idx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+    if (idx !== -1) {
+      fallbackProducts[idx].is_active = false;
+      fallbackProducts[idx].updated_at = new Date().toISOString();
+    }
+    return res.json({
+      success: true,
+      status: true,
+      archived: true,
+      order_references: orderRefCount,
+      message: 'Product has existing order history and was deactivated to preserve order records.'
+    });
+  }
+
+  fallbackProducts = fallbackProducts.filter(p => Number(p.id) !== prodId);
+  for (const imgUrl of imagesToDelete) {
+    if (imgUrl && imgUrl.includes('/uploads/products/')) {
+      const fn = path.basename(imgUrl.split('?')[0]);
+      await safeDeleteLocalImageFile(pool, fn, prodId);
+    }
+  }
+  return res.json({ success: true, status: true, archived: false, message: 'Product deleted.' });
 });
 
 // ==========================================
@@ -9274,52 +10201,178 @@ DB_PASSWORD=Xtragclub_vendor2026</pre>
   }
 });
 
-app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
+function handleAdminDashboardUpload(req, res, next) {
+  const ctype = String(req.headers['content-type'] || '').toLowerCase();
+  if (!ctype.includes('multipart/form-data')) {
+    return next();
+  }
+  rawUpload.any()(req, res, async (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        req.uploadError = 'File size exceeds maximum limit of 15MB.';
+      } else {
+        req.uploadError = err.message || 'File upload validation failed.';
+      }
+      return next();
+    }
+
+    if (req.files) {
+      const fileList = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
+      const seenHashes = new Set();
+      const uniqueFiles = [];
+      const createdWebpPaths = [];
+
+      const cleanupRemainingTempFiles = (fromIndex) => {
+        for (let i = fromIndex; i < fileList.length; i++) {
+          const rem = fileList[i];
+          if (rem && rem.path && fs.existsSync(rem.path)) {
+            try { fs.unlinkSync(rem.path); } catch (e) {}
+          }
+        }
+        for (const wp of createdWebpPaths) {
+          if (wp && fs.existsSync(wp)) {
+            try { fs.unlinkSync(wp); } catch (e) {}
+          }
+        }
+      };
+
+      for (let i = 0; i < fileList.length; i++) {
+        const f = fileList[i];
+        if (!f || !f.path) continue;
+        const tempPath = f.path;
+        let rawBuf = null;
+        try {
+          rawBuf = fs.readFileSync(tempPath);
+        } finally {
+          try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (e) {}
+        }
+
+        if ((!rawBuf || rawBuf.length === 0) && !String(f.originalname || '').trim()) {
+          continue;
+        }
+
+        const hash = crypto.createHash('sha256').update(rawBuf).digest('hex');
+        if (seenHashes.has(hash)) continue;
+        seenHashes.add(hash);
+
+        try {
+          const webpBuf = await convertImageBufferToWebp(rawBuf, {
+            originalName: f.originalname,
+            mimeType: f.mimetype
+          });
+          const webpFilename = `prod_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.webp`;
+          const webpPath = path.join(uploadDir, webpFilename);
+          fs.writeFileSync(webpPath, webpBuf);
+          try { fs.chmodSync(webpPath, 0o644); } catch (e) {}
+          createdWebpPaths.push(webpPath);
+
+          f.filename = webpFilename;
+          f.path = webpPath;
+          f.mimetype = 'image/webp';
+          f.size = webpBuf.length;
+          uniqueFiles.push(f);
+        } catch (convErr) {
+          cleanupRemainingTempFiles(i + 1);
+          req.files = [];
+          req.uploadError = convErr.message || 'Could not process uploaded image into WebP format.';
+          return next();
+        }
+      }
+
+      req.files = uniqueFiles;
+      if (req.file) {
+        const found = uniqueFiles.find(f => f.path === req.file.path);
+        req.file = found || (uniqueFiles.length > 0 ? uniqueFiles[0] : null);
+      }
+    }
+    next();
+  });
+}
+
+app.post(['/admin', '/admin/dashboard'], requireAdminDashboardAuth, handleAdminDashboardUpload, async (req, res) => {
   const dbActive = await checkDbReachable(pool, deletionCtx);
   if (dbActive) {
     await ensureGstTables(pool);
+    await ensureProductPriceColumns(pool);
     await ensureProductCategoriesTable(pool);
+    await ensureSellerDeletionSchemaNode(pool);
   }
+  const adminActorId = Number((req.adminUser && req.adminUser.id) || 1);
   let feedbackMsg = null;
   let feedbackErr = null;
   try {
     const body = req.body || {};
-    const action = body.action;
+    const action = String(body.action || '').trim();
 
-    if (!dbActive) {
-      feedbackErr = 'Direct MySQL actions (GST/Category/Seller edit) require MySQL connection; use the Seller Deletion API workspace above in fallback mode.';
+    if (req.uploadError) {
+      cleanupTempReqFiles(req);
+      feedbackErr = req.uploadError;
     } else if (action === 'approve_gst') {
       const sellerId = parseInt(body.seller_id, 10);
-      const notes = (body.notes || 'Approved by administrator').trim();
-      const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
-      if (gstRows.length > 0) {
-        const prevStatus = gstRows[0].status;
-        await pool.query(
-          'UPDATE seller_gst_details SET status = "Approved", rejection_reason = NULL, verified_by = 1, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
-          [gstRows[0].id]
-        );
-        await logGstAction(pool, {
-          seller_id: sellerId,
-          gst_id: gstRows[0].id,
-          action: 'approved',
-          previous_status: prevStatus,
-          new_status: 'Approved',
-          notes,
-          performed_by: 1,
-          performer_role: 'admin'
-        });
-        feedbackMsg = `Seller #${sellerId} document verification approved.`;
-      }
-    } else if (action === 'reject_gst') {
-      const sellerId = parseInt(body.seller_id, 10);
-      const reason = (body.rejection_reason || '').trim();
-      if (reason) {
+      const notes = String(body.notes || 'Approved by administrator').trim() || 'Approved by administrator';
+      if (dbActive) {
         const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
         if (gstRows.length > 0) {
           const prevStatus = gstRows[0].status;
           await pool.query(
-            'UPDATE seller_gst_details SET status = "Rejected", rejection_reason = ?, verified_by = 1, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
-            [reason, gstRows[0].id]
+            'UPDATE seller_gst_details SET status = "Approved", rejection_reason = NULL, verified_by = ?, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+            [adminActorId, gstRows[0].id]
+          );
+          await logGstAction(pool, {
+            seller_id: sellerId,
+            gst_id: gstRows[0].id,
+            action: 'approved',
+            previous_status: prevStatus,
+            new_status: 'Approved',
+            notes,
+            performed_by: adminActorId,
+            performer_role: 'admin'
+          });
+          feedbackMsg = `Seller #${sellerId} document verification approved.`;
+        } else {
+          feedbackErr = `No GST record found for Seller #${sellerId}.`;
+        }
+      } else {
+        fallbackDeletionStore.gstDetails = fallbackDeletionStore.gstDetails || [];
+        fallbackDeletionStore.gstVerificationLogs = fallbackDeletionStore.gstVerificationLogs || [];
+        const gstRow = fallbackDeletionStore.gstDetails.find(g => Number(g.seller_id) === sellerId);
+        if (gstRow) {
+          const prevStatus = gstRow.status || 'Pending';
+          const nowIso = new Date().toISOString();
+          gstRow.status = 'Approved';
+          gstRow.rejection_reason = null;
+          gstRow.verified_by = adminActorId;
+          gstRow.verified_at = nowIso;
+          gstRow.updated_at = nowIso;
+          fallbackDeletionStore.gstVerificationLogs.push({
+            id: fallbackDeletionStore.gstVerificationLogs.length + 1,
+            seller_id: sellerId,
+            gst_id: gstRow.id || sellerId,
+            action: 'approved',
+            previous_status: prevStatus,
+            new_status: 'Approved',
+            notes,
+            performed_by: adminActorId,
+            performer_role: 'admin',
+            created_at: nowIso
+          });
+          feedbackMsg = `Seller #${sellerId} document verification approved.`;
+        } else {
+          feedbackErr = `No GST record found for Seller #${sellerId}.`;
+        }
+      }
+    } else if (action === 'reject_gst') {
+      const sellerId = parseInt(body.seller_id, 10);
+      const reason = String(body.rejection_reason || '').trim();
+      if (!reason) {
+        feedbackErr = 'A rejection reason is mandatory when rejecting GST documents.';
+      } else if (dbActive) {
+        const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [sellerId]);
+        if (gstRows.length > 0) {
+          const prevStatus = gstRows[0].status;
+          await pool.query(
+            'UPDATE seller_gst_details SET status = "Rejected", rejection_reason = ?, verified_by = ?, verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+            [reason, adminActorId, gstRows[0].id]
           );
           await logGstAction(pool, {
             seller_id: sellerId,
@@ -9328,20 +10381,50 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
             previous_status: prevStatus,
             new_status: 'Rejected',
             notes: reason,
-            performed_by: 1,
+            performed_by: adminActorId,
             performer_role: 'admin'
           });
           feedbackMsg = `Seller #${sellerId} verification rejected.`;
+        } else {
+          feedbackErr = `No GST record found for Seller #${sellerId}.`;
+        }
+      } else {
+        fallbackDeletionStore.gstDetails = fallbackDeletionStore.gstDetails || [];
+        fallbackDeletionStore.gstVerificationLogs = fallbackDeletionStore.gstVerificationLogs || [];
+        const gstRow = fallbackDeletionStore.gstDetails.find(g => Number(g.seller_id) === sellerId);
+        if (gstRow) {
+          const prevStatus = gstRow.status || 'Pending';
+          const nowIso = new Date().toISOString();
+          gstRow.status = 'Rejected';
+          gstRow.rejection_reason = reason;
+          gstRow.verified_by = adminActorId;
+          gstRow.verified_at = nowIso;
+          gstRow.updated_at = nowIso;
+          fallbackDeletionStore.gstVerificationLogs.push({
+            id: fallbackDeletionStore.gstVerificationLogs.length + 1,
+            seller_id: sellerId,
+            gst_id: gstRow.id || sellerId,
+            action: 'rejected',
+            previous_status: prevStatus,
+            new_status: 'Rejected',
+            notes: reason,
+            performed_by: adminActorId,
+            performer_role: 'admin',
+            created_at: nowIso
+          });
+          feedbackMsg = `Seller #${sellerId} verification rejected.`;
+        } else {
+          feedbackErr = `No GST record found for Seller #${sellerId}.`;
         }
       }
     } else if (action === 'add_category') {
       const catName = String(body.name || '').trim();
       const catDesc = String(body.description || '').trim();
       const catIcon = String(body.icon || '').trim() || '🏷️';
-      const catActive = (body.is_active === undefined || body.is_active === '1' || body.is_active === 'on' || body.is_active === true) ? 1 : 0;
+      const catActive = (body.is_active === undefined || ['1', 'true', 'on', 'yes'].includes(String(body.is_active).toLowerCase())) ? 1 : 0;
       if (!catName) {
         feedbackErr = 'Category name is required.';
-      } else {
+      } else if (dbActive) {
         const [dup] = await pool.query('SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1', [catName]);
         if (dup.length > 0) {
           feedbackErr = `Category "${catName}" already exists.`;
@@ -9358,6 +10441,34 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
           );
           feedbackMsg = `Category "${catName}" added successfully.`;
         }
+      } else {
+        if (fallbackCategories.some(c => String(c.name || '').toLowerCase() === catName.toLowerCase())) {
+          feedbackErr = `Category "${catName}" already exists.`;
+        } else {
+          let sortOrder = parseInt(body.sort_order, 10);
+          if (isNaN(sortOrder)) {
+            sortOrder = fallbackCategories.reduce((mx, c) => Math.max(mx, Number(c.sort_order || 0)), 0) + 1;
+          }
+          let slug = toCategorySlug(catName);
+          let suf = 2;
+          while (fallbackCategories.some(c => String(c.slug || '').toLowerCase() === slug)) {
+            slug = `${toCategorySlug(catName)}-${suf++}`;
+          }
+          const nextCatId = fallbackCategories.reduce((mx, c) => Math.max(mx, Number(c.id || 0)), 0) + 1;
+          fallbackCategories.push({
+            id: nextCatId,
+            name: catName,
+            slug,
+            description: catDesc || null,
+            icon: catIcon,
+            image_url: null,
+            sort_order: sortOrder,
+            is_active: Boolean(catActive),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+          feedbackMsg = `Category "${catName}" added successfully.`;
+        }
       }
     } else if (action === 'edit_category') {
       const catId = parseInt(body.category_id, 10);
@@ -9365,10 +10476,10 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
       const catDesc = String(body.description || '').trim();
       const catIcon = String(body.icon || '').trim();
       const catSort = isNaN(parseInt(body.sort_order, 10)) ? 0 : parseInt(body.sort_order, 10);
-      const catActive = (body.is_active === '1' || body.is_active === 'on' || body.is_active === true) ? 1 : 0;
+      const catActive = ['1', 'true', 'on', 'yes'].includes(String(body.is_active || '').toLowerCase()) ? 1 : 0;
       if (!catId || !catName) {
         feedbackErr = 'Category ID and name are required.';
-      } else {
+      } else if (dbActive) {
         const [existingRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [catId]);
         if (existingRows.length === 0) {
           feedbackErr = `Category #${catId} not found.`;
@@ -9394,66 +10505,132 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
             feedbackMsg = `Category #${catId} updated to "${catName}".`;
           }
         }
+      } else {
+        const idx = fallbackCategories.findIndex(c => Number(c.id) === catId);
+        if (idx === -1) {
+          feedbackErr = `Category #${catId} not found.`;
+        } else if (fallbackCategories.some((c, i) => i !== idx && String(c.name || '').toLowerCase() === catName.toLowerCase())) {
+          feedbackErr = `Another category named "${catName}" already exists.`;
+        } else {
+          const oldName = String(fallbackCategories[idx].name || '');
+          fallbackCategories[idx].name = catName;
+          if (oldName !== catName) {
+            let slug = toCategorySlug(catName);
+            let suf = 2;
+            while (fallbackCategories.some((c, i) => i !== idx && String(c.slug || '').toLowerCase() === slug)) {
+              slug = `${toCategorySlug(catName)}-${suf++}`;
+            }
+            fallbackCategories[idx].slug = slug;
+            for (const pr of fallbackProducts) {
+              if (Number(pr.category_id) === catId || String(pr.category || '').toLowerCase() === oldName.toLowerCase()) {
+                pr.category = catName;
+                pr.category_id = catId;
+              }
+            }
+          }
+          fallbackCategories[idx].description = catDesc || null;
+          fallbackCategories[idx].icon = catIcon || null;
+          fallbackCategories[idx].sort_order = catSort;
+          fallbackCategories[idx].is_active = Boolean(catActive);
+          fallbackCategories[idx].updated_at = new Date().toISOString();
+          feedbackMsg = `Category #${catId} updated to "${catName}".`;
+        }
       }
     } else if (action === 'delete_category') {
       const catId = parseInt(body.category_id, 10);
-      const [existingRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [catId]);
-      if (existingRows.length > 0) {
-        const oldName = existingRows[0].name;
-        await pool.query(
-          "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
-          [catId, oldName]
-        );
-        await pool.query('DELETE FROM categories WHERE id = ?', [catId]);
-        feedbackMsg = `Category "${oldName}" deleted.`;
+      if (dbActive) {
+        const [existingRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [catId]);
+        if (existingRows.length > 0) {
+          const oldName = existingRows[0].name;
+          await pool.query(
+            "UPDATE products SET category = 'General', category_id = NULL, updated_at = NOW() WHERE category_id = ? OR LOWER(category) = LOWER(?)",
+            [catId, oldName]
+          );
+          await pool.query('DELETE FROM categories WHERE id = ?', [catId]);
+          feedbackMsg = `Category "${oldName}" deleted.`;
+        } else {
+          feedbackErr = `Category #${catId} not found.`;
+        }
       } else {
-        feedbackErr = `Category #${catId} not found.`;
+        const idx = fallbackCategories.findIndex(c => Number(c.id) === catId);
+        if (idx !== -1) {
+          const oldName = fallbackCategories[idx].name;
+          fallbackCategories.splice(idx, 1);
+          for (const pr of fallbackProducts) {
+            if (Number(pr.category_id) === catId || String(pr.category || '').toLowerCase() === String(oldName || '').toLowerCase()) {
+              pr.category = 'General';
+              pr.category_id = null;
+            }
+          }
+          feedbackMsg = `Category "${oldName}" deleted.`;
+        } else {
+          feedbackErr = `Category #${catId} not found.`;
+        }
       }
     } else if (action === 'update_product_category') {
       const prodId = parseInt(body.product_id, 10);
       const targetCatId = parseInt(body.category_id, 10);
       if (prodId > 0 && targetCatId > 0) {
-        const [catRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [targetCatId]);
-        if (catRows.length > 0) {
-          await pool.query(
-            'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE id = ?',
-            [catRows[0].name, Number(catRows[0].id), prodId]
-          );
-          feedbackMsg = `Product #${prodId} category changed to "${catRows[0].name}".`;
+        if (dbActive) {
+          const [catRows] = await pool.query('SELECT * FROM categories WHERE id = ? LIMIT 1', [targetCatId]);
+          const [prodRows] = await pool.query('SELECT id FROM products WHERE id = ? LIMIT 1', [prodId]);
+          if (prodRows.length === 0) {
+            feedbackErr = `Product #${prodId} not found.`;
+          } else if (catRows.length > 0) {
+            await pool.query(
+              'UPDATE products SET category = ?, category_id = ?, updated_at = NOW() WHERE id = ?',
+              [catRows[0].name, Number(catRows[0].id), prodId]
+            );
+            feedbackMsg = `Product #${prodId} category changed to "${catRows[0].name}".`;
+          } else {
+            feedbackErr = 'Selected category not found.';
+          }
         } else {
-          feedbackErr = 'Selected category not found.';
+          const catRow = fallbackCategories.find(c => Number(c.id) === targetCatId);
+          const prodRow = fallbackProducts.find(p => Number(p.id) === prodId);
+          if (!prodRow) {
+            feedbackErr = `Product #${prodId} not found.`;
+          } else if (catRow) {
+            prodRow.category = catRow.name;
+            prodRow.category_id = Number(catRow.id);
+            prodRow.updated_at = new Date().toISOString();
+            feedbackMsg = `Product #${prodId} category changed to "${catRow.name}".`;
+          } else {
+            feedbackErr = 'Selected category not found.';
+          }
         }
       } else {
         feedbackErr = 'Please select a valid product and category.';
       }
     } else if (action === 'create_seller') {
-      const name = (body.seller_name || '').trim();
-      const rawAdminPhone = (body.phone || '').trim();
-      const phone = rawAdminPhone ? normalizePhone(rawAdminPhone) : '';
-      const email = (body.email || '').trim().toLowerCase();
-      const address = (body.address || '').trim();
-      const landmark = (body.landmark || '').trim() || 'None';
-      const state = (body.state || '').trim();
-      const country = (body.country || 'India').trim();
-      const password = body.password || '';
-      const confirmPassword = body.password_confirmation || '';
+      const name = String(body.seller_name || '').trim();
+      const rawAdminPhone = String(body.phone || '').trim();
+      const dialCode = String(body.country_code || body.dial_code || '').trim();
+      const phone = rawAdminPhone ? normalizePhoneNumberNode(rawAdminPhone, dialCode) : '';
+      const phoneErr = rawAdminPhone ? validatePhoneFormatNode(phone, rawAdminPhone) : null;
+      const email = String(body.email || '').trim().toLowerCase();
+      const address = String(body.address || '').trim();
+      const landmark = String(body.landmark || '').trim() || 'None';
+      const state = String(body.state || '').trim();
+      const country = String(body.country || 'India').trim();
+      const password = String(body.password || '');
+      const confirmPassword = String(body.password_confirmation || '');
 
-      if (!name || (!phone && !email) || !address || !state || !password) {
+      if (!name || (!rawAdminPhone && !email) || !address || !state || !password) {
         feedbackErr = 'Seller name, email or phone number, address, state, and password are required.';
-      } else if (rawAdminPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-        feedbackErr = 'Phone must be in international format with country code (e.g. +919876543210).';
+      } else if (phoneErr) {
+        feedbackErr = phoneErr;
       } else if (email && !isValidEmailAddress(email)) {
         feedbackErr = 'Please enter a valid email address.';
       } else if (password.length < 8) {
         feedbackErr = 'Password must be at least 8 characters.';
       } else if (password !== confirmPassword) {
         feedbackErr = 'Password confirmation does not match.';
-      } else {
-        const dupPhone = phone
-          ? (await pool.query('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]))[0]
-          : [];
+      } else if (dbActive) {
+        await ensureNormalizedPhoneSchemaNode(pool);
+        const dupPhone = phone ? await findUsersByPhoneDb(pool, rawAdminPhone, phone, dialCode) : [];
         const dupEmail = email
-          ? (await pool.query('SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1', [email]))[0]
+          ? (await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]))[0]
           : [];
         if (dupPhone.length > 0) {
           feedbackErr = 'A seller with this phone number already exists.';
@@ -9463,62 +10640,118 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
           const hashedPassword = await bcrypt.hash(password, 10);
           const dbEmail = email || makeSyntheticPhoneEmail(phone);
           const dbPhone = phone || null;
-          await pool.query(
-            `INSERT INTO users (name, email, seller_name, phone, address, landmark, state, country, password, role, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
-            [name, dbEmail, name, dbPhone, address, landmark, state, country, hashedPassword]
-          );
+          try {
+            await pool.query(
+              `INSERT INTO users (name, email, seller_name, phone, normalized_phone, address, landmark, state, country, password, role, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'seller', NOW(), NOW())`,
+              [name, dbEmail, name, dbPhone, dbPhone, address, landmark, state, country, hashedPassword]
+            );
+            feedbackMsg = `Seller "${name}" created.`;
+          } catch (insErr) {
+            if (isDuplicateKeyErrorNode(insErr)) {
+              feedbackErr = String(insErr.message || '').toLowerCase().includes('email')
+                ? 'A seller with this email address already exists.'
+                : 'A seller with this phone number already exists.';
+            } else {
+              throw insErr;
+            }
+          }
+        }
+      } else {
+        const dupPhoneFb = phone ? fallbackSellers.some(u => matchesPhoneRecord(u.phone, phone, rawAdminPhone, dialCode)) : false;
+        const dupEmailFb = email ? fallbackSellers.some(u => String(u.email || '').toLowerCase() === email) : false;
+        if (dupPhoneFb) {
+          feedbackErr = 'A seller with this phone number already exists.';
+        } else if (dupEmailFb) {
+          feedbackErr = 'A seller with this email address already exists.';
+        } else {
+          const hashedPassword = await bcrypt.hash(password, 10);
+          const nextUid = fallbackSellers.reduce((mx, u) => Math.max(mx, Number(u.id || 0)), 0) + 1;
+          fallbackSellers.push({
+            id: nextUid,
+            name,
+            seller_name: name,
+            email: email || makeSyntheticPhoneEmail(phone),
+            phone: phone || null,
+            normalized_phone: phone || null,
+            address,
+            landmark,
+            state,
+            country,
+            password: hashedPassword,
+            _password: password,
+            role: 'seller',
+            account_status: 'ACTIVE',
+            token_version: 1,
+            created_at: new Date().toISOString()
+          });
           feedbackMsg = `Seller "${name}" created.`;
         }
       }
     } else if (action === 'edit_seller') {
       const sellerId = parseInt(body.seller_id, 10);
-      const name = (body.seller_name || '').trim();
-      const rawAdminPhone = (body.phone || '').trim();
-      const phone = rawAdminPhone ? normalizePhone(rawAdminPhone) : '';
-      const email = (body.email || '').trim().toLowerCase();
-      const address = (body.address || '').trim();
-      const landmark = (body.landmark || '').trim();
-      const state = (body.state || '').trim();
-      const country = (body.country || 'India').trim();
-      const currentPassword = body.current_password || '';
-      const newPassword = body.new_password || body.password || '';
-      const confirmPassword = body.confirm_password || '';
+      const name = String(body.seller_name || '').trim();
+      const rawAdminPhone = String(body.phone || '').trim();
+      const dialCode = String(body.country_code || body.dial_code || '').trim();
+      const phone = rawAdminPhone ? normalizePhoneNumberNode(rawAdminPhone, dialCode) : '';
+      const phoneErr = rawAdminPhone ? validatePhoneFormatNode(phone, rawAdminPhone) : null;
+      const email = String(body.email || '').trim().toLowerCase();
+      const address = String(body.address || '').trim();
+      const landmark = String(body.landmark || '').trim();
+      const state = String(body.state || '').trim();
+      const country = String(body.country || 'India').trim();
+      const currentPassword = String(body.current_password || '');
+      const newPassword = String(body.new_password || body.password || '');
+      const confirmPassword = String(body.confirm_password || '');
 
-      if (!sellerId || !name || (!phone && !email) || !address || !state) {
+      if (!sellerId || !name || (!rawAdminPhone && !email) || !address || !state) {
         feedbackErr = 'Seller ID, name, email or phone number, address, and state are required.';
-      } else if (rawAdminPhone && !/^\+[1-9]\d{7,14}$/.test(phone)) {
-        feedbackErr = 'Phone must be in international format with country code (e.g. +919876543210).';
+      } else if (phoneErr) {
+        feedbackErr = phoneErr;
       } else if (email && !isValidEmailAddress(email)) {
         feedbackErr = 'Please enter a valid email address.';
-      } else {
+      } else if (dbActive) {
+        await ensureNormalizedPhoneSchemaNode(pool);
         if (phone) {
-          const [dupPhone] = await pool.query('SELECT id FROM users WHERE phone = ? AND id != ? LIMIT 1', [phone, sellerId]);
+          const dupPhone = await findUsersByPhoneDb(pool, rawAdminPhone, phone, dialCode, sellerId);
           if (dupPhone.length > 0) {
             feedbackErr = 'This phone number is already registered to another account.';
           }
         }
         if (!feedbackErr && email) {
-          const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [email, sellerId]);
+          const [dupEmail] = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ? LIMIT 1', [email, sellerId]);
           if (dupEmail.length > 0) {
             feedbackErr = 'This email address is already used by another account.';
           }
         }
-        if (!feedbackErr) {
-          let passwordToUpdate = null;
-          if (newPassword && newPassword.length >= 8 && newPassword === confirmPassword) {
+        let passwordToUpdate = null;
+        if (!feedbackErr && newPassword) {
+          if (newPassword.length < 8) {
+            feedbackErr = 'The new password must be at least 8 characters.';
+          } else if (newPassword !== confirmPassword) {
+            feedbackErr = 'The new password and confirm password do not match.';
+          } else {
             if (currentPassword) {
               const [rows] = await pool.query('SELECT password FROM users WHERE id = ? LIMIT 1', [sellerId]);
-              if (rows.length > 0 && (await bcrypt.compare(currentPassword, rows[0].password))) {
-                passwordToUpdate = await bcrypt.hash(newPassword, 10);
+              if (rows.length > 0 && rows[0].password && !(await bcrypt.compare(currentPassword, rows[0].password))) {
+                feedbackErr = 'The current password is incorrect.';
               }
-            } else {
+            }
+            if (!feedbackErr) {
               passwordToUpdate = await bcrypt.hash(newPassword, 10);
             }
           }
-
+        }
+        if (!feedbackErr) {
           const updates = ['name = ?', 'seller_name = ?', 'phone = ?', 'address = ?', 'landmark = ?', 'state = ?', 'country = ?'];
           const params = [name, name, phone || null, address, landmark, state, country];
+          try {
+            const [nCols] = await pool.query("SHOW COLUMNS FROM users LIKE 'normalized_phone'");
+            if (nCols.length > 0) {
+              updates.push('normalized_phone = ?');
+              params.push(phone || null);
+            }
+          } catch (ignore) {}
           if (email) {
             updates.push('email = ?');
             params.push(email);
@@ -9529,22 +10762,482 @@ app.post('/admin', requireAdminDashboardAuth, async (req, res) => {
           }
           updates.push('updated_at = NOW()');
           params.push(sellerId);
-          await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
-          feedbackMsg = `Seller #${sellerId} updated.`;
+          try {
+            await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+            feedbackMsg = `Seller #${sellerId} updated.`;
+          } catch (updErr) {
+            if (isDuplicateKeyErrorNode(updErr)) {
+              feedbackErr = String(updErr.message || '').toLowerCase().includes('email')
+                ? 'This email address is already used by another account.'
+                : 'This phone number is already registered to another account.';
+            } else {
+              throw updErr;
+            }
+          }
+        }
+      } else {
+        const idx = fallbackSellers.findIndex(u => Number(u.id) === sellerId);
+        if (idx === -1) {
+          feedbackErr = `Seller #${sellerId} not found.`;
+        } else if (phone && fallbackSellers.some(u => Number(u.id) !== sellerId && matchesPhoneRecord(u.phone, phone, rawAdminPhone, dialCode))) {
+          feedbackErr = 'This phone number is already registered to another account.';
+        } else if (email && fallbackSellers.some(u => Number(u.id) !== sellerId && String(u.email || '').toLowerCase() === email)) {
+          feedbackErr = 'This email address is already used by another account.';
+        } else {
+          let passwordToUpdate = null;
+          if (newPassword) {
+            if (newPassword.length < 8) {
+              feedbackErr = 'The new password must be at least 8 characters.';
+            } else if (newPassword !== confirmPassword) {
+              feedbackErr = 'The new password and confirm password do not match.';
+            } else {
+              if (currentPassword) {
+                const target = fallbackSellers[idx];
+                const currMatch = target.password
+                  ? await bcrypt.compare(currentPassword, target.password)
+                  : (target._password !== undefined ? currentPassword === target._password : true);
+                if (!currMatch) {
+                  feedbackErr = 'The current password is incorrect.';
+                }
+              }
+              if (!feedbackErr) {
+                passwordToUpdate = await bcrypt.hash(newPassword, 10);
+              }
+            }
+          }
+          if (!feedbackErr) {
+            const target = fallbackSellers[idx];
+            target.name = name;
+            target.seller_name = name;
+            target.phone = phone || null;
+            target.normalized_phone = phone || null;
+            target.address = address;
+            target.landmark = landmark;
+            target.state = state;
+            target.country = country;
+            if (email) target.email = email;
+            if (passwordToUpdate) {
+              target.password = passwordToUpdate;
+              target._password = newPassword;
+            }
+            target.updated_at = new Date().toISOString();
+            feedbackMsg = `Seller #${sellerId} updated.`;
+          }
         }
       }
+    } else if (action === 'create_product') {
+      const targetSellerId = parseInt(body.seller_id, 10);
+      const prodName = String(body.name || '').trim();
+      const rawPrice = body.price;
+      const rawStock = body.stock !== undefined && body.stock !== '' ? body.stock : '0';
+      const prodDesc = String(body.description || '').trim();
+      const prodSku = String(body.sku || '').trim();
+      const prodBrand = String(body.brand || '').trim() || 'Generic';
+      const prodActive = ['1', 'true', 'on', 'yes'].includes(String(body.is_active || '').toLowerCase()) ? 1 : 0;
+
+      if (!targetSellerId || targetSellerId <= 0 || !prodName || rawPrice === undefined || rawPrice === '' || isNaN(parseFloat(rawPrice)) || parseFloat(rawPrice) < 0) {
+        cleanupTempReqFiles(req);
+        feedbackErr = 'Valid seller, product name, and non-negative price are required.';
+      } else if (isNaN(parseInt(rawStock, 10)) || parseInt(rawStock, 10) < 0) {
+        cleanupTempReqFiles(req);
+        feedbackErr = 'Stock quantity must be zero or a positive integer.';
+      } else {
+        let sRow = null;
+        if (dbActive) {
+          const [sRows] = await pool.query("SELECT id, name, seller_name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = ? LIMIT 1", [targetSellerId]);
+          sRow = sRows[0] || null;
+        } else {
+          sRow = fallbackSellers.find(u => Number(u.id) === targetSellerId) || null;
+        }
+        const sAcc = String((sRow && sRow.account_status) || 'ACTIVE').toUpperCase();
+        if (!sRow) {
+          cleanupTempReqFiles(req);
+          feedbackErr = `Seller #${targetSellerId} was not found.`;
+        } else if (['DELETED', 'LOCKED', 'DELETION_PENDING'].includes(sAcc)) {
+          cleanupTempReqFiles(req);
+          feedbackErr = `Cannot create products for seller #${targetSellerId} because account status is ${sAcc}.`;
+        } else {
+          const catRes = await resolveProductCategoryInput(pool, body, true);
+          if (catRes.error) {
+            cleanupTempReqFiles(req);
+            feedbackErr = 'Selected category was not found.';
+          } else {
+            const urlText = String(body.image_urls ?? body.images ?? '').trim();
+            const imgRes = await resolveProductImages({
+              headers: req.headers,
+              protocol: req.protocol,
+              get: typeof req.get === 'function' ? req.get.bind(req) : undefined,
+              files: req.files || [],
+              body: urlText ? { image_urls: urlText } : {}
+            });
+            const finalImages = dedupeImagesByFilename(imgRes.images || []).slice(0, 4);
+            const finalPrimaryUrl = finalImages[0] || null;
+            const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
+            const pricing = resolveProductPricing({ price: rawPrice, mrp: body.mrp });
+
+            if (dbActive) {
+              const [insRes] = await pool.query(
+                `INSERT INTO products (seller_id, name, description, sku, category, category_id, brand, mrp, seller_price, commission, delivery_charge, gst, other_charges, price, stock, image_url, images, is_active, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                [
+                  targetSellerId,
+                  prodName,
+                  prodDesc || null,
+                  prodSku || null,
+                  catRes.category || 'General',
+                  catRes.category_id || null,
+                  prodBrand,
+                  Number(pricing.mrp).toFixed(2),
+                  Number(pricing.seller_price).toFixed(2),
+                  Number(pricing.commission).toFixed(2),
+                  Number(pricing.delivery_charge).toFixed(2),
+                  Number(pricing.gst).toFixed(2),
+                  Number(pricing.other_charges).toFixed(2),
+                  Number(pricing.price).toFixed(2),
+                  parseInt(rawStock, 10),
+                  finalPrimaryUrl,
+                  finalImagesJson,
+                  prodActive
+                ]
+              );
+              const newProdId = Number(insRes.insertId);
+              if (finalImages.length > 0) {
+                await syncProductImagesRecord(pool, targetSellerId, newProdId, finalImages, imgRes.filesInfo || []);
+              }
+              feedbackMsg = `Product #${newProdId} ("${prodName}") created successfully!`;
+            } else {
+              const newProdId = fallbackProducts.reduce((mx, p) => Math.max(mx, Number(p.id || 0)), 0) + 1;
+              fallbackProducts.unshift({
+                id: newProdId,
+                seller_id: targetSellerId,
+                seller_name: sRow.seller_name || sRow.name || 'Verified Seller',
+                name: prodName,
+                description: prodDesc || null,
+                sku: prodSku || `SKU-${String(newProdId).padStart(4, '0')}`,
+                category: catRes.category || 'General',
+                category_id: catRes.category_id || null,
+                brand: prodBrand,
+                mrp: Number(pricing.mrp).toFixed(2),
+                seller_price: Number(pricing.seller_price).toFixed(2),
+                price: Number(pricing.price).toFixed(2),
+                discount_percent: pricing.discount_percent,
+                delivery_charge: Number(pricing.delivery_charge).toFixed(2),
+                delivery_text: pricing.delivery_text,
+                stock: parseInt(rawStock, 10),
+                image_url: finalPrimaryUrl,
+                images: finalImages,
+                is_active: Boolean(prodActive),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+              });
+              feedbackMsg = `Product #${newProdId} ("${prodName}") created successfully!`;
+            }
+          }
+        }
+      }
+    } else if (action === 'edit_product') {
+      const prodId = parseInt(body.product_id, 10);
+      const prodName = String(body.name || '').trim();
+      const rawPrice = body.price;
+      const rawStock = body.stock !== undefined && body.stock !== '' ? body.stock : '0';
+      const prodDesc = String(body.description || '').trim();
+      const prodSku = String(body.sku || '').trim();
+      const prodBrand = String(body.brand || '').trim() || 'Generic';
+      const prodActive = ['1', 'true', 'on', 'yes'].includes(String(body.is_active || '').toLowerCase()) ? 1 : 0;
+
+      let existingProd = null;
+      let existingFbIdx = -1;
+      if (dbActive) {
+        const [pRows] = await pool.query('SELECT * FROM products WHERE id = ? LIMIT 1', [prodId]);
+        existingProd = pRows[0] || null;
+      } else {
+        existingFbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+        existingProd = existingFbIdx !== -1 ? fallbackProducts[existingFbIdx] : null;
+      }
+
+      if (!existingProd) {
+        cleanupTempReqFiles(req);
+        feedbackErr = `Product #${prodId} not found.`;
+      } else if (!prodName || rawPrice === undefined || rawPrice === '' || isNaN(parseFloat(rawPrice)) || parseFloat(rawPrice) < 0) {
+        cleanupTempReqFiles(req);
+        feedbackErr = 'Product name and valid non-negative price are required.';
+      } else if (isNaN(parseInt(rawStock, 10)) || parseInt(rawStock, 10) < 0) {
+        cleanupTempReqFiles(req);
+        feedbackErr = 'Stock quantity must be zero or a positive integer.';
+      } else {
+        const targetSellerId = parseInt(body.seller_id || existingProd.seller_id, 10);
+        const sellerChanged = targetSellerId !== Number(existingProd.seller_id);
+        let sRow = null;
+        if (dbActive) {
+          const [sRows] = await pool.query("SELECT id, name, seller_name, COALESCE(account_status, 'ACTIVE') AS account_status FROM users WHERE id = ? LIMIT 1", [targetSellerId]);
+          sRow = sRows[0] || null;
+        } else {
+          sRow = fallbackSellers.find(u => Number(u.id) === targetSellerId) || null;
+        }
+        const sAcc = String((sRow && sRow.account_status) || 'ACTIVE').toUpperCase();
+
+        if (!sRow) {
+          cleanupTempReqFiles(req);
+          feedbackErr = `Selected seller #${targetSellerId} was not found.`;
+        } else if (sellerChanged && ['DELETED', 'LOCKED', 'DELETION_PENDING'].includes(sAcc)) {
+          cleanupTempReqFiles(req);
+          feedbackErr = `Cannot reassign product to seller #${targetSellerId} with account status ${sAcc}.`;
+        } else {
+          const catRes = await resolveProductCategoryInput(pool, body, false);
+          if (catRes.error) {
+            cleanupTempReqFiles(req);
+            feedbackErr = 'Selected category was not found.';
+          } else {
+            const oldImgs = dedupeImagesByFilename([
+              ...parseImagesJson(existingProd.images),
+              ...(existingProd.image_url ? [String(existingProd.image_url)] : [])
+            ]);
+
+            const clearImgs = Boolean(body.clear_images && !['0', 'false', 'off'].includes(String(body.clear_images).toLowerCase()));
+            const replaceImgs = Boolean(body.replace_images && !['0', 'false', 'off'].includes(String(body.replace_images).toLowerCase()));
+            const hasControl = Boolean(body.existing_images_control);
+            const retainedRaw = []
+              .concat(body['retain_images[]'] !== undefined ? body['retain_images[]'] : [])
+              .concat(body.retain_images !== undefined ? body.retain_images : [])
+              .filter(v => typeof v === 'string' && v.trim() !== '');
+            const newUrlsRaw = String(body.image_urls ?? '').trim();
+
+            let finalImages = [];
+            let filesInfo = [];
+            if (clearImgs) {
+              cleanupTempReqFiles(req);
+              finalImages = [];
+            } else {
+              let candidateList = [];
+              if (replaceImgs) {
+                candidateList = newUrlsRaw ? [newUrlsRaw] : [];
+              } else if (hasControl) {
+                candidateList = [...retainedRaw, ...(newUrlsRaw ? [newUrlsRaw] : [])];
+              } else {
+                candidateList = [...oldImgs, ...(newUrlsRaw ? [newUrlsRaw] : [])];
+              }
+              const imgRes = await resolveProductImages({
+                headers: req.headers,
+                protocol: req.protocol,
+                get: typeof req.get === 'function' ? req.get.bind(req) : undefined,
+                files: req.files || [],
+                body: candidateList.length > 0 ? { image_urls: candidateList } : {}
+              });
+              finalImages = dedupeImagesByFilename(imgRes.images || []).slice(0, 4);
+              filesInfo = imgRes.filesInfo || [];
+              if (!replaceImgs && !hasControl && !imgRes.hasImages) {
+                finalImages = oldImgs;
+              }
+            }
+
+            const finalPrimaryUrl = finalImages[0] || null;
+            const finalImagesJson = finalImages.length > 0 ? JSON.stringify(finalImages) : null;
+            const pricing = resolveProductPricing({ price: rawPrice, mrp: body.mrp }, existingProd);
+            const nextCategory = catRes.provided ? catRes.category : (existingProd.category || 'General');
+            const nextCategoryId = catRes.provided ? catRes.category_id : (existingProd.category_id ?? null);
+
+            if (dbActive) {
+              await pool.query(
+                `UPDATE products
+                 SET seller_id = ?, name = ?, description = ?, sku = ?, category = ?, category_id = ?, brand = ?,
+                     mrp = ?, seller_price = ?, commission = ?, delivery_charge = ?, price = ?, stock = ?,
+                     image_url = ?, images = ?, is_active = ?, updated_at = NOW()
+                 WHERE id = ?`,
+                [
+                  targetSellerId,
+                  prodName,
+                  prodDesc || null,
+                  prodSku || null,
+                  nextCategory,
+                  nextCategoryId,
+                  prodBrand,
+                  Number(pricing.mrp).toFixed(2),
+                  Number(pricing.seller_price).toFixed(2),
+                  Number(pricing.commission).toFixed(2),
+                  Number(pricing.delivery_charge).toFixed(2),
+                  Number(pricing.price).toFixed(2),
+                  parseInt(rawStock, 10),
+                  finalPrimaryUrl,
+                  finalImagesJson,
+                  prodActive,
+                  prodId
+                ]
+              );
+              const keptNames = new Set(finalImages.map(u => getImageBasename(u)).filter(Boolean));
+              for (const oldU of oldImgs) {
+                const oldBn = getImageBasename(oldU);
+                if (oldBn && !keptNames.has(oldBn)) {
+                  try {
+                    await pool.query('DELETE FROM product_images WHERE product_id = ? AND file_name = ?', [prodId, oldBn]);
+                  } catch (e) {}
+                  await safeDeleteLocalImageFile(pool, oldBn, prodId);
+                }
+              }
+              if (finalImages.length > 0) {
+                await syncProductImagesRecord(pool, targetSellerId, prodId, finalImages, filesInfo);
+              }
+              feedbackMsg = `Product #${prodId} ("${prodName}") updated successfully!`;
+            } else {
+              const target = fallbackProducts[existingFbIdx];
+              target.seller_id = targetSellerId;
+              target.seller_name = sRow.seller_name || sRow.name || 'Verified Seller';
+              target.name = prodName;
+              target.description = prodDesc || null;
+              target.sku = prodSku || target.sku || `SKU-${String(prodId).padStart(4, '0')}`;
+              target.category = nextCategory;
+              target.category_id = nextCategoryId;
+              target.brand = prodBrand;
+              target.mrp = Number(pricing.mrp).toFixed(2);
+              target.seller_price = Number(pricing.seller_price).toFixed(2);
+              target.price = Number(pricing.price).toFixed(2);
+              target.discount_percent = pricing.discount_percent;
+              target.delivery_charge = Number(pricing.delivery_charge).toFixed(2);
+              target.delivery_text = pricing.delivery_text;
+              target.stock = parseInt(rawStock, 10);
+              target.image_url = finalPrimaryUrl;
+              target.images = finalImages;
+              target.is_active = Boolean(prodActive);
+              target.updated_at = new Date().toISOString();
+
+              const keptNames = new Set(finalImages.map(u => getImageBasename(u)).filter(Boolean));
+              for (const oldU of oldImgs) {
+                const oldBn = getImageBasename(oldU);
+                if (oldBn && !keptNames.has(oldBn)) {
+                  await safeDeleteLocalImageFile(null, oldBn, prodId);
+                }
+              }
+              feedbackMsg = `Product #${prodId} ("${prodName}") updated successfully!`;
+            }
+          }
+        }
+      }
+    } else if (action === 'toggle_product_status') {
+      const prodId = parseInt(body.product_id, 10);
+      if (dbActive) {
+        const [pRows] = await pool.query('SELECT id, name, is_active FROM products WHERE id = ? LIMIT 1', [prodId]);
+        if (pRows.length > 0) {
+          const nextActive = Number(pRows[0].is_active ?? 1) === 1 ? 0 : 1;
+          await pool.query('UPDATE products SET is_active = ?, updated_at = NOW() WHERE id = ?', [nextActive, prodId]);
+          feedbackMsg = `Product #${prodId} ("${pRows[0].name}") has been ${nextActive ? 'ACTIVATED' : 'DEACTIVATED'}.`;
+        } else {
+          feedbackErr = `Product #${prodId} not found.`;
+        }
+      } else {
+        const prodRow = fallbackProducts.find(p => Number(p.id) === prodId);
+        if (prodRow) {
+          const currActive = Number(prodRow.is_active === false ? 0 : (prodRow.is_active ?? 1)) === 1;
+          const nextActive = currActive ? 0 : 1;
+          prodRow.is_active = Boolean(nextActive);
+          prodRow.updated_at = new Date().toISOString();
+          feedbackMsg = `Product #${prodId} ("${prodRow.name}") has been ${nextActive ? 'ACTIVATED' : 'DEACTIVATED'}.`;
+        } else {
+          feedbackErr = `Product #${prodId} not found.`;
+        }
+      }
+    } else if (action === 'delete_product') {
+      const prodId = parseInt(body.product_id, 10);
+      if (dbActive) {
+        const [pRows] = await pool.query('SELECT id, name, image_url, images FROM products WHERE id = ? LIMIT 1', [prodId]);
+        if (pRows.length === 0) {
+          feedbackErr = `Product #${prodId} not found.`;
+        } else {
+          const prodRow = pRows[0];
+          let orderRefCount = 0;
+          try {
+            const [[oiRow]] = await pool.query('SELECT COUNT(*) as cnt FROM order_items WHERE product_id = ?', [prodId]);
+            orderRefCount = Number((oiRow && oiRow.cnt) || 0);
+          } catch (e) {
+            orderRefCount = 0;
+          }
+          if (orderRefCount > 0) {
+            await pool.query('UPDATE products SET is_active = 0, updated_at = NOW() WHERE id = ?', [prodId]);
+            feedbackMsg = `Product #${prodId} ("${prodRow.name}") has ${orderRefCount} historical order item(s), so it was archived (deactivated) instead of deleted to preserve order history.`;
+          } else {
+            const imgsToDel = [
+              ...parseImagesJson(prodRow.images),
+              ...(prodRow.image_url ? [String(prodRow.image_url)] : [])
+            ];
+            await pool.query('DELETE FROM products WHERE id = ?', [prodId]);
+            try {
+              await pool.query('DELETE FROM product_images WHERE product_id = ?', [prodId]);
+            } catch (e) {}
+            for (const imgU of imgsToDel) {
+              if (typeof imgU === 'string' && imgU.includes('/uploads/products/')) {
+                await safeDeleteLocalImageFile(pool, getImageBasename(imgU), prodId);
+              }
+            }
+            feedbackMsg = `Product #${prodId} ("${prodRow.name}") deleted permanently.`;
+          }
+        }
+      } else {
+        const fbIdx = fallbackProducts.findIndex(p => Number(p.id) === prodId);
+        if (fbIdx === -1) {
+          feedbackErr = `Product #${prodId} not found.`;
+        } else {
+          const prodRow = fallbackProducts[fbIdx];
+          let orderRefCount = 0;
+          for (const ord of (fallbackOrders || [])) {
+            for (const it of (ord.items || [])) {
+              if (Number(it.product_id) === prodId) orderRefCount++;
+            }
+          }
+          if (orderRefCount > 0) {
+            prodRow.is_active = false;
+            prodRow.updated_at = new Date().toISOString();
+            feedbackMsg = `Product #${prodId} ("${prodRow.name}") has ${orderRefCount} historical order item(s), so it was archived (deactivated) instead of deleted to preserve order history.`;
+          } else {
+            const imgsToDel = [
+              ...parseImagesJson(prodRow.images),
+              ...(prodRow.image_url ? [String(prodRow.image_url)] : [])
+            ];
+            fallbackProducts.splice(fbIdx, 1);
+            for (const imgU of imgsToDel) {
+              if (typeof imgU === 'string' && imgU.includes('/uploads/products/')) {
+                await safeDeleteLocalImageFile(null, getImageBasename(imgU), prodId);
+              }
+            }
+            feedbackMsg = `Product #${prodId} ("${prodRow.name}") deleted permanently.`;
+          }
+        }
+      }
+    } else if (action) {
+      feedbackErr = `Unknown admin action: ${action}`;
     }
   } catch (err) {
+    cleanupTempReqFiles(req);
     console.error('Admin POST action error:', err);
     feedbackErr = err.message || 'Action failed.';
   }
+  const defaultTabByAction = {
+    approve_gst: 'gst',
+    reject_gst: 'gst',
+    add_category: 'categories',
+    edit_category: 'categories',
+    delete_category: 'categories',
+    update_product_category: 'products',
+    create_product: 'products',
+    edit_product: 'products',
+    toggle_product_status: 'products',
+    delete_product: 'products',
+    create_seller: 'sellers',
+    edit_seller: 'sellers'
+  };
+  const allowedReturnTabs = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+  const rawReturnTab = String((req.body && req.body.return_tab) || '').trim().toLowerCase();
+  const actionKey = String((req.body && req.body.action) || '').trim();
+  const returnTab = allowedReturnTabs.includes(rawReturnTab)
+    ? rawReturnTab
+    : (defaultTabByAction[actionKey] || 'overview');
+  const redirParams = [];
+  if (returnTab && returnTab !== 'overview') {
+    redirParams.push('tab=' + encodeURIComponent(returnTab));
+  }
   if (feedbackErr) {
-    return res.redirect('/admin?err=' + encodeURIComponent(feedbackErr));
+    redirParams.push('err=' + encodeURIComponent(feedbackErr));
+  } else if (feedbackMsg) {
+    redirParams.push('msg=' + encodeURIComponent(feedbackMsg));
   }
-  if (feedbackMsg) {
-    return res.redirect('/admin?msg=' + encodeURIComponent(feedbackMsg));
-  }
-  res.redirect('/admin');
+  res.redirect('/admin' + (redirParams.length ? '?' + redirParams.join('&') : ''));
 });
 
 function getPersistentGstUploadDir() {
@@ -9750,6 +11443,7 @@ app.get('/admin/view_gst_doc', requireAdminDashboardAuth, async (req, res) => {
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', `${disposition}; filename="${safeAsciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
 
     const stream = fs.createReadStream(realPath);
@@ -9772,15 +11466,40 @@ app.get('/admin/get_gst_details', requireAdminDashboardAuth, async (req, res) =>
     const dbActive = await checkDbReachable(pool, deletionCtx);
     if (!dbActive) {
       const store = fallbackDeletionStore;
-      const gst = (store.gstDetails || []).find(g => Number(g.seller_id) === targetId) || null;
-      return res.json({ status: 'success', gst, documents: [], logs: [] });
+      store.gstDetails = store.gstDetails || [];
+      store.gstDocuments = store.gstDocuments || [];
+      store.gstVerificationLogs = store.gstVerificationLogs || [];
+      const uRow = fallbackSellers.find(s => Number(s.id) === targetId) || null;
+      const gst = store.gstDetails.find(g => Number(g.seller_id) === targetId) || null;
+      const fbDocs = store.gstDocuments
+        .filter(d => Number(d.seller_id) === targetId)
+        .sort((a, b) => (Number(b.is_primary || 0) - Number(a.is_primary || 0)) || (Number(b.id) - Number(a.id)))
+        .map(d => ({
+          ...formatGstDocumentRecord(d, true),
+          admin_preview_url: `/admin/view_gst_doc?id=${d.id}&mode=preview`,
+          admin_download_url: `/admin/view_gst_doc?id=${d.id}&mode=download`,
+          file_exists: Boolean(resolveGstDocumentPath(d))
+        }));
+      const fbLogs = store.gstVerificationLogs
+        .filter(l => Number(l.seller_id) === targetId)
+        .sort((a, b) => Number(b.id) - Number(a.id));
+      return res.json({
+        status: 'success',
+        seller: uRow ? { id: Number(uRow.id), name: uRow.name || null, seller_name: uRow.seller_name || null, phone: uRow.phone || null, email: getPublicSellerEmail(uRow.email) } : null,
+        gst,
+        documents: fbDocs,
+        logs: fbLogs
+      });
     }
+    const [uRows] = await pool.query('SELECT id, name, seller_name, phone, email FROM users WHERE id = ? LIMIT 1', [targetId]);
+    const uRow = uRows[0] || null;
     const [gstRows] = await pool.query('SELECT * FROM seller_gst_details WHERE seller_id = ? LIMIT 1', [targetId]);
     const [docs] = await pool.query('SELECT * FROM seller_gst_documents WHERE seller_id = ? ORDER BY is_primary DESC, id DESC', [targetId]);
     const [logs] = await pool.query('SELECT * FROM seller_gst_verification_logs WHERE seller_id = ? ORDER BY id DESC', [targetId]);
 
     res.json({
       status: 'success',
+      seller: uRow ? { id: Number(uRow.id), name: uRow.name || null, seller_name: uRow.seller_name || null, phone: uRow.phone || null, email: getPublicSellerEmail(uRow.email) } : null,
       gst: gstRows[0] || null,
       documents: docs.map(d => ({
         ...formatGstDocumentRecord(d, true),
@@ -9795,8 +11514,26 @@ app.get('/admin/get_gst_details', requireAdminDashboardAuth, async (req, res) =>
   }
 });
 
-// GET /admin & /admin/seller-deletions - Admin Dashboard with Seller Deletion & Refund Management
-app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async (req, res) => {
+// GET /admin, /admin/dashboard, /admin/products, /admin/sellers, /admin/create-seller, /admin/seller-deletions, /admin/gst-verifications, /admin/categories
+app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/admin/create-seller', '/admin/seller-deletions', '/admin/gst-verifications', '/admin/categories'], requireAdminDashboardAuth, async (req, res) => {
+  if ((!req.cookies || !req.cookies.admin_token) && req.adminUser && !res.headersSent) {
+    const mintedToken = jwt.sign(
+      {
+        id: Number(req.adminUser.id || 1),
+        role: 'admin',
+        email: req.adminUser.email || 'admin@vendor.app',
+        tv: Number(req.adminUser.token_version || 1)
+      },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    res.setHeader('Set-Cookie', [
+      'admin_logged_in=1; Path=/; Max-Age=604800; SameSite=Lax',
+      `admin_email=${encodeURIComponent(req.adminUser.email || 'admin@vendor.app')}; Path=/; Max-Age=604800; SameSite=Lax`,
+      `admin_token=${mintedToken}; Path=/; HttpOnly; Max-Age=604800; SameSite=Lax`
+    ]);
+  }
+
   const dbActive = await checkDbReachable(pool, deletionCtx);
   if (dbActive) {
     await ensureGstTables(pool);
@@ -9804,7 +11541,17 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     await ensureProductCategoriesTable(pool);
     await ensureSellerDeletionSchemaNode(pool);
   }
-  const focusDeletionTab = req.path === '/admin/seller-deletions' || String(req.query.tab || '').toLowerCase() === 'seller-deletions';
+  const allowedTabs = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+  let defaultPathTab = 'overview';
+  if (req.path === '/admin/products') defaultPathTab = 'products';
+  else if (req.path === '/admin/sellers') defaultPathTab = 'sellers';
+  else if (req.path === '/admin/create-seller') defaultPathTab = 'create-seller';
+  else if (req.path === '/admin/seller-deletions') defaultPathTab = 'seller-deletions';
+  else if (req.path === '/admin/gst-verifications') defaultPathTab = 'gst';
+  else if (req.path === '/admin/categories') defaultPathTab = 'categories';
+  const requestedTab = String(req.query.tab || '').trim().toLowerCase();
+  const activeTab = allowedTabs.includes(requestedTab) ? requestedTab : defaultPathTab;
+  const focusDeletionTab = activeTab === 'seller-deletions';
 
   try {
     let count = 0;
@@ -9812,6 +11559,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     let categoryCount = 0;
     let categoriesList = [];
     let adminProducts = [];
+    let eligibleSellersForProducts = [];
     let orderCount = 0;
     let metrics = { total_gst: 0, pending_gst: 0, approved_gst: 0, rejected_gst: 0 };
     let gstSellers = [];
@@ -9840,13 +11588,30 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
       } catch (e) {}
 
       try {
+        const [spRows] = await pool.query(`
+          SELECT u.id, u.name, u.seller_name, COALESCE(u.account_status, 'ACTIVE') AS account_status
+          FROM users u
+          WHERE u.role = 'seller'
+          ORDER BY u.id DESC
+          LIMIT 1000
+        `);
+        eligibleSellersForProducts = spRows.map(r => ({
+          id: Number(r.id),
+          display_name: r.seller_name || r.name || ('Seller #' + r.id),
+          account_status: String(r.account_status || 'ACTIVE').toUpperCase()
+        }));
+      } catch (e) {}
+
+      try {
         const [pRows] = await pool.query(`
-          SELECT p.id, p.seller_id, p.name, p.sku, p.category, p.category_id, p.price, p.stock, p.is_active,
-                 COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+          SELECT p.id, p.seller_id, p.name, p.description, p.sku, p.category, p.category_id, p.brand,
+                 p.mrp, p.seller_price, p.price, p.stock, p.image_url, p.images, p.is_active, p.created_at, p.updated_at,
+                 COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+                 COALESCE(u.account_status, 'ACTIVE') AS seller_account_status
           FROM products p
           LEFT JOIN users u ON p.seller_id = u.id
           ORDER BY p.id DESC
-          LIMIT 80
+          LIMIT 1000
         `);
         adminProducts = pRows;
       } catch (e) {}
@@ -9882,7 +11647,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           FROM seller_gst_details g
           JOIN users u ON g.seller_id = u.id
           ORDER BY (CASE WHEN g.status = 'Pending' OR g.status = 'Resubmitted' THEN 0 ELSE 1 END), g.updated_at DESC
-          LIMIT 100
+          LIMIT 1000
         `);
         gstSellers = rows.map(g => ({
           ...g,
@@ -9906,35 +11671,91 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           FROM users u
           WHERE u.role = 'seller'
           ORDER BY u.id DESC
-          LIMIT 50
+          LIMIT 1000
         `);
         sellers = rows;
       } catch (e) {}
     } else {
       const fbSellerUsers = fallbackSellers.filter(s => s.role !== 'admin');
+      fallbackDeletionStore.gstDetails = fallbackDeletionStore.gstDetails || [];
+      fallbackDeletionStore.gstDocuments = fallbackDeletionStore.gstDocuments || [];
       count = fbSellerUsers.length;
-      productCount = fallbackProducts.filter(p => Number(p.is_active ?? 1) === 1).length;
-      categoryCount = fallbackCategories.filter(c => Number(c.is_active ?? 1) === 1).length;
+      productCount = fallbackProducts.filter(p => parseBoolBitNode(p.is_active, 1) === 1).length;
+      categoryCount = fallbackCategories.filter(c => c.is_active !== false && Number(c.is_active ?? 1) === 1).length;
       categoriesList = fallbackCategories.map(c => ({
         ...c,
-        products_count: fallbackProducts.filter(p => Number(p.is_active ?? 1) === 1 && (Number(p.category_id) === Number(c.id) || String(p.category || '').toLowerCase() === String(c.name || '').toLowerCase())).length
+        products_count: fallbackProducts.filter(p => parseBoolBitNode(p.is_active, 1) === 1 && (Number(p.category_id) === Number(c.id) || String(p.category || '').toLowerCase() === String(c.name || '').toLowerCase())).length
       }));
-      adminProducts = fallbackProducts.slice(0, 80).map(p => {
+      eligibleSellersForProducts = fbSellerUsers
+        .map(u => ({
+          id: Number(u.id),
+          display_name: u.seller_name || u.name || ('Seller #' + u.id),
+          account_status: String(u.account_status || 'ACTIVE').toUpperCase()
+        }))
+        .sort((a, b) => b.id - a.id)
+        .slice(0, 1000);
+      adminProducts = fallbackProducts.slice(0, 1000).map(p => {
         const u = fallbackSellers.find(s => Number(s.id) === Number(p.seller_id));
-        return { ...p, seller_name: (u && (u.seller_name || u.name)) || 'Verified Seller' };
+        return {
+          ...p,
+          seller_name: (u && (u.seller_name || u.name)) || p.seller_name || 'Verified Seller',
+          seller_account_status: String((u && u.account_status) || 'ACTIVE').toUpperCase()
+        };
       });
       orderCount = fallbackOrders.length;
+
+      const fbGstRows = fallbackDeletionStore.gstDetails.filter(g => fallbackSellers.some(u => Number(u.id) === Number(g.seller_id)));
+      metrics = {
+        total_gst: fbGstRows.length,
+        pending_gst: fbGstRows.filter(g => ['pending', 'resubmitted'].includes(String(g.status || 'Pending').toLowerCase())).length,
+        approved_gst: fbGstRows.filter(g => String(g.status || '').toLowerCase() === 'approved').length,
+        rejected_gst: fbGstRows.filter(g => String(g.status || '').toLowerCase() === 'rejected').length
+      };
+      gstSellers = fbGstRows.map(g => {
+        const u = fallbackSellers.find(s => Number(s.id) === Number(g.seller_id)) || {};
+        const docs = fallbackDeletionStore.gstDocuments
+          .filter(d => Number(d.seller_id) === Number(g.seller_id))
+          .sort((a, b) => (Number(b.is_primary || 0) - Number(a.is_primary || 0)) || (Number(b.id) - Number(a.id)));
+        const latest = docs[0] || null;
+        return {
+          ...g,
+          seller_name: u.seller_name || null,
+          user_name: u.name || null,
+          phone: u.phone || null,
+          email: u.email || null,
+          user_address: u.address || null,
+          user_state: u.state || null,
+          doc_count: docs.length,
+          pdf_count: docs.filter(d => String(d.mime_type || '').toLowerCase() === 'application/pdf' || String(d.original_name || '').toLowerCase().endsWith('.pdf')).length,
+          latest_doc_id: latest ? latest.id : null,
+          latest_doc_name: latest ? latest.original_name : null,
+          latest_doc_file_name: latest ? latest.file_name : null,
+          latest_doc_file_path: latest ? latest.file_path : null,
+          latest_doc_size: latest ? latest.file_size : 0,
+          latest_doc_exists: latest ? Boolean(resolveGstDocumentPath(latest)) : false
+        };
+      }).sort((a, b) => {
+        const aP = ['pending', 'resubmitted'].includes(String(a.status || 'Pending').toLowerCase()) ? 0 : 1;
+        const bP = ['pending', 'resubmitted'].includes(String(b.status || 'Pending').toLowerCase()) ? 0 : 1;
+        if (aP !== bP) return aP - bP;
+        return String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
+      }).slice(0, 1000);
+
       sellers = fbSellerUsers.map(u => {
         const activeReq = fallbackDeletionStore.deletionRequests.find(r => Number(r.seller_id) === Number(u.id) && !['DELETED', 'DELETION_REJECTED'].includes(r.status));
+        const gRow = fallbackDeletionStore.gstDetails.find(g => Number(g.seller_id) === Number(u.id)) || null;
+        const docs = fallbackDeletionStore.gstDocuments
+          .filter(d => Number(d.seller_id) === Number(u.id))
+          .sort((a, b) => (Number(b.is_primary || 0) - Number(a.is_primary || 0)) || (Number(b.id) - Number(a.id)));
         return {
           ...u,
           account_status: u.account_status || 'ACTIVE',
-          products_count: fallbackProducts.filter(p => Number(p.seller_id) === Number(u.id) && Number(p.is_active ?? 1) === 1).length,
-          doc_status: null,
-          latest_doc_id: null,
+          products_count: fallbackProducts.filter(p => Number(p.seller_id) === Number(u.id) && parseBoolBitNode(p.is_active, 1) === 1).length,
+          doc_status: gRow ? (gRow.status || 'Pending') : null,
+          latest_doc_id: docs[0] ? docs[0].id : null,
           active_deletion_request_id: activeReq ? Number(activeReq.id) : null
         };
-      }).sort((a, b) => Number(b.id) - Number(a.id));
+      }).sort((a, b) => Number(b.id) - Number(a.id)).slice(0, 1000);
     }
 
     try {
@@ -9963,7 +11784,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     }
 
     function escapeHtml(str) {
-      if (!str) return '';
+      if (str === null || str === undefined) return '';
       return String(str).replace(/[&<>'"]/g, tag => ({
         '&': '&amp;',
         '<': '&lt;',
@@ -9987,10 +11808,26 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     const approvedGstCount = Number(metrics.approved_gst || 0);
     const rejectedGstCount = Number(metrics.rejected_gst || 0);
     const totalGstCount = Number(metrics.total_gst || 0);
+    const totalListedProducts = adminProducts.length;
+    const activeListedProducts = adminProducts.filter(p => parseBoolBitNode(p.is_active, 1) === 1).length;
+    const inactiveListedProducts = Math.max(0, totalListedProducts - activeListedProducts);
+    const outOfStockProducts = adminProducts.filter(p => Number(p.stock || 0) <= 0).length;
     const flashMsg = req.query.msg ? String(req.query.msg) : '';
     const flashErr = req.query.err ? String(req.query.err) : '';
     const delKpis = deletionRequestsData.kpis || {};
     const delRequests = deletionRequestsData.requests || [];
+    const panelVisible = (panelTab) => (activeTab === 'all' || activeTab === panelTab);
+    const tabMeta = {
+      overview: { title: 'Dashboard Overview', sub: 'Structured Admin Header, Portal KPIs, Page-Wise Category Stepper & Footer Navigation.' },
+      gst: { title: 'PDF Verifications', sub: 'Page 1 — Inspect seller-uploaded PDF certificates inline, approve compliance, or reject with mandatory feedback.' },
+      sellers: { title: 'Seller Accounts', sub: 'Page 2 — Manage registered sellers, search & filter accounts, edit profiles, or trigger deletion audits.' },
+      'create-seller': { title: 'Create Seller Account', sub: 'Page 3 — Register a new merchant account manually with normalized phone or email credentials.' },
+      'seller-deletions': { title: 'Seller Management → Seller Deletion Requests', sub: 'Page 4 — Verify orders (Rules A–E), automated Razorpay refunds, settlements, and 6-gate deletion approvals.' },
+      products: { title: 'Manage Products', sub: 'Page 5 — Add products, upload gallery photos, edit pricing/stock, filter catalog, reassign categories, or archive safely.' },
+      categories: { title: 'Product Categories', sub: 'Page 6 — Create, edit, sort, and manage product categories with automatic catalog sync.' },
+      all: { title: 'Complete Admin Portal (All Lists)', sub: 'All management lists displayed together on a single page.' }
+    };
+    const curMeta = tabMeta[activeTab] || tabMeta.overview;
 
     res.send(`
     <!doctype html>
@@ -9998,21 +11835,58 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Vendor Admin Dashboard — Venter App</title>
+      <title>${escapeHtml(curMeta.title)} — Vendor Admin Portal</title>
       <style>
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; }
-        .top { background: #25204a; color: white; padding: 18px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-        .brand { font-size: 21px; font-weight: 800; }
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5fb; color: #20243a; min-height: 100vh; display: flex; flex-direction: column; }
+        .top { background: #25204a; color: white; padding: 14px 5%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; position: sticky; top: 0; z-index: 200; box-shadow: 0 4px 16px rgba(20, 16, 48, 0.16); }
+        .brand { font-size: 20px; font-weight: 800; color: #fff; text-decoration: none; }
         .top-nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; }
+        .nav-pill { color: #e2e8f0; text-decoration: none; font-size: 13px; font-weight: 700; padding: 7px 12px; border-radius: 8px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); transition: all .15s; white-space: nowrap; }
         .nav-pill:hover, .nav-pill.active { background: #6366f1; color: #fff; border-color: #818cf8; }
-        .wrap { max-width: 1180px; margin: 28px auto; padding: 0 18px; }
+        .wrap { flex: 1; width: 100%; max-width: 1220px; margin: 24px auto; padding: 0 18px; }
         .card { background: #fff; border-radius: 14px; padding: 24px; box-shadow: 0 8px 30px rgba(37,32,74,0.06); margin-bottom: 24px; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
         .stat { font-size: 30px; font-weight: 800; color: #5c49d8; margin-top: 6px; }
         h1, h2 { margin-top: 0; color: #1e1b4b; }
         p.muted { color: #64748b; font-size: 14px; margin-top: -6px; }
+        .admin-view-panel { display: none; }
+        .admin-view-panel.is-visible { display: block; }
+        .admin-view-panel + .admin-view-panel.is-visible { margin-top: 20px; }
+        .cat-pager { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; box-shadow: 0 4px 16px rgba(37,32,74,0.04); }
+        .cat-pager-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+        .cat-page-pill { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; border-radius: 8px; background: #f1f5f9; color: #475569; text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid #e2e8f0; transition: all .15s; white-space: nowrap; }
+        .cat-page-pill:hover { background: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
+        .cat-page-pill.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .cat-pager-nav { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .cat-step-btn { background: #f8fafc; color: #1e1b4b; border: 1px solid #cbd5e1; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .cat-step-btn:hover:not(:disabled) { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .cat-step-indicator { font-size: 12px; font-weight: 700; color: #475569; padding: 0 4px; white-space: nowrap; }
+        .pagination-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #475569; }
+        .pg-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+        .pg-btn { background: #f8fafc; color: #334155; border: 1px solid #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; min-width: 32px; text-align: center; }
+        .pg-btn:hover:not(:disabled) { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
+        .pg-btn.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+        .pg-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .pg-select { width: auto !important; min-width: 105px; padding: 5px 8px !important; font-size: 12px !important; border-radius: 6px !important; border: 1px solid #cbd5e1 !important; background: #fff; }
+        .reject-presets { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+        .reject-chip { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 9999px; padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .reject-chip:hover { background: #fecaca; }
+        .modal-err-banner { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; border-left: 4px solid #dc2626; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+        .kpi-card-link { cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; border: 1px solid #eef2ff; }
+        .kpi-card-link:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(37,32,74,0.1); border-color: #c7d2fe; }
+        .dir-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; margin-top: 8px; }
+        .dir-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; gap: 14px; box-shadow: 0 6px 20px rgba(37,32,74,0.04); transition: transform .15s ease, border-color .15s ease; }
+        .dir-card:hover { transform: translateY(-2px); border-color: #a5b4fc; }
+        .dir-card h3 { margin: 0 0 6px; font-size: 16px; color: #1e1b4b; }
+        .dir-card p { margin: 0; font-size: 13px; color: #64748b; line-height: 1.5; }
+        .dir-card-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 10px; border-top: 1px solid #f1f5f9; }
+        .sub-kpi-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+        .admin-footer { background: #1e1b4b; color: #cbd5e1; padding: 22px 5%; margin-top: 32px; border-top: 1px solid #312e81; }
+        .footer-inner { max-width: 1220px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; font-size: 13px; }
+        .footer-links { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+        .footer-links a { color: #cbd5e1; text-decoration: none; font-weight: 600; transition: color .15s; }
+        .footer-links a:hover, .footer-links a.active { color: #fff; text-decoration: underline; }
         label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: #334155; }
         input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
         input:focus, textarea:focus, select:focus { border-color: #6366f1; }
@@ -10034,6 +11908,13 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
         .btn-del-req { background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .btn-del-req:hover { background: #fee2e2; }
         .badge-prod { background: #e0e7ff; color: #4338ca; font-weight: 700; font-size: 12px; padding: 3px 8px; border-radius: 9999px; }
+        .prod-thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid #e2e8f0; background: #f8fafc; flex-shrink: 0; }
+        .prod-thumb-empty { width: 44px; height: 44px; border-radius: 8px; border: 1px dashed #cbd5e1; background: #f8fafc; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #94a3b8; flex-shrink: 0; }
+        .existing-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 10px; margin-top: 6px; }
+        .existing-img-item { border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; background: #f8fafc; text-align: center; font-size: 11px; }
+        .existing-img-item img { width: 100%; height: 72px; object-fit: cover; border-radius: 6px; display: block; margin-bottom: 4px; }
+        .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .filter-bar select { width: auto; min-width: 145px; padding: 7px 10px; font-size: 13px; }
         .badge-pending { background: #fef3c7; color: #b45309; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
         .badge-approved { background: #dcfce7; color: #15803d; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
         .badge-rejected { background: #fee2e2; color: #b91c1c; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 9999px; display: inline-flex; align-items: center; gap: 4px; }
@@ -10075,24 +11956,29 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
     </head>
     <body>
       <header class="top">
-        <div class="brand">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></div>
-        <nav class="top-nav">
-          <a href="/admin#sellersSection" class="nav-pill ${!focusDeletionTab ? 'active' : ''}">Seller Management</a>
-          <a href="/admin/seller-deletions" class="nav-pill ${focusDeletionTab ? 'active' : ''}">Seller Deletion Requests (${Number(delKpis.total || 0)})</a>
-          <a href="/admin#gstSection" class="nav-pill">PDF Verifications</a>
-          <a href="/admin#categoriesSection" class="nav-pill">Categories</a>
+        <a href="/admin" class="brand" onclick="return switchAdminTab('overview', event);">Vendor <span style="font-weight:400; opacity:.85;">Admin Portal</span></a>
+        <nav class="top-nav" id="adminTopNav">
+          <a href="/admin" data-tab="overview" class="nav-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">Overview</a>
+          <a href="/admin/gst-verifications" data-tab="gst" class="nav-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">PDF Verifications${pendingGstCount > 0 ? ' (' + pendingGstCount + ')' : ''}</a>
+          <a href="/admin/sellers" data-tab="sellers" class="nav-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">Seller Accounts (${count})</a>
+          <a href="/admin/create-seller" data-tab="create-seller" class="nav-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
+          <a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount">${Number(delKpis.total || 0)}</span>)</a>
+          <a href="/admin/products" data-tab="products" class="nav-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">Manage Products (${totalListedProducts})</a>
+          <a href="/admin/categories" data-tab="categories" class="nav-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">Categories (${categoriesList.length})</a>
+          <a href="/admin?tab=all" data-tab="all" class="nav-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Lists</a>
         </nav>
-        <div style="display:flex; align-items:center; gap:14px;">
-          <span style="font-size:14px; opacity:.9;">admin@vendor.app</span>
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <button type="button" class="btn-approve-sm" style="padding:7px 11px;" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
+          <span style="font-size:13px; opacity:.9;">${escapeHtml((req.adminUser && req.adminUser.email) || 'admin@vendor.app')}</span>
           <a href="/admin/logout" class="logout-btn">Sign out</a>
         </div>
       </header>
 
       <main class="wrap">
-        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
           <div>
-            <h1 style="margin-bottom:6px;">${focusDeletionTab ? 'Seller Management → Seller Deletion Requests' : 'Dashboard'}</h1>
-            <p class="muted" style="margin:0;">Manage marketplace sellers, Seller Account Deletion & Refund workflows, categories, and PDF verifications.</p>
+            <h1 id="adminPageTitle" style="margin-bottom:6px;">${escapeHtml(curMeta.title)}</h1>
+            <p id="adminPageSubtitle" class="muted" style="margin:0;">${escapeHtml(curMeta.sub)}</p>
           </div>
           <div class="status-legend">
             <span class="del-badge del-yellow">PENDING</span>
@@ -10106,43 +11992,144 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
         ${flashMsg ? `<div style="background:#ecfdf5; color:#047857; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashMsg)}</div>` : ''}
         ${flashErr ? `<div style="background:#fef2f2; color:#b91c1c; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:14px; font-weight:600;">${escapeHtml(flashErr)}</div>` : ''}
 
-        <!-- KPI Metrics Grid -->
-        <div class="grid" style="margin-bottom: 24px;">
+        <!-- Page-Wise Admin Category Stepper Bar -->
+        <nav class="cat-pager" id="adminCategoryPager" aria-label="Admin Category Pages">
+          <div class="cat-pager-pills">
+            <a href="/admin" data-tab="overview" class="cat-page-pill ${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">🏠 Overview</a>
+            <a href="/admin/gst-verifications" data-tab="gst" class="cat-page-pill ${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">1. Seller PDF Verification (${totalGstCount})</a>
+            <a href="/admin/sellers" data-tab="sellers" class="cat-page-pill ${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">2. Seller Accounts (${count})</a>
+            <a href="/admin/create-seller" data-tab="create-seller" class="cat-page-pill ${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">3. Create Seller</a>
+            <a href="/admin/seller-deletions" data-tab="seller-deletions" class="cat-page-pill ${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (${Number(delKpis.total || 0)})</a>
+            <a href="/admin/products" data-tab="products" class="cat-page-pill ${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">5. Manage Products (${totalListedProducts})</a>
+            <a href="/admin/categories" data-tab="categories" class="cat-page-pill ${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">6. Categories (${categoriesList.length})</a>
+            <a href="/admin?tab=all" data-tab="all" class="cat-page-pill ${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Pages</a>
+          </div>
+          <div class="cat-pager-nav">
+            <button type="button" id="catPrevBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(-1)">← Previous</button>
+            <span id="categoryPageIndicator" class="cat-step-indicator">Overview</span>
+            <button type="button" id="catNextBtn" class="cat-step-btn" onclick="stepAdminCategoryPage(1)">Next →</button>
+          </div>
+        </nav>
+
+        <!-- KPI Metrics Grid (shown cleanly on Overview & All Lists; clickable to jump directly to any module list) -->
+        <div class="admin-view-panel ${(activeTab === 'overview' || activeTab === 'all') ? 'is-visible' : ''}" data-admin-panel="overview,all">
+          <div class="grid" style="margin-bottom: 24px;">
+            <section class="card kpi-card-link" onclick="switchAdminTab('sellers')">
+              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
+              <div class="stat">${count}</div>
+            </section>
+            <section class="card kpi-card-link" onclick="switchAdminTab('products')">
+              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
+              <div class="stat" style="color:#2563eb;">${productCount}</div>
+            </section>
+            <section class="card kpi-card-link" onclick="switchAdminTab('categories')">
+              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
+              <div class="stat" style="color:#7c3aed;">${categoryCount}</div>
+            </section>
+            <section class="card">
+              <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
+              <div class="stat" style="color:#0891b2;">${orderCount}</div>
+            </section>
+            <section class="card kpi-card-link" style="border-left: 4px solid #f59e0b; background:${pendingGstCount > 0 ? '#fffbeb' : '#fff'};" onclick="switchAdminTab('gst')">
+              <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
+                Pending PDF Reviews
+                ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>' : ''}
+              </div>
+              <div class="stat" style="color:#b45309;">${pendingGstCount}</div>
+            </section>
+            <section class="card kpi-card-link" style="border-left: 4px solid #10b981;" onclick="switchAdminTab('gst')">
+              <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
+              <div class="stat" style="color:#10b981;">${approvedGstCount}</div>
+            </section>
+            <section class="card kpi-card-link" style="border-left: 4px solid #ef4444;" onclick="switchAdminTab('seller-deletions')">
+              <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Deletion Requests</div>
+              <div class="stat" style="color:#dc2626;">${Number(delKpis.total || 0)}</div>
+            </section>
+          </div>
+        </div>
+
+        <!-- Overview Directory Grid (clean page-wise category cards into each Admin page/list) -->
+        <div class="admin-view-panel ${activeTab === 'overview' ? 'is-visible' : ''}" data-admin-panel="overview" id="overviewSection">
           <section class="card">
-            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Registered Sellers</div>
-            <div class="stat">${count}</div>
-          </section>
-          <section class="card">
-            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Active Products</div>
-            <div class="stat" style="color:#2563eb;">${productCount}</div>
-          </section>
-          <section class="card">
-            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Product Categories</div>
-            <div class="stat" style="color:#7c3aed;">${categoryCount}</div>
-          </section>
-          <section class="card">
-            <div style="color:#64748b; font-size:12px; font-weight:700; text-transform:uppercase;">Marketplace Orders</div>
-            <div class="stat" style="color:#0891b2;">${orderCount}</div>
-          </section>
-          <section class="card" style="border-left: 4px solid #f59e0b; background:${pendingGstCount > 0 ? '#fffbeb' : '#fff'};">
-            <div style="color:#b45309; font-size:12px; font-weight:700; text-transform:uppercase; display:flex; align-items:center; gap:6px;">
-              Pending PDF Reviews
-              ${pendingGstCount > 0 ? '<span style="background:#f59e0b; color:white; font-size:10px; padding:2px 6px; border-radius:999px;">Action Required</span>' : ''}
+            <h2>Admin Categories — Page-Wise Navigation</h2>
+            <p class="muted">Select any category page from the stepper above, directory cards below, or footer. Every list supports search, status filters, and page-wise table pagination.</p>
+            <div class="dir-grid">
+              <div class="dir-card" style="border-left: 4px solid #f59e0b;">
+                <div>
+                  <h3>📄 Page 1: Seller PDF Document Verification</h3>
+                  <p>Inspect uploaded GST &amp; seller certificates inline, preview PDFs, approve compliance, view Details &amp; Logs, or reject with feedback.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <span class="badge-pending">${pendingGstCount} pending &bull; ${rejectedGstCount} rejected</span>
+                  <a href="/admin/gst-verifications" class="btn-sm" style="background:#d97706;" onclick="return switchAdminTab('gst', event);">Open Page 1 →</a>
+                </div>
+              </div>
+              <div class="dir-card">
+                <div>
+                  <h3>🏪 Page 2: Seller Accounts</h3>
+                  <p>Search and paginate registered sellers, edit store profiles, inspect document links, or initiate Seller Deletion audits.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <span class="badge-prod">${count} sellers</span>
+                  <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">Open Page 2 →</a>
+                </div>
+              </div>
+              <div class="dir-card">
+                <div>
+                  <h3>➕ Page 3: Create Seller Account</h3>
+                  <p>Manually onboard a new merchant account with validated phone (+91 / international) or email and shop address details.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <a href="/admin/create-seller" class="btn-sm" style="background:#4f46e5;" onclick="return switchAdminTab('create-seller', event);">Open Page 3 →</a>
+                </div>
+              </div>
+              <div class="dir-card" style="border-left: 4px solid #dc2626;">
+                <div>
+                  <h3>🗑 Page 4: Seller Deletion &amp; Refunds</h3>
+                  <p>Execute 6-gate order verification (Rules A–E), automated Razorpay refunds, settlement checks, holds, rejections, and final soft-deletion.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <span class="badge-pending">${Number(delKpis.pending || 0) + Number(delKpis.processing || 0)} active &bull; ${Number(delKpis.total || 0)} total</span>
+                  <a href="/admin/seller-deletions" class="btn-sm" style="background:#dc2626;" onclick="return switchAdminTab('seller-deletions', event);">Open Page 4 →</a>
+                </div>
+              </div>
+              <div class="dir-card">
+                <div>
+                  <h3>📦 Page 5: Manage Products</h3>
+                  <p>Create products, upload up to 4 WebP photos, edit pricing/MRP/stock/SKU, filter by seller or category, toggle Active/Inactive, or archive safely.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <span class="badge-prod">${totalListedProducts} total &bull; ${activeListedProducts} active</span>
+                  <a href="/admin/products" class="btn-sm" onclick="return switchAdminTab('products', event);">Open Page 5 →</a>
+                  <button type="button" class="btn-approve-sm" onclick="switchAdminTab('products'); openProductModal(null);">+ Add Product</button>
+                </div>
+              </div>
+              <div class="dir-card">
+                <div>
+                  <h3>🏷 Page 6: Product Categories</h3>
+                  <p>Organize catalog taxonomy, icons, sort order, active status, and rename categories with automatic product syncing.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <span class="badge-prod">${categoriesList.length} categories</span>
+                  <a href="/admin/categories" class="btn-sm" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
+                </div>
+              </div>
+              <div class="dir-card">
+                <div>
+                  <h3>📋 Combined All-Lists Mode</h3>
+                  <p>View all paginated tables (PDF Verification, Sellers, Create Seller, Deletions, Categories, Products) stacked in one continuous screen.</p>
+                </div>
+                <div class="dir-card-actions">
+                  <a href="/admin?tab=all" class="btn-sm" style="background:#475569;" onclick="return switchAdminTab('all', event);">Show All Sections</a>
+                </div>
+              </div>
             </div>
-            <div class="stat" style="color:#b45309;">${pendingGstCount}</div>
-          </section>
-          <section class="card" style="border-left: 4px solid #10b981;">
-            <div style="color:#15803d; font-size:12px; font-weight:700; text-transform:uppercase;">Approved Sellers</div>
-            <div class="stat" style="color:#10b981;">${approvedGstCount}</div>
-          </section>
-          <section class="card" style="border-left: 4px solid #ef4444;">
-            <div style="color:#b91c1c; font-size:12px; font-weight:700; text-transform:uppercase;">Rejected Requests</div>
-            <div class="stat" style="color:#ef4444;">${rejectedGstCount}</div>
           </section>
         </div>
 
-        <!-- Section 1: Seller PDF Document Verification Hub (Primary Function) -->
-        <section class="card" id="gstSection">
+        <!-- Section 1: Seller PDF Document Verification Hub -->
+        <div class="admin-view-panel ${panelVisible('gst') ? 'is-visible' : ''}" data-admin-panel="gst">
+        <section class="card" id="gstSection" style="margin-top:0;">
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; margin-bottom: 8px;">
             <div>
               <h2>Seller PDF Document Verification</h2>
@@ -10205,7 +12192,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                           ${!g.latest_doc_exists ? `<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;" title="File was uploaded to an earlier temporary build container">Re-upload needed</span>` : ''}
                         </div>
                         <div style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                          <button type="button" class="btn-view" style="border:none; cursor:pointer;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">
+                          <button type="button" class="btn-view" style="border:none; cursor:pointer;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false, ${Number(latestDocId)})">
                             📄 Preview PDF
                           </button>
                           <a href="/admin/view_gst_doc?id=${latestDocId}&mode=preview" target="_blank" class="btn-view" style="background:#475569;" title="Open PDF in New Tab">
@@ -10238,7 +12225,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                     <td>
                       <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
                         ${st !== 'approved' ? `
-                          <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Approve verification for ${escapeHtml(sellerLabel)}?');">
+                          <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Approve Verification" data-confirm-msg="${escapeHtml('Approve verification for ' + sellerLabel + '?')}" onsubmit="return openFormConfirmModal(this);">
                             <input type="hidden" name="action" value="approve_gst">
                             <input type="hidden" name="seller_id" value="${g.seller_id}">
                             <input type="hidden" name="notes" value="Approved by administrator">
@@ -10250,7 +12237,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                           <button type="button" class="btn-reject-sm" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModalWithReject(${g.seller_id}, this.getAttribute('data-seller-name'))" title="Reject with Reason">✕ Reject</button>
                         ` : ''}
 
-                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">Details & Logs</button>
+                        <button type="button" class="btn-sm" style="background:#4f46e5; padding:5px 9px;" data-seller-name="${escapeHtml(sellerLabel)}" onclick="openGstModal(${g.seller_id}, this.getAttribute('data-seller-name'), false)">Details &amp; Logs</button>
                       </div>
                     </td>
                   </tr>
@@ -10258,15 +12245,33 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               }).join('')}
             </tbody>
           </table>
+          <div id="gstPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
-        <!-- Section 2: Seller Accounts Overview with Account Status & Request Deletion -->
-        <section class="card" id="sellersSection" style="margin-top:24px;">
+        <!-- Section 2: Seller Accounts Overview with Search, Status Filter, Pagination & Deletion Controls -->
+        <div class="admin-view-panel ${panelVisible('sellers') ? 'is-visible' : ''}" data-admin-panel="sellers">
+        <section class="card" id="sellersSection" style="margin-top:0;">
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
             <div>
               <h2>Seller Accounts</h2>
-              <p class="muted">All registered sellers on Venter App with inventory counts, verification status, and deletion controls.</p>
+              <p class="muted">All registered sellers on Venter App with inventory counts, verification status, search/filtering, and deletion controls.</p>
             </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+              <a href="/admin/create-seller" class="btn-sm" style="background:#16a34a; padding:8px 13px; font-size:12px;" onclick="return switchAdminTab('create-seller', event);">+ Add New Seller</a>
+            </div>
+          </div>
+          <div class="filter-bar" style="margin-bottom:12px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
+            <div class="search-box" style="max-width:280px; flex:1; min-width:190px;">
+              <input type="text" id="sellersSearchInput" onkeyup="filterSellersSearch(this.value)" placeholder="Search seller name, phone, email, state, ID...">
+            </div>
+            <select id="sellersStatusFilter" onchange="applySellerFilters()">
+              <option value="all">All Account Statuses</option>
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="DELETION_PENDING">DELETION_PENDING</option>
+              <option value="LOCKED">LOCKED</option>
+              <option value="DELETED">DELETED</option>
+            </select>
           </div>
           <table>
             <thead>
@@ -10282,7 +12287,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                 <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody id="sellersTableBody">
               ${sellers.length === 0 ? `
                 <tr><td colspan="9" style="color:#94a3b8; text-align:center; padding:24px;">No sellers registered yet.</td></tr>
               ` : sellers.map(s => {
@@ -10291,19 +12296,21 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                 const docBadgeClass = (dSt === 'approved') ? 'badge-approved' : ((dSt === 'rejected') ? 'badge-rejected' : ((dSt === 'pending') ? 'badge-pending' : ''));
                 const accStatus = String(s.account_status || 'ACTIVE').toUpperCase();
                 const accBadgeCls = accStatus === 'ACTIVE' ? 'del-badge del-green' : (accStatus === 'DELETION_PENDING' ? 'del-badge del-yellow' : (accStatus === 'LOCKED' ? 'del-badge del-orange' : 'del-badge del-red'));
+                const pubSellerEmail = getPublicSellerEmail(s.email) || '';
+                const sellerSearchStr = ((s.seller_name || s.name || '') + ' ' + (s.phone || '') + ' ' + pubSellerEmail + ' ' + (s.state || '') + ' #' + Number(s.id)).toLowerCase();
 
                 return `
-                  <tr>
+                  <tr id="seller-row-${Number(s.id)}" class="seller-account-row" data-status="${escapeHtml(accStatus)}" data-search="${escapeHtml(sellerSearchStr)}">
                     <td>#${s.id}</td>
                     <td>
                       <strong>${escapeHtml(s.seller_name || s.name)}</strong>
                     </td>
                     <td>
                       <div>${escapeHtml(s.phone || '—')}</div>
-                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(getPublicSellerEmail(s.email) || '')}</div>
+                      <div style="font-size:11px; color:#94a3b8;">${escapeHtml(pubSellerEmail)}</div>
                     </td>
                     <td>${escapeHtml(s.state || '—')}</td>
-                    <td><span class="badge-prod">${s.products_count || 0} items</span></td>
+                    <td><span class="badge-prod">${s.products_count || 0} products</span></td>
                     <td>
                       ${docBadgeClass ? `
                         <span class="${docBadgeClass}">${escapeHtml(s.doc_status)}</span>
@@ -10312,16 +12319,18 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                         <span style="color:#94a3b8; font-size:12px;">Not Uploaded</span>
                       `}
                     </td>
-                    <td><span class="${accBadgeCls}">${escapeHtml(accStatus)}</span></td>
+                    <td class="seller-acc-cell"><span class="${accBadgeCls}">${escapeHtml(accStatus)}</span></td>
                     <td>${String(s.created_at || '').slice(0, 10)}</td>
                     <td>
-                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-                        <button type="button" class="btn-sm" onclick='openSellerModal(${JSON.stringify(s).replace(/'/g, "&#39;")})'>View / Edit</button>
-                        ${s.active_deletion_request_id ? `
-                          <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(${Number(s.active_deletion_request_id)})">Manage Deletion #${Number(s.active_deletion_request_id)}</button>
-                        ` : (accStatus !== 'DELETED' ? `
-                          <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(${Number(s.id)})">Request Seller Deletion</button>
-                        ` : '')}
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;" data-seller-id="${Number(s.id)}">
+                        <button type="button" class="btn-sm" data-seller="${escapeHtml(JSON.stringify(s))}" onclick="openSellerModal(this)">View / Edit</button>
+                        <span class="seller-del-btn-slot">
+                          ${s.active_deletion_request_id ? `
+                            <button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(${Number(s.active_deletion_request_id)})">Manage Deletion #${Number(s.active_deletion_request_id)}</button>
+                          ` : (accStatus !== 'DELETED' ? `
+                            <button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(${Number(s.id)})">Request Seller Deletion</button>
+                          ` : '')}
+                        </span>
                       </div>
                     </td>
                   </tr>
@@ -10329,10 +12338,13 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               }).join('')}
             </tbody>
           </table>
+          <div id="sellersPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
         <!-- Section 2B: Seller Management → Seller Deletion Requests -->
-        <section class="card" id="deletionRequestsSection" style="margin-top:24px; border-top: 4px solid #dc2626;">
+        <div class="admin-view-panel ${panelVisible('seller-deletions') ? 'is-visible' : ''}" data-admin-panel="seller-deletions">
+        <section class="card" id="deletionRequestsSection" style="margin-top:0; border-top: 4px solid #dc2626;">
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:10px;">
             <div>
               <h2>Seller Management → Seller Deletion Requests</h2>
@@ -10413,14 +12425,20 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               }).join('')}
             </tbody>
           </table>
+          <div id="delPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
         <!-- Section 3: Product Categories Management (5 Starter Categories + Editable) -->
-        <section class="card" id="categoriesSection" style="margin-top:24px;">
+        <div class="admin-view-panel ${panelVisible('categories') ? 'is-visible' : ''}" data-admin-panel="categories">
+        <section class="card" id="categoriesSection" style="margin-top:0;">
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
             <div>
               <h2>Product Categories (Editable)</h2>
               <p class="muted">Manage product categories (5 default starter categories pre-seeded). Renaming a category automatically syncs linked products.</p>
+            </div>
+            <div class="search-box">
+              <input type="text" id="categoriesSearchInput" onkeyup="filterCategorySearch(this.value)" placeholder="Search categories...">
             </div>
           </div>
 
@@ -10437,11 +12455,11 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                 <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody id="categoriesTableBody">
               ${categoriesList.length === 0 ? `
                 <tr><td colspan="8" style="color:#94a3b8; text-align:center; padding:24px;">No categories found.</td></tr>
               ` : categoriesList.map(cat => `
-                <tr>
+                <tr class="cat-list-row" data-search="${escapeHtml(((cat.name || '') + ' ' + (cat.slug || '') + ' ' + (cat.description || '') + ' #' + cat.id).toLowerCase())}">
                   <td>#${cat.id}</td>
                   <td>
                     <span style="font-size:16px; margin-right:4px;">${escapeHtml(cat.icon || '🏷️')}</span>
@@ -10449,7 +12467,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                   </td>
                   <td><code style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:12px;">${escapeHtml(cat.slug)}</code></td>
                   <td style="color:#64748b; font-size:13px; max-width:260px;">${escapeHtml(cat.description || '—')}</td>
-                  <td><span class="badge-prod">${Number(cat.products_count || 0)} items</span></td>
+                  <td><span class="badge-prod">${Number(cat.products_count || 0)} products</span></td>
                   <td>${Number(cat.sort_order || 0)}</td>
                   <td>
                     ${Number(cat.is_active) ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
@@ -10457,7 +12475,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                   <td>
                     <div style="display:flex; gap:6px; align-items:center;">
                       <button type="button" class="btn-sm" data-cat="${escapeHtml(JSON.stringify(cat))}" onclick="openCategoryModal(this)">Edit</button>
-                      <form method="POST" action="/admin" style="display:inline;" onsubmit="return confirm('Delete this category? Linked products will fall back to General.');">
+                      <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete Category" data-confirm-msg="${escapeHtml('Delete category "' + cat.name + '"? Linked products will fall back to General.')}" onsubmit="return openFormConfirmModal(this);">
                         <input type="hidden" name="action" value="delete_category">
                         <input type="hidden" name="category_id" value="${cat.id}">
                         <button type="submit" class="btn-reject-sm">Delete</button>
@@ -10468,6 +12486,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               `).join('')}
             </tbody>
           </table>
+          <div id="categoriesPaginationBar" class="pagination-bar"></div>
 
           <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e2e8f0;">
             <h3 style="margin:0 0 8px; font-size:15px; color:#1e1b4b;">+ Add New Category</h3>
@@ -10500,17 +12519,43 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             </form>
           </div>
         </section>
+        </div>
 
-        <!-- Section 4: Products - Edit Category -->
-        <section class="card" id="productCategoriesSection" style="margin-top:24px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
+        <!-- Section 4: Dedicated Admin Manage Products Page -->
+        <div class="admin-view-panel ${panelVisible('products') ? 'is-visible' : ''}" data-admin-panel="products">
+          <div class="sub-kpi-bar">
+            <div class="metric-mini"><div class="k">Total Catalog Products</div><div class="v">${totalListedProducts}</div></div>
+            <div class="metric-mini" style="background:#f0fdf4;"><div class="k" style="color:#15803d;">Active on Storefront</div><div class="v" style="color:#15803d;">${activeListedProducts}</div></div>
+            <div class="metric-mini" style="background:#fef2f2;"><div class="k" style="color:#b91c1c;">Inactive / Archived</div><div class="v" style="color:#b91c1c;">${inactiveListedProducts}</div></div>
+            <div class="metric-mini" style="background:#fffbeb;"><div class="k" style="color:#b45309;">Out of Stock</div><div class="v" style="color:#b45309;">${outOfStockProducts}</div></div>
+          </div>
+        <section class="card" id="productCategoriesSection" style="margin-top:0;">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
             <div>
-              <h2>Products — Edit Category</h2>
-              <p class="muted">Reassign or update the category of any product directly.</p>
+              <h2>Products — Catalog &amp; Category Management</h2>
+              <p class="muted">Add new products, edit details/pricing/images, filter by seller/category/status, reassign categories, activate/deactivate, or delete/archive safely.</p>
             </div>
-            <div class="search-box">
-              <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search product or category...">
+            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+              <button type="button" class="btn-sm" style="background:#16a34a; padding:9px 14px; font-size:13px;" onclick="openProductModal(null)">+ Add New Product</button>
             </div>
+          </div>
+          <div class="filter-bar" style="margin-bottom:14px; padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;">
+            <div class="search-box" style="max-width:260px; flex:1; min-width:190px;">
+              <input type="text" id="prodCatSearchInput" onkeyup="filterAdminProductSearch(this.value)" placeholder="Search name, SKU, brand, seller, ID...">
+            </div>
+            <select id="prodSellerFilter" onchange="applyAdminProductFilters()">
+              <option value="">All Sellers</option>
+              ${eligibleSellersForProducts.map(sfOpt => `<option value="${Number(sfOpt.id)}">${escapeHtml(sfOpt.display_name + ' (#' + Number(sfOpt.id) + ')')}</option>`).join('')}
+            </select>
+            <select id="prodCategoryFilter" onchange="applyAdminProductFilters()">
+              <option value="">All Categories</option>
+              ${categoriesList.map(cfOpt => `<option value="${escapeHtml(String(cfOpt.name || '').toLowerCase())}">${escapeHtml(cfOpt.name)}</option>`).join('')}
+            </select>
+            <select id="prodStatusFilter" onchange="applyAdminProductFilters()">
+              <option value="all">All Statuses</option>
+              <option value="1">Active Only</option>
+              <option value="0">Inactive Only</option>
+            </select>
           </div>
           <table>
             <thead>
@@ -10518,55 +12563,123 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                 <th>ID</th>
                 <th>Product</th>
                 <th>Seller</th>
-                <th>Price</th>
-                <th>Current Category</th>
-                <th>Change Category</th>
+                <th>Pricing &amp; Stock</th>
+                <th>Status</th>
+                <th>Category &amp; Reassign</th>
+                <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody id="productsTableBody">
               ${adminProducts.length === 0 ? `
-                <tr><td colspan="6" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet.</td></tr>
+                <tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:24px;">No products available yet. Use "+ Add New Product" above to add one.</td></tr>
               ` : adminProducts.map(ap => {
-                const pSearch = ((ap.name || '') + ' ' + (ap.category || '') + ' ' + (ap.seller_name || '')).toLowerCase();
+                const sAccProd = String(ap.seller_account_status || 'ACTIVE').toUpperCase();
+                const isProdActive = parseBoolBitNode(ap.is_active, 1) === 1;
+                const formattedAp = {
+                  ...formatProductRecord(ap, { req, isSellerView: true }),
+                  is_active: isProdActive,
+                  seller_account_status: sAccProd
+                };
+                const thumbRaw = formattedAp.image_url || '';
+                const thumbSrc = (thumbRaw && thumbRaw.includes('/uploads/products/'))
+                  ? '/uploads/products/' + path.basename(thumbRaw.split('?')[0])
+                  : thumbRaw;
+                const pSearch = (
+                  (formattedAp.name || '') + ' ' +
+                  (formattedAp.sku || '') + ' ' +
+                  (formattedAp.brand || '') + ' ' +
+                  (formattedAp.category || '') + ' ' +
+                  (formattedAp.seller_name || '') + ' #' + formattedAp.id
+                ).toLowerCase();
                 let hasMatch = false;
                 const optionsHtml = categoriesList.map(catOpt => {
                   const matched = (ap.category_id && Number(ap.category_id) === Number(catOpt.id)) || (String(ap.category || '').toLowerCase() === String(catOpt.name || '').toLowerCase());
                   if (matched) hasMatch = true;
                   return `<option value="${catOpt.id}" ${matched ? 'selected' : ''}>${escapeHtml(catOpt.name)}</option>`;
                 }).join('');
+
                 return `
-                  <tr class="prod-cat-row" data-search="${escapeHtml(pSearch)}">
-                    <td>#${ap.id}</td>
+                  <tr class="prod-cat-row"
+                      data-search="${escapeHtml(pSearch)}"
+                      data-seller-id="${Number(ap.seller_id)}"
+                      data-category="${escapeHtml(String(formattedAp.category || 'General').toLowerCase())}"
+                      data-active="${isProdActive ? '1' : '0'}">
+                    <td><strong>#${Number(ap.id)}</strong></td>
                     <td>
-                      <strong>${escapeHtml(ap.name)}</strong>
-                      <div style="font-size:11px; color:#64748b;">Stock: ${Number(ap.stock || 0)}</div>
+                      <div style="display:flex; gap:10px; align-items:center;">
+                        ${thumbSrc ? `<img src="${escapeHtml(thumbSrc)}" alt="" class="prod-thumb" loading="lazy">` : `<div class="prod-thumb-empty" title="No Image">📦</div>`}
+                        <div>
+                          <strong style="color:#1e1b4b;">${escapeHtml(formattedAp.name)}</strong>
+                          <div style="font-size:11px; color:#64748b; margin-top:2px;">
+                            SKU: <code>${escapeHtml(formattedAp.sku)}</code> &bull; Brand: ${escapeHtml(formattedAp.brand)}
+                          </div>
+                        </div>
+                      </div>
                     </td>
-                    <td>${escapeHtml(ap.seller_name)}</td>
-                    <td>₹${Number(ap.price || 0).toFixed(2)}</td>
-                    <td><span class="badge-prod">${escapeHtml(ap.category || 'General')}</span></td>
                     <td>
+                      <div>${escapeHtml(formattedAp.seller_name)}</div>
+                      <div style="font-size:11px; color:#64748b;">
+                        Seller #${Number(ap.seller_id)}
+                        ${sAccProd !== 'ACTIVE' ? `&bull; <span class="${delBadgeClass(sAccProd)}" style="font-size:9px; padding:1px 5px;">${escapeHtml(sAccProd)}</span>` : ''}
+                      </div>
+                    </td>
+                    <td>
+                      <div><strong>₹${Number(formattedAp.price || 0).toFixed(2)}</strong></div>
+                      ${Number(formattedAp.mrp || 0) > Number(formattedAp.price || 0) ? `<div style="font-size:11px; color:#94a3b8; text-decoration:line-through;">MRP ₹${Number(formattedAp.mrp).toFixed(2)}</div>` : ''}
+                      <div style="font-size:11px; color:#475569;">Stock: <strong>${Number(formattedAp.stock || 0)}</strong></div>
+                    </td>
+                    <td>
+                      ${isProdActive ? '<span class="badge-approved">Active</span>' : '<span class="badge-rejected">Inactive</span>'}
+                    </td>
+                    <td>
+                      <div style="margin-bottom:5px;"><span class="badge-prod">${escapeHtml(formattedAp.category || 'General')}</span></div>
                       <form method="POST" action="/admin" style="display:flex; gap:6px; align-items:center;">
                         <input type="hidden" name="action" value="update_product_category">
-                        <input type="hidden" name="product_id" value="${ap.id}">
-                        <select name="category_id" required style="padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                        <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                        <select name="category_id" required style="padding:5px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; max-width:155px;">
                           ${!hasMatch ? '<option value="" disabled selected>-- Select Category --</option>' : ''}
                           ${optionsHtml}
                         </select>
                         <button type="submit" class="btn-sm">Save</button>
                       </form>
                     </td>
+                    <td>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                        <button type="button" class="btn-sm" data-product="${escapeHtml(JSON.stringify(formattedAp))}" onclick="openProductModal(this)">Edit</button>
+                        <form method="POST" action="/admin" style="display:inline;">
+                          <input type="hidden" name="action" value="toggle_product_status">
+                          <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                          <button type="submit" class="${isProdActive ? 'btn-hold-sm' : 'btn-approve-sm'}" title="${isProdActive ? 'Hide from storefront' : 'Make visible on storefront'}">
+                            ${isProdActive ? 'Deactivate' : 'Activate'}
+                          </button>
+                        </form>
+                        <form method="POST" action="/admin" style="display:inline;" data-confirm-title="Delete / Archive Product" data-confirm-msg="${escapeHtml('Delete product #' + Number(ap.id) + ' ("' + formattedAp.name + '")? Products with existing orders are automatically archived (deactivated) instead of deleted to preserve order history.')}" onsubmit="return openFormConfirmModal(this);">
+                          <input type="hidden" name="action" value="delete_product">
+                          <input type="hidden" name="product_id" value="${Number(ap.id)}">
+                          <button type="submit" class="btn-reject-sm">Delete</button>
+                        </form>
+                      </div>
+                    </td>
                   </tr>
                 `;
               }).join('')}
             </tbody>
           </table>
+          <div id="productsPaginationBar" class="pagination-bar"></div>
         </section>
+        </div>
 
-        <!-- Section 5: Create Seller Account -->
-        <section class="card" style="margin-top:24px;">
-          <h2>Create New Seller Account</h2>
-          <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with country code, e.g. +919876543210).</p>
-          <form method="POST" action="/admin">
+        <!-- Section 5: Create Seller Account (Dedicated Page 3 or visible in All Lists) -->
+        <div class="admin-view-panel ${panelVisible('create-seller') ? 'is-visible' : ''}" data-admin-panel="create-seller">
+        <section class="card" id="createSellerSection" style="margin-top:0;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+            <div>
+              <h2>Create New Seller Account</h2>
+              <p class="muted">Add a new merchant to Venter App manually. Provide Email Address or Phone Number (with country code, e.g. +919876543210).</p>
+            </div>
+            <a href="/admin/sellers" class="btn-sm" onclick="return switchAdminTab('sellers', event);">← Back to Seller Accounts</a>
+          </div>
+          <form method="POST" action="/admin" data-default-tab="sellers">
             <input type="hidden" name="action" value="create_seller">
             <div class="grid">
               <div>
@@ -10606,7 +12719,30 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             <button type="submit" style="background:#4f46e5;">+ Create Seller Account</button>
           </form>
         </section>
+        </div>
       </main>
+
+      <footer class="admin-footer">
+        <div class="footer-inner">
+          <div>
+            <strong>Vendor Admin Portal</strong> &bull; Venter App Marketplace Operations
+            <div style="font-size:11px; color:#94a3b8; margin-top:3px;">Catalog, Sellers, GST Compliance, Automated Refunds &amp; Settlement Audit Suite</div>
+          </div>
+          <nav class="footer-links" id="adminFooterNav">
+            <a href="/admin" data-tab="overview" class="${activeTab === 'overview' ? 'active' : ''}" onclick="return switchAdminTab('overview', event);">Overview</a>
+            <a href="/admin/gst-verifications" data-tab="gst" class="${activeTab === 'gst' ? 'active' : ''}" onclick="return switchAdminTab('gst', event);">PDF Verifications</a>
+            <a href="/admin/sellers" data-tab="sellers" class="${activeTab === 'sellers' ? 'active' : ''}" onclick="return switchAdminTab('sellers', event);">Seller Accounts</a>
+            <a href="/admin/create-seller" data-tab="create-seller" class="${activeTab === 'create-seller' ? 'active' : ''}" onclick="return switchAdminTab('create-seller', event);">+ Create Seller</a>
+            <a href="/admin/seller-deletions" data-tab="seller-deletions" class="${activeTab === 'seller-deletions' ? 'active' : ''}" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests</a>
+            <a href="/admin/products" data-tab="products" class="${activeTab === 'products' ? 'active' : ''}" onclick="return switchAdminTab('products', event);">Manage Products</a>
+            <a href="/admin/categories" data-tab="categories" class="${activeTab === 'categories' ? 'active' : ''}" onclick="return switchAdminTab('categories', event);">Categories</a>
+            <a href="/admin?tab=all" data-tab="all" class="${activeTab === 'all' ? 'active' : ''}" onclick="return switchAdminTab('all', event);">All Lists</a>
+          </nav>
+          <div style="font-size:12px; color:#94a3b8;">
+            <a href="/admin/logout" style="color:#f8fafc; font-weight:700; text-decoration:none;">Sign out</a>
+          </div>
+        </div>
+      </footer>
 
       <!-- GST Review & Verification Modal -->
       <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
@@ -10617,14 +12753,20 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           </div>
           <div class="modal-body">
             <div id="gstModalLoading" style="text-align:center; padding:32px; color:#64748b;">
-              Loading details & documents...
+              Loading details &amp; documents...
             </div>
 
             <div id="gstModalContent" style="display:none;">
+              <div id="gstFetchErrorBox" class="modal-err-banner" style="display:none;"></div>
               <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:18px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:6px;">
                   <strong style="font-size:16px; color:#1e1b4b;" id="modalSellerName">—</strong>
                   <div id="modalGstStatus">—</div>
+                </div>
+                <div id="modalSellerMeta" style="font-size:12px; color:#475569; margin-bottom:8px;">—</div>
+                <div id="modalGstinRow" style="display:none; font-size:13px; color:#334155; margin-bottom:6px;">
+                  <div><strong>GSTIN:</strong> <code id="modalGstin">—</code> &bull; <strong>Business:</strong> <span id="modalBusinessName">—</span></div>
+                  <div style="font-size:12px; color:#475569; margin-top:4px;"><strong>Address:</strong> <span id="modalBusinessAddress">—</span> &bull; <strong>State &amp; PIN:</strong> <span id="modalStatePin">—</span></div>
                 </div>
                 <div style="font-size:13px; color:#64748b;">
                   <div><strong>Submitted:</strong> <span id="modalSubmittedAt">—</span> &bull; <strong>Verified:</strong> <span id="modalVerifiedAt">—</span></div>
@@ -10646,16 +12788,18 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                   <div style="display:flex; gap:8px; align-items:center;">
                     <a id="modalPreviewNewTab" href="#" target="_blank" style="font-size:12px; font-weight:700; color:#0284c7; text-decoration:none;">↗ Open Full Screen</a>
                     <a id="modalPreviewDownload" href="#" style="font-size:12px; font-weight:700; color:#475569; text-decoration:none;">⬇ Download</a>
+                    <button type="button" class="btn-dl" style="font-size:11px; padding:4px 8px;" onclick="closeInlineDocPreview()">Close Preview</button>
                   </div>
                 </div>
                 <div id="modalPreviewFrameWrap" style="width:100%; height:440px; background:#e2e8f0; display:flex; align-items:center; justify-content:center;"></div>
+                <div id="modalPreviewHint" style="font-size:12px; color:#64748b; padding:6px 14px; background:#f8fafc; border-top:1px solid #e2e8f0;">If your browser blocks embedded PDF rendering, use <strong>Open Full Screen</strong> or <strong>Download</strong> above.</div>
               </div>
 
               <div style="border-top:1px solid #e2e8f0; padding-top:18px; margin-top:18px;">
                 <h4 style="margin: 0 0 12px; color:#1e1b4b;">Admin Verification Actions</h4>
                 
                 <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
-                  <form method="POST" action="/admin" onsubmit="return confirm('Are you sure you want to APPROVE this seller document verification?');">
+                  <form method="POST" action="/admin" data-confirm-title="Approve Document Verification" data-confirm-msg="Are you sure you want to APPROVE this seller document verification?" onsubmit="return openFormConfirmModal(this);">
                     <input type="hidden" name="action" value="approve_gst">
                     <input type="hidden" name="seller_id" id="approveSellerId">
                     <input type="hidden" name="notes" value="Approved by administrator">
@@ -10671,7 +12815,13 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                     <input type="hidden" name="action" value="reject_gst">
                     <input type="hidden" name="seller_id" id="rejectSellerId">
                     <label style="margin-top:0; color:#991b1b; font-weight:700;">Mandatory Rejection Reason <span style="color:#ef4444;">*</span></label>
-                    <textarea name="rejection_reason" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry text, expired certificate)..."></textarea>
+                    <div class="reject-presets">
+                      <button type="button" class="reject-chip" onclick="setRejectPreset('Blurry or unreadable scan — please upload a clearer PDF.')">Blurry Scan</button>
+                      <button type="button" class="reject-chip" onclick="setRejectPreset('Invalid or expired certificate — please upload a valid document.')">Invalid / Expired</button>
+                      <button type="button" class="reject-chip" onclick="setRejectPreset('Business / Seller name mismatch with registration profile.')">Name Mismatch</button>
+                      <button type="button" class="reject-chip" onclick="setRejectPreset('Uploaded file missing from storage — please re-upload PDF certificate.')">Request Re-upload</button>
+                    </div>
+                    <textarea name="rejection_reason" id="rejectReasonInput" required rows="3" style="width:100%; padding:10px; border:1px solid #fca5a5; border-radius:8px; font-family:inherit; font-size:13px; outline:none; margin-top:4px;" placeholder="Explain clearly to the seller why their document was rejected (e.g. invalid document, blurry text, expired certificate)..."></textarea>
                     <div style="display:flex; gap:10px; margin-top:10px;">
                       <button type="submit" class="btn-reject-sm" style="padding:8px 16px;">Confirm Rejection</button>
                       <button type="button" onclick="toggleRejectBox()" style="background:#e2e8f0; color:#334155;" class="btn">Cancel</button>
@@ -10777,7 +12927,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                 </div>
                 <div style="grid-column: 1 / -1;">
                   <label>Landmark</label>
-                  <input name="landmark" id="formLandmark" required>
+                  <input name="landmark" id="formLandmark" placeholder="Nearest landmark (optional)">
                 </div>
                 <div style="grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
                   <strong style="color: #334155; font-size: 13px;">Change Password</strong>
@@ -10834,16 +12984,528 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
         </div>
       </div>
 
+      <!-- Admin Product Add / Edit Modal -->
+      <div id="productModal" class="modal-overlay" onclick="if(event.target.id==='productModal') closeProductModal();">
+        <div class="modal-box" style="max-width:760px;">
+          <div class="modal-header">
+            <h3 id="prodModalTitle">Add New Product</h3>
+            <button type="button" class="modal-close" onclick="closeProductModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <form method="POST" action="/admin" enctype="multipart/form-data">
+              <input type="hidden" name="action" id="prodFormAction" value="create_product">
+              <input type="hidden" name="product_id" id="prodFormId" value="">
+              <input type="hidden" name="existing_images_control" id="prodFormExistingControl" value="1">
+              <div class="grid">
+                <div style="grid-column: 1 / -1;">
+                  <label>Product Name *</label>
+                  <input name="name" id="prodFormName" required maxlength="200" placeholder="e.g. Wireless Noise-Cancelling Headphones">
+                </div>
+                <div>
+                  <label>Seller Account *</label>
+                  <select name="seller_id" id="prodFormSeller" required>
+                    <option value="">-- Select Seller --</option>
+                    ${eligibleSellersForProducts.map(spOpt => {
+                      const spAcc = String(spOpt.account_status || 'ACTIVE').toUpperCase();
+                      return `<option value="${Number(spOpt.id)}" data-acc-status="${escapeHtml(spAcc)}">${escapeHtml(spOpt.display_name + ' (#' + Number(spOpt.id) + ')' + (spAcc !== 'ACTIVE' ? ' [' + spAcc + ']' : ''))}</option>`;
+                    }).join('')}
+                  </select>
+                </div>
+                <div>
+                  <label>Category *</label>
+                  <select name="category_id" id="prodFormCategory" required>
+                    ${categoriesList.map(catOpt => `<option value="${Number(catOpt.id)}">${escapeHtml(catOpt.name)}</option>`).join('')}
+                  </select>
+                </div>
+                <div>
+                  <label>Selling Price (₹) *</label>
+                  <input type="number" step="0.01" min="0" name="price" id="prodFormPrice" required placeholder="0.00">
+                </div>
+                <div>
+                  <label>MRP (₹)</label>
+                  <input type="number" step="0.01" min="0" name="mrp" id="prodFormMrp" placeholder="Optional (defaults +30%)">
+                </div>
+                <div>
+                  <label>Stock Quantity *</label>
+                  <input type="number" step="1" min="0" name="stock" id="prodFormStock" required value="0">
+                </div>
+                <div>
+                  <label>SKU</label>
+                  <input name="sku" id="prodFormSku" maxlength="100" placeholder="Auto-generated if left blank">
+                </div>
+                <div>
+                  <label>Brand</label>
+                  <input name="brand" id="prodFormBrand" maxlength="100" value="Generic" placeholder="Generic">
+                </div>
+                <div style="display:flex; align-items:flex-end; padding-bottom:6px;">
+                  <label style="display:inline-flex; align-items:center; gap:8px; margin:0; cursor:pointer;">
+                    <input type="checkbox" name="is_active" id="prodFormActive" value="1" checked style="width:auto;"> Active (Visible on Storefront)
+                  </label>
+                </div>
+                <div style="grid-column: 1 / -1;">
+                  <label>Description</label>
+                  <textarea name="description" id="prodFormDesc" rows="3" placeholder="Product features, specifications, warranty details..."></textarea>
+                </div>
+                <div id="prodExistingImagesWrap" style="grid-column: 1 / -1; display:none;">
+                  <label style="margin-bottom:4px;">Current Product Images (uncheck to remove)</label>
+                  <div id="prodModalExistingImgs" class="existing-img-grid"></div>
+                </div>
+                <div>
+                  <label>Upload Product Images (up to 4, auto-WebP)</label>
+                  <input type="file" name="images[]" id="prodFormFiles" accept="image/*" multiple>
+                </div>
+                <div>
+                  <label>Add Image URLs (optional, comma/newline separated)</label>
+                  <textarea name="image_urls" id="prodFormImageUrls" rows="2" placeholder="https://example.com/photo.jpg or /uploads/products/img.webp"></textarea>
+                </div>
+                <div id="prodEditImageOptions" style="grid-column: 1 / -1; display:none; gap:16px; flex-wrap:wrap; align-items:center; padding:8px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
+                  <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px;">
+                    <input type="checkbox" name="replace_images" id="prodFormReplaceImgs" value="1" style="width:auto;"> Replace all existing images with new uploads/URLs
+                  </label>
+                  <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer; font-size:12px; color:#b91c1c;">
+                    <input type="checkbox" name="clear_images" id="prodFormClearImgs" value="1" style="width:auto;"> Remove all images
+                  </label>
+                </div>
+              </div>
+              <br>
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <button type="submit" id="prodFormSubmitBtn">Save Product</button>
+                <button type="button" onclick="closeProductModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Shared In-Page Form Confirmation Modal (replaces native confirm()) -->
+      <div id="confirmActionModal" class="modal-overlay" style="z-index: 1100;" onclick="if(event.target.id==='confirmActionModal') closeConfirmModal();">
+        <div class="modal-box" style="max-width:460px;">
+          <div class="modal-header">
+            <h3 id="confirmModalTitle">Confirm Action</h3>
+            <button type="button" class="modal-close" onclick="closeConfirmModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p id="confirmModalMessage" style="margin:0 0 18px; color:#334155; font-size:14px; line-height:1.5;">Are you sure?</p>
+            <div style="display:flex; justify-content:flex-end; gap:10px;">
+              <button type="button" onclick="closeConfirmModal()" style="background:#e2e8f0; color:#334155;">Cancel</button>
+              <button type="button" onclick="confirmPendingForm()" style="background:#dc2626;">Confirm</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <script>
+        window._pendingConfirmForm = null;
+        window._activeGstStatus = 'all';
+        window._activeGstSearch = '';
+        window._activeSellerSearch = '';
+        window._activeSellerStatus = 'all';
+        window._activeCategorySearch = '';
+        window._modalGstDocs = {};
+        window._activeDelStatusFilter = 'all';
+        window._activeDelSearch = '';
+        window._currentWsData = null;
+        window._tablePagerState = {};
+
+        var ADMIN_CATEGORY_ORDER = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+        var ADMIN_PAGE_LABELS = {
+          overview: 'Overview Directory',
+          gst: 'Page 1 of 6: PDF Verification',
+          sellers: 'Page 2 of 6: Seller Accounts',
+          'create-seller': 'Page 3 of 6: Create Seller',
+          'seller-deletions': 'Page 4 of 6: Deletion Requests',
+          products: 'Page 5 of 6: Manage Products',
+          categories: 'Page 6 of 6: Categories',
+          all: 'Combined All-Pages View'
+        };
+
+        var TABLE_PAGER_CFG = {
+          gst: { tbodyId: 'gstTableBody', rowSelector: '.gst-row', barId: 'gstPaginationBar', defaultSize: 10, label: 'verification records' },
+          sellers: { tbodyId: 'sellersTableBody', rowSelector: '.seller-account-row', barId: 'sellersPaginationBar', defaultSize: 10, label: 'sellers' },
+          del: { tbodyId: 'deletionRequestsTbody', rowSelector: '.del-req-row', barId: 'delPaginationBar', defaultSize: 10, label: 'deletion requests' },
+          products: { tbodyId: 'productsTableBody', rowSelector: '.prod-cat-row', barId: 'productsPaginationBar', defaultSize: 10, label: 'products' },
+          categories: { tbodyId: 'categoriesTableBody', rowSelector: '.cat-list-row', barId: 'categoriesPaginationBar', defaultSize: 10, label: 'categories' }
+        };
+
+        var ADMIN_TAB_META = {
+          overview: {
+            url: '/admin',
+            title: 'Dashboard Overview',
+            sub: 'Structured Admin Header, Portal KPIs, Page-Wise Category Stepper & Footer Navigation.'
+          },
+          gst: {
+            url: '/admin/gst-verifications',
+            title: 'PDF Verifications',
+            sub: 'Page 1 \u2014 Inspect seller-uploaded PDF certificates inline, approve compliance, or reject with mandatory feedback.'
+          },
+          sellers: {
+            url: '/admin/sellers',
+            title: 'Seller Accounts',
+            sub: 'Page 2 \u2014 Manage registered sellers, search & filter accounts, edit profiles, or trigger deletion audits.'
+          },
+          'create-seller': {
+            url: '/admin/create-seller',
+            title: 'Create Seller Account',
+            sub: 'Page 3 \u2014 Register a new merchant account manually with normalized phone or email credentials.'
+          },
+          'seller-deletions': {
+            url: '/admin/seller-deletions',
+            title: 'Seller Management \u2192 Seller Deletion Requests',
+            sub: 'Page 4 \u2014 Verify orders (Rules A\u2013E), automated Razorpay refunds, settlements, and 6-gate deletion approvals.'
+          },
+          products: {
+            url: '/admin/products',
+            title: 'Manage Products',
+            sub: 'Page 5 \u2014 Add products, upload gallery photos, edit pricing/stock, filter catalog, reassign categories, or archive safely.'
+          },
+          categories: {
+            url: '/admin/categories',
+            title: 'Product Categories',
+            sub: 'Page 6 \u2014 Create, edit, sort, and manage product categories with automatic catalog sync.'
+          },
+          all: {
+            url: '/admin?tab=all',
+            title: 'Complete Admin Portal (All Lists)',
+            sub: 'All management lists displayed together on a single page.'
+          }
+        };
+
+        function detectInitialAdminTab() {
+          var activePill = document.querySelector('#adminTopNav .nav-pill.active');
+          if (activePill && activePill.getAttribute('data-tab')) {
+            return activePill.getAttribute('data-tab');
+          }
+          var p = String(window.location.pathname || '').toLowerCase();
+          var q = String(window.location.search || '').toLowerCase();
+          if (q.indexOf('tab=all') !== -1) return 'all';
+          if (p.indexOf('/admin/create-seller') !== -1 || q.indexOf('tab=create-seller') !== -1) return 'create-seller';
+          if (p.indexOf('seller-deletions') !== -1 || q.indexOf('seller-deletions') !== -1) return 'seller-deletions';
+          if (p.indexOf('/admin/products') !== -1 || q.indexOf('tab=products') !== -1) return 'products';
+          if (p.indexOf('/admin/sellers') !== -1 || q.indexOf('tab=sellers') !== -1) return 'sellers';
+          if (p.indexOf('/admin/gst-verifications') !== -1 || q.indexOf('tab=gst') !== -1) return 'gst';
+          if (p.indexOf('/admin/categories') !== -1 || q.indexOf('tab=categories') !== -1) return 'categories';
+          return 'overview';
+        }
+
+        window._activeAdminTab = detectInitialAdminTab();
+
+        function getTableRows(key) {
+          var cfg = TABLE_PAGER_CFG[key];
+          if (!cfg) return [];
+          var tbody = cfg.tbodyId ? document.getElementById(cfg.tbodyId) : null;
+          var list = [];
+          if (tbody && typeof tbody.querySelectorAll === 'function') {
+            list = Array.prototype.slice.call(tbody.querySelectorAll(cfg.rowSelector) || []);
+          }
+          if (!list.length && typeof document.querySelectorAll === 'function') {
+            list = Array.prototype.slice.call(document.querySelectorAll(cfg.rowSelector) || []);
+          }
+          return list;
+        }
+
+        function refreshTablePagination(key, resetPage) {
+          var cfg = TABLE_PAGER_CFG[key];
+          if (!cfg) return;
+          if (!window._tablePagerState[key]) {
+            window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+          }
+          var st = window._tablePagerState[key];
+          if (resetPage) st.page = 1;
+
+          var allRows = getTableRows(key);
+          var matchedRows = [];
+          allRows.forEach(function(r) {
+            var flag = typeof r.getAttribute === 'function' ? r.getAttribute('data-filter-match') : null;
+            if (flag !== '0') matchedRows.push(r);
+          });
+
+          var pageSize = Number(st.pageSize) || 10;
+          var totalMatched = matchedRows.length;
+          var totalPages = Math.max(1, Math.ceil(totalMatched / pageSize));
+          if (st.page > totalPages) st.page = totalPages;
+          if (st.page < 1) st.page = 1;
+
+          var startIdx = (st.page - 1) * pageSize;
+          var endIdx = startIdx + pageSize;
+
+          allRows.forEach(function(r) {
+            if (r && r.style) r.style.display = 'none';
+          });
+          matchedRows.forEach(function(r, idx) {
+            if (r && r.style && idx >= startIdx && idx < endIdx) {
+              r.style.display = '';
+            }
+          });
+
+          var barEl = cfg.barId ? document.getElementById(cfg.barId) : null;
+          if (!barEl) return;
+
+          var summaryText = '';
+          if (allRows.length === 0) {
+            summaryText = '0 ' + cfg.label;
+          } else if (totalMatched === 0) {
+            summaryText = '0 of ' + allRows.length + ' ' + cfg.label + ' match filter';
+          } else {
+            var fromNum = startIdx + 1;
+            var toNum = Math.min(endIdx, totalMatched);
+            summaryText = 'Showing ' + fromNum + '\u2013' + toNum + ' of ' + totalMatched + ' ' + cfg.label + ' (Page ' + st.page + ' of ' + totalPages + ')';
+          }
+
+          var sizeOpts = [10, 20, 50, 100];
+          var optsHtml = '';
+          sizeOpts.forEach(function(sz) {
+            optsHtml += '<option value="' + sz + '"' + (pageSize === sz ? ' selected' : '') + '>' + sz + ' / page</option>';
+          });
+
+          var pagesHtml = '';
+          var safeKey = escapeHtml(key);
+          var winStart = Math.max(1, st.page - 2);
+          var winEnd = Math.min(totalPages, st.page + 2);
+          if (winStart > 1) {
+            pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="1" onclick="setTablePageFromBtn(this)">1</button>';
+            if (winStart > 2) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+          }
+          for (var pNum = winStart; pNum <= winEnd; pNum++) {
+            pagesHtml += '<button type="button" class="pg-btn' + (pNum === st.page ? ' active' : '') + '" data-pg-key="' + safeKey + '" data-pg-num="' + pNum + '" onclick="setTablePageFromBtn(this)">' + pNum + '</button>';
+          }
+          if (winEnd < totalPages) {
+            if (winEnd < totalPages - 1) pagesHtml += '<span style="padding:0 4px; color:#94a3b8;">...</span>';
+            pagesHtml += '<button type="button" class="pg-btn" data-pg-key="' + safeKey + '" data-pg-num="' + totalPages + '" onclick="setTablePageFromBtn(this)">' + totalPages + '</button>';
+          }
+
+          barEl.innerHTML = '<div><strong>' + escapeHtml(summaryText) + '</strong></div>' +
+            '<div class="pg-controls">' +
+            '<select class="pg-select" aria-label="Rows per page" data-pg-key="' + safeKey + '" onchange="setTablePageSizeFromEl(this)">' + optsHtml + '</select>' +
+            '<button type="button" class="pg-btn"' + (st.page <= 1 ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page - 1) + '" onclick="setTablePageFromBtn(this)">Prev</button>' +
+            pagesHtml +
+            '<button type="button" class="pg-btn"' + (st.page >= totalPages ? ' disabled' : '') + ' data-pg-key="' + safeKey + '" data-pg-num="' + (st.page + 1) + '" onclick="setTablePageFromBtn(this)">Next</button>' +
+            '</div>';
+        }
+
+        function setTablePageFromBtn(btn) {
+          if (!btn || typeof btn.getAttribute !== 'function') return;
+          setTablePage(btn.getAttribute('data-pg-key'), btn.getAttribute('data-pg-num'));
+        }
+
+        function setTablePageSizeFromEl(sel) {
+          if (!sel || typeof sel.getAttribute !== 'function') return;
+          setTablePageSize(sel.getAttribute('data-pg-key'), sel.value);
+        }
+
+        function setTablePage(key, pageNum) {
+          var cfg = TABLE_PAGER_CFG[key];
+          if (!cfg) return;
+          if (!window._tablePagerState[key]) {
+            window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+          }
+          window._tablePagerState[key].page = Math.max(1, parseInt(pageNum, 10) || 1);
+          refreshTablePagination(key, false);
+        }
+
+        function setTablePageSize(key, sizeVal) {
+          var cfg = TABLE_PAGER_CFG[key];
+          if (!cfg) return;
+          if (!window._tablePagerState[key]) {
+            window._tablePagerState[key] = { page: 1, pageSize: cfg.defaultSize || 10 };
+          }
+          var parsed = parseInt(sizeVal, 10);
+          window._tablePagerState[key].pageSize = (parsed > 0) ? parsed : (cfg.defaultSize || 10);
+          window._tablePagerState[key].page = 1;
+          refreshTablePagination(key, false);
+        }
+
+        function refreshAllTablePaginations() {
+          Object.keys(TABLE_PAGER_CFG).forEach(function(k) {
+            refreshTablePagination(k, false);
+          });
+        }
+
+        function updateCategoryPagerUI(tab) {
+          var idx = ADMIN_CATEGORY_ORDER.indexOf(tab);
+          if (idx === -1) idx = 0;
+          var indEl = document.getElementById('categoryPageIndicator');
+          if (indEl) indEl.innerText = ADMIN_PAGE_LABELS[tab] || ADMIN_PAGE_LABELS.overview;
+          var prevBtn = document.getElementById('catPrevBtn');
+          if (prevBtn) prevBtn.disabled = (idx <= 0);
+          var nextBtn = document.getElementById('catNextBtn');
+          if (nextBtn) nextBtn.disabled = (idx >= ADMIN_CATEGORY_ORDER.length - 1);
+        }
+
+        function stepAdminCategoryPage(delta) {
+          var cur = window._activeAdminTab || 'overview';
+          var idx = ADMIN_CATEGORY_ORDER.indexOf(cur);
+          if (idx === -1) idx = 0;
+          var nextIdx = idx + (Number(delta) || 0);
+          if (nextIdx < 0) nextIdx = 0;
+          if (nextIdx >= ADMIN_CATEGORY_ORDER.length) nextIdx = ADMIN_CATEGORY_ORDER.length - 1;
+          return switchAdminTab(ADMIN_CATEGORY_ORDER[nextIdx]);
+        }
+
+        function syncReturnTabInputs(tab) {
+          var currentTab = ADMIN_TAB_META[tab] ? tab : 'overview';
+          document.querySelectorAll('form[method="POST"], form[method="post"]').forEach(function(formEl) {
+            var panelEl = formEl.closest ? formEl.closest('[data-admin-panel]') : null;
+            var actionInput = formEl.querySelector('input[name="action"]');
+            var actName = actionInput ? String(actionInput.value || '') : '';
+            var defaultTab = formEl.getAttribute('data-default-tab');
+            if (!defaultTab && panelEl) {
+              var rawPanel = String(panelEl.getAttribute('data-admin-panel') || '');
+              var firstToken = rawPanel.split(',')[0].trim();
+              if (firstToken && firstToken !== 'overview') {
+                defaultTab = firstToken;
+              }
+            }
+            if (!defaultTab) {
+              if (actName === 'approve_gst' || actName === 'reject_gst') defaultTab = 'gst';
+              else if (actName === 'add_category' || actName === 'edit_category' || actName === 'delete_category') defaultTab = 'categories';
+              else if (actName === 'create_product' || actName === 'edit_product' || actName === 'toggle_product_status' || actName === 'delete_product' || actName === 'update_product_category') defaultTab = 'products';
+              else if (actName === 'create_seller' || actName === 'edit_seller') defaultTab = 'sellers';
+              else defaultTab = currentTab;
+            }
+            var targetReturnTab = (currentTab === 'all') ? 'all' : (defaultTab || currentTab);
+            var retInput = formEl.querySelector('input[name="return_tab"]');
+            if (!retInput) {
+              retInput = document.createElement('input');
+              retInput.type = 'hidden';
+              retInput.name = 'return_tab';
+              formEl.appendChild(retInput);
+            }
+            retInput.value = targetReturnTab;
+          });
+        }
+
+        function switchAdminTab(tab, ev, skipPush) {
+          if (ev && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button === 1)) {
+            return true;
+          }
+          if (ev && typeof ev.preventDefault === 'function') {
+            ev.preventDefault();
+          }
+          var nextTab = ADMIN_TAB_META[tab] ? tab : 'overview';
+          window._activeAdminTab = nextTab;
+
+          document.querySelectorAll('[data-admin-panel]').forEach(function(el) {
+            var tokens = String(el.getAttribute('data-admin-panel') || '').split(',');
+            var visible = (nextTab === 'all')
+              ? (tokens.indexOf('all') !== -1 || tokens.indexOf('overview') === -1)
+              : (tokens.indexOf(nextTab) !== -1);
+            if (visible) el.classList.add('is-visible');
+            else el.classList.remove('is-visible');
+          });
+
+          document.querySelectorAll('#adminTopNav .nav-pill, #adminFooterNav a[data-tab], #adminCategoryPager .cat-page-pill').forEach(function(link) {
+            var lt = link.getAttribute('data-tab');
+            if (lt === nextTab) link.classList.add('active');
+            else link.classList.remove('active');
+          });
+
+          var meta = ADMIN_TAB_META[nextTab] || ADMIN_TAB_META.overview;
+          var titleEl = document.getElementById('adminPageTitle');
+          var subEl = document.getElementById('adminPageSubtitle');
+          if (titleEl) titleEl.innerText = meta.title;
+          if (subEl) subEl.innerText = meta.sub;
+          document.title = meta.title + ' \u2014 Vendor Admin Portal';
+
+          updateCategoryPagerUI(nextTab);
+          syncReturnTabInputs(nextTab);
+          refreshAllTablePaginations();
+
+          if (!skipPush && window.history && typeof window.history.pushState === 'function') {
+            var currentPath = window.location.pathname + window.location.search;
+            if (currentPath !== meta.url) {
+              window.history.pushState({ adminTab: nextTab }, '', meta.url);
+            }
+          }
+          if (typeof window.scrollTo === 'function') {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+          return false;
+        }
+
+        window.addEventListener('popstate', function(ev) {
+          var stTab = (ev.state && ev.state.adminTab) ? ev.state.adminTab : detectInitialAdminTab();
+          switchAdminTab(stTab, null, true);
+        });
+
+        window.addEventListener('DOMContentLoaded', function() {
+          syncReturnTabInputs(window._activeAdminTab);
+          updateCategoryPagerUI(window._activeAdminTab);
+          refreshAllTablePaginations();
+        });
+
+        document.addEventListener('submit', function() {
+          syncReturnTabInputs(window._activeAdminTab);
+        }, true);
+
+        function parseDataJson(btnOrObj, attrName) {
+          if (!btnOrObj) return null;
+          if (typeof btnOrObj.getAttribute === 'function') {
+            try {
+              return JSON.parse(btnOrObj.getAttribute(attrName) || 'null');
+            } catch (e) {
+              return null;
+            }
+          }
+          return btnOrObj;
+        }
+
+        function toAdminPreviewUrl(u) {
+          if (!u) return '';
+          var s = String(u);
+          var idx = s.indexOf('/uploads/products/');
+          if (idx !== -1) {
+            return s.slice(idx);
+          }
+          return s;
+        }
+
+        function escapeHtml(str) {
+          if (str === null || str === undefined) return '';
+          return String(str).replace(/[&<>'"]/g, function(tag) {
+            return ({
+              '&': '&amp;',
+              '<': '&lt;',
+              '>': '&gt;',
+              "'": '&#39;',
+              '"': '&quot;'
+            })[tag] || tag;
+          });
+        }
+
+        function openFormConfirmModal(form) {
+          if (!form) return false;
+          syncReturnTabInputs(window._activeAdminTab);
+          window._pendingConfirmForm = form;
+          document.getElementById('confirmModalTitle').innerText = form.getAttribute('data-confirm-title') || 'Confirm Action';
+          document.getElementById('confirmModalMessage').innerText = form.getAttribute('data-confirm-msg') || 'Are you sure you want to proceed?';
+          document.getElementById('confirmActionModal').classList.add('active');
+          return false;
+        }
+
+        function closeConfirmModal() {
+          window._pendingConfirmForm = null;
+          document.getElementById('confirmActionModal').classList.remove('active');
+        }
+
+        function confirmPendingForm() {
+          var f = window._pendingConfirmForm;
+          closeConfirmModal();
+          if (f) {
+            HTMLFormElement.prototype.submit.call(f);
+          }
+        }
+
         function openCategoryModal(btnOrObj) {
-          var cat = (btnOrObj && btnOrObj.getAttribute) ? JSON.parse(btnOrObj.getAttribute('data-cat')) : btnOrObj;
-          document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' — ' + (cat.name || '');
+          var cat = parseDataJson(btnOrObj, 'data-cat');
+          if (!cat) return;
+          document.getElementById('catModalTitle').innerText = 'Edit Category #' + cat.id + ' \u2014 ' + (cat.name || '');
           document.getElementById('editCatId').value = cat.id;
           document.getElementById('editCatName').value = cat.name || '';
           document.getElementById('editCatIcon').value = cat.icon || '';
           document.getElementById('editCatDesc').value = cat.description || '';
           document.getElementById('editCatSort').value = cat.sort_order !== undefined ? cat.sort_order : 0;
           document.getElementById('editCatActive').checked = Boolean(Number(cat.is_active));
+          syncReturnTabInputs(window._activeAdminTab);
           document.getElementById('editCategoryModal').classList.add('active');
         }
 
@@ -10851,23 +13513,185 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           document.getElementById('editCategoryModal').classList.remove('active');
         }
 
-        function filterAdminProductSearch(query) {
-          var q = (query || '').toLowerCase().trim();
-          document.querySelectorAll('.prod-cat-row').forEach(function(r) {
-            var s = r.getAttribute('data-search') || '';
-            r.style.display = (!q || s.indexOf(q) !== -1) ? '' : 'none';
-          });
+        function openProductModal(btnOrProd) {
+          var prod = btnOrProd ? parseDataJson(btnOrProd, 'data-product') : null;
+          var isEdit = Boolean(prod && prod.id);
+          document.getElementById('prodModalTitle').innerText = isEdit
+            ? ('Edit Product #' + prod.id + ' \u2014 ' + (prod.name || ''))
+            : 'Add New Product';
+          document.getElementById('prodFormAction').value = isEdit ? 'edit_product' : 'create_product';
+          document.getElementById('prodFormId').value = isEdit ? prod.id : '';
+          document.getElementById('prodFormName').value = isEdit ? (prod.name || '') : '';
+          document.getElementById('prodFormSku').value = isEdit ? (prod.sku || '') : '';
+          document.getElementById('prodFormBrand').value = isEdit ? (prod.brand || 'Generic') : 'Generic';
+          document.getElementById('prodFormPrice').value = isEdit ? (prod.price !== undefined && prod.price !== null ? prod.price : '') : '';
+          document.getElementById('prodFormMrp').value = isEdit ? (prod.mrp !== undefined && prod.mrp !== null ? prod.mrp : '') : '';
+          document.getElementById('prodFormStock').value = isEdit ? (prod.stock !== undefined && prod.stock !== null ? prod.stock : 0) : 0;
+          document.getElementById('prodFormDesc').value = isEdit ? (prod.description || '') : '';
+          document.getElementById('prodFormActive').checked = isEdit ? Boolean(prod.is_active) : true;
+          document.getElementById('prodFormFiles').value = '';
+          document.getElementById('prodFormImageUrls').value = '';
+          document.getElementById('prodFormReplaceImgs').checked = false;
+          document.getElementById('prodFormClearImgs').checked = false;
+          document.getElementById('prodEditImageOptions').style.display = isEdit ? 'flex' : 'none';
+          document.getElementById('prodFormSubmitBtn').innerText = isEdit ? 'Save Product Changes' : '+ Create Product';
+
+          var sellerSel = document.getElementById('prodFormSeller');
+          if (isEdit) {
+            var targetSid = String(prod.seller_id || '');
+            var hasOpt = false;
+            Array.from(sellerSel.options).forEach(function(opt) {
+              if (opt.value === targetSid) hasOpt = true;
+            });
+            if (!hasOpt && targetSid) {
+              var extra = document.createElement('option');
+              extra.value = targetSid;
+              extra.text = (prod.seller_name || ('Seller #' + targetSid)) + ' (#' + targetSid + ')';
+              sellerSel.appendChild(extra);
+            }
+            sellerSel.value = targetSid;
+          } else {
+            var firstActive = '';
+            Array.from(sellerSel.options).forEach(function(opt) {
+              if (!firstActive && opt.value && (opt.getAttribute('data-acc-status') || 'ACTIVE') === 'ACTIVE') {
+                firstActive = opt.value;
+              }
+            });
+            sellerSel.value = firstActive || '';
+          }
+
+          var catSel = document.getElementById('prodFormCategory');
+          if (isEdit) {
+            var matchedCat = '';
+            var targetCid = prod.category_id ? String(prod.category_id) : '';
+            var targetCname = String(prod.category || '').toLowerCase();
+            Array.from(catSel.options).forEach(function(opt) {
+              if ((targetCid && opt.value === targetCid) || (!matchedCat && opt.text.toLowerCase() === targetCname)) {
+                matchedCat = opt.value;
+              }
+            });
+            if (matchedCat) catSel.value = matchedCat;
+          } else if (catSel.options.length > 0) {
+            catSel.selectedIndex = 0;
+          }
+
+          var existingWrap = document.getElementById('prodExistingImagesWrap');
+          var existingGrid = document.getElementById('prodModalExistingImgs');
+          var imgs = (isEdit && Array.isArray(prod.images)) ? prod.images : ((isEdit && prod.image_url) ? [prod.image_url] : []);
+          if (isEdit && imgs.length > 0) {
+            existingWrap.style.display = 'block';
+            var imgHtml = '';
+            imgs.forEach(function(u, idx) {
+              var previewUrl = toAdminPreviewUrl(u);
+              imgHtml += '<div class="existing-img-item">' +
+                '<img src="' + escapeHtml(previewUrl) + '" alt="Image ' + (idx + 1) + '">' +
+                '<label style="margin:0;display:inline-flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;">' +
+                '<input type="checkbox" name="retain_images[]" value="' + escapeHtml(u) + '" checked style="width:auto;"> Keep #' + (idx + 1) +
+                '</label>' +
+                '</div>';
+            });
+            existingGrid.innerHTML = imgHtml;
+          } else {
+            existingWrap.style.display = 'none';
+            existingGrid.innerHTML = '';
+          }
+
+          syncReturnTabInputs(window._activeAdminTab);
+          document.getElementById('productModal').classList.add('active');
         }
 
-        function openSellerModal(seller) {
-          document.getElementById('modalTitle').innerText = 'Seller Profile — ' + (seller.seller_name || seller.name || 'Seller');
+        function closeProductModal() {
+          document.getElementById('productModal').classList.remove('active');
+        }
+
+        function applyAdminProductFilters(preservePage) {
+          var q = (document.getElementById('prodCatSearchInput') ? document.getElementById('prodCatSearchInput').value : '').toLowerCase().trim();
+          var sellerFilter = document.getElementById('prodSellerFilter') ? document.getElementById('prodSellerFilter').value : '';
+          var catFilter = (document.getElementById('prodCategoryFilter') ? document.getElementById('prodCategoryFilter').value : '').toLowerCase();
+          var statusFilter = document.getElementById('prodStatusFilter') ? document.getElementById('prodStatusFilter').value : 'all';
+
+          getTableRows('products').forEach(function(r) {
+            var s = r.getAttribute('data-search') || '';
+            var rSid = r.getAttribute('data-seller-id') || '';
+            var rCat = (r.getAttribute('data-category') || '').toLowerCase();
+            var rAct = r.getAttribute('data-active') || '1';
+
+            var matchQ = (!q || s.indexOf(q) !== -1);
+            var matchS = (!sellerFilter || rSid === sellerFilter);
+            var matchC = (!catFilter || rCat === catFilter);
+            var matchSt = (statusFilter === 'all' || rAct === statusFilter);
+            var okMatch = (matchQ && matchS && matchC && matchSt);
+            if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+          });
+          refreshTablePagination('products', !preservePage);
+        }
+
+        function filterAdminProductSearch(query) {
+          var inp = document.getElementById('prodCatSearchInput');
+          if (inp && typeof query === 'string' && inp.value !== query) {
+            inp.value = query;
+          }
+          applyAdminProductFilters(false);
+        }
+
+        function applySellerFilters(preservePage) {
+          var searchEl = document.getElementById('sellersSearchInput');
+          var q = (searchEl && typeof searchEl.value === 'string' && searchEl.value) ? searchEl.value.toLowerCase().trim() : (window._activeSellerSearch || '');
+          var statusEl = document.getElementById('sellersStatusFilter');
+          var st = statusEl ? (statusEl.value || 'all') : (window._activeSellerStatus || 'all');
+          window._activeSellerStatus = st;
+
+          getTableRows('sellers').forEach(function(r) {
+            var s = r.getAttribute('data-search') || '';
+            var rSt = r.getAttribute('data-status') || '';
+            var matchQ = (!q || s.indexOf(q) !== -1);
+            var matchSt = (st === 'all' || rSt === st);
+            var okMatch = (matchQ && matchSt);
+            if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+          });
+          refreshTablePagination('sellers', !preservePage);
+        }
+
+        function filterSellersSearch(query) {
+          window._activeSellerSearch = (query || '').toLowerCase().trim();
+          var inp = document.getElementById('sellersSearchInput');
+          if (inp && typeof query === 'string' && inp.value !== query) {
+            inp.value = query;
+          }
+          applySellerFilters(false);
+        }
+
+        function applyCategoryFilters(preservePage) {
+          var searchEl = document.getElementById('categoriesSearchInput');
+          var q = (searchEl && typeof searchEl.value === 'string' && searchEl.value) ? searchEl.value.toLowerCase().trim() : (window._activeCategorySearch || '');
+          getTableRows('categories').forEach(function(r) {
+            var s = r.getAttribute('data-search') || '';
+            var okMatch = (!q || s.indexOf(q) !== -1);
+            if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
+          });
+          refreshTablePagination('categories', !preservePage);
+        }
+
+        function filterCategorySearch(query) {
+          window._activeCategorySearch = (query || '').toLowerCase().trim();
+          var inp = document.getElementById('categoriesSearchInput');
+          if (inp && typeof query === 'string' && inp.value !== query) {
+            inp.value = query;
+          }
+          applyCategoryFilters(false);
+        }
+
+        function openSellerModal(btnOrSeller) {
+          var seller = parseDataJson(btnOrSeller, 'data-seller');
+          if (!seller) return;
+          document.getElementById('modalTitle').innerText = 'Seller Profile \u2014 ' + (seller.seller_name || seller.name || 'Seller');
           document.getElementById('viewSellerId').innerText = '#' + seller.id;
-          document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '—';
+          document.getElementById('viewCreatedAt').innerText = (seller.created_at || '').slice(0, 10) || '\u2014';
 
           document.getElementById('formSellerId').value = seller.id;
           document.getElementById('formSellerName').value = seller.seller_name || seller.name || '';
           document.getElementById('formPhone').value = seller.phone || '';
-          document.getElementById('formEmail').value = (seller.email && !seller.email.endsWith('@phone.vendor.local')) ? seller.email : '';
+          document.getElementById('formEmail').value = (seller.email && seller.email.indexOf('@phone.vendor.local') === -1) ? seller.email : '';
           document.getElementById('formAddress').value = seller.address || '';
           document.getElementById('formLandmark').value = seller.landmark || '';
           document.getElementById('formState').value = seller.state || '';
@@ -10877,6 +13701,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           document.getElementById('formNewPassword').value = '';
           document.getElementById('formConfirmPassword').value = '';
 
+          syncReturnTabInputs(window._activeAdminTab);
           document.getElementById('sellerModal').classList.add('active');
         }
 
@@ -10890,108 +13715,177 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           }
         }
 
-        function filterGstRows(status, btn) {
-          document.querySelectorAll('#gstSection .tab-btn').forEach(b => b.classList.remove('active'));
-          if (btn) btn.classList.add('active');
-
-          const rows = document.querySelectorAll('.gst-row');
-          rows.forEach(r => {
-            const rStatus = r.getAttribute('data-status');
-            if (status === 'all' || rStatus === status) {
-              r.style.display = '';
-            } else {
-              r.style.display = 'none';
-            }
+        function applyGstFilters(preservePage) {
+          var status = window._activeGstStatus || 'all';
+          var q = window._activeGstSearch || '';
+          getTableRows('gst').forEach(function(r) {
+            var rStatus = r.getAttribute('data-status') || '';
+            var searchData = r.getAttribute('data-search') || '';
+            var matchStatus = (status === 'all' || rStatus === status);
+            var matchQuery = (!q || searchData.indexOf(q) !== -1);
+            var okMatch = (matchStatus && matchQuery);
+            if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
           });
+          refreshTablePagination('gst', !preservePage);
+        }
+
+        function filterGstRows(status, btn) {
+          window._activeGstStatus = status || 'all';
+          document.querySelectorAll('#gstSection .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+          if (btn && btn.classList) btn.classList.add('active');
+          applyGstFilters(false);
         }
 
         function filterGstSearch(query) {
-          const q = (query || '').toLowerCase().trim();
-          const rows = document.querySelectorAll('.gst-row');
-          rows.forEach(r => {
-            const searchData = r.getAttribute('data-search') || '';
-            if (!q || searchData.includes(q)) {
-              r.style.display = '';
-            } else {
-              r.style.display = 'none';
-            }
-          });
+          window._activeGstSearch = (query || '').toLowerCase().trim();
+          applyGstFilters(false);
         }
 
-        window._modalGstDocs = {};
+        function closeInlineDocPreview() {
+          var box = document.getElementById('modalInlinePreviewBox');
+          var wrap = document.getElementById('modalPreviewFrameWrap');
+          if (wrap) wrap.innerHTML = '';
+          if (box) box.style.display = 'none';
+        }
+
+        function focusRejectBoxInModal() {
+          var b = document.getElementById('rejectBox');
+          if (b) {
+            b.style.display = 'block';
+            if (typeof b.scrollIntoView === 'function') b.scrollIntoView({ behavior: 'smooth' });
+          }
+          var rInp = document.getElementById('rejectReasonInput');
+          if (rInp && typeof rInp.focus === 'function') rInp.focus();
+        }
+
+        function setRejectPreset(reasonText) {
+          var inp = document.getElementById('rejectReasonInput');
+          if (inp) inp.value = String(reasonText || '');
+          focusRejectBoxInModal();
+        }
+
+        function focusRejectWithReuploadPrompt() {
+          setRejectPreset('Uploaded file missing from storage \u2014 please re-upload PDF certificate.');
+        }
 
         function openGstModalWithReject(sellerId, sellerName) {
-          openGstModal(sellerId, sellerName, true);
+          openGstModal(sellerId, sellerName, true, null);
         }
 
         function showInlineDocPreview(docId) {
-          const d = (window._modalGstDocs && window._modalGstDocs[docId]) || {};
-          const docName = d.original_name || ('Document #' + docId);
-          const isPdf = Boolean(d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf') || (docName.toLowerCase().endsWith('.pdf')));
-          const fileExists = (d.file_exists !== false);
+          var d = (window._modalGstDocs && window._modalGstDocs[docId]) || {};
+          var docName = d.original_name || ('Document #' + docId);
+          var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (docName.toLowerCase().slice(-4) === '.pdf'));
+          var fileExists = (d.file_exists !== false);
 
-          const previewBox = document.getElementById('modalInlinePreviewBox');
-          const frameWrap = document.getElementById('modalPreviewFrameWrap');
-          const labelEl = document.getElementById('modalPreviewLabel');
-          const newTabEl = document.getElementById('modalPreviewNewTab');
-          const dlEl = document.getElementById('modalPreviewDownload');
+          var previewBox = document.getElementById('modalInlinePreviewBox');
+          var frameWrap = document.getElementById('modalPreviewFrameWrap');
+          var labelEl = document.getElementById('modalPreviewLabel');
+          var newTabEl = document.getElementById('modalPreviewNewTab');
+          var dlEl = document.getElementById('modalPreviewDownload');
+          var hintEl = document.getElementById('modalPreviewHint');
           if (!previewBox || !frameWrap) return;
 
-          const previewUrl = '/admin/view_gst_doc?id=' + docId + '&mode=preview';
-          const dlUrl = '/admin/view_gst_doc?id=' + docId + '&mode=download';
-          labelEl.innerText = 'Preview: ' + docName;
-          newTabEl.href = previewUrl;
-          dlEl.href = dlUrl;
+          var previewUrl = d.admin_preview_url || ('/admin/view_gst_doc?id=' + Number(docId) + '&mode=preview');
+          var dlUrl = d.admin_download_url || ('/admin/view_gst_doc?id=' + Number(docId) + '&mode=download');
+          if (labelEl) labelEl.innerText = 'Preview: ' + docName;
+          if (newTabEl) newTabEl.href = previewUrl;
+          if (dlEl) dlEl.href = dlUrl;
           previewBox.style.display = 'block';
 
           if (!fileExists) {
-            frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><strong>⚠ File Not Found on Server Disk</strong><p style="font-size:13px;max-width:420px;margin:8px 0 0;">This document was uploaded before persistent storage was active. Ask the seller to re-upload the PDF.</p></div>';
+            if (hintEl) hintEl.style.display = 'none';
+            frameWrap.innerHTML = '<div style="padding:24px;text-align:center;color:#92400e;background:#fffbeb;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;">' +
+              '<strong>File Not Found on Server Disk</strong>' +
+              '<p style="font-size:13px;max-width:440px;margin:0;line-height:1.5;">This document was uploaded before persistent storage was active or has been removed from disk. Ask the seller to re-upload their PDF certificate.</p>' +
+              '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="focusRejectWithReuploadPrompt()">Reject &amp; Request Re-upload</button>' +
+              '</div>';
             return;
           }
 
+          if (hintEl) hintEl.style.display = 'block';
           if (isPdf) {
-            frameWrap.innerHTML = '<iframe src="' + previewUrl + '#toolbar=1&navpanes=0" style="width:100%;height:100%;border:none;background:#fff;"></iframe>';
+            frameWrap.innerHTML = '<iframe src="' + escapeHtml(previewUrl) + '#toolbar=1&navpanes=0" title="PDF Preview" style="width:100%;height:100%;border:none;background:#fff;"></iframe>';
           } else {
-            frameWrap.innerHTML = '<img src="' + previewUrl + '" alt="Document Preview" style="max-width:100%;max-height:100%;object-fit:contain;">';
+            frameWrap.innerHTML = '<img src="' + escapeHtml(previewUrl) + '" alt="Document Preview" style="max-width:100%;max-height:100%;object-fit:contain;">';
           }
         }
 
-        function openGstModal(sellerId, sellerName, autoShowReject) {
-          document.getElementById('gstModalTitle').innerText = 'Verification Review — ' + (sellerName || 'Seller #' + sellerId);
+        function openGstModal(sellerId, sellerName, autoShowReject, previewDocId) {
+          document.getElementById('gstModalTitle').innerText = 'Verification Review \u2014 ' + (sellerName || 'Seller #' + sellerId);
           document.getElementById('approveSellerId').value = sellerId;
           document.getElementById('rejectSellerId').value = sellerId;
-          document.getElementById('rejectBox').style.display = 'none';
-          document.getElementById('modalInlinePreviewBox').style.display = 'none';
-          document.getElementById('modalPreviewFrameWrap').innerHTML = '';
+          var rejInput = document.getElementById('rejectReasonInput');
+          if (rejInput) rejInput.value = '';
+          document.getElementById('rejectBox').style.display = autoShowReject ? 'block' : 'none';
+          var errBox = document.getElementById('gstFetchErrorBox');
+          if (errBox) {
+            errBox.style.display = 'none';
+            errBox.innerText = '';
+          }
+          closeInlineDocPreview();
+          window._modalGstDocs = {};
 
-          document.getElementById('gstModalLoading').style.display = 'block';
+          var loadingEl = document.getElementById('gstModalLoading');
+          loadingEl.innerText = 'Loading details & documents...';
+          loadingEl.style.display = 'block';
           document.getElementById('gstModalContent').style.display = 'none';
+          syncReturnTabInputs(window._activeAdminTab);
           document.getElementById('gstReviewModal').classList.add('active');
 
-          fetch('/admin/get_gst_details?seller_id=' + sellerId, { credentials: 'same-origin' })
-            .then(res => res.json())
-            .then(data => {
-              document.getElementById('gstModalLoading').style.display = 'none';
+          fetch('/admin/get_gst_details?seller_id=' + Number(sellerId), { credentials: 'same-origin' })
+            .then(function(res) {
+              if (!res.ok) {
+                return res.text().then(function(t) { throw new Error('HTTP ' + res.status + ': ' + String(t || '').slice(0, 120)); });
+              }
+              return res.json();
+            })
+            .then(function(data) {
+              loadingEl.style.display = 'none';
               document.getElementById('gstModalContent').style.display = 'block';
 
-              const g = data.gst || {};
-              const docs = data.documents || [];
-              const logs = data.logs || [];
+              var sl = data.seller || {};
+              var g = data.gst || {};
+              var docs = data.documents || [];
+              var logs = data.logs || [];
 
               window._modalGstDocs = {};
-              docs.forEach(d => { window._modalGstDocs[d.id] = d; });
+              docs.forEach(function(d) { window._modalGstDocs[d.id] = d; });
 
-              document.getElementById('modalSellerName').innerText = sellerName + ' (#' + sellerId + ')';
-              document.getElementById('modalSubmittedAt').innerText = (g.submitted_at || g.created_at || '—').slice(0, 16).replace('T', ' ');
-              document.getElementById('modalVerifiedAt').innerText = (g.verified_at || '—').slice(0, 16).replace('T', ' ');
+              var resolvedName = sellerName || sl.seller_name || sl.name || ('Seller #' + sellerId);
+              document.getElementById('modalSellerName').innerText = resolvedName + ' (#' + sellerId + ')';
+              var metaParts = [];
+              if (sl.phone) metaParts.push('Phone: ' + sl.phone);
+              if (sl.email) metaParts.push('Email: ' + sl.email);
+              var metaEl = document.getElementById('modalSellerMeta');
+              if (metaEl) metaEl.innerText = metaParts.length ? metaParts.join(' \u2022 ') : ('Seller ID #' + sellerId);
 
-              const st = (g.status || 'Pending').toLowerCase();
-              let badgeHtml = '<span class="badge-pending">' + (g.status || 'Pending') + '</span>';
-              if (st === 'approved') badgeHtml = '<span class="badge-approved">' + g.status + '</span>';
-              if (st === 'rejected') badgeHtml = '<span class="badge-rejected">' + g.status + '</span>';
+              document.getElementById('modalSubmittedAt').innerText = String(g.submitted_at || g.created_at || '\u2014').slice(0, 16).replace('T', ' ');
+              document.getElementById('modalVerifiedAt').innerText = String(g.verified_at || '\u2014').slice(0, 16).replace('T', ' ');
+
+              var gstinRow = document.getElementById('modalGstinRow');
+              if (gstinRow) {
+                if (g.gstin || g.business_name || g.business_address || g.state || g.pincode) {
+                  gstinRow.style.display = 'block';
+                  document.getElementById('modalGstin').innerText = g.gstin || '\u2014';
+                  document.getElementById('modalBusinessName').innerText = g.business_name || '\u2014';
+                  var addrEl = document.getElementById('modalBusinessAddress');
+                  if (addrEl) addrEl.innerText = g.business_address || '\u2014';
+                  var spEl = document.getElementById('modalStatePin');
+                  var statePinStr = ((g.state || '') + (g.pincode ? (' - ' + g.pincode) : '')).trim();
+                  if (spEl) spEl.innerText = statePinStr || '\u2014';
+                } else {
+                  gstinRow.style.display = 'none';
+                }
+              }
+
+              var st = String(g.status || 'Pending').toLowerCase();
+              var badgeHtml = '<span class="badge-pending">' + escapeHtml(g.status || 'Pending') + '</span>';
+              if (st === 'approved') badgeHtml = '<span class="badge-approved">' + escapeHtml(g.status) + '</span>';
+              if (st === 'rejected') badgeHtml = '<span class="badge-rejected">' + escapeHtml(g.status) + '</span>';
               document.getElementById('modalGstStatus').innerHTML = badgeHtml;
 
-              const rejBox = document.getElementById('rejectionAlertBox');
+              var rejBox = document.getElementById('rejectionAlertBox');
               if (g.rejection_reason) {
                 rejBox.style.display = 'block';
                 document.getElementById('modalRejectionReason').innerText = g.rejection_reason;
@@ -11000,85 +13894,103 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               }
 
               document.getElementById('modalDocCount').innerText = docs.length;
-              const docsContainer = document.getElementById('modalDocumentsList');
+              var docsContainer = document.getElementById('modalDocumentsList');
               if (docs.length === 0) {
                 docsContainer.innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">No documents uploaded by this seller yet.</div>';
               } else {
-                let docsHtml = '';
-                docs.forEach(d => {
-                  const isPdf = d.is_pdf || (d.mime_type && d.mime_type.toLowerCase() === 'application/pdf') || (d.original_name && d.original_name.toLowerCase().endsWith('.pdf'));
-                  const typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
-                  const primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
-                  const missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Old Build)</span>' : '';
+                var docsHtml = '';
+                docs.forEach(function(d) {
+                  var dName = String(d.original_name || ('Document #' + d.id));
+                  var isPdf = Boolean(d.is_pdf || (d.mime_type && String(d.mime_type).toLowerCase() === 'application/pdf') || (dName.toLowerCase().slice(-4) === '.pdf'));
+                  var typeBadge = isPdf ? '<span class="badge-pdf">PDF</span>' : '<span class="badge-img">IMAGE</span>';
+                  var primaryTag = d.is_primary ? '<span style="background:#e0e7ff; color:#3730a3; font-size:11px; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;">Main Document</span>' : '';
+                  var missingTag = (d.file_exists === false) ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">File Missing (Re-upload Needed)</span>' : '';
+                  var previewHref = d.admin_preview_url || ('/admin/view_gst_doc?id=' + Number(d.id) + '&mode=preview');
+                  var dlHref = d.admin_download_url || ('/admin/view_gst_doc?id=' + Number(d.id) + '&mode=download');
 
-                  docsHtml += \`
-                    <div class="doc-card">
-                      <div>
-                        <div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                          \${typeBadge} \${escapeHtml(d.original_name)} \${primaryTag} \${missingTag}
-                        </div>
-                        <div style="font-size:12px; color:#64748b; margin-top:4px;">
-                          \${d.file_size_formatted || ''} &bull; Uploaded \${d.created_at ? d.created_at.slice(0, 10) : ''}
-                        </div>
-                      </div>
-                      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                        <button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(\${d.id})">👁 View Here</button>
-                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=preview" target="_blank" class="btn-view" style="background:#475569;">↗ New Tab</a>
-                        <a href="/admin/view_gst_doc?id=\${d.id}&mode=download" class="btn-dl">⬇ Download</a>
-                      </div>
-                    </div>
-                  \`;
+                  docsHtml += '<div class="doc-card">' +
+                    '<div>' +
+                    '<div style="font-weight:700; font-size:14px; color:#1e293b; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">' +
+                    typeBadge + ' ' + escapeHtml(dName) + ' ' + primaryTag + ' ' + missingTag +
+                    '</div>' +
+                    '<div style="font-size:12px; color:#64748b; margin-top:4px;">' +
+                    escapeHtml(d.file_size_formatted || '') + ' &bull; Uploaded ' + escapeHtml(d.created_at ? String(d.created_at).slice(0, 10) : '') +
+                    '</div>' +
+                    '</div>' +
+                    '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
+                    '<button type="button" class="btn-view" style="border:none;cursor:pointer;" onclick="showInlineDocPreview(' + Number(d.id) + ')">View Here</button>' +
+                    '<a href="' + escapeHtml(previewHref) + '" target="_blank" class="btn-view" style="background:#475569;">New Tab</a>' +
+                    '<a href="' + escapeHtml(dlHref) + '" class="btn-dl">Download</a>' +
+                    '</div>' +
+                    '</div>';
                 });
                 docsContainer.innerHTML = docsHtml;
 
-                const firstDoc = docs[0];
-                if (firstDoc) {
-                  showInlineDocPreview(firstDoc.id);
+                var firstDocId = previewDocId || (docs[0] && docs[0].id);
+                if (firstDocId && (!autoShowReject || previewDocId)) {
+                  showInlineDocPreview(firstDocId);
                 }
               }
 
-              const logsContainer = document.getElementById('modalLogsList');
+              var logsContainer = document.getElementById('modalLogsList');
               if (logs.length === 0) {
                 logsContainer.innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">No history logs recorded yet.</div>';
               } else {
-                let logsHtml = '';
-                logs.forEach(l => {
-                  logsHtml += \`
-                    <div class="log-row">
-                      <div style="color:#64748b; font-size:12px; min-width:130px;">\${escapeHtml((l.created_at || '').slice(0, 16).replace('T', ' '))}</div>
-                      <div style="flex:1;">
-                        <strong>\${escapeHtml(l.action.toUpperCase())}</strong>
-                        <span style="color:#64748b;">(\${escapeHtml(l.performer_role || 'seller')}):</span>
-                        \${escapeHtml(l.notes || '')}
-                      </div>
-                      <div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">\${escapeHtml(l.new_status)}</span></div>
-                    </div>
-                  \`;
+                var logsHtml = '';
+                logs.forEach(function(l) {
+                  logsHtml += '<div class="log-row">' +
+                    '<div style="color:#64748b; font-size:12px; min-width:130px;">' + escapeHtml(String(l.created_at || '').slice(0, 16).replace('T', ' ')) + '</div>' +
+                    '<div style="flex:1;">' +
+                    '<strong>' + escapeHtml(String(l.action || '').toUpperCase()) + '</strong> ' +
+                    '<span style="color:#64748b;">(' + escapeHtml(l.performer_role || 'seller') + '):</span> ' +
+                    escapeHtml(l.notes || '') +
+                    '</div>' +
+                    '<div><span class="badge-prod" style="background:#f1f5f9; color:#475569;">' + escapeHtml(l.new_status) + '</span></div>' +
+                    '</div>';
                 });
                 logsContainer.innerHTML = logsHtml;
               }
 
               if (autoShowReject) {
-                const b = document.getElementById('rejectBox');
-                if (b) {
-                  b.style.display = 'block';
-                  b.scrollIntoView({ behavior: 'smooth' });
-                }
+                focusRejectBoxInModal();
               }
             })
-            .catch(err => {
-              document.getElementById('gstModalLoading').innerText = 'Failed to load details: ' + err.message;
+            .catch(function(err) {
+              loadingEl.style.display = 'none';
+              var contentEl = document.getElementById('gstModalContent');
+              if (contentEl) contentEl.style.display = 'block';
+              var eBox = document.getElementById('gstFetchErrorBox');
+              if (eBox) {
+                eBox.style.display = 'block';
+                eBox.innerText = 'Could not load server details (' + ((err && err.message) ? err.message : 'Request failed') + '). You can still Approve or Reject this seller below.';
+              }
+              var msName = document.getElementById('modalSellerName');
+              if (msName) msName.innerText = (sellerName || ('Seller #' + sellerId)) + ' (#' + sellerId + ')';
+              var msMeta = document.getElementById('modalSellerMeta');
+              if (msMeta) msMeta.innerText = 'Seller ID #' + sellerId;
+              document.getElementById('modalGstStatus').innerHTML = '<span class="badge-pending">Offline / Partial</span>';
+              document.getElementById('modalDocCount').innerText = '0';
+              document.getElementById('modalDocumentsList').innerHTML = '<div style="color:#94a3b8; font-size:13px; padding:12px; background:#f8fafc; border-radius:8px;">Document metadata unavailable while fetch failed.</div>';
+              document.getElementById('modalLogsList').innerHTML = '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">Logs unavailable while fetch failed.</div>';
+              if (autoShowReject) {
+                focusRejectBoxInModal();
+              }
             });
         }
 
         function closeGstModal() {
+          closeInlineDocPreview();
           document.getElementById('gstReviewModal').classList.remove('active');
-          document.getElementById('modalPreviewFrameWrap').innerHTML = '';
         }
 
         function toggleRejectBox() {
-          const b = document.getElementById('rejectBox');
+          var b = document.getElementById('rejectBox');
+          if (!b) return;
           b.style.display = (b.style.display === 'none' || !b.style.display) ? 'block' : 'none';
+          if (b.style.display === 'block') {
+            var rInp = document.getElementById('rejectReasonInput');
+            if (rInp && typeof rInp.focus === 'function') rInp.focus();
+          }
         }
 
         function handleGstOverlayClick(e) {
@@ -11087,21 +13999,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           }
         }
 
-        function escapeHtml(str) {
-          if (!str) return '';
-          return String(str).replace(/[&<>'"]/g, tag => ({
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            "'": '&#39;',
-            '"': '&quot;'
-          }[tag] || tag));
-        }
-
         // === Seller Deletion & Refund Management UI Controller ===
-        window._activeDelStatusFilter = 'all';
-        window._currentWsData = null;
-
         function delStatusBadgeHtml(statusOrColor, textOverride) {
           var s = String(statusOrColor || '').toUpperCase();
           var cls = 'del-yellow';
@@ -11113,31 +14011,55 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
         }
 
         function fmtCur(v) {
-          return '₹' + Number(v || 0).toFixed(2);
+          return '\u20B9' + Number(v || 0).toFixed(2);
+        }
+
+        function syncSellerAccountRow(sellerId, accountStatus, activeReqId) {
+          var row = document.getElementById('seller-row-' + Number(sellerId));
+          if (!row) return;
+          var accUpper = String(accountStatus || 'ACTIVE').toUpperCase();
+          if (typeof row.setAttribute === 'function') row.setAttribute('data-status', accUpper);
+          var accCell = row.querySelector('.seller-acc-cell');
+          if (accCell) {
+            var cls = accUpper === 'ACTIVE' ? 'del-green' : (accUpper === 'DELETION_PENDING' ? 'del-yellow' : (accUpper === 'LOCKED' ? 'del-orange' : 'del-red'));
+            accCell.innerHTML = '<span class="del-badge ' + cls + '">' + escapeHtml(accUpper) + '</span>';
+          }
+          var slot = row.querySelector('.seller-del-btn-slot');
+          if (slot) {
+            if (activeReqId && accUpper !== 'DELETED') {
+              slot.innerHTML = '<button type="button" class="btn-hold-sm" onclick="openDeletionWorkspaceModal(' + Number(activeReqId) + ')">Manage Deletion #' + Number(activeReqId) + '</button>';
+            } else if (accUpper !== 'DELETED') {
+              slot.innerHTML = '<button type="button" class="btn-del-req" onclick="openDeletionPreflightModal(' + Number(sellerId) + ')">Request Seller Deletion</button>';
+            } else {
+              slot.innerHTML = '';
+            }
+          }
         }
 
         function filterDeletionStatus(status, btn) {
           window._activeDelStatusFilter = status || 'all';
           document.querySelectorAll('#delFilterTabs .tab-btn').forEach(function(b) { b.classList.remove('active'); });
-          if (btn) btn.classList.add('active');
-          applyDeletionTableFilters();
+          if (btn && btn.classList) btn.classList.add('active');
+          applyDeletionTableFilters(false);
         }
 
         function filterDeletionTableSearch(q) {
           window._activeDelSearch = (q || '').toLowerCase().trim();
-          applyDeletionTableFilters();
+          applyDeletionTableFilters(false);
         }
 
-        function applyDeletionTableFilters() {
+        function applyDeletionTableFilters(preservePage) {
           var st = window._activeDelStatusFilter || 'all';
           var q = window._activeDelSearch || '';
-          document.querySelectorAll('.del-req-row').forEach(function(r) {
+          getTableRows('del').forEach(function(r) {
             var rSt = r.getAttribute('data-status') || '';
             var rTxt = r.getAttribute('data-search') || '';
             var matchSt = (st === 'all' || rSt === st);
             var matchQ = (!q || rTxt.indexOf(q) !== -1);
-            r.style.display = (matchSt && matchQ) ? '' : 'none';
+            var okMatch = (matchSt && matchQ);
+            if (typeof r.setAttribute === 'function') r.setAttribute('data-filter-match', okMatch ? '1' : '0');
           });
+          refreshTablePagination('del', !preservePage);
         }
 
         function reloadDeletionRequestsList() {
@@ -11148,6 +14070,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               var k = data.kpis || {};
               var el;
               if ((el = document.getElementById('delKpiTotal'))) el.innerText = Number(k.total || 0);
+              if ((el = document.getElementById('navDelCount'))) el.innerText = Number(k.total || 0);
               if ((el = document.getElementById('delKpiPending'))) el.innerText = Number(k.pending || 0);
               if ((el = document.getElementById('delKpiProcessing'))) el.innerText = Number(k.processing || 0);
               if ((el = document.getElementById('delKpiFailed'))) el.innerText = Number(k.failed || 0);
@@ -11158,6 +14081,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               if (!tbody) return;
               if (data.requests.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="7" style="color:#94a3b8; text-align:center; padding:28px;">No seller deletion requests submitted yet.</td></tr>';
+                refreshTablePagination('del', true);
                 return;
               }
               var html = '';
@@ -11179,7 +14103,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
                   '</tr>';
               });
               tbody.innerHTML = html;
-              applyDeletionTableFilters();
+              applyDeletionTableFilters(true);
             })
             .catch(function() {});
         }
@@ -11189,7 +14113,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
         }
 
         function openDeletionPreflightModal(sellerId) {
-          document.getElementById('delPreflightTitle').innerText = 'Request Seller Deletion — Seller #' + sellerId;
+          document.getElementById('delPreflightTitle').innerText = 'Request Seller Deletion \u2014 Seller #' + sellerId;
           document.getElementById('delPreflightLoading').style.display = 'block';
           document.getElementById('delPreflightBody').style.display = 'none';
           document.getElementById('deletionPreflightModal').classList.add('active');
@@ -11223,7 +14147,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               ];
               var html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">' +
                 '<div><strong style="font-size:16px;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + s.id)) + '</strong>' +
-                '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '—') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
+                '<div style="font-size:12px;color:#64748b;margin-top:2px;">Seller ID #' + Number(s.id) + ' &bull; ' + escapeHtml(s.phone || '\u2014') + (s.email ? ' &bull; ' + escapeHtml(s.email) : '') + '</div></div>' +
                 '<div>' + delStatusBadgeHtml(s.account_status === 'ACTIVE' ? 'GREEN' : 'YELLOW', s.account_status || 'ACTIVE') + '</div></div>' +
                 '<div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(175px, 1fr));gap:10px;margin-bottom:16px;">';
               cards.forEach(function(c) {
@@ -11271,6 +14195,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             closeDeletionPreflightModal();
             reloadDeletionRequestsList();
             if (resObj.d && resObj.d.deletion_request) {
+              syncSellerAccountRow(sellerId, (resObj.d.seller && resObj.d.seller.account_status) || 'DELETION_PENDING', resObj.d.deletion_request.id);
               openDeletionWorkspaceModal(resObj.d.deletion_request.id);
             }
           })
@@ -11330,6 +14255,10 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               return;
             }
             if (resObj.d && resObj.d.deletion_request) {
+              var dr = resObj.d.deletion_request;
+              var sl = resObj.d.seller || {};
+              var nextActiveReq = (dr.status === 'DELETED' || dr.status === 'DELETION_REJECTED') ? null : dr.id;
+              syncSellerAccountRow(dr.seller_id, sl.account_status || 'DELETION_PENDING', nextActiveReq);
               renderDeletionWorkspace(resObj.d, (resObj.d.message || 'Action completed.'));
             }
             reloadDeletionRequestsList();
@@ -11337,6 +14266,38 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           .catch(function(err) {
             if (msgBox) msgBox.innerHTML = '<div style="background:#fee2e2;color:#b91c1c;padding:10px;border-radius:8px;margin-bottom:12px;">' + escapeHtml(err.message) + '</div>';
           });
+        }
+
+        function wsLockAccount(reqId) {
+          runDelAction(reqId, 'lock', {});
+        }
+
+        function wsVerifyOrders(reqId) {
+          var chk = document.getElementById('wsApproveRuleB');
+          runDelAction(reqId, 'verify-orders', {
+            approve_accepted_cancellations: Boolean(chk && chk.checked)
+          });
+        }
+
+        function wsProcessRefunds(reqId) {
+          runDelAction(reqId, 'process-refunds', {});
+        }
+
+        function wsVerifySettlement(reqId) {
+          runDelAction(reqId, 'verify-settlement', {});
+        }
+
+        function wsResolveDispute(reqId, dpId) {
+          runDelAction(reqId, 'resolve-dispute', {
+            dispute_id: Number(dpId),
+            resolution: 'RESOLVED',
+            mark_delivered: true,
+            close_return_window: true
+          });
+        }
+
+        function wsApproveDeletion(reqId) {
+          runDelAction(reqId, 'approve', {});
         }
 
         function handleSettlePayoutClick(reqId) {
@@ -11348,16 +14309,38 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           });
         }
 
-        function handleHoldClick(reqId) {
-          var reason = prompt('Enter reason for putting this seller deletion request ON HOLD:', 'Awaiting manual verification / return period');
-          if (reason === null) return;
-          runDelAction(reqId, 'hold', { reason: reason });
+        function toggleWsHoldBox() {
+          var h = document.getElementById('wsHoldBox');
+          var r = document.getElementById('wsRejectBox');
+          if (r) r.style.display = 'none';
+          if (h) h.style.display = (h.style.display === 'none' || !h.style.display) ? 'block' : 'none';
         }
 
-        function handleRejectClick(reqId) {
-          var reason = prompt('Enter MANDATORY reason to REJECT seller deletion and restore seller to ACTIVE:', '');
-          if (!reason || !reason.trim()) return;
-          runDelAction(reqId, 'reject', { reason: reason.trim() });
+        function submitWsHold(reqId) {
+          var inp = document.getElementById('wsHoldReasonInput');
+          var reason = inp ? inp.value.trim() : '';
+          runDelAction(reqId, 'hold', { reason: reason || 'Awaiting manual verification / return period' });
+        }
+
+        function toggleWsRejectBox() {
+          var h = document.getElementById('wsHoldBox');
+          var r = document.getElementById('wsRejectBox');
+          var err = document.getElementById('wsRejectErr');
+          if (h) h.style.display = 'none';
+          if (err) err.innerText = '';
+          if (r) r.style.display = (r.style.display === 'none' || !r.style.display) ? 'block' : 'none';
+        }
+
+        function submitWsReject(reqId) {
+          var inp = document.getElementById('wsRejectReasonInput');
+          var err = document.getElementById('wsRejectErr');
+          var reason = inp ? inp.value.trim() : '';
+          if (!reason) {
+            if (err) err.innerText = 'Rejection reason is required to reject deletion and restore seller to ACTIVE.';
+            return;
+          }
+          if (err) err.innerText = '';
+          runDelAction(reqId, 'reject', { reason: reason });
         }
 
         function toggleFinalDeleteConfirm() {
@@ -11383,7 +14366,6 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           var set = data.settlement || {};
           var orders = data.orders || [];
           var refunds = data.refunds || [];
-          var payouts = data.payouts || [];
           var disputes = data.disputes || [];
           var checks = data.checks || [];
           var logs = data.audit_logs || [];
@@ -11393,20 +14375,18 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             (successBanner ? '<div style="background:#dcfce7;color:#15803d;padding:10px 14px;border-radius:8px;margin-bottom:12px;font-weight:600;">' + escapeHtml(successBanner) + '</div>' : '') +
             '</div>';
 
-          // Header Card: Seller Info, ID, Request Date, Stage & Status
           html += '<div class="ws-section" style="background:#f8fafc;">' +
             '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">' +
             '<div>' +
             '<div style="font-size:17px;font-weight:800;color:#1e1b4b;">' + escapeHtml(s.seller_name || s.name || ('Seller #' + dr.seller_id)) + ' <span style="font-size:13px;color:#64748b;">(Seller ID #' + Number(dr.seller_id) + ')</span></div>' +
-            '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '—') + ' &bull; Email: ' + escapeHtml(s.email || '—') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
-            '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '—') + '</div>' +
+            '<div style="font-size:13px;color:#475569;margin-top:4px;">Phone: ' + escapeHtml(s.phone || '\u2014') + ' &bull; Email: ' + escapeHtml(s.email || '\u2014') + ' &bull; Account: <strong>' + escapeHtml(s.account_status || 'ACTIVE') + '</strong></div>' +
+            '<div style="font-size:12px;color:#64748b;margin-top:4px;">Request Date: <strong>' + escapeHtml((dr.created_at || '').slice(0, 19).replace('T', ' ')) + '</strong> &bull; Reason: ' + escapeHtml(dr.request_reason || '\u2014') + '</div>' +
             '</div>' +
             '<div style="text-align:right;">' +
             '<div style="margin-bottom:6px;">Stage: <code style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-weight:700;">' + escapeHtml(dr.stage) + '</code></div>' +
             '<div>' + delStatusBadgeHtml(dr.badge_color || dr.status, dr.status) + '</div>' +
             '</div></div></div>';
 
-          // Verification Checklist Section
           html += '<div class="ws-section"><h4><span>6-Gate Verification Checklist</span><span>' +
             (data.all_checks_passed ? delStatusBadgeHtml('GREEN', 'ALL CHECKS PASSED') : delStatusBadgeHtml('YELLOW', 'VERIFICATION INCOMPLETE')) +
             '</span></h4><table><thead><tr><th>Check Requirement</th><th>Status</th></tr></thead><tbody>';
@@ -11415,12 +14395,11 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           });
           html += '</tbody></table></div>';
 
-          // Order Summary (Rules A-E)
           html += '<div class="ws-section"><h4><span>Order Summary (' + Number(m.total_orders || 0) + ' orders)</span>' +
             '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' +
             '<label style="margin:0;display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;cursor:pointer;"><input type="checkbox" id="wsApproveRuleB" style="width:auto;"> Approve Accepted Order Cancellations (Rule B)</label>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'lock\', {})">Lock Account</button>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-orders\', { approve_accepted_cancellations: Boolean(document.getElementById(\'wsApproveRuleB\') && document.getElementById(\'wsApproveRuleB\').checked) })">Verify Orders</button>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsLockAccount(' + Number(dr.id) + ')">Lock Account</button>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifyOrders(' + Number(dr.id) + ')">Verify Orders</button>' +
             '</div></h4>' +
             '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px;">' +
             '<div class="metric-mini"><div class="k">Pending (A)</div><div class="v">' + Number(m.pending_orders || 0) + '</div></div>' +
@@ -11442,9 +14421,8 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           }
           html += '</div>';
 
-          // Payment & Refund Summary
           html += '<div class="ws-section"><h4><span>Payment &amp; Automatic Refund Summary</span>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'process-refunds\', {})">Process Eligible Refunds (Razorpay)</button></h4>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsProcessRefunds(' + Number(dr.id) + ')">Process Eligible Refunds (Razorpay)</button></h4>' +
             '<div style="font-size:13px;color:#475569;margin-bottom:8px;">Successful Payments: <strong>' + fmtCur(m.total_successful_payments || 0) + '</strong> &bull; Pending Refunds: <strong>' + Number(m.pending_refunds_count || 0) + ' (' + fmtCur(m.pending_refunds_amount || 0) + ')</strong></div>';
           if (refunds.length === 0) {
             html += '<div style="font-size:12px;color:#94a3b8;">No refund records queued for this seller.</div>';
@@ -11452,7 +14430,7 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             html += '<table><thead><tr><th>Refund ID</th><th>Order ID</th><th>Eligible / Refunded</th><th>Gateway Refund ID</th><th>Status</th><th>Gateway Note</th></tr></thead><tbody>';
             refunds.forEach(function(rf) {
               html += '<tr><td>#' + Number(rf.id) + '</td><td>#' + Number(rf.order_id) + '</td><td>' + fmtCur(rf.eligible_refund_amount) + ' / ' + fmtCur(rf.refunded_amount) + '</td>' +
-                '<td><code>' + escapeHtml(rf.gateway_refund_id || '—') + '</code></td>' +
+                '<td><code>' + escapeHtml(rf.gateway_refund_id || '\u2014') + '</code></td>' +
                 '<td>' + delStatusBadgeHtml(rf.badge_color || rf.status, rf.status) + '</td>' +
                 '<td style="font-size:11px;color:#b91c1c;">' + escapeHtml(rf.failure_reason || 'Confirmed') + '</td></tr>';
             });
@@ -11460,9 +14438,8 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           }
           html += '</div>';
 
-          // Financial Settlement & Disputes Summary
           html += '<div class="ws-section"><h4><span>Financial Settlement &amp; Disputes Summary</span>' +
-            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'verify-settlement\', {})">Verify Settlement</button></h4>' +
+            '<button type="button" class="btn-sm" ' + (isTerminal ? 'disabled' : '') + ' onclick="wsVerifySettlement(' + Number(dr.id) + ')">Verify Settlement</button></h4>' +
             '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px;">' +
             '<div class="metric-mini"><div class="k">Wallet Balance</div><div class="v">' + fmtCur(set.available_seller_balance) + '</div></div>' +
             '<div class="metric-mini"><div class="k">Pending Payouts</div><div class="v">' + Number(set.pending_payouts_count || 0) + ' (' + fmtCur(set.pending_payouts_amount) + ')</div></div>' +
@@ -11483,23 +14460,37 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
               html += '<tr><td>#' + Number(dp.id) + '</td><td>#' + Number(dp.order_id) + '</td><td>' + escapeHtml(dp.dispute_type) + '</td><td>' + fmtCur(dp.claim_amount) + '</td>' +
                 '<td>' + delStatusBadgeHtml(isOpen ? 'ORANGE' : 'GREEN', dp.status) + '</td>' +
                 '<td>' + (isOpen && !isTerminal
-                  ? '<button type="button" class="btn-sm" onclick="runDelAction(' + Number(dr.id) + ', \'resolve-dispute\', { dispute_id: ' + Number(dp.id) + ', resolution: \'RESOLVED\', mark_delivered: true, close_return_window: true })">Mark Delivered &amp; Resolve</button>'
+                  ? '<button type="button" class="btn-sm" onclick="wsResolveDispute(' + Number(dr.id) + ', ' + Number(dp.id) + ')">Mark Delivered &amp; Resolve</button>'
                   : 'Resolved') + '</td></tr>';
             });
             html += '</tbody></table>';
           }
           html += '</div>';
 
-          // Admin Remarks & Final Action Controls
           html += '<div class="ws-section"><h4>Admin Decision &amp; Final Confirmation</h4>' +
             '<label style="margin-top:0;">Admin Remarks</label>' +
             '<textarea id="wsAdminRemarks" rows="2" placeholder="Enter audit remarks...">' + escapeHtml(dr.admin_remarks || '') + '</textarea>' +
             '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;">' +
-            '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="runDelAction(' + Number(dr.id) + ', \'approve\', {})">✓ Approve Deletion</button>' +
-            '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleHoldClick(' + Number(dr.id) + ')">⏸ Put On Hold</button>' +
-            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="handleRejectClick(' + Number(dr.id) + ')">✕ Reject Request</button>' +
-            '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">🗑 Final Delete Seller</button>' +
+            '<button type="button" class="btn-approve-sm" style="padding:10px 16px;font-size:13px;" ' + (!dr.approve_allowed ? 'disabled' : '') + ' onclick="wsApproveDeletion(' + Number(dr.id) + ')">\u2713 Approve Deletion</button>' +
+            '<button type="button" class="btn-hold-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsHoldBox()">\u23F8 Put On Hold</button>' +
+            '<button type="button" class="btn-reject-sm" style="padding:10px 16px;font-size:13px;" ' + (isTerminal ? 'disabled' : '') + ' onclick="toggleWsRejectBox()">\u2715 Reject Request</button>' +
+            '<button type="button" id="wsFinalDeleteBtn" style="background:#7f1d1d;padding:10px 18px;font-size:13px;" ' + (!dr.final_delete_allowed ? 'disabled' : '') + ' onclick="toggleFinalDeleteConfirm()">\uD83D\uDDD1 Final Delete Seller</button>' +
             '</div>' +
+            '<div id="wsHoldBox" style="display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:14px;margin-top:12px;">' +
+            '<strong style="color:#9a3412;font-size:13px;">Put Deletion Request On Hold</strong>' +
+            '<input type="text" id="wsHoldReasonInput" value="Awaiting manual verification / return period" style="margin-top:6px;">' +
+            '<div style="display:flex;gap:8px;margin-top:10px;">' +
+            '<button type="button" class="btn-hold-sm" style="padding:8px 14px;" onclick="submitWsHold(' + Number(dr.id) + ')">Confirm Put On Hold</button>' +
+            '<button type="button" onclick="toggleWsHoldBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+            '</div></div>' +
+            '<div id="wsRejectBox" style="display:none;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px;margin-top:12px;">' +
+            '<strong style="color:#991b1b;font-size:13px;">Mandatory Reason to Reject Deletion &amp; Restore Seller ACTIVE *</strong>' +
+            '<textarea id="wsRejectReasonInput" rows="2" placeholder="Explain why this deletion request is rejected..." style="margin-top:6px;border-color:#fca5a5;"></textarea>' +
+            '<div id="wsRejectErr" style="color:#b91c1c;font-size:12px;margin-top:4px;"></div>' +
+            '<div style="display:flex;gap:8px;margin-top:10px;">' +
+            '<button type="button" class="btn-reject-sm" style="padding:8px 14px;" onclick="submitWsReject(' + Number(dr.id) + ')">Confirm Rejection &amp; Restore ACTIVE</button>' +
+            '<button type="button" onclick="toggleWsRejectBox()" style="background:#e2e8f0;color:#334155;padding:8px 14px;font-size:12px;">Cancel</button>' +
+            '</div></div>' +
             (!dr.final_delete_allowed && dr.status !== 'DELETED' ? '<div style="font-size:12px;color:#64748b;margin-top:8px;">Final Delete remains disabled until all 6 checks are GREEN (SUCCESS) and Admin Approval issues the confirmation token.</div>' : '') +
             '<div id="wsFinalConfirmBox" style="display:none;background:#fef2f2;border:2px solid #dc2626;border-radius:10px;padding:14px;margin-top:12px;">' +
             '<strong style="color:#991b1b;font-size:14px;">Second Explicit Confirmation Required</strong>' +
@@ -11509,7 +14500,6 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
             '<button type="button" class="btn-reject-sm" style="padding:10px 16px;" onclick="submitFinalDelete(' + Number(dr.id) + ')">Confirm Permanent Soft-Delete</button>' +
             '</div></div></div>';
 
-          // Admin Activity History
           html += '<div class="ws-section"><h4>Admin Activity History (' + logs.length + ')</h4>';
           if (logs.length === 0) {
             html += '<div style="font-size:12px;color:#94a3b8;">No admin activity recorded yet.</div>';
@@ -11523,13 +14513,6 @@ app.get(['/admin', '/admin/seller-deletions'], requireAdminDashboardAuth, async 
           html += '</div>';
 
           document.getElementById('delWsBody').innerHTML = html;
-        }
-
-        if (window.location.pathname.indexOf('seller-deletions') !== -1 || window.location.search.indexOf('seller-deletions') !== -1) {
-          window.addEventListener('DOMContentLoaded', function() {
-            var sec = document.getElementById('deletionRequestsSection');
-            if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth' });
-          });
         }
       </script>
     </body>

@@ -29,6 +29,9 @@ function getSharpModule() {
       process.env.VIPS_CONCURRENCY = '1';
     }
     const s = require('sharp');
+    if (typeof s.block === 'function') {
+      s.block({ operation: ['VipsForeignLoadSvg'] });
+    }
     if (typeof s.concurrency === 'function') s.concurrency(1);
     if (typeof s.cache === 'function') s.cache(false);
     sharpModule = s;
@@ -607,14 +610,7 @@ async function convertImageBufferToWebp(inputBuffer, meta = {}, options = {}) {
     if (!isSafeSvgBuffer(inputBuffer)) {
       throw new ValidationImageError('SVG contains prohibited active content.');
     }
-    if (sharp) {
-      try {
-        const out = await sharp(inputBuffer, { failOn: 'none', density: 150, limitInputPixels: MAX_IMAGE_PIXELS })
-          .webp({ quality: 85, effort: 4 })
-          .toBuffer();
-        if (isWebpBuffer(out)) return out;
-      } catch (_) {}
-    }
+    // Render SVGs via sandboxed @resvg/resvg-wasm only (never native librsvg)
     const { Resvg } = await getResvgModule();
     const resvg = new Resvg(inputBuffer);
     const rendered = resvg.render();
@@ -623,7 +619,7 @@ async function convertImageBufferToWebp(inputBuffer, meta = {}, options = {}) {
       data: new Uint8ClampedArray(rendered.pixels),
       width: rendered.width,
       height: rendered.height
-    });
+    }, sharp);
   }
 
   // 2. BMP bitmap image
