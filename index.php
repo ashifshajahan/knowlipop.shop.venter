@@ -30,26 +30,6 @@ if (str_starts_with($requestUri, '/index.php')) {
 // 1. Web & Admin Routes
 // ==========================================
 
-if ($requestUri === '/test-firebase' || $requestUri === '/firebase-otp') {
-    header('Content-Type: text/html; charset=utf-8');
-    if (file_exists(__DIR__ . '/test-firebase.html')) {
-        readfile(__DIR__ . '/test-firebase.html');
-    } else {
-        echo 'Firebase tester file not found.';
-    }
-    exit;
-}
-
-if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
-    header('Content-Type: text/html; charset=utf-8');
-    if (file_exists(__DIR__ . '/test-buyer.html')) {
-        readfile(__DIR__ . '/test-buyer.html');
-    } else {
-        echo 'Buyer test module file not found.';
-    }
-    exit;
-}
-
 // Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /storage/app/public/, /public/storage/, /images/, /products/, double-URLs)
 $imgMatch = [];
 $hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $requestUri, $imgMatch);
@@ -142,11 +122,9 @@ if ($requestUri === '/' || $requestUri === '') {
             <p>High-performance, zero-dependency REST API for Vendor marketplace.</p>
             <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
                 <a href="/admin/login" class="btn">Admin Dashboard</a>
-                <a href="/test-buyer" class="btn" style="background: #0284c7;">Buyer Test Module</a>
             </div>
             <div class="endpoints">
                 <strong>Available Endpoints:</strong><br>
-                • GET /test-buyer (Interactive Buyer Hub & Order Editor)<br>
                 • GET /invoice/{id} (Downloadable Provider Tax Invoice)<br>
                 • GET /api/orders<br>
                 • POST /api/orders<br>

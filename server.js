@@ -1780,24 +1780,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.get(['/test-buyer', '/buyer'], (req, res) => {
-  const buyerPath = path.join(__dirname, 'test-buyer.html');
-  if (fs.existsSync(buyerPath)) {
-    res.sendFile(buyerPath);
-  } else {
-    res.status(404).send('Buyer test module file not found.');
-  }
-});
-
-app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
-  const fbPath = path.join(__dirname, 'test-firebase.html');
-  if (fs.existsSync(fbPath)) {
-    res.sendFile(fbPath);
-  } else {
-    res.status(404).send('Firebase tester file not found.');
-  }
-});
-
 app.get('/api/health', async (req, res) => {
   let dbStatus = 'disconnected';
   let dbError = null;
@@ -10087,7 +10069,6 @@ function generateInvoiceHtml(order, items, provider, serverUrl) {
       <span style="font-size: 12px; color: #64748b; margin-left: 8px;">Order #${esc(order.order_number)}</span>
     </div>
     <div style="display: flex; gap: 10px;">
-      <a href="/test-buyer" class="btn btn-back">← Back to Hub</a>
       <button type="button" class="btn btn-download" onclick="downloadInvoiceHtml()">💾 Save HTML</button>
       <button type="button" class="btn btn-print" onclick="window.print()">🖨️ Download as PDF / Print</button>
     </div>
@@ -15317,24 +15298,6 @@ app.get('/admin/logout', (req, res) => {
     'admin_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT'
   ]);
   res.redirect('/admin/login');
-});
-
-app.get(['/test-firebase', '/firebase-otp'], (req, res) => {
-  const filePath = path.resolve(__dirname, 'test-firebase.html');
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
-  } else {
-    res.status(404).send('Firebase tester page not found.');
-  }
-});
-
-app.get(['/test-buyer', '/buyer', '/buyer-module'], (req, res) => {
-  const filePath = path.resolve(__dirname, 'test-buyer.html');
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
-  } else {
-    res.status(404).send('Buyer test module page not found.');
-  }
 });
 
 // ============================================================================
