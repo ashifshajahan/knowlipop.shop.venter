@@ -4684,8 +4684,6 @@ function formatProductRecord(p, options = {}) {
     in_stock: stock > 0,
     rating,
     ratings_count: ratingsCount,
-    image_url: primaryImageUrl,
-    image: primaryImageUrl,
     images: finalImagesArray,
     is_active: Boolean(p.is_active),
     created_at: p.created_at || null,
@@ -13130,7 +13128,7 @@ app.get(['/admin', '/admin/dashboard', '/admin/products', '/admin/sellers', '/ad
                       is_active: isProdActive,
                       seller_account_status: sAccProd
                     };
-                    const thumbRaw = formattedAp.image_url || '';
+                    const thumbRaw = (Array.isArray(formattedAp.images) && formattedAp.images[0]) ? formattedAp.images[0] : '';
                     const thumbSrc = (thumbRaw && thumbRaw.includes('/uploads/products/'))
                       ? '/uploads/products/' + path.basename(thumbRaw.split('?')[0])
                       : thumbRaw;

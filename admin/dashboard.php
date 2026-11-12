@@ -1988,7 +1988,7 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                         $sAccProd = strtoupper((string) ($ap['seller_account_status'] ?? 'ACTIVE'));
                                         $formattedAp['seller_account_status'] = $sAccProd;
                                         $isProdActive = !empty($formattedAp['is_active']);
-                                        $thumbRaw = $formattedAp['image_url'] ?? '';
+                                        $thumbRaw = $formattedAp['images'][0] ?? '';
                                         $thumbSrc = ($thumbRaw !== '' && str_contains($thumbRaw, '/uploads/products/'))
                                             ? '/uploads/products/' . basename(explode('?', $thumbRaw)[0])
                                             : $thumbRaw;
