@@ -168,6 +168,8 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `delivery_fee` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   `discount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `carrier` VARCHAR(100) NULL DEFAULT NULL,
+  `tracking_number` VARCHAR(100) NULL DEFAULT NULL,
   `notes` TEXT NULL DEFAULT NULL,
   `rejection_reason` TEXT NULL DEFAULT NULL,
   `cancellation_reason` TEXT NULL DEFAULT NULL,
@@ -210,10 +212,32 @@ CREATE TABLE IF NOT EXISTS `order_items` (
   CONSTRAINT `fk_order_items_order` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `order_activities` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `order_id` BIGINT UNSIGNED NOT NULL,
+  `actor_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `actor_role` VARCHAR(40) NOT NULL DEFAULT 'system',
+  `actor_name` VARCHAR(150) NULL DEFAULT NULL,
+  `action` VARCHAR(60) NOT NULL,
+  `from_status` VARCHAR(40) NULL DEFAULT NULL,
+  `to_status` VARCHAR(40) NULL DEFAULT NULL,
+  `notes` TEXT NULL DEFAULT NULL,
+  `tracking_number` VARCHAR(100) NULL DEFAULT NULL,
+  `carrier` VARCHAR(100) NULL DEFAULT NULL,
+  `metadata` LONGTEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_oa_order` (`order_id`),
+  INDEX `idx_oa_action` (`action`),
+  INDEX `idx_oa_created` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `notifications` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
   `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
+  `recipient_role` VARCHAR(40) NULL DEFAULT NULL,
+  `order_id` BIGINT UNSIGNED NULL DEFAULT NULL,
   `title` VARCHAR(255) NOT NULL,
   `message` TEXT NOT NULL,
   `type` VARCHAR(50) NOT NULL DEFAULT 'order',
@@ -224,7 +248,9 @@ CREATE TABLE IF NOT EXISTS `notifications` (
   PRIMARY KEY (`id`),
   INDEX `idx_notifications_user` (`user_id`),
   INDEX `idx_notifications_phone` (`buyer_phone`),
-  INDEX `idx_notifications_read` (`is_read`)
+  INDEX `idx_notifications_read` (`is_read`),
+  INDEX `idx_notifications_order` (`order_id`),
+  INDEX `idx_notifications_role` (`recipient_role`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `device_tokens` (
@@ -343,6 +369,15 @@ CREATE TABLE IF NOT EXISTS `payment_transactions` (
   `amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   `currency` VARCHAR(10) NOT NULL DEFAULT 'INR',
   `status` VARCHAR(40) NOT NULL DEFAULT 'captured',
+  `commission_rate` DECIMAL(5,4) NOT NULL DEFAULT 0.0500,
+  `commission_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `net_seller_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
+  `buyer_name` VARCHAR(150) NULL DEFAULT NULL,
+  `refund_id` VARCHAR(120) NULL DEFAULT NULL,
+  `idempotency_key` VARCHAR(120) NULL DEFAULT NULL,
+  `error_code` VARCHAR(100) NULL DEFAULT NULL,
+  `error_description` TEXT NULL DEFAULT NULL,
   `gateway_payload` LONGTEXT NULL DEFAULT NULL,
   `settled_at` TIMESTAMP NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
@@ -351,7 +386,25 @@ CREATE TABLE IF NOT EXISTS `payment_transactions` (
   INDEX `idx_pt_order` (`order_id`),
   INDEX `idx_pt_seller` (`seller_id`),
   INDEX `idx_pt_gateway_payment` (`gateway_payment_id`),
-  INDEX `idx_pt_status` (`status`)
+  INDEX `idx_pt_gateway_order` (`gateway_order_id`),
+  INDEX `idx_pt_status` (`status`),
+  INDEX `idx_pt_type` (`transaction_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `webhook_logs` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `event_id` VARCHAR(120) NOT NULL,
+  `event_type` VARCHAR(100) NOT NULL,
+  `gateway` VARCHAR(40) NOT NULL DEFAULT 'razorpay',
+  `order_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `payload` LONGTEXT NULL DEFAULT NULL,
+  `status` VARCHAR(40) NOT NULL DEFAULT 'processed',
+  `error_message` TEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_webhook_event` (`event_id`),
+  INDEX `idx_wl_order` (`order_id`),
+  INDEX `idx_wl_event` (`event_type`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `seller_deletion_requests` (

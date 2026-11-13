@@ -879,6 +879,174 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// Handle Admin Approve Cancellation
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'admin_approve_cancellation') {
+    $orderId = (int) ($_POST['order_id'] ?? 0);
+    $notes = trim($_POST['notes'] ?? 'Cancellation approved by Admin');
+    try {
+        require_once __DIR__ . '/../api/orders.php';
+        require_once __DIR__ . '/../helpers/payment.php';
+        ensureOrdersSchema($pdo);
+        ensurePaymentSchemaPhp($pdo);
+
+        $stmt = $pdo->prepare("SELECT * FROM orders WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => $orderId]);
+        $ord = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$ord) {
+            $error = "Order #{$orderId} not found.";
+        } else {
+            $curSt = normalizeOrderStatus($ord['order_status']);
+            if ($curSt !== 'cancellation_requested') {
+                $error = "Cannot approve cancellation: order is in '{$curSt}' status, not 'cancellation_requested'.";
+            } else {
+                $pdo->beginTransaction();
+                $rStmt = $pdo->prepare("SELECT product_id, quantity FROM order_items WHERE order_id = :oid");
+                $rStmt->execute([':oid' => $orderId]);
+                $rItems = $rStmt->fetchAll(PDO::FETCH_ASSOC);
+                $upStock = $pdo->prepare("UPDATE products SET stock = stock + :qty WHERE id = :pid");
+                foreach ($rItems as $ri) {
+                    if (!empty($ri['product_id'])) {
+                        $upStock->execute([':qty' => (int)$ri['quantity'], ':pid' => (int)$ri['product_id']]);
+                    }
+                }
+                $pdo->prepare("UPDATE orders SET order_status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = :id")->execute([':id' => $orderId]);
+                $pdo->prepare("UPDATE order_items SET item_status = 'cancelled' WHERE order_id = :oid")->execute([':oid' => $orderId]);
+                $pdo->commit();
+
+                logOrderActivityPhp($pdo, $orderId, 'cancellation_approved', 'cancellation_requested', 'cancelled', [
+                    'actor_id' => (int)($_SESSION['admin_id'] ?? 1),
+                    'actor_role' => 'admin',
+                    'actor_name' => $_SESSION['admin_name'] ?? 'Admin',
+                    'notes' => $notes,
+                ]);
+
+                $isPaid = strtolower((string)($ord['payment_status'] ?? '')) === 'paid' || ((float)($ord['captured_amount'] ?? 0) > 0);
+                if ($isPaid) {
+                    $refRes = processPaymentRefundPhp($pdo, $orderId, null, 'Cancellation approved: ' . $notes, ['role' => 'system']);
+                    if (!empty($refRes['ok'])) {
+                        logOrderActivityPhp($pdo, $orderId, 'refund_processed', null, null, [
+                            'actor_role' => 'system',
+                            'notes' => 'Automatic refund processed on admin cancellation approval',
+                            'metadata' => $refRes['data'] ?? [],
+                        ]);
+                        dispatchOrderNotificationPhp($pdo, $orderId, 'refund_processed', [
+                            'amount' => $refRes['data']['refund_amount'] ?? $ord['total_amount']
+                        ]);
+                    } else {
+                        $pdo->prepare("UPDATE orders SET payment_status = 'refund_pending' WHERE id = :id")->execute([':id' => $orderId]);
+                    }
+                }
+
+                dispatchOrderNotificationPhp($pdo, $orderId, 'cancellation_approved', [
+                    'refunded' => $isPaid,
+                    'refund_amount' => $ord['total_amount'],
+                ]);
+
+                $success = "Cancellation request for Order #{$ord['order_number']} approved successfully." . ($isPaid ? " Refund processed." : "");
+            }
+        }
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        $error = "Failed to approve cancellation: " . $e->getMessage();
+    }
+}
+
+// Handle Admin Reject Cancellation
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'admin_reject_cancellation') {
+    $orderId = (int) ($_POST['order_id'] ?? 0);
+    $reason = trim($_POST['rejection_reason'] ?? $_POST['reason'] ?? 'Cancellation request declined by Admin.');
+    try {
+        require_once __DIR__ . '/../api/orders.php';
+        ensureOrdersSchema($pdo);
+
+        $stmt = $pdo->prepare("SELECT * FROM orders WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => $orderId]);
+        $ord = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$ord) {
+            $error = "Order #{$orderId} not found.";
+        } else {
+            $toStatus = 'processing';
+            $pdo->prepare("UPDATE orders SET order_status = :st, updated_at = CURRENT_TIMESTAMP WHERE id = :id")->execute([':st' => $toStatus, ':id' => $orderId]);
+            $pdo->prepare("UPDATE order_items SET item_status = :st WHERE order_id = :oid")->execute([':st' => $toStatus, ':oid' => $orderId]);
+
+            logOrderActivityPhp($pdo, $orderId, 'cancellation_rejected', 'cancellation_requested', $toStatus, [
+                'actor_id' => (int)($_SESSION['admin_id'] ?? 1),
+                'actor_role' => 'admin',
+                'actor_name' => $_SESSION['admin_name'] ?? 'Admin',
+                'notes' => $reason,
+            ]);
+
+            dispatchOrderNotificationPhp($pdo, $orderId, 'cancellation_rejected', ['reason' => $reason]);
+
+            $success = "Cancellation request for Order #{$ord['order_number']} declined. Order resumed to {$toStatus}.";
+        }
+    } catch (Throwable $e) {
+        $error = "Failed to decline cancellation: " . $e->getMessage();
+    }
+}
+
+// Handle Admin Direct Status Update
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'admin_update_order_status') {
+    $orderId = (int) ($_POST['order_id'] ?? 0);
+    require_once __DIR__ . '/../api/orders.php';
+    ensureOrdersSchema($pdo);
+
+    $newSt = normalizeOrderStatus($_POST['order_status'] ?? '');
+    $carrier = trim($_POST['carrier'] ?? '');
+    $trackingNumber = trim($_POST['tracking_number'] ?? '');
+    $notes = trim($_POST['notes'] ?? '');
+
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM orders WHERE id = :id LIMIT 1");
+        $stmt->execute([':id' => $orderId]);
+        $ord = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$ord) {
+            $error = "Order #{$orderId} not found.";
+        } elseif (!$newSt) {
+            $error = "Invalid order status provided.";
+        } else {
+            $oldSt = normalizeOrderStatus($ord['order_status']);
+            $pdo->prepare("
+                UPDATE orders
+                SET order_status = :st,
+                    carrier = COALESCE(NULLIF(:carrier, ''), carrier),
+                    tracking_number = COALESCE(NULLIF(:tnum, ''), tracking_number),
+                    shipped_at = CASE WHEN :st1 = 'shipped' AND shipped_at IS NULL THEN CURRENT_TIMESTAMP ELSE shipped_at END,
+                    delivered_at = CASE WHEN :st2 = 'delivered' AND delivered_at IS NULL THEN CURRENT_TIMESTAMP ELSE delivered_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            ")->execute([
+                ':st' => $newSt,
+                ':carrier' => $carrier,
+                ':tnum' => $trackingNumber,
+                ':st1' => $newSt,
+                ':st2' => $newSt,
+                ':id' => $orderId,
+            ]);
+
+            $pdo->prepare("UPDATE order_items SET item_status = :st WHERE order_id = :oid")->execute([':st' => $newSt, ':oid' => $orderId]);
+
+            logOrderActivityPhp($pdo, $orderId, 'status_updated', $oldSt, $newSt, [
+                'actor_id' => (int)($_SESSION['admin_id'] ?? 1),
+                'actor_role' => 'admin',
+                'actor_name' => $_SESSION['admin_name'] ?? 'Admin',
+                'notes' => $notes ?: "Admin status update to {$newSt}",
+                'carrier' => $carrier ?: ($ord['carrier'] ?? null),
+                'tracking_number' => $trackingNumber ?: ($ord['tracking_number'] ?? null),
+            ]);
+
+            dispatchOrderNotificationPhp($pdo, $orderId, 'order_' . $newSt, [
+                'carrier' => $carrier ?: ($ord['carrier'] ?? null),
+                'tracking_number' => $trackingNumber ?: ($ord['tracking_number'] ?? null),
+            ]);
+
+            $success = "Order #{$ord['order_number']} status changed from {$oldSt} to {$newSt} successfully.";
+        }
+    } catch (Throwable $e) {
+        $error = "Failed to update order status: " . $e->getMessage();
+    }
+}
+
 // Marketplace Stats
 try {
     $sellerCount = (int) $pdo->query("SELECT COUNT(*) FROM users WHERE role = 'seller'")->fetchColumn();
@@ -989,6 +1157,29 @@ $deletionData = deletionListRequestsPhp($pdo, []);
 $delRequests = $deletionData['requests'] ?? [];
 $delKpis = $deletionData['kpis'] ?? ['total' => 0, 'pending' => 0, 'processing' => 0, 'failed' => 0, 'on_hold' => 0, 'approved' => 0, 'deleted' => 0, 'rejected' => 0];
 
+require_once __DIR__ . '/../helpers/payment.php';
+ensurePaymentSchemaPhp($pdo);
+
+$txFilters = [
+    'page' => max(1, (int) ($_GET['tx_page'] ?? 1)),
+    'limit' => 50,
+    'status' => $_GET['tx_status'] ?? 'all',
+    'search' => $_GET['tx_search'] ?? '',
+];
+$adminTxData = getAdminPaymentTransactionsPhp($pdo, $txFilters);
+$adminTransactions = $adminTxData['data']['transactions'] ?? [];
+$txPagination = $adminTxData['data']['pagination'] ?? [];
+$txMetrics = $adminTxData['data']['metrics'] ?? [
+    'total_volume' => 0.0,
+    'captured_volume' => 0.0,
+    'refunded_volume' => 0.0,
+    'total_transactions' => 0,
+    'captured_count' => 0,
+    'failed_count' => 0,
+    'refunded_count' => 0,
+    'pending_count' => 0,
+];
+
 $totalListedProducts = count($adminProducts);
 $activeListedProducts = 0;
 $outOfStockProducts = 0;
@@ -1002,7 +1193,76 @@ foreach ($adminProducts as $apCountRow) {
 }
 $inactiveListedProducts = max(0, $totalListedProducts - $activeListedProducts);
 
-$allowedAdminTabs = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+// ==========================================
+// Admin Orders & Cancellation Hub Data
+// ==========================================
+require_once __DIR__ . '/../api/orders.php';
+ensureOrdersSchema($pdo);
+
+$adminOrdersStmt = $pdo->query("
+    SELECT o.*, 
+           COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name,
+           u.phone AS seller_phone,
+           COUNT(i.id) AS items_count,
+           COALESCE(SUM(i.quantity), 0) AS total_quantity
+    FROM `orders` o
+    LEFT JOIN `users` u ON o.seller_id = u.id
+    LEFT JOIN `order_items` i ON o.id = i.order_id
+    GROUP BY o.id
+    ORDER BY o.id DESC
+    LIMIT 500
+");
+$adminOrdersList = $adminOrdersStmt ? $adminOrdersStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+
+$adminOrderIds = array_column($adminOrdersList, 'id');
+$adminOrderItems = [];
+if (!empty($adminOrderIds)) {
+    $inPh = implode(',', array_fill(0, count($adminOrderIds), '?'));
+    try {
+        $oitStmt = $pdo->prepare("
+            SELECT oi.*, 
+                   COALESCE(NULLIF(oi.product_name, 'Product'), p.name, oi.product_name, 'Product') AS resolved_product_name,
+                   COALESCE(u.seller_name, u.name, 'Verified Seller') AS item_seller_name
+            FROM `order_items` oi
+            LEFT JOIN `products` p ON oi.product_id = p.id
+            LEFT JOIN `users` u ON oi.seller_id = u.id
+            WHERE oi.order_id IN ({$inPh})
+            ORDER BY oi.id ASC
+        ");
+        $oitStmt->execute($adminOrderIds);
+        while ($itRow = $oitStmt->fetch(PDO::FETCH_ASSOC)) {
+            $adminOrderItems[(int)$itRow['order_id']][] = $itRow;
+        }
+    } catch (Throwable $e) {}
+}
+
+$adminOrderMetrics = [
+    'total' => count($adminOrdersList),
+    'cancellation_requested' => 0,
+    'pending' => 0,
+    'confirmed' => 0,
+    'processing' => 0,
+    'shipped' => 0,
+    'delivered' => 0,
+    'cancelled' => 0,
+    'returned' => 0,
+    'total_sales' => 0.0,
+];
+
+foreach ($adminOrdersList as &$ao) {
+    $oid = (int)$ao['id'];
+    $ao['items'] = $adminOrderItems[$oid] ?? [];
+    $st = normalizeOrderStatus($ao['order_status']);
+    if (isset($adminOrderMetrics[$st])) {
+        $adminOrderMetrics[$st]++;
+    }
+    if (!in_array($st, ['cancelled', 'rejected'], true)) {
+        $adminOrderMetrics['total_sales'] += (float)$ao['total_amount'];
+    }
+}
+unset($ao);
+
+$allowedAdminTabs = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'transactions', 'orders', 'all'];
 $reqPathOnly = strtolower((string) (parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?: ''));
 $defaultPathTab = 'overview';
 if (str_contains($reqPathOnly, 'seller-deletions')) {
@@ -1017,6 +1277,10 @@ if (str_contains($reqPathOnly, 'seller-deletions')) {
     $defaultPathTab = 'gst';
 } elseif ($reqPathOnly === '/admin/categories') {
     $defaultPathTab = 'categories';
+} elseif ($reqPathOnly === '/admin/transactions' || $reqPathOnly === '/admin/payments' || str_contains($reqPathOnly, 'transactions')) {
+    $defaultPathTab = 'transactions';
+} elseif ($reqPathOnly === '/admin/orders' || str_contains($reqPathOnly, 'orders')) {
+    $defaultPathTab = 'orders';
 }
 $defaultTabByAction = [
     'approve_gst' => 'gst',
@@ -1031,6 +1295,9 @@ $defaultTabByAction = [
     'delete_product' => 'products',
     'create_seller' => 'sellers',
     'edit_seller' => 'sellers',
+    'admin_approve_cancellation' => 'orders',
+    'admin_reject_cancellation' => 'orders',
+    'admin_update_order_status' => 'orders',
 ];
 $rawPostRetTab = strtolower(trim((string) ($_POST['return_tab'] ?? '')));
 $rawQueryTab = strtolower(trim((string) ($_GET['tab'] ?? '')));
@@ -1054,6 +1321,8 @@ $tabMetaPhp = [
     'seller-deletions' => ['title' => 'Seller Management → Seller Deletion Requests', 'sub' => 'Page 4 — Verify orders (Rules A–E), automated Razorpay refunds, settlements, and 6-gate deletion approvals.'],
     'products' => ['title' => 'Manage Products', 'sub' => 'Page 5 — Add products, upload gallery photos, edit pricing/stock, filter catalog, reassign categories, or archive safely.'],
     'categories' => ['title' => 'Product Categories', 'sub' => 'Page 6 — Create, edit, sort, and manage product categories with automatic catalog sync.'],
+    'transactions' => ['title' => 'Payment Transactions Management', 'sub' => 'Page 7 — Monitor Razorpay payments, statuses, seller commissions, and process full or partial refunds.'],
+    'orders' => ['title' => 'Orders & Cancellation Hub', 'sub' => 'Page 8 — Centralized order monitoring, cancellation review queue, activity tracking, and multi-vendor delivery status.'],
     'all' => ['title' => 'Complete Admin Portal (All Lists)', 'sub' => 'All management lists displayed together on a single page.'],
 ];
 $curMetaPhp = $tabMetaPhp[$activeTab] ?? $tabMetaPhp['overview'];
@@ -1245,6 +1514,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <li class="nav-item"><a href="/admin/seller-deletions" data-tab="seller-deletions" class="nav-link nav-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests (<span id="navDelCount"><?= (int) ($delKpis['total'] ?? 0) ?></span>)</a></li>
                     <li class="nav-item"><a href="/admin/products" data-tab="products" class="nav-link nav-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products (<?= (int) $totalListedProducts ?>)</a></li>
                     <li class="nav-item"><a href="/admin/categories" data-tab="categories" class="nav-link nav-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories (<?= count($categoriesList) ?>)</a></li>
+                    <li class="nav-item"><a href="/admin/transactions" data-tab="transactions" class="nav-link nav-pill <?= $activeTab === 'transactions' ? 'active' : '' ?>" onclick="return switchAdminTab('transactions', event);"><i class="bi bi-credit-card me-1"></i>Transactions (<span id="navTxCount"><?= (int) ($txMetrics['total_transactions'] ?? 0) ?></span>)</a></li>
+                    <li class="nav-item"><a href="/admin/orders" data-tab="orders" class="nav-link nav-pill <?= $activeTab === 'orders' ? 'active' : '' ?>" onclick="return switchAdminTab('orders', event);"><i class="bi bi-box-seam me-1"></i>Orders (<span id="navOrdersCount"><?= count($adminOrdersList) ?></span>)</a></li>
                     <li class="nav-item"><a href="/admin?tab=all" data-tab="all" class="nav-link nav-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a></li>
                 </ul>
                 <div class="d-flex align-items-center gap-2 flex-wrap">
@@ -1304,6 +1575,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                     <a href="/admin/seller-deletions" data-tab="seller-deletions" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">4. Deletion Requests (<?= (int) ($delKpis['total'] ?? 0) ?>)</a>
                     <a href="/admin/products" data-tab="products" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">5. Manage Products (<?= (int) $totalListedProducts ?>)</a>
                     <a href="/admin/categories" data-tab="categories" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">6. Categories (<?= count($categoriesList) ?>)</a>
+                    <a href="/admin/transactions" data-tab="transactions" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'transactions' ? 'active' : '' ?>" onclick="return switchAdminTab('transactions', event);">7. Transactions (<span id="pagerTxCount"><?= (int) ($txMetrics['total_transactions'] ?? 0) ?></span>)</a>
+                    <a href="/admin/orders" data-tab="orders" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'orders' ? 'active' : '' ?>" onclick="return switchAdminTab('orders', event);">8. Orders &amp; Cancellations (<span id="pagerOrdersCount"><?= count($adminOrdersList) ?></span>)</a>
                     <a href="/admin?tab=all" data-tab="all" class="btn btn-sm btn-outline-secondary cat-page-pill <?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Pages</a>
                 </div>
                 <div class="d-flex gap-2 align-items-center flex-wrap">
@@ -1375,6 +1648,15 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                         <div class="card-body">
                             <div class="text-danger small fw-bold text-uppercase">Deletion Requests</div>
                             <div class="fs-2 fw-bold text-danger mt-1"><?= (int) ($delKpis['total'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="card h-100 border-0 shadow-sm border-start border-4 border-info kpi-card-link" onclick="switchAdminTab('transactions')">
+                        <div class="card-body">
+                            <div class="text-info-emphasis small fw-bold text-uppercase">Payment Volume</div>
+                            <div class="fs-2 fw-bold text-info-emphasis mt-1">₹<?= number_format((float) ($txMetrics['captured_volume'] ?? 0), 0) ?></div>
+                            <div class="small text-muted" style="font-size:11px;"><?= (int) ($txMetrics['captured_count'] ?? 0) ?> captured &bull; <?= (int) ($txMetrics['refunded_count'] ?? 0) ?> refunded</div>
                         </div>
                     </div>
                 </div>
@@ -1459,6 +1741,30 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                                 <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
                                     <span class="badge-prod"><?= count($categoriesList) ?> categories</span>
                                     <a href="/admin/categories" class="btn btn-secondary btn-sm fw-semibold" onclick="return switchAdminTab('categories', event);">Open Page 6 →</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-info dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-credit-card text-info me-1"></i> Page 7: Payment Transactions</h3>
+                                    <p class="text-body-secondary small mb-0">Monitor online Razorpay checkouts, inspect payment states, audit 5% platform commission splits, and trigger full or partial refunds.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-prod"><?= (int) ($txMetrics['captured_count'] ?? 0) ?> captured &bull; <?= (int) ($txMetrics['refunded_count'] ?? 0) ?> refunded</span>
+                                    <a href="/admin/transactions" class="btn btn-info btn-sm fw-semibold text-white" onclick="return switchAdminTab('transactions', event);">Open Page 7 →</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col">
+                            <div class="card h-100 border shadow-sm border-start border-4 border-success dir-card">
+                                <div class="card-body">
+                                    <h3 class="h6 fw-bold mb-2"><i class="bi bi-box-seam text-success me-1"></i> Page 8: Orders &amp; Cancellation Hub</h3>
+                                    <p class="text-body-secondary small mb-0">Track all multi-vendor orders, review buyer cancellation requests, inspect activity audit logs, and manage shipping delivery states.</p>
+                                </div>
+                                <div class="card-footer bg-transparent border-top d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                                    <span class="badge-prod"><?= count($adminOrdersList) ?> orders &bull; <?= (int) ($adminOrderMetrics['cancellation_requested'] ?? 0) ?> cancel requests</span>
+                                    <a href="/admin/orders" class="btn btn-success btn-sm fw-semibold text-white" onclick="return switchAdminTab('orders', event);">Open Page 8 →</a>
                                 </div>
                             </div>
                         </div>
@@ -2152,6 +2458,378 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             </div>
         </section>
         </div>
+
+        <!-- Section 7: Payment Transactions Management -->
+        <div class="admin-view-panel <?= $panelVisiblePhp('transactions') ? 'is-visible' : '' ?>" data-admin-panel="transactions">
+        <section class="card border-0 shadow-sm border-top border-4 border-info" id="transactionsSection">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div>
+                    <h2 class="h5 fw-bold mb-1"><i class="bi bi-credit-card-2-front text-info me-2"></i>Payment Transactions Management</h2>
+                    <p class="text-body-secondary small mb-0">Track Razorpay payments, statuses, automatic 5% marketplace commission splits, and process full or partial refunds.</p>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="window.location.reload();">
+                        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+                    </button>
+                    <a href="/test-buyer" target="_blank" class="btn btn-outline-primary btn-sm">
+                        <i class="bi bi-cart-check me-1"></i>Open Test Buyer
+                    </a>
+                </div>
+            </div>
+
+            <!-- Transaction Metrics Cards -->
+            <div class="card-body border-bottom bg-light py-3">
+                <div class="row row-cols-2 row-cols-md-4 g-2">
+                    <div class="col">
+                        <div class="p-2 bg-white rounded border text-center">
+                            <div class="text-muted small fw-semibold">TOTAL VOLUME</div>
+                            <div class="fs-5 fw-bold text-dark">₹<?= number_format((float) ($txMetrics['total_volume'] ?? 0), 2) ?></div>
+                            <div class="small text-muted" style="font-size:11px;"><?= (int) ($txMetrics['total_transactions'] ?? 0) ?> transactions</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 bg-white rounded border text-center">
+                            <div class="text-muted small fw-semibold text-success">CAPTURED / PAID</div>
+                            <div class="fs-5 fw-bold text-success">₹<?= number_format((float) ($txMetrics['captured_volume'] ?? 0), 2) ?></div>
+                            <div class="small text-muted" style="font-size:11px;"><?= (int) ($txMetrics['captured_count'] ?? 0) ?> orders</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 bg-white rounded border text-center">
+                            <div class="text-muted small fw-semibold text-warning">REFUNDED</div>
+                            <div class="fs-5 fw-bold text-warning-emphasis">₹<?= number_format((float) ($txMetrics['refunded_volume'] ?? 0), 2) ?></div>
+                            <div class="small text-muted" style="font-size:11px;"><?= (int) ($txMetrics['refunded_count'] ?? 0) ?> refunds</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 bg-white rounded border text-center">
+                            <div class="text-muted small fw-semibold text-danger">FAILED / PENDING</div>
+                            <div class="fs-5 fw-bold text-danger"><?= (int) ($txMetrics['failed_count'] ?? 0) ?> / <?= (int) ($txMetrics['pending_count'] ?? 0) ?></div>
+                            <div class="small text-muted" style="font-size:11px;">unsuccessful / waiting</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Filter Controls -->
+            <div class="card-body bg-white py-3 border-bottom">
+                <div class="row g-2 align-items-center">
+                    <div class="col-md-5">
+                        <div class="input-group input-group-sm">
+                            <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
+                            <input type="text" class="form-control" id="txSearchInput" placeholder="Search by Order ID, Razorpay Payment/Order ID, Customer, Phone..." onkeyup="filterTransactionsSearch()">
+                        </div>
+                    </div>
+                    <div class="col-md-7 d-flex justify-content-md-end gap-1 flex-wrap" id="txStatusFilterGroup">
+                        <button type="button" class="btn btn-sm btn-dark tx-filter-btn active" onclick="filterTransactionsByStatus('all', this)">All (<?= count($adminTransactions) ?>)</button>
+                        <button type="button" class="btn btn-sm btn-outline-success tx-filter-btn" onclick="filterTransactionsByStatus('captured', this)">Captured / Paid</button>
+                        <button type="button" class="btn btn-sm btn-outline-warning tx-filter-btn" onclick="filterTransactionsByStatus('pending', this)">Pending</button>
+                        <button type="button" class="btn btn-sm btn-outline-danger tx-filter-btn" onclick="filterTransactionsByStatus('failed', this)">Failed</button>
+                        <button type="button" class="btn btn-sm btn-outline-info tx-filter-btn" onclick="filterTransactionsByStatus('refunded', this)">Refunded</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Table -->
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0" id="adminTransactionsTable" style="min-width: 900px;">
+                    <thead class="table-light">
+                        <tr class="small text-muted text-uppercase">
+                            <th style="width: 100px;">Order / Tx</th>
+                            <th>Customer</th>
+                            <th>Seller / Product</th>
+                            <th>Amount &amp; Split</th>
+                            <th>Gateway Reference</th>
+                            <th>Status</th>
+                            <th>Date</th>
+                            <th class="text-end" style="width: 110px;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adminTransactionsTbody">
+                        <?php if (empty($adminTransactions)): ?>
+                            <tr id="txEmptyRow">
+                                <td colspan="8" class="text-center py-5 text-muted">
+                                    <i class="bi bi-credit-card fs-1 d-block mb-2 text-secondary opacity-50"></i>
+                                    No payment transactions recorded yet.<br>
+                                    <a href="/test-buyer" target="_blank" class="btn btn-sm btn-outline-primary mt-2">Open Test Buyer to place a test payment</a>
+                                </td>
+                            </tr>
+                        <?php else: ?>
+                            <?php foreach ($adminTransactions as $txRow): ?>
+                                <?php
+                                $st = strtolower((string) ($txRow['status'] ?? 'pending'));
+                                $badgeCls = match($st) {
+                                    'captured', 'paid', 'success' => 'badge text-bg-success',
+                                    'failed' => 'badge text-bg-danger',
+                                    'refunded' => 'badge text-bg-purple text-white',
+                                    'partially_refunded' => 'badge text-bg-info text-dark',
+                                    default => 'badge text-bg-warning text-dark',
+                                };
+                                $isRefundable = in_array($st, ['captured', 'paid', 'partially_refunded'], true) && ((float) ($txRow['refundable_amount'] ?? 0) > 0);
+                                $txJson = htmlspecialchars(json_encode($txRow, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, 'UTF-8');
+                                ?>
+                                <tr class="tx-row" data-tx-status="<?= htmlspecialchars($st) ?>" data-tx-search="<?= htmlspecialchars(strtolower(($txRow['order_id'] ?? '') . ' ' . ($txRow['gateway_payment_id'] ?? '') . ' ' . ($txRow['gateway_order_id'] ?? '') . ' ' . ($txRow['customer_name'] ?? '') . ' ' . ($txRow['customer_phone'] ?? '') . ' ' . ($txRow['seller_name'] ?? ''))) ?>">
+                                    <td>
+                                        <div class="fw-bold text-dark">#<?= (int) ($txRow['order_id'] ?? 0) ?></div>
+                                        <div class="small text-muted" style="font-size: 11px;">Tx #<?= (int) ($txRow['id'] ?? 0) ?></div>
+                                    </td>
+                                    <td>
+                                        <div class="fw-semibold text-dark"><?= htmlspecialchars($txRow['customer_name'] ?? 'Guest Customer') ?></div>
+                                        <div class="small text-muted"><?= htmlspecialchars($txRow['customer_phone'] ?? '—') ?></div>
+                                    </td>
+                                    <td>
+                                        <div class="fw-semibold text-dark"><?= htmlspecialchars($txRow['seller_name'] ?? 'Vendor #' . ($txRow['seller_id'] ?? '')) ?></div>
+                                        <div class="small text-muted"><?= htmlspecialchars($txRow['product_title'] ?? '') ?></div>
+                                    </td>
+                                    <td>
+                                        <div class="fw-bold text-dark">₹<?= number_format((float) $txRow['amount'], 2) ?></div>
+                                        <div class="small text-muted" style="font-size: 11px;">
+                                            Fee: ₹<?= number_format((float) $txRow['commission_amount'], 2) ?> &bull; 
+                                            Net: <span class="text-success">₹<?= number_format((float) $txRow['net_seller_amount'], 2) ?></span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <?php if (!empty($txRow['gateway_payment_id'])): ?>
+                                            <code class="text-primary fw-semibold"><?= htmlspecialchars($txRow['gateway_payment_id']) ?></code>
+                                        <?php else: ?>
+                                            <span class="text-muted">—</span>
+                                        <?php endif; ?>
+                                        <?php if (!empty($txRow['gateway_order_id'])): ?>
+                                            <div class="small text-muted" style="font-size: 10px;"><code><?= htmlspecialchars($txRow['gateway_order_id']) ?></code></div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <span class="<?= $badgeCls ?>"><?= htmlspecialchars(strtoupper($txRow['status'])) ?></span>
+                                        <?php if (($txRow['transaction_type'] ?? '') === 'refund'): ?>
+                                            <span class="badge text-bg-warning ms-1" style="font-size: 10px;">Refund</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <div class="small text-dark"><?= htmlspecialchars(substr((string) ($txRow['created_at'] ?? ''), 0, 16)) ?></div>
+                                    </td>
+                                    <td class="text-end">
+                                        <div class="btn-group btn-group-sm">
+                                            <button type="button" class="btn btn-outline-secondary" onclick='openTxDetailModal(<?= $txJson ?>)' title="View payload & details">
+                                                <i class="bi bi-eye"></i>
+                                            </button>
+                                            <?php if ($isRefundable): ?>
+                                                <button type="button" class="btn btn-outline-danger" onclick='openTxRefundModal(<?= $txJson ?>)' title="Issue Full or Partial Refund">
+                                                    <i class="bi bi-arrow-counterclockwise"></i>
+                                                </button>
+                                            <?php endif; ?>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            <div class="card-footer bg-white py-3" id="transactionsPaginationBar">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div class="small text-muted">
+                        Showing <strong><?= count($adminTransactions) ?></strong> transactions &bull; Total records: <strong><?= (int) ($txPagination['total'] ?? count($adminTransactions)) ?></strong>
+                    </div>
+                </div>
+            </div>
+        </section>
+        </div>
+
+        <!-- Section 8: Orders & Cancellation Management Hub -->
+        <div class="admin-view-panel <?= $panelVisiblePhp('orders') ? 'is-visible' : '' ?>" data-admin-panel="orders">
+        <section class="card border-0 shadow-sm border-top border-4 border-success mb-4" id="ordersSection">
+            <div class="card-header bg-white py-3">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
+                    <div>
+                        <h2 class="h5 fw-bold mb-1"><i class="bi bi-box-seam text-success me-2"></i>Orders &amp; Cancellation Management Hub</h2>
+                        <p class="text-body-secondary small mb-0">Unified order supervision across all sellers and buyers, cancellation request triage, live activity audit trails, and fulfillment tracking.</p>
+                    </div>
+                    <div class="d-flex align-items-center gap-2 flex-wrap">
+                        <div class="input-group input-group-sm" style="max-width: 320px;">
+                            <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
+                            <input type="text" class="form-control" id="adminOrderSearchInput" onkeyup="filterAdminOrdersSearch(this.value)" placeholder="Search order #, buyer, seller, phone...">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- KPI Metric Pills -->
+                <div class="row row-cols-2 row-cols-md-4 row-cols-xl-6 g-2 mt-2">
+                    <div class="col">
+                        <div class="p-2 border rounded bg-light text-center">
+                            <div class="small text-muted fw-semibold">Total Orders</div>
+                            <div class="h5 fw-bold text-dark mb-0"><?= (int) ($adminOrderMetrics['total'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded bg-danger-subtle text-center">
+                            <div class="small text-danger fw-semibold">Cancellation Queue</div>
+                            <div class="h5 fw-bold text-danger mb-0" id="crMetricCount"><?= (int) ($adminOrderMetrics['cancellation_requested'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded bg-warning-subtle text-center">
+                            <div class="small text-warning-emphasis fw-semibold">Processing / Pending</div>
+                            <div class="h5 fw-bold text-warning-emphasis mb-0"><?= (int) (($adminOrderMetrics['pending'] ?? 0) + ($adminOrderMetrics['processing'] ?? 0) + ($adminOrderMetrics['confirmed'] ?? 0)) ?></div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded bg-info-subtle text-center">
+                            <div class="small text-info-emphasis fw-semibold">Shipped / In Transit</div>
+                            <div class="h5 fw-bold text-info-emphasis mb-0"><?= (int) ($adminOrderMetrics['shipped'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded bg-success-subtle text-center">
+                            <div class="small text-success fw-semibold">Delivered</div>
+                            <div class="h5 fw-bold text-success mb-0"><?= (int) ($adminOrderMetrics['delivered'] ?? 0) ?></div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded bg-light text-center">
+                            <div class="small text-muted fw-semibold">Net Sales</div>
+                            <div class="h5 fw-bold text-success mb-0">₹<?= number_format((float) ($adminOrderMetrics['total_sales'] ?? 0), 2) ?></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Status Filter Tabs -->
+                <div class="d-flex gap-1 flex-wrap mt-3 pt-2 border-top">
+                    <button type="button" class="btn btn-sm btn-outline-secondary active order-filter-pill" data-status="all" onclick="filterAdminOrdersTab('all', this)">All Orders (<?= count($adminOrdersList) ?>)</button>
+                    <button type="button" class="btn btn-sm btn-outline-danger order-filter-pill position-relative" data-status="cancellation_requested" onclick="filterAdminOrdersTab('cancellation_requested', this)">
+                        ⚠️ Cancellation Requests
+                        <?php if (($adminOrderMetrics['cancellation_requested'] ?? 0) > 0): ?>
+                            <span class="badge bg-danger ms-1"><?= (int) $adminOrderMetrics['cancellation_requested'] ?></span>
+                        <?php endif; ?>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-warning text-dark order-filter-pill" data-status="pending,confirmed,processing" onclick="filterAdminOrdersTab('pending,confirmed,processing', this)">Pending &amp; Processing</button>
+                    <button type="button" class="btn btn-sm btn-outline-info text-dark order-filter-pill" data-status="shipped" onclick="filterAdminOrdersTab('shipped', this)">Shipped (<?= (int) ($adminOrderMetrics['shipped'] ?? 0) ?>)</button>
+                    <button type="button" class="btn btn-sm btn-outline-success order-filter-pill" data-status="delivered" onclick="filterAdminOrdersTab('delivered', this)">Delivered (<?= (int) ($adminOrderMetrics['delivered'] ?? 0) ?>)</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary order-filter-pill" data-status="cancelled,rejected,return_requested,returned" onclick="filterAdminOrdersTab('cancelled,rejected,return_requested,returned', this)">Cancelled / Returns</button>
+                </div>
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0" id="adminOrdersTable">
+                    <thead class="table-light">
+                        <tr class="small text-muted text-uppercase">
+                            <th style="width: 140px;">Order #</th>
+                            <th>Buyer Details</th>
+                            <th>Seller</th>
+                            <th>Items</th>
+                            <th>Financials</th>
+                            <th>Status</th>
+                            <th class="text-end" style="width: 160px;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adminOrdersTbody">
+                        <?php if (empty($adminOrdersList)): ?>
+                            <tr>
+                                <td colspan="7" class="text-center py-5 text-muted">
+                                    <i class="bi bi-box-seam fs-1 d-block mb-2 text-secondary opacity-50"></i>
+                                    No orders found in the database.
+                                </td>
+                            </tr>
+                        <?php else: ?>
+                            <?php foreach ($adminOrdersList as $orderRow): ?>
+                                <?php
+                                $ordId = (int) $orderRow['id'];
+                                $ost = normalizeOrderStatus($orderRow['order_status']);
+                                $pst = strtolower((string) ($orderRow['payment_status'] ?? 'unpaid'));
+                                $orderBadgeCls = match($ost) {
+                                    'delivered' => 'badge text-bg-success',
+                                    'shipped' => 'badge text-bg-info text-dark',
+                                    'processing' => 'badge text-bg-primary',
+                                    'confirmed', 'accepted' => 'badge text-bg-primary-subtle text-primary-emphasis border border-primary',
+                                    'cancellation_requested' => 'badge text-bg-danger text-white animate-pulse',
+                                    'cancelled' => 'badge text-bg-secondary text-white',
+                                    'rejected' => 'badge text-bg-danger text-white',
+                                    'return_requested' => 'badge text-bg-warning text-dark',
+                                    'returned' => 'badge text-bg-dark text-white',
+                                    default => 'badge text-bg-warning text-dark',
+                                };
+                                $payBadgeCls = match($pst) {
+                                    'paid' => 'badge bg-success-subtle text-success-emphasis border border-success-subtle',
+                                    'refunded' => 'badge bg-purple-subtle text-purple border',
+                                    'partially_refunded' => 'badge bg-info-subtle text-info-emphasis border',
+                                    'failed' => 'badge bg-danger-subtle text-danger border',
+                                    default => 'badge bg-light text-muted border',
+                                };
+                                $itemsList = $orderRow['items'] ?? [];
+                                $itemsCount = count($itemsList);
+                                $firstItemName = !empty($itemsList[0]['resolved_product_name']) ? $itemsList[0]['resolved_product_name'] : (!empty($itemsList[0]['product_name']) ? $itemsList[0]['product_name'] : 'Item');
+                                $orderJson = htmlspecialchars(json_encode($orderRow, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP), ENT_QUOTES, 'UTF-8');
+                                ?>
+                                <tr class="admin-order-row" data-order-status="<?= htmlspecialchars($ost) ?>" data-order-search="<?= htmlspecialchars(strtolower($orderRow['order_number'] . ' ' . $orderRow['buyer_name'] . ' ' . $orderRow['buyer_phone'] . ' ' . $orderRow['seller_name'])) ?>">
+                                    <td>
+                                        <div class="fw-bold text-dark">#<?= htmlspecialchars($orderRow['order_number']) ?></div>
+                                        <div class="small text-muted" style="font-size: 11px;"><?= htmlspecialchars(substr((string) ($orderRow['created_at'] ?? ''), 0, 16)) ?></div>
+                                        <?php if (!empty($orderRow['tracking_number'])): ?>
+                                            <span class="badge text-bg-light border text-secondary mt-1" style="font-size: 10px;">
+                                                <i class="bi bi-truck me-1"></i><?= htmlspecialchars($orderRow['carrier'] ? $orderRow['carrier'] . ': ' : '') ?><?= htmlspecialchars($orderRow['tracking_number']) ?>
+                                            </span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <div class="fw-semibold text-dark"><?= htmlspecialchars($orderRow['buyer_name']) ?></div>
+                                        <div class="small text-muted"><i class="bi bi-telephone me-1"></i><?= htmlspecialchars($orderRow['buyer_phone']) ?></div>
+                                        <div class="small text-muted text-truncate" style="max-width: 220px;" title="<?= htmlspecialchars($orderRow['shipping_address'] ?? '') ?>">
+                                            <?= htmlspecialchars($orderRow['city'] ? $orderRow['city'] . ', ' . $orderRow['state'] : $orderRow['shipping_address']) ?>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="fw-semibold text-dark"><?= htmlspecialchars($orderRow['seller_name']) ?></div>
+                                        <div class="small text-muted">ID: #<?= (int) ($orderRow['seller_id'] ?? 0) ?></div>
+                                    </td>
+                                    <td>
+                                        <div class="text-dark small fw-medium"><?= htmlspecialchars($firstItemName) ?><?= $itemsCount > 1 ? ' <span class="text-muted">(+' . ($itemsCount - 1) . ' more)</span>' : '' ?></div>
+                                        <div class="small text-muted"><?= (int) ($orderRow['total_quantity'] ?? $itemsCount) ?> item(s) total</div>
+                                    </td>
+                                    <td>
+                                        <div class="fw-bold text-dark">₹<?= number_format((float) $orderRow['total_amount'], 2) ?></div>
+                                        <span class="<?= $payBadgeCls ?>" style="font-size: 10px;"><?= strtoupper($pst) ?> (<?= strtoupper($orderRow['payment_method'] ?? 'COD') ?>)</span>
+                                    </td>
+                                    <td>
+                                        <span class="<?= $orderBadgeCls ?>"><?= htmlspecialchars(strtoupper(str_replace('_', ' ', $ost))) ?></span>
+                                        <?php if ($ost === 'cancellation_requested'): ?>
+                                            <div class="small text-danger mt-1" style="font-size: 11px;">
+                                                <strong>Reason:</strong> <?= htmlspecialchars($orderRow['cancellation_reason'] ?? 'Requested by buyer') ?>
+                                            </div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td class="text-end">
+                                        <div class="btn-group btn-group-sm">
+                                            <button type="button" class="btn btn-outline-primary" onclick='openAdminOrderDetailModal(<?= $orderJson ?>)' title="View Order & Activity Timeline">
+                                                <i class="bi bi-eye"></i>
+                                            </button>
+                                            <?php if ($ost === 'cancellation_requested'): ?>
+                                                <button type="button" class="btn btn-success" onclick='adminQuickApproveCancellation(<?= $ordId ?>, <?= json_encode($orderRow["order_number"]) ?>)' title="Approve Cancellation & Refund">
+                                                    <i class="bi bi-check-lg"></i>
+                                                </button>
+                                                <button type="button" class="btn btn-danger" onclick='adminQuickRejectCancellation(<?= $ordId ?>, <?= json_encode($orderRow["order_number"]) ?>)' title="Decline Cancellation">
+                                                    <i class="bi bi-x-lg"></i>
+                                                </button>
+                                            <?php else: ?>
+                                                <button type="button" class="btn btn-outline-secondary" onclick='openAdminOrderStatusModal(<?= $ordId ?>, <?= json_encode($ost) ?>, <?= json_encode($orderRow["carrier"] ?? "") ?>, <?= json_encode($orderRow["tracking_number"] ?? "") ?>)' title="Change Order Status">
+                                                    <i class="bi bi-pencil-square"></i>
+                                                </button>
+                                            <?php endif; ?>
+                                        </div>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            <div class="card-footer bg-white py-3" id="ordersPaginationBar">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div class="small text-muted">
+                        Showing <strong><?= count($adminOrdersList) ?></strong> orders &bull; Total recorded: <strong><?= (int) ($adminOrderMetrics['total'] ?? count($adminOrdersList)) ?></strong>
+                    </div>
+                </div>
+            </div>
+        </section>
+        </div>
     </main>
 
     <footer class="admin-footer py-4 border-top border-secondary-subtle">
@@ -2168,6 +2846,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 <a href="/admin/seller-deletions" data-tab="seller-deletions" class="<?= $activeTab === 'seller-deletions' ? 'active' : '' ?>" onclick="return switchAdminTab('seller-deletions', event);">Deletion Requests</a>
                 <a href="/admin/products" data-tab="products" class="<?= $activeTab === 'products' ? 'active' : '' ?>" onclick="return switchAdminTab('products', event);">Manage Products</a>
                 <a href="/admin/categories" data-tab="categories" class="<?= $activeTab === 'categories' ? 'active' : '' ?>" onclick="return switchAdminTab('categories', event);">Categories</a>
+                <a href="/admin/transactions" data-tab="transactions" class="<?= $activeTab === 'transactions' ? 'active' : '' ?>" onclick="return switchAdminTab('transactions', event);">Transactions</a>
+                <a href="/admin/orders" data-tab="orders" class="<?= $activeTab === 'orders' ? 'active' : '' ?>" onclick="return switchAdminTab('orders', event);">Orders</a>
                 <a href="/admin?tab=all" data-tab="all" class="<?= $activeTab === 'all' ? 'active' : '' ?>" onclick="return switchAdminTab('all', event);">All Lists</a>
             </nav>
             <div>
@@ -2175,6 +2855,121 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             </div>
         </div>
     </footer>
+
+    <!-- Admin Order Details & Activity Timeline Modal -->
+    <div id="orderDetailAdminModal" class="modal-overlay" onclick="handleAdminOrderModalClick(event)">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4 bg-light">
+                    <div>
+                        <h3 class="modal-title h5 fw-bold mb-0" id="admOrdModalNumber">Order Details</h3>
+                        <div class="small text-muted" id="admOrdModalDate">Placed on ...</div>
+                    </div>
+                    <button type="button" class="btn-close" onclick="closeAdminOrderModal()"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div class="row g-3 mb-4">
+                        <div class="col-md-6">
+                            <div class="p-3 bg-light rounded border h-100">
+                                <h6 class="fw-bold text-dark mb-2"><i class="bi bi-person me-1"></i>Buyer Information</h6>
+                                <div class="fw-semibold text-dark" id="admOrdModalBuyerName">—</div>
+                                <div class="small text-muted" id="admOrdModalBuyerPhone">—</div>
+                                <div class="small text-dark mt-2" id="admOrdModalBuyerAddr">—</div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="p-3 bg-light rounded border h-100">
+                                <h6 class="fw-bold text-dark mb-2"><i class="bi bi-shop me-1"></i>Fulfillment &amp; Payment</h6>
+                                <div><strong>Seller:</strong> <span id="admOrdModalSellerName">—</span></div>
+                                <div><strong>Payment Method:</strong> <span id="admOrdModalPayMethod">—</span></div>
+                                <div><strong>Payment Status:</strong> <span id="admOrdModalPayStatus" class="badge bg-secondary">—</span></div>
+                                <div><strong>Order Status:</strong> <span id="admOrdModalStatus" class="badge bg-primary">—</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Ordered Items Table -->
+                    <h6 class="fw-bold text-dark mb-2"><i class="bi bi-bag-check me-1"></i>Purchased Items</h6>
+                    <div class="table-responsive border rounded mb-4">
+                        <table class="table table-sm align-middle mb-0">
+                            <thead class="table-light">
+                                <tr class="small text-muted">
+                                    <th>Item</th>
+                                    <th>Seller</th>
+                                    <th>Unit Price</th>
+                                    <th>Qty</th>
+                                    <th class="text-end">Subtotal</th>
+                                </tr>
+                            </thead>
+                            <tbody id="admOrdModalItemsTbody">
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Chronological Activity & Tracking Timeline -->
+                    <h6 class="fw-bold text-dark mb-2"><i class="bi bi-clock-history me-1"></i>Order Audit Timeline &amp; Activity Log</h6>
+                    <div id="admOrdTimelineContainer" class="p-3 bg-light rounded border" style="max-height: 280px; overflow-y: auto;">
+                        <div class="text-center py-3 text-muted">Loading activities...</div>
+                    </div>
+                </div>
+                <div class="modal-footer border-top py-2 px-4 bg-light d-flex justify-content-between">
+                    <div id="admOrdModalActionsLeft"></div>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeAdminOrderModal()">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Admin Order Status Transition Modal -->
+    <div id="orderStatusAdminModal" class="modal-overlay" onclick="handleAdminOrderStatusOverlayClick(event)">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <form method="POST" action="/admin/orders">
+                    <input type="hidden" name="action" value="admin_update_order_status">
+                    <input type="hidden" name="return_tab" value="orders">
+                    <input type="hidden" name="order_id" id="adminStatusModalOrderId">
+                    <div class="modal-header border-bottom py-3 px-4">
+                        <h3 class="modal-title h5 fw-bold mb-0">Update Order Status</h3>
+                        <button type="button" class="btn-close" onclick="closeAdminOrderStatusModal()"></button>
+                    </div>
+                    <div class="modal-body p-4">
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Select New Status</label>
+                            <select name="order_status" id="adminStatusModalSelect" class="form-select" onchange="toggleCarrierInputs(this.value)" required>
+                                <option value="pending">Pending</option>
+                                <option value="confirmed">Confirmed / Accepted</option>
+                                <option value="processing">Processing &amp; Packing</option>
+                                <option value="shipped">Shipped (In Transit)</option>
+                                <option value="delivered">Delivered</option>
+                                <option value="cancelled">Cancelled</option>
+                                <option value="rejected">Rejected</option>
+                                <option value="return_requested">Return Requested</option>
+                                <option value="returned">Returned</option>
+                            </select>
+                        </div>
+                        <div id="adminCarrierInputs" style="display: none;">
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Shipping Carrier</label>
+                                <input type="text" name="carrier" id="adminStatusCarrierInput" class="form-control" placeholder="e.g. BlueDart, Delhivery, DTDC">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Tracking Number / AWB</label>
+                                <input type="text" name="tracking_number" id="adminStatusTrackingInput" class="form-control" placeholder="e.g. BLU123456789">
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Activity Log Notes (Optional)</label>
+                            <textarea name="notes" class="form-control" rows="2" placeholder="Provide reason or notes for audit trail..."></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer border-top py-2 px-4">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="closeAdminOrderStatusModal()">Cancel</button>
+                        <button type="submit" class="btn btn-primary btn-sm fw-bold">Save Status Transition</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
 
     <!-- GST Review & Verification Modal -->
     <div id="gstReviewModal" class="modal-overlay" onclick="handleGstOverlayClick(event)">
@@ -2630,6 +3425,78 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         </div>
     </div>
 
+    <!-- Payment Transaction Detail Modal -->
+    <div id="txDetailModal" class="modal-overlay" onclick="if(event.target===this)closeTxDetailModal()">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4">
+                    <h3 class="modal-title h5 fw-bold mb-0"><i class="bi bi-receipt text-primary me-2"></i>Transaction Details</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeTxDetailModal()"></button>
+                </div>
+                <div class="modal-body p-4" id="txDetailModalBody">
+                    <!-- Populated dynamically via openTxDetailModal -->
+                </div>
+                <div class="modal-footer border-top py-2 px-4 bg-light">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeTxDetailModal()">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Payment Transaction Refund Modal -->
+    <div id="txRefundModal" class="modal-overlay" onclick="if(event.target===this)closeTxRefundModal()">
+        <div class="modal-dialog modal-dialog-centered modal-sm-custom">
+            <div class="modal-content border-0 shadow-lg rounded-4">
+                <div class="modal-header border-bottom py-3 px-4 bg-light">
+                    <h3 class="modal-title h6 fw-bold mb-0 text-danger"><i class="bi bi-arrow-counterclockwise me-2"></i>Process Refund</h3>
+                    <button type="button" class="btn-close" aria-label="Close" onclick="closeTxRefundModal()"></button>
+                </div>
+                <form id="txRefundForm" onsubmit="return submitTxRefund(event)">
+                    <div class="modal-body p-4">
+                        <div id="txRefundAlert" class="alert alert-danger py-2 px-3 small mb-3" style="display:none;"></div>
+                        <input type="hidden" id="rfTxId">
+                        <input type="hidden" id="rfOrderId">
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold text-muted mb-1">Order / Payment ID</label>
+                            <div class="fw-bold" id="rfOrderDisplay">—</div>
+                            <div class="small text-muted font-monospace" id="rfPaymentDisplay">—</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold text-muted mb-1">Max Refundable Amount</label>
+                            <div class="fs-5 fw-bold text-success" id="rfMaxAmountDisplay">₹0.00</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold">Refund Amount (₹) *</label>
+                            <input type="number" step="0.01" min="1" class="form-control" id="rfAmountInput" required>
+                            <div class="form-text small">Enter partial or full amount up to the refundable limit.</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold">Reason for Refund</label>
+                            <select class="form-select form-select-sm" id="rfReasonSelect">
+                                <option value="customer_requested">Customer Requested / Cancellation</option>
+                                <option value="seller_deletion">Seller Account Deletion Audit</option>
+                                <option value="product_out_of_stock">Product Out of Stock</option>
+                                <option value="duplicate">Duplicate Payment</option>
+                                <option value="fraudulent">Fraudulent / Unauthorized</option>
+                                <option value="other">Other Administrative Reason</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold">Admin Notes (optional)</label>
+                            <textarea class="form-control form-control-sm" id="rfNoteInput" rows="2" placeholder="Audit note..."></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer border-top py-2 px-4 bg-light d-flex justify-content-between">
+                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="closeTxRefundModal()">Cancel</button>
+                        <button type="submit" id="rfSubmitBtn" class="btn btn-danger btn-sm fw-semibold">
+                            <i class="bi bi-arrow-counterclockwise me-1"></i>Confirm Refund
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <script>
         window._pendingConfirmForm = null;
         window._activeGstStatus = 'all';
@@ -2643,15 +3510,17 @@ function delBadgeClassPhp(?string $statusOrColor): string {
         window._currentWsData = null;
         window._tablePagerState = {};
 
-        var ADMIN_CATEGORY_ORDER = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'all'];
+        var ADMIN_CATEGORY_ORDER = ['overview', 'gst', 'sellers', 'create-seller', 'seller-deletions', 'products', 'categories', 'transactions', 'orders', 'all'];
         var ADMIN_PAGE_LABELS = {
             overview: 'Overview Directory',
-            gst: 'Page 1 of 6: PDF Verification',
-            sellers: 'Page 2 of 6: Seller Accounts',
-            'create-seller': 'Page 3 of 6: Create Seller',
-            'seller-deletions': 'Page 4 of 6: Deletion Requests',
-            products: 'Page 5 of 6: Manage Products',
-            categories: 'Page 6 of 6: Categories',
+            gst: 'Page 1 of 8: PDF Verification',
+            sellers: 'Page 2 of 8: Seller Accounts',
+            'create-seller': 'Page 3 of 8: Create Seller',
+            'seller-deletions': 'Page 4 of 8: Deletion Requests',
+            products: 'Page 5 of 8: Manage Products',
+            categories: 'Page 6 of 8: Categories',
+            transactions: 'Page 7 of 8: Payment Transactions',
+            orders: 'Page 8 of 8: Orders & Cancellations',
             all: 'Combined All-Pages View'
         };
 
@@ -2660,7 +3529,9 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             sellers: { tbodyId: 'sellersTableBody', rowSelector: '.seller-account-row', barId: 'sellersPaginationBar', defaultSize: 10, label: 'sellers' },
             del: { tbodyId: 'deletionRequestsTbody', rowSelector: '.del-req-row', barId: 'delPaginationBar', defaultSize: 10, label: 'deletion requests' },
             products: { tbodyId: 'productsTableBody', rowSelector: '.prod-cat-row', barId: 'productsPaginationBar', defaultSize: 10, label: 'products' },
-            categories: { tbodyId: 'categoriesTableBody', rowSelector: '.cat-list-row', barId: 'categoriesPaginationBar', defaultSize: 10, label: 'categories' }
+            categories: { tbodyId: 'categoriesTableBody', rowSelector: '.cat-list-row', barId: 'categoriesPaginationBar', defaultSize: 10, label: 'categories' },
+            transactions: { tbodyId: 'adminTransactionsTbody', rowSelector: '.tx-row', barId: 'transactionsPaginationBar', defaultSize: 25, label: 'transactions' },
+            orders: { tbodyId: 'adminOrdersTbody', rowSelector: '.admin-order-row', barId: 'ordersPaginationBar', defaultSize: 25, label: 'orders' }
         };
 
         var ADMIN_TAB_META = {
@@ -2699,6 +3570,16 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 title: 'Product Categories',
                 sub: 'Page 6 \u2014 Create, edit, sort, and manage product categories with automatic catalog sync.'
             },
+            transactions: {
+                url: '/admin/transactions',
+                title: 'Payment Transactions Management',
+                sub: 'Page 7 \u2014 Monitor Razorpay payments, statuses, seller commissions, and process full or partial refunds.'
+            },
+            orders: {
+                url: '/admin/orders',
+                title: 'Orders & Cancellation Hub',
+                sub: 'Page 8 \u2014 Centralized order monitoring, cancellation review queue, activity tracking, and multi-vendor delivery status.'
+            },
             all: {
                 url: '/admin?tab=all',
                 title: 'Complete Admin Portal (All Lists)',
@@ -2720,6 +3601,8 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             if (p.indexOf('/admin/sellers') !== -1 || q.indexOf('tab=sellers') !== -1) return 'sellers';
             if (p.indexOf('/admin/gst-verifications') !== -1 || q.indexOf('tab=gst') !== -1) return 'gst';
             if (p.indexOf('/admin/categories') !== -1 || q.indexOf('tab=categories') !== -1) return 'categories';
+            if (p.indexOf('/admin/transactions') !== -1 || q.indexOf('tab=transactions') !== -1) return 'transactions';
+            if (p.indexOf('/admin/orders') !== -1 || q.indexOf('tab=orders') !== -1) return 'orders';
             return 'overview';
         }
 
@@ -2961,6 +3844,208 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             return false;
         }
 
+        // ==========================================
+        // Admin Orders & Cancellation Hub Functions
+        // ==========================================
+        function filterAdminOrdersTab(statusFilter, btn) {
+            document.querySelectorAll('.order-filter-pill').forEach(function(b) { b.classList.remove('active'); });
+            if (btn) btn.classList.add('active');
+
+            var filterList = statusFilter === 'all' ? [] : statusFilter.split(',').map(function(s) { return s.trim().toLowerCase(); });
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var rowStatus = (r.getAttribute('data-order-status') || '').toLowerCase();
+                var visible = (statusFilter === 'all') || (filterList.indexOf(rowStatus) !== -1);
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function filterAdminOrdersSearch(term) {
+            var q = (term || '').trim().toLowerCase();
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var txt = (r.getAttribute('data-order-search') || '').toLowerCase();
+                var visible = !q || txt.indexOf(q) !== -1;
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function openAdminOrderDetailModal(order) {
+            if (!order) return;
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (!modal) return;
+
+            document.getElementById('admOrdModalNumber').innerText = 'Order #' + (order.order_number || order.id);
+            document.getElementById('admOrdModalDate').innerText = 'Placed on ' + (order.created_at || '—');
+            document.getElementById('admOrdModalBuyerName').innerText = order.buyer_name || 'Guest Buyer';
+            document.getElementById('admOrdModalBuyerPhone').innerText = order.buyer_phone || '—';
+            document.getElementById('admOrdModalBuyerAddr').innerText = (order.shipping_address || '') + (order.landmark ? ' (Landmark: ' + order.landmark + ')' : '') + (order.city ? ', ' + order.city : '') + (order.pincode ? ' - ' + order.pincode : '');
+
+            document.getElementById('admOrdModalSellerName').innerText = order.seller_name || ('Seller #' + order.seller_id);
+            document.getElementById('admOrdModalPayMethod').innerText = (order.payment_method || 'cod').toUpperCase();
+
+            var pst = (order.payment_status || 'unpaid').toUpperCase();
+            var pstEl = document.getElementById('admOrdModalPayStatus');
+            pstEl.innerText = pst;
+            pstEl.className = 'badge ' + (pst === 'PAID' ? 'bg-success' : (pst === 'REFUNDED' ? 'bg-purple text-white' : 'bg-secondary'));
+
+            var ost = (order.order_status || 'pending').toUpperCase().replace(/_/g, ' ');
+            var ostEl = document.getElementById('admOrdModalStatus');
+            ostEl.innerText = ost;
+            ostEl.className = 'badge ' + (order.order_status === 'cancellation_requested' ? 'bg-danger' : (order.order_status === 'delivered' ? 'bg-success' : 'bg-primary'));
+
+            var tbody = document.getElementById('admOrdModalItemsTbody');
+            tbody.innerHTML = '';
+            var items = order.items || [];
+            if (items.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-2 text-muted">No items recorded for this order.</td></tr>';
+            } else {
+                items.forEach(function(it) {
+                    var pName = it.resolved_product_name || it.product_name || 'Product';
+                    var sName = it.item_seller_name || it.seller_name || ('Seller #' + (it.seller_id || 1));
+                    var uPrice = parseFloat(it.price || 0);
+                    var qty = parseInt(it.quantity || 1, 10);
+                    var sub = parseFloat(it.subtotal || (uPrice * qty));
+                    var tr = document.createElement('tr');
+                    tr.innerHTML = '<td><div class="fw-semibold text-dark">' + pName + '</div><div class="text-muted small">Item #' + it.id + '</div></td>' +
+                                   '<td>' + sName + '</td>' +
+                                   '<td>₹' + uPrice.toFixed(2) + '</td>' +
+                                   '<td>' + qty + '</td>' +
+                                   '<td class="text-end fw-bold">₹' + sub.toFixed(2) + '</td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            var actionsLeft = document.getElementById('admOrdModalActionsLeft');
+            actionsLeft.innerHTML = '';
+            if (order.order_status === 'cancellation_requested') {
+                actionsLeft.innerHTML = '<button type="button" class="btn btn-success btn-sm fw-bold me-2" onclick="closeAdminOrderModal(); adminQuickApproveCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-check-lg me-1"></i>Approve Cancellation &amp; Refund</button>' +
+                                        '<button type="button" class="btn btn-danger btn-sm fw-bold" onclick="closeAdminOrderModal(); adminQuickRejectCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-x-lg me-1"></i>Decline Cancellation</button>';
+            }
+
+            var timelineBox = document.getElementById('admOrdTimelineContainer');
+            timelineBox.innerHTML = '<div class="text-center py-3 text-muted"><span class="spinner-border spinner-border-sm me-1"></span> Loading activity audit trail...</div>';
+
+            fetch('/api/orders/' + (order.order_number || order.id) + '/activities')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var acts = (d && d.activities) ? d.activities : [];
+                    if (acts.length === 0) {
+                        timelineBox.innerHTML = '<div class="text-center py-3 text-muted">No historical activities logged for this order yet.</div>';
+                    } else {
+                        var html = '<div class="timeline-v" style="position:relative; padding-left:24px; border-left:2px solid #cbd5e1;">';
+                        acts.forEach(function(a) {
+                            var icon = 'bi-circle-fill text-primary';
+                            if (a.action === 'created') icon = 'bi-bag-plus text-success';
+                            else if (a.action === 'cancellation_requested') icon = 'bi-exclamation-triangle text-danger';
+                            else if (a.action === 'cancellation_approved' || a.to_status === 'cancelled') icon = 'bi-x-circle text-danger';
+                            else if (a.action === 'cancellation_rejected') icon = 'bi-arrow-repeat text-warning';
+                            else if (a.to_status === 'shipped') icon = 'bi-truck text-info';
+                            else if (a.to_status === 'delivered') icon = 'bi-gift text-success';
+                            else if (a.action === 'refund_processed') icon = 'bi-credit-card text-purple';
+
+                            var actor = (a.actor_role || 'system').toUpperCase();
+                            if (a.actor_name) actor += ' (' + a.actor_name + ')';
+
+                            var noteHtml = a.notes ? '<div class="small text-muted mt-1 bg-white p-2 rounded border" style="font-size:12px;">' + a.notes + '</div>' : '';
+                            var trackHtml = (a.tracking_number) ? '<div class="small text-primary mt-1"><i class="bi bi-truck me-1"></i>Carrier: ' + (a.carrier || 'Standard') + ' &bull; AWB: ' + a.tracking_number + '</div>' : '';
+
+                            html += '<div class="mb-3 position-relative">' +
+                                    '<i class="bi ' + icon + ' position-absolute" style="left:-31px; top:2px; font-size:14px; background:#f8fafc; border-radius:50%;"></i>' +
+                                    '<div class="d-flex justify-content-between align-items-baseline">' +
+                                    '<strong class="text-dark small">' + a.action.toUpperCase().replace(/_/g, ' ') + '</strong>' +
+                                    '<span class="text-muted" style="font-size:11px;">' + (a.created_at || '') + '</span>' +
+                                    '</div>' +
+                                    '<div class="text-muted" style="font-size:11px;">By <span class="fw-semibold text-secondary">' + actor + '</span>' +
+                                    (a.from_status && a.to_status ? ' &bull; <span class="badge text-bg-light border" style="font-size:10px;">' + a.from_status + ' → ' + a.to_status + '</span>' : '') +
+                                    '</div>' +
+                                    noteHtml +
+                                    trackHtml +
+                                    '</div>';
+                        });
+                        html += '</div>';
+                        timelineBox.innerHTML = html;
+                    }
+                })
+                .catch(function(e) {
+                    timelineBox.innerHTML = '<div class="text-danger small">Failed to load activity logs: ' + e.message + '</div>';
+                });
+
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderModal() {
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderModalClick(e) {
+            if (e.target && e.target.id === 'orderDetailAdminModal') {
+                closeAdminOrderModal();
+            }
+        }
+
+        function openAdminOrderStatusModal(orderId, currentStatus, carrier, tracking) {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (!modal) return;
+            document.getElementById('adminStatusModalOrderId').value = orderId;
+            var sel = document.getElementById('adminStatusModalSelect');
+            sel.value = currentStatus || 'pending';
+            document.getElementById('adminStatusCarrierInput').value = carrier || '';
+            document.getElementById('adminStatusTrackingInput').value = tracking || '';
+            toggleCarrierInputs(sel.value);
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderStatusModal() {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderStatusOverlayClick(e) {
+            if (e.target && e.target.id === 'orderStatusAdminModal') {
+                closeAdminOrderStatusModal();
+            }
+        }
+
+        function toggleCarrierInputs(status) {
+            var box = document.getElementById('adminCarrierInputs');
+            if (box) {
+                box.style.display = (status === 'shipped') ? 'block' : 'none';
+            }
+        }
+
+        function adminQuickApproveCancellation(orderId, orderNum) {
+            if (!confirm('Are you sure you want to approve cancellation for Order #' + orderNum + '?\n\nIf the order was paid, an automated refund will be initiated.')) {
+                return;
+            }
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_approve_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="notes" value="Cancellation approved via Admin Dashboard">';
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function adminQuickRejectCancellation(orderId, orderNum) {
+            var reason = prompt('Please enter the reason for declining cancellation for Order #' + orderNum + ':', 'Order is already being processed/prepared and cannot be cancelled.');
+            if (reason === null) return;
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_reject_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="rejection_reason" value="' + (reason || 'Declined by Admin') + '">';
+            document.body.appendChild(form);
+            form.submit();
+        }
+
         window.addEventListener('popstate', function(ev) {
             var stTab = (ev.state && ev.state.adminTab) ? ev.state.adminTab : detectInitialAdminTab();
             switchAdminTab(stTab, null, true);
@@ -3019,6 +4104,208 @@ function delBadgeClassPhp(?string $statusOrColor): string {
             document.getElementById('confirmModalMessage').innerText = form.getAttribute('data-confirm-msg') || 'Are you sure you want to proceed?';
             document.getElementById('confirmActionModal').classList.add('active');
             return false;
+        }
+
+        // ==========================================
+        // Admin Orders & Cancellation Hub Functions
+        // ==========================================
+        function filterAdminOrdersTab(statusFilter, btn) {
+            document.querySelectorAll('.order-filter-pill').forEach(function(b) { b.classList.remove('active'); });
+            if (btn) btn.classList.add('active');
+
+            var filterList = statusFilter === 'all' ? [] : statusFilter.split(',').map(function(s) { return s.trim().toLowerCase(); });
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var rowStatus = (r.getAttribute('data-order-status') || '').toLowerCase();
+                var visible = (statusFilter === 'all') || (filterList.indexOf(rowStatus) !== -1);
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function filterAdminOrdersSearch(term) {
+            var q = (term || '').trim().toLowerCase();
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var txt = (r.getAttribute('data-order-search') || '').toLowerCase();
+                var visible = !q || txt.indexOf(q) !== -1;
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function openAdminOrderDetailModal(order) {
+            if (!order) return;
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (!modal) return;
+
+            document.getElementById('admOrdModalNumber').innerText = 'Order #' + (order.order_number || order.id);
+            document.getElementById('admOrdModalDate').innerText = 'Placed on ' + (order.created_at || '—');
+            document.getElementById('admOrdModalBuyerName').innerText = order.buyer_name || 'Guest Buyer';
+            document.getElementById('admOrdModalBuyerPhone').innerText = order.buyer_phone || '—';
+            document.getElementById('admOrdModalBuyerAddr').innerText = (order.shipping_address || '') + (order.landmark ? ' (Landmark: ' + order.landmark + ')' : '') + (order.city ? ', ' + order.city : '') + (order.pincode ? ' - ' + order.pincode : '');
+
+            document.getElementById('admOrdModalSellerName').innerText = order.seller_name || ('Seller #' + order.seller_id);
+            document.getElementById('admOrdModalPayMethod').innerText = (order.payment_method || 'cod').toUpperCase();
+
+            var pst = (order.payment_status || 'unpaid').toUpperCase();
+            var pstEl = document.getElementById('admOrdModalPayStatus');
+            pstEl.innerText = pst;
+            pstEl.className = 'badge ' + (pst === 'PAID' ? 'bg-success' : (pst === 'REFUNDED' ? 'bg-purple text-white' : 'bg-secondary'));
+
+            var ost = (order.order_status || 'pending').toUpperCase().replace(/_/g, ' ');
+            var ostEl = document.getElementById('admOrdModalStatus');
+            ostEl.innerText = ost;
+            ostEl.className = 'badge ' + (order.order_status === 'cancellation_requested' ? 'bg-danger' : (order.order_status === 'delivered' ? 'bg-success' : 'bg-primary'));
+
+            var tbody = document.getElementById('admOrdModalItemsTbody');
+            tbody.innerHTML = '';
+            var items = order.items || [];
+            if (items.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-2 text-muted">No items recorded for this order.</td></tr>';
+            } else {
+                items.forEach(function(it) {
+                    var pName = it.resolved_product_name || it.product_name || 'Product';
+                    var sName = it.item_seller_name || it.seller_name || ('Seller #' + (it.seller_id || 1));
+                    var uPrice = parseFloat(it.price || 0);
+                    var qty = parseInt(it.quantity || 1, 10);
+                    var sub = parseFloat(it.subtotal || (uPrice * qty));
+                    var tr = document.createElement('tr');
+                    tr.innerHTML = '<td><div class="fw-semibold text-dark">' + pName + '</div><div class="text-muted small">Item #' + it.id + '</div></td>' +
+                                   '<td>' + sName + '</td>' +
+                                   '<td>₹' + uPrice.toFixed(2) + '</td>' +
+                                   '<td>' + qty + '</td>' +
+                                   '<td class="text-end fw-bold">₹' + sub.toFixed(2) + '</td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            var actionsLeft = document.getElementById('admOrdModalActionsLeft');
+            actionsLeft.innerHTML = '';
+            if (order.order_status === 'cancellation_requested') {
+                actionsLeft.innerHTML = '<button type="button" class="btn btn-success btn-sm fw-bold me-2" onclick="closeAdminOrderModal(); adminQuickApproveCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-check-lg me-1"></i>Approve Cancellation &amp; Refund</button>' +
+                                        '<button type="button" class="btn btn-danger btn-sm fw-bold" onclick="closeAdminOrderModal(); adminQuickRejectCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-x-lg me-1"></i>Decline Cancellation</button>';
+            }
+
+            var timelineBox = document.getElementById('admOrdTimelineContainer');
+            timelineBox.innerHTML = '<div class="text-center py-3 text-muted"><span class="spinner-border spinner-border-sm me-1"></span> Loading activity audit trail...</div>';
+
+            fetch('/api/orders/' + (order.order_number || order.id) + '/activities')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var acts = (d && d.activities) ? d.activities : [];
+                    if (acts.length === 0) {
+                        timelineBox.innerHTML = '<div class="text-center py-3 text-muted">No historical activities logged for this order yet.</div>';
+                    } else {
+                        var html = '<div class="timeline-v" style="position:relative; padding-left:24px; border-left:2px solid #cbd5e1;">';
+                        acts.forEach(function(a) {
+                            var icon = 'bi-circle-fill text-primary';
+                            if (a.action === 'created') icon = 'bi-bag-plus text-success';
+                            else if (a.action === 'cancellation_requested') icon = 'bi-exclamation-triangle text-danger';
+                            else if (a.action === 'cancellation_approved' || a.to_status === 'cancelled') icon = 'bi-x-circle text-danger';
+                            else if (a.action === 'cancellation_rejected') icon = 'bi-arrow-repeat text-warning';
+                            else if (a.to_status === 'shipped') icon = 'bi-truck text-info';
+                            else if (a.to_status === 'delivered') icon = 'bi-gift text-success';
+                            else if (a.action === 'refund_processed') icon = 'bi-credit-card text-purple';
+
+                            var actor = (a.actor_role || 'system').toUpperCase();
+                            if (a.actor_name) actor += ' (' + a.actor_name + ')';
+
+                            var noteHtml = a.notes ? '<div class="small text-muted mt-1 bg-white p-2 rounded border" style="font-size:12px;">' + a.notes + '</div>' : '';
+                            var trackHtml = (a.tracking_number) ? '<div class="small text-primary mt-1"><i class="bi bi-truck me-1"></i>Carrier: ' + (a.carrier || 'Standard') + ' &bull; AWB: ' + a.tracking_number + '</div>' : '';
+
+                            html += '<div class="mb-3 position-relative">' +
+                                    '<i class="bi ' + icon + ' position-absolute" style="left:-31px; top:2px; font-size:14px; background:#f8fafc; border-radius:50%;"></i>' +
+                                    '<div class="d-flex justify-content-between align-items-baseline">' +
+                                    '<strong class="text-dark small">' + a.action.toUpperCase().replace(/_/g, ' ') + '</strong>' +
+                                    '<span class="text-muted" style="font-size:11px;">' + (a.created_at || '') + '</span>' +
+                                    '</div>' +
+                                    '<div class="text-muted" style="font-size:11px;">By <span class="fw-semibold text-secondary">' + actor + '</span>' +
+                                    (a.from_status && a.to_status ? ' &bull; <span class="badge text-bg-light border" style="font-size:10px;">' + a.from_status + ' → ' + a.to_status + '</span>' : '') +
+                                    '</div>' +
+                                    noteHtml +
+                                    trackHtml +
+                                    '</div>';
+                        });
+                        html += '</div>';
+                        timelineBox.innerHTML = html;
+                    }
+                })
+                .catch(function(e) {
+                    timelineBox.innerHTML = '<div class="text-danger small">Failed to load activity logs: ' + e.message + '</div>';
+                });
+
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderModal() {
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderModalClick(e) {
+            if (e.target && e.target.id === 'orderDetailAdminModal') {
+                closeAdminOrderModal();
+            }
+        }
+
+        function openAdminOrderStatusModal(orderId, currentStatus, carrier, tracking) {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (!modal) return;
+            document.getElementById('adminStatusModalOrderId').value = orderId;
+            var sel = document.getElementById('adminStatusModalSelect');
+            sel.value = currentStatus || 'pending';
+            document.getElementById('adminStatusCarrierInput').value = carrier || '';
+            document.getElementById('adminStatusTrackingInput').value = tracking || '';
+            toggleCarrierInputs(sel.value);
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderStatusModal() {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderStatusOverlayClick(e) {
+            if (e.target && e.target.id === 'orderStatusAdminModal') {
+                closeAdminOrderStatusModal();
+            }
+        }
+
+        function toggleCarrierInputs(status) {
+            var box = document.getElementById('adminCarrierInputs');
+            if (box) {
+                box.style.display = (status === 'shipped') ? 'block' : 'none';
+            }
+        }
+
+        function adminQuickApproveCancellation(orderId, orderNum) {
+            if (!confirm('Are you sure you want to approve cancellation for Order #' + orderNum + '?\n\nIf the order was paid, an automated refund will be initiated.')) {
+                return;
+            }
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_approve_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="notes" value="Cancellation approved via Admin Dashboard">';
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function adminQuickRejectCancellation(orderId, orderNum) {
+            var reason = prompt('Please enter the reason for declining cancellation for Order #' + orderNum + ':', 'Order is already being processed/prepared and cannot be cancelled.');
+            if (reason === null) return;
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_reject_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="rejection_reason" value="' + (reason || 'Declined by Admin') + '">';
+            document.body.appendChild(form);
+            form.submit();
         }
 
         function closeConfirmModal() {
@@ -4186,6 +5473,434 @@ function delBadgeClassPhp(?string $statusOrColor): string {
                 banner.className = 'alert alert-danger small py-2 mb-3';
                 banner.innerText = 'Network error sending test email.';
             });
+        }
+
+        // ==========================================
+        // Payment Transactions Management Handlers
+        // ==========================================
+        window._activeTxStatus = 'all';
+        window._activeTxSearch = '';
+
+        function filterTransactionsSearch() {
+            var input = document.getElementById('txSearchInput');
+            window._activeTxSearch = input ? input.value.trim().toLowerCase() : '';
+            applyTxTableFilters();
+        }
+
+        function filterTransactionsByStatus(status, btn) {
+            window._activeTxStatus = status;
+            var group = document.getElementById('txStatusFilterGroup');
+            if (group) {
+                group.querySelectorAll('.tx-filter-btn').forEach(function(b) {
+                    b.classList.remove('active', 'btn-dark');
+                    b.classList.add('btn-outline-secondary');
+                });
+            }
+            if (btn) {
+                btn.classList.remove('btn-outline-secondary');
+                btn.classList.add('active', 'btn-dark');
+            }
+            applyTxTableFilters();
+        }
+
+        function applyTxTableFilters() {
+            var rows = document.querySelectorAll('#adminTransactionsTbody .tx-row');
+            var visibleCount = 0;
+            rows.forEach(function(r) {
+                var st = r.getAttribute('data-tx-status') || '';
+                var search = r.getAttribute('data-tx-search') || '';
+                var matchesStatus = (window._activeTxStatus === 'all') || (st === window._activeTxStatus);
+                var matchesSearch = (!window._activeTxSearch) || (search.indexOf(window._activeTxSearch) !== -1);
+                if (matchesStatus && matchesSearch) {
+                    r.style.display = '';
+                    visibleCount++;
+                } else {
+                    r.style.display = 'none';
+                }
+            });
+            var emptyRow = document.getElementById('txEmptyRow');
+            if (emptyRow) {
+                emptyRow.style.display = (visibleCount === 0 && rows.length > 0) ? '' : 'none';
+            }
+            refreshTablePager('transactions');
+        }
+
+        function openTxDetailModal(tx) {
+            var modal = document.getElementById('txDetailModal');
+            var body = document.getElementById('txDetailModalBody');
+            if (!modal || !body || !tx) return;
+
+            var amountFormatted = Number(tx.amount || 0).toFixed(2);
+            var commFormatted = Number(tx.commission_amount || 0).toFixed(2);
+            var netFormatted = Number(tx.net_seller_amount || 0).toFixed(2);
+            var refAmountFormatted = Number(tx.refunded_amount || 0).toFixed(2);
+            var maxRefundable = Number(tx.refundable_amount != null ? tx.refundable_amount : tx.amount || 0).toFixed(2);
+
+            var metaHtml = '';
+            if (tx.metadata) {
+                try {
+                    var parsed = typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : tx.metadata;
+                    metaHtml = '<pre class="bg-light p-3 rounded border small text-dark mb-0" style="max-height: 200px; overflow-y: auto;">' +
+                        JSON.stringify(parsed, null, 2) + '</pre>';
+                } catch(e) {
+                    metaHtml = '<div class="text-muted small">' + String(tx.metadata) + '</div>';
+                }
+            } else {
+                metaHtml = '<div class="text-muted small">No extra metadata logged.</div>';
+            }
+
+            var html = '<div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom">' +
+                '<div>' +
+                    '<span class="badge text-bg-primary me-2">Order #' + (tx.order_id || '—') + '</span>' +
+                    '<span class="badge text-bg-secondary">Tx #' + (tx.id || '—') + '</span>' +
+                '</div>' +
+                '<span class="badge ' + (tx.status === 'captured' ? 'text-bg-success' : (tx.status === 'failed' ? 'text-bg-danger' : 'text-bg-warning')) + ' text-uppercase fs-6">' + (tx.status || 'PENDING') + '</span>' +
+            '</div>' +
+            '<div class="row g-3 mb-3">' +
+                '<div class="col-md-6">' +
+                    '<div class="p-3 bg-light rounded border">' +
+                        '<div class="small text-muted fw-bold mb-1">CUSTOMER DETAILS</div>' +
+                        '<div class="fw-bold text-dark">' + (tx.customer_name || 'Guest') + '</div>' +
+                        '<div class="small text-muted">' + (tx.customer_phone || 'No phone') + '</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="col-md-6">' +
+                    '<div class="p-3 bg-light rounded border">' +
+                        '<div class="small text-muted fw-bold mb-1">SELLER DETAILS</div>' +
+                        '<div class="fw-bold text-dark">' + (tx.seller_name || 'Seller #' + tx.seller_id) + '</div>' +
+                        '<div class="small text-muted">ID: #' + (tx.seller_id || '—') + ' &bull; Product: ' + (tx.product_title || 'Item') + '</div>' +
+                    '</div>' +
+                '</div>' +
+            '</div>' +
+            '<div class="p-3 bg-light rounded border mb-3">' +
+                '<div class="small text-muted fw-bold mb-2">FINANCIAL BREAKDOWN (5% COMMISSION)</div>' +
+                '<div class="d-flex justify-content-between py-1 border-bottom small">' +
+                    '<span>Gross Amount Paid:</span><strong class="text-dark">₹' + amountFormatted + '</strong>' +
+                '</div>' +
+                '<div class="d-flex justify-content-between py-1 border-bottom small">' +
+                    '<span>Platform Commission (' + Number(tx.commission_rate || 5) + '%):</span><strong class="text-primary">₹' + commFormatted + '</strong>' +
+                '</div>' +
+                '<div class="d-flex justify-content-between py-1 border-bottom small">' +
+                    '<span>Net Seller Earnings:</span><strong class="text-success">₹' + netFormatted + '</strong>' +
+                '</div>' +
+                '<div class="d-flex justify-content-between py-1 small">' +
+                    '<span>Refunded so far:</span><strong class="text-danger">₹' + refAmountFormatted + '</strong>' +
+                '</div>' +
+            '</div>' +
+            '<div class="p-3 bg-light rounded border mb-3">' +
+                '<div class="small text-muted fw-bold mb-1">GATEWAY IDENTIFIERS</div>' +
+                '<div class="small mb-1"><strong>Razorpay Payment ID:</strong> <code class="text-primary">' + (tx.gateway_payment_id || 'None') + '</code></div>' +
+                '<div class="small mb-1"><strong>Razorpay Order ID:</strong> <code class="text-secondary">' + (tx.gateway_order_id || 'None') + '</code></div>' +
+                '<div class="small"><strong>Created At:</strong> ' + (tx.created_at || '—') + '</div>' +
+            '</div>' +
+            '<div class="mb-2">' +
+                '<div class="small text-muted fw-bold mb-1">RAW GATEWAY METADATA / PAYLOAD</div>' +
+                metaHtml +
+            '</div>';
+
+            body.innerHTML = html;
+            modal.classList.add('active');
+        }
+
+        function closeTxDetailModal() {
+            var modal = document.getElementById('txDetailModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function openTxRefundModal(tx) {
+            var modal = document.getElementById('txRefundModal');
+            if (!modal || !tx) return;
+
+            document.getElementById('rfTxId').value = tx.id || '';
+            document.getElementById('rfOrderId').value = tx.order_id || '';
+            document.getElementById('rfOrderDisplay').innerText = 'Order #' + (tx.order_id || '—');
+            document.getElementById('rfPaymentDisplay').innerText = tx.gateway_payment_id || 'No payment ID';
+
+            var maxRef = Number(tx.refundable_amount != null ? tx.refundable_amount : tx.amount || 0);
+            document.getElementById('rfMaxAmountDisplay').innerText = '₹' + maxRef.toFixed(2);
+
+            var amtInput = document.getElementById('rfAmountInput');
+            amtInput.max = maxRef;
+            amtInput.value = maxRef.toFixed(2);
+
+            var alertBox = document.getElementById('txRefundAlert');
+            if (alertBox) {
+                alertBox.style.display = 'none';
+                alertBox.innerText = '';
+            }
+
+            modal.classList.add('active');
+        }
+
+        function closeTxRefundModal() {
+            var modal = document.getElementById('txRefundModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function submitTxRefund(e) {
+            e.preventDefault();
+            var alertBox = document.getElementById('txRefundAlert');
+            var btn = document.getElementById('rfSubmitBtn');
+            var txId = document.getElementById('rfTxId').value;
+            var orderId = document.getElementById('rfOrderId').value;
+            var amount = parseFloat(document.getElementById('rfAmountInput').value);
+            var reason = document.getElementById('rfReasonSelect').value;
+            var notes = document.getElementById('rfNoteInput').value;
+
+            if (isNaN(amount) || amount <= 0) {
+                if (alertBox) {
+                    alertBox.style.display = 'block';
+                    alertBox.innerText = 'Please enter a valid refund amount.';
+                }
+                return false;
+            }
+
+            if (!confirm('Are you sure you want to issue a refund of ₹' + amount.toFixed(2) + ' for Order #' + orderId + '?')) {
+                return false;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Processing...';
+            if (alertBox) alertBox.style.display = 'none';
+
+            fetch('/api/payment/refund', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    transaction_id: txId,
+                    order_id: orderId,
+                    amount: amount,
+                    reason: reason,
+                    notes: notes
+                })
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-arrow-counterclockwise me-1"></i>Confirm Refund';
+                if (data && data.success) {
+                    alert('Refund processed successfully! Refund ID: ' + (data.data && data.data.refund_id ? data.data.refund_id : 'N/A'));
+                    closeTxRefundModal();
+                    window.location.reload();
+                } else {
+                    if (alertBox) {
+                        alertBox.style.display = 'block';
+                        alertBox.innerText = data.error || 'Failed to process refund.';
+                    }
+                }
+            })
+            .catch(function(err) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-arrow-counterclockwise me-1"></i>Confirm Refund';
+                if (alertBox) {
+                    alertBox.style.display = 'block';
+                    alertBox.innerText = 'Network error: ' + (err.message || err);
+                }
+            });
+
+            return false;
+        }
+
+        // ==========================================
+        // Admin Orders & Cancellation Hub Functions
+        // ==========================================
+        function filterAdminOrdersTab(statusFilter, btn) {
+            document.querySelectorAll('.order-filter-pill').forEach(function(b) { b.classList.remove('active'); });
+            if (btn) btn.classList.add('active');
+
+            var filterList = statusFilter === 'all' ? [] : statusFilter.split(',').map(function(s) { return s.trim().toLowerCase(); });
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var rowStatus = (r.getAttribute('data-order-status') || '').toLowerCase();
+                var visible = (statusFilter === 'all') || (filterList.indexOf(rowStatus) !== -1);
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function filterAdminOrdersSearch(term) {
+            var q = (term || '').trim().toLowerCase();
+            var rows = document.querySelectorAll('#adminOrdersTbody .admin-order-row');
+            rows.forEach(function(r) {
+                var txt = (r.getAttribute('data-order-search') || '').toLowerCase();
+                var visible = !q || txt.indexOf(q) !== -1;
+                r.style.display = visible ? '' : 'none';
+            });
+            if (typeof initOrUpdateTablePager === 'function') initOrUpdateTablePager('orders');
+        }
+
+        function openAdminOrderDetailModal(order) {
+            if (!order) return;
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (!modal) return;
+
+            document.getElementById('admOrdModalNumber').innerText = 'Order #' + (order.order_number || order.id);
+            document.getElementById('admOrdModalDate').innerText = 'Placed on ' + (order.created_at || '—');
+            document.getElementById('admOrdModalBuyerName').innerText = order.buyer_name || 'Guest Buyer';
+            document.getElementById('admOrdModalBuyerPhone').innerText = order.buyer_phone || '—';
+            document.getElementById('admOrdModalBuyerAddr').innerText = (order.shipping_address || '') + (order.landmark ? ' (Landmark: ' + order.landmark + ')' : '') + (order.city ? ', ' + order.city : '') + (order.pincode ? ' - ' + order.pincode : '');
+
+            document.getElementById('admOrdModalSellerName').innerText = order.seller_name || ('Seller #' + order.seller_id);
+            document.getElementById('admOrdModalPayMethod').innerText = (order.payment_method || 'cod').toUpperCase();
+
+            var pst = (order.payment_status || 'unpaid').toUpperCase();
+            var pstEl = document.getElementById('admOrdModalPayStatus');
+            pstEl.innerText = pst;
+            pstEl.className = 'badge ' + (pst === 'PAID' ? 'bg-success' : (pst === 'REFUNDED' ? 'bg-purple text-white' : 'bg-secondary'));
+
+            var ost = (order.order_status || 'pending').toUpperCase().replace(/_/g, ' ');
+            var ostEl = document.getElementById('admOrdModalStatus');
+            ostEl.innerText = ost;
+            ostEl.className = 'badge ' + (order.order_status === 'cancellation_requested' ? 'bg-danger' : (order.order_status === 'delivered' ? 'bg-success' : 'bg-primary'));
+
+            var tbody = document.getElementById('admOrdModalItemsTbody');
+            tbody.innerHTML = '';
+            var items = order.items || [];
+            if (items.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-2 text-muted">No items recorded for this order.</td></tr>';
+            } else {
+                items.forEach(function(it) {
+                    var pName = it.resolved_product_name || it.product_name || 'Product';
+                    var sName = it.item_seller_name || it.seller_name || ('Seller #' + (it.seller_id || 1));
+                    var uPrice = parseFloat(it.price || 0);
+                    var qty = parseInt(it.quantity || 1, 10);
+                    var sub = parseFloat(it.subtotal || (uPrice * qty));
+                    var tr = document.createElement('tr');
+                    tr.innerHTML = '<td><div class="fw-semibold text-dark">' + pName + '</div><div class="text-muted small">Item #' + it.id + '</div></td>' +
+                                   '<td>' + sName + '</td>' +
+                                   '<td>₹' + uPrice.toFixed(2) + '</td>' +
+                                   '<td>' + qty + '</td>' +
+                                   '<td class="text-end fw-bold">₹' + sub.toFixed(2) + '</td>';
+                    tbody.appendChild(tr);
+                });
+            }
+
+            var actionsLeft = document.getElementById('admOrdModalActionsLeft');
+            actionsLeft.innerHTML = '';
+            if (order.order_status === 'cancellation_requested') {
+                actionsLeft.innerHTML = '<button type="button" class="btn btn-success btn-sm fw-bold me-2" onclick="closeAdminOrderModal(); adminQuickApproveCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-check-lg me-1"></i>Approve Cancellation &amp; Refund</button>' +
+                                        '<button type="button" class="btn btn-danger btn-sm fw-bold" onclick="closeAdminOrderModal(); adminQuickRejectCancellation(' + order.id + ', \'' + order.order_number + '\');"><i class="bi bi-x-lg me-1"></i>Decline Cancellation</button>';
+            }
+
+            var timelineBox = document.getElementById('admOrdTimelineContainer');
+            timelineBox.innerHTML = '<div class="text-center py-3 text-muted"><span class="spinner-border spinner-border-sm me-1"></span> Loading activity audit trail...</div>';
+
+            fetch('/api/orders/' + (order.order_number || order.id) + '/activities')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var acts = (d && d.activities) ? d.activities : [];
+                    if (acts.length === 0) {
+                        timelineBox.innerHTML = '<div class="text-center py-3 text-muted">No historical activities logged for this order yet.</div>';
+                    } else {
+                        var html = '<div class="timeline-v" style="position:relative; padding-left:24px; border-left:2px solid #cbd5e1;">';
+                        acts.forEach(function(a) {
+                            var icon = 'bi-circle-fill text-primary';
+                            if (a.action === 'created') icon = 'bi-bag-plus text-success';
+                            else if (a.action === 'cancellation_requested') icon = 'bi-exclamation-triangle text-danger';
+                            else if (a.action === 'cancellation_approved' || a.to_status === 'cancelled') icon = 'bi-x-circle text-danger';
+                            else if (a.action === 'cancellation_rejected') icon = 'bi-arrow-repeat text-warning';
+                            else if (a.to_status === 'shipped') icon = 'bi-truck text-info';
+                            else if (a.to_status === 'delivered') icon = 'bi-gift text-success';
+                            else if (a.action === 'refund_processed') icon = 'bi-credit-card text-purple';
+
+                            var actor = (a.actor_role || 'system').toUpperCase();
+                            if (a.actor_name) actor += ' (' + a.actor_name + ')';
+
+                            var noteHtml = a.notes ? '<div class="small text-muted mt-1 bg-white p-2 rounded border" style="font-size:12px;">' + a.notes + '</div>' : '';
+                            var trackHtml = (a.tracking_number) ? '<div class="small text-primary mt-1"><i class="bi bi-truck me-1"></i>Carrier: ' + (a.carrier || 'Standard') + ' &bull; AWB: ' + a.tracking_number + '</div>' : '';
+
+                            html += '<div class="mb-3 position-relative">' +
+                                    '<i class="bi ' + icon + ' position-absolute" style="left:-31px; top:2px; font-size:14px; background:#f8fafc; border-radius:50%;"></i>' +
+                                    '<div class="d-flex justify-content-between align-items-baseline">' +
+                                    '<strong class="text-dark small">' + a.action.toUpperCase().replace(/_/g, ' ') + '</strong>' +
+                                    '<span class="text-muted" style="font-size:11px;">' + (a.created_at || '') + '</span>' +
+                                    '</div>' +
+                                    '<div class="text-muted" style="font-size:11px;">By <span class="fw-semibold text-secondary">' + actor + '</span>' +
+                                    (a.from_status && a.to_status ? ' &bull; <span class="badge text-bg-light border" style="font-size:10px;">' + a.from_status + ' → ' + a.to_status + '</span>' : '') +
+                                    '</div>' +
+                                    noteHtml +
+                                    trackHtml +
+                                    '</div>';
+                        });
+                        html += '</div>';
+                        timelineBox.innerHTML = html;
+                    }
+                })
+                .catch(function(e) {
+                    timelineBox.innerHTML = '<div class="text-danger small">Failed to load activity logs: ' + e.message + '</div>';
+                });
+
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderModal() {
+            var modal = document.getElementById('orderDetailAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderModalClick(e) {
+            if (e.target && e.target.id === 'orderDetailAdminModal') {
+                closeAdminOrderModal();
+            }
+        }
+
+        function openAdminOrderStatusModal(orderId, currentStatus, carrier, tracking) {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (!modal) return;
+            document.getElementById('adminStatusModalOrderId').value = orderId;
+            var sel = document.getElementById('adminStatusModalSelect');
+            sel.value = currentStatus || 'pending';
+            document.getElementById('adminStatusCarrierInput').value = carrier || '';
+            document.getElementById('adminStatusTrackingInput').value = tracking || '';
+            toggleCarrierInputs(sel.value);
+            modal.classList.add('active');
+        }
+
+        function closeAdminOrderStatusModal() {
+            var modal = document.getElementById('orderStatusAdminModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function handleAdminOrderStatusOverlayClick(e) {
+            if (e.target && e.target.id === 'orderStatusAdminModal') {
+                closeAdminOrderStatusModal();
+            }
+        }
+
+        function toggleCarrierInputs(status) {
+            var box = document.getElementById('adminCarrierInputs');
+            if (box) {
+                box.style.display = (status === 'shipped') ? 'block' : 'none';
+            }
+        }
+
+        function adminQuickApproveCancellation(orderId, orderNum) {
+            if (!confirm('Are you sure you want to approve cancellation for Order #' + orderNum + '?\n\nIf the order was paid, an automated refund will be initiated.')) {
+                return;
+            }
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_approve_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="notes" value="Cancellation approved via Admin Dashboard">';
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function adminQuickRejectCancellation(orderId, orderNum) {
+            var reason = prompt('Please enter the reason for declining cancellation for Order #' + orderNum + ':', 'Order is already being processed/prepared and cannot be cancelled.');
+            if (reason === null) return;
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/admin/orders';
+            form.innerHTML = '<input type="hidden" name="action" value="admin_reject_cancellation">' +
+                             '<input type="hidden" name="return_tab" value="orders">' +
+                             '<input type="hidden" name="order_id" value="' + orderId + '">' +
+                             '<input type="hidden" name="rejection_reason" value="' + (reason || 'Declined by Admin') + '">';
+            document.body.appendChild(form);
+            form.submit();
         }
     </script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>

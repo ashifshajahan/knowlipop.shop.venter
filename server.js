@@ -1,4 +1,6 @@
 const express = require('express');
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
@@ -101,6 +103,114 @@ let activeConfig = candidateConfigs[0] || {
 };
 
 const app = express();
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: (origin, callback) => callback(null, true),
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+  }
+});
+
+const deliveredNotificationIds = new Set();
+
+function deliverRealtimeNotification(notif) {
+  if (!io) return;
+  const notifId = notif.id ? String(notif.id) : (notif.order_id ? `${notif.type}_${notif.order_id}_${Date.now()}` : null);
+  if (notifId && deliveredNotificationIds.has(notifId)) {
+    return; // deduplicated
+  }
+  if (notifId) {
+    deliveredNotificationIds.add(notifId);
+    if (deliveredNotificationIds.size > 5000) {
+      const firstEntry = deliveredNotificationIds.values().next().value;
+      deliveredNotificationIds.delete(firstEntry);
+    }
+  }
+
+  const payload = {
+    id: notif.id ? Number(notif.id) : null,
+    user_id: notif.user_id ? Number(notif.user_id) : null,
+    phone: notif.buyer_phone || notif.phone || null,
+    recipient_role: notif.recipient_role || null,
+    order_id: notif.order_id ? Number(notif.order_id) : null,
+    title: notif.title,
+    message: notif.message,
+    type: notif.type || 'order',
+    data: typeof notif.data === 'string' ? (() => { try { return JSON.parse(notif.data); } catch(e) { return notif.data; } })() : (notif.data || null),
+    is_read: Boolean(notif.is_read),
+    created_at: notif.created_at || new Date().toISOString()
+  };
+
+  // 1. Direct user room
+  if (payload.user_id) {
+    io.to(`user:${payload.user_id}`).emit('notification', payload);
+    if (payload.recipient_role === 'seller' || !payload.recipient_role) {
+      io.to(`seller:${payload.user_id}`).emit('notification', payload);
+    }
+  }
+
+  // 2. Specific seller from payload data
+  if (payload.data && payload.data.seller_id) {
+    io.to(`seller:${payload.data.seller_id}`).emit('notification', payload);
+    io.to(`user:${payload.data.seller_id}`).emit('notification', payload);
+  }
+
+  // 3. Buyer Phone room
+  if (payload.phone) {
+    const raw = String(payload.phone).trim();
+    const clean = raw.replace(/\D/g, '');
+    io.to(`phone:${raw}`).emit('notification', payload);
+    if (clean && clean !== raw) {
+      io.to(`phone:${clean}`).emit('notification', payload);
+    }
+  }
+
+  // 4. Admin room
+  if (payload.recipient_role === 'admin' || (payload.type && payload.type.startsWith('admin_'))) {
+    io.to('role:admin').emit('notification', payload);
+  }
+}
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      socket.user = decoded;
+    } catch (e) {}
+  }
+  next();
+});
+
+io.on('connection', (socket) => {
+  const authUser = socket.user;
+  const handshakeQuery = socket.handshake.query || {};
+  const handshakeAuth = socket.handshake.auth || {};
+
+  const userId = authUser?.id || handshakeAuth.user_id || handshakeQuery.user_id;
+  const sellerId = handshakeAuth.seller_id || handshakeQuery.seller_id || (authUser?.role === 'seller' ? authUser.id : null);
+  const role = authUser?.role || handshakeAuth.role || handshakeQuery.role;
+  const rawPhone = authUser?.phone || handshakeAuth.phone || handshakeQuery.phone;
+
+  if (userId) socket.join(`user:${userId}`);
+  if (sellerId) {
+    socket.join(`seller:${sellerId}`);
+    socket.join(`user:${sellerId}`);
+  }
+  if (role === 'admin') socket.join('role:admin');
+  if (rawPhone) {
+    const pStr = String(rawPhone).trim();
+    socket.join(`phone:${pStr}`);
+    const clean = pStr.replace(/\D/g, '');
+    if (clean && clean !== pStr) socket.join(`phone:${clean}`);
+  }
+
+  socket.on('join_room', (room) => {
+    if (typeof room === 'string' && room.trim()) socket.join(room.trim());
+  });
+});
+
 const PORT = process.env.PORT || 8000;
 const JWT_SECRET = process.env.JWT_SECRET || 'vendor_jwt_secret_key_987654321';
 
@@ -1772,12 +1882,21 @@ app.get('/', (req, res) => {
           • POST /api/register<br>
           • POST /api/login<br>
           • GET /api/products (Catalog + 5 Editable Categories)<br>
-          • GET /admin/login
+          • GET /admin/login<br>
+          • GET /test-buyer (Customer Checkout & Razorpay Test Portal)
         </div>
       </div>
     </body>
     </html>
   `);
+});
+
+app.get(['/test-buyer', '/buyer'], (req, res) => {
+  const buyerPath = path.join(__dirname, 'test-buyer.html');
+  if (fs.existsSync(buyerPath)) {
+    return res.sendFile(buyerPath);
+  }
+  return res.status(404).send('test-buyer.html not found');
 });
 
 app.get('/api/health', async (req, res) => {
@@ -7598,6 +7717,8 @@ async function ensureOrdersTables(p) {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         user_id BIGINT UNSIGNED NULL DEFAULT NULL,
         buyer_phone VARCHAR(30) NULL DEFAULT NULL,
+        recipient_role VARCHAR(40) NULL DEFAULT NULL,
+        order_id BIGINT UNSIGNED NULL DEFAULT NULL,
         title VARCHAR(255) NOT NULL,
         message TEXT NOT NULL,
         type VARCHAR(50) NOT NULL DEFAULT 'order',
@@ -7608,9 +7729,21 @@ async function ensureOrdersTables(p) {
         PRIMARY KEY (id),
         INDEX idx_notifications_user (user_id),
         INDEX idx_notifications_phone (buyer_phone),
-        INDEX idx_notifications_read (is_read)
+        INDEX idx_notifications_read (is_read),
+        INDEX idx_notifications_order (order_id),
+        INDEX idx_notifications_role (recipient_role)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    try {
+      const [rCols] = await p.query('SHOW COLUMNS FROM notifications LIKE "recipient_role"');
+      if (rCols.length === 0) await p.query('ALTER TABLE notifications ADD COLUMN recipient_role VARCHAR(40) NULL DEFAULT NULL AFTER buyer_phone');
+    } catch (e) {}
+
+    try {
+      const [oCols] = await p.query('SHOW COLUMNS FROM notifications LIKE "order_id"');
+      if (oCols.length === 0) await p.query('ALTER TABLE notifications ADD COLUMN order_id BIGINT UNSIGNED NULL DEFAULT NULL AFTER recipient_role');
+    } catch (e) {}
 
     await p.query(`
       CREATE TABLE IF NOT EXISTS device_tokens (
@@ -7676,10 +7809,99 @@ async function ensureOrdersTables(p) {
       if (cols.length === 0) await p.query('ALTER TABLE users ADD COLUMN fcm_token VARCHAR(255) NULL DEFAULT NULL');
     } catch (e) {}
 
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "carrier"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN carrier VARCHAR(100) NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "tracking_number"');
+      if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN tracking_number VARCHAR(100) NULL DEFAULT NULL');
+    } catch (e) {}
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS order_activities (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        order_id BIGINT UNSIGNED NOT NULL,
+        actor_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        actor_role VARCHAR(40) NOT NULL DEFAULT 'system',
+        actor_name VARCHAR(150) NULL DEFAULT NULL,
+        action VARCHAR(60) NOT NULL,
+        from_status VARCHAR(40) NULL DEFAULT NULL,
+        to_status VARCHAR(40) NULL DEFAULT NULL,
+        notes TEXT NULL DEFAULT NULL,
+        tracking_number VARCHAR(100) NULL DEFAULT NULL,
+        carrier VARCHAR(100) NULL DEFAULT NULL,
+        metadata JSON NULL DEFAULT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_order_activities_order (order_id),
+        INDEX idx_order_activities_action (action)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
     // Ensure product pricing breakdown columns exist
     await ensureProductPriceColumns(p);
   } catch (err) {
     // ignore
+  }
+}
+
+async function logOrderActivityNode(p, orderId, action, fromStatus, toStatus, opts = {}) {
+  try {
+    if (!p) return 0;
+    const actorId = opts.actorId ? Number(opts.actorId) : null;
+    const actorRole = opts.actorRole ? String(opts.actorRole).trim() : 'system';
+    const actorName = opts.actorName ? String(opts.actorName).trim() : null;
+    const notes = opts.notes ? String(opts.notes).trim() : null;
+    const trackingNumber = opts.trackingNumber ? String(opts.trackingNumber).trim() : null;
+    const carrier = opts.carrier ? String(opts.carrier).trim() : null;
+    const metadata = opts.metadata ? (typeof opts.metadata === 'string' ? opts.metadata : JSON.stringify(opts.metadata)) : null;
+
+    const [res] = await p.query(
+      `INSERT INTO order_activities (order_id, actor_id, actor_role, actor_name, action, from_status, to_status, notes, tracking_number, carrier, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [orderId, actorId, actorRole, actorName, action, fromStatus, toStatus, notes, trackingNumber, carrier, metadata]
+    );
+    return res.insertId || 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+async function getOrderActivitiesNode(p, orderId) {
+  try {
+    if (!p) return [];
+    const [rows] = await p.query(
+      `SELECT id, order_id, actor_id, actor_role, actor_name, action, from_status, to_status, notes, tracking_number, carrier, metadata, created_at
+       FROM order_activities
+       WHERE order_id = ?
+       ORDER BY id ASC`,
+      [orderId]
+    );
+    return rows.map(r => {
+      let meta = null;
+      if (r.metadata) {
+        try { meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata; } catch (e) { meta = r.metadata; }
+      }
+      return {
+        id: Number(r.id),
+        order_id: Number(r.order_id),
+        actor_id: r.actor_id ? Number(r.actor_id) : null,
+        actor_role: r.actor_role,
+        actor_name: r.actor_name,
+        action: r.action,
+        from_status: r.from_status,
+        to_status: r.to_status,
+        notes: r.notes,
+        tracking_number: r.tracking_number,
+        carrier: r.carrier,
+        metadata: meta,
+        created_at: r.created_at
+      };
+    });
+  } catch (e) {
+    return [];
   }
 }
 
@@ -7706,7 +7928,7 @@ async function sendPushNotification({ userId, phone, title, message, data }) {
   if (fcmKey && tokens.length > 0) {
     for (const token of tokens) {
       try {
-        await fetch('https://fcm.googleapis.com/fcm/send', {
+        const fcmRes = await fetch('https://fcm.googleapis.com/fcm/send', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -7718,6 +7940,17 @@ async function sendPushNotification({ userId, phone, title, message, data }) {
             data: data || {}
           })
         });
+        const fcmJson = await fcmRes.json().catch(() => null);
+        if (fcmJson && fcmJson.results && fcmJson.results[0] && fcmJson.results[0].error) {
+          const err = fcmJson.results[0].error;
+          if (['NotRegistered', 'InvalidRegistration', 'registration-token-not-registered'].includes(err)) {
+            console.log(`[FCM] Pruning expired/invalid device token: ${token}`);
+            if (pool) {
+              await pool.query('DELETE FROM device_tokens WHERE token = ?', [token]).catch(() => {});
+              await pool.query('UPDATE users SET fcm_token = NULL WHERE fcm_token = ?', [token]).catch(() => {});
+            }
+          }
+        }
       } catch (fcmErr) {
         console.error('FCM Dispatch error:', fcmErr.message);
       }
@@ -7726,10 +7959,12 @@ async function sendPushNotification({ userId, phone, title, message, data }) {
   return { success: true, delivered: tokens.length };
 }
 
-async function createNotification(p, { userId = null, phone = null, title, message, type = 'order', data = null }) {
+async function createNotification(p, { userId = null, phone = null, title, message, type = 'order', data = null, recipient_role = null, order_id = null }) {
   const notifObj = {
     user_id: userId ? Number(userId) : null,
     buyer_phone: phone || null,
+    recipient_role: recipient_role || null,
+    order_id: order_id ? Number(order_id) : null,
     title,
     message,
     type,
@@ -7742,20 +7977,34 @@ async function createNotification(p, { userId = null, phone = null, title, messa
     if (p) {
       await ensureOrdersTables(p);
       const [res] = await p.query(
+        `INSERT INTO notifications (user_id, buyer_phone, recipient_role, order_id, title, message, type, data, is_read)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        [notifObj.user_id, notifObj.buyer_phone, notifObj.recipient_role, notifObj.order_id, notifObj.title, notifObj.message, notifObj.type, notifObj.data]
+      );
+      notifObj.id = res.insertId;
+    }
+  } catch (err) {
+    try {
+      const [res] = await p.query(
         `INSERT INTO notifications (user_id, buyer_phone, title, message, type, data, is_read)
          VALUES (?, ?, ?, ?, ?, ?, 0)`,
         [notifObj.user_id, notifObj.buyer_phone, notifObj.title, notifObj.message, notifObj.type, notifObj.data]
       );
       notifObj.id = res.insertId;
+    } catch (fallbackDbErr) {
+      console.error('Failed to insert notification into DB:', fallbackDbErr.message);
     }
-  } catch (err) {
-    console.error('Failed to insert notification into DB:', err.message);
   }
 
   if (!notifObj.id) {
     notifObj.id = fallbackNotifications.length ? Math.max(...fallbackNotifications.map(n => n.id || 0)) + 1 : 1;
   }
   fallbackNotifications.unshift(notifObj);
+
+  // Deliver in real-time via Socket.IO
+  try {
+    deliverRealtimeNotification(notifObj);
+  } catch (socketErr) {}
 
   try {
     await sendPushNotification({ userId, phone, title, message, data });
@@ -8561,29 +8810,71 @@ const handleGetSellerDashboard = async (req, res) => {
 // 4a-2. In-App & Push Notifications Controller
 // ==========================================
 const handleGetNotifications = async (req, res) => {
-  const optUser = req.user || getOptionalUser(req);
-  if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
+  let optUser = req.user || getOptionalUser(req);
+  if (!optUser) {
+    if (req.query.seller_id || req.headers['x-seller-id']) {
+      const sid = parseInt(req.query.seller_id || req.headers['x-seller-id'], 10);
+      optUser = { id: sid, role: 'seller' };
+    } else if (req.query.phone || req.headers['x-buyer-phone']) {
+      optUser = { phone: req.query.phone || req.headers['x-buyer-phone'], role: 'buyer' };
+    }
+  }
+  if (!optUser) return res.status(401).json({ message: 'Authentication or phone identification required.' });
 
-  const userId = optUser.id;
-  const userPhone = optUser.phone;
-  const isReadFilter = req.query.is_read !== undefined ? parseInt(req.query.is_read, 10) : null;
+  const userId = optUser.id ? Number(optUser.id) : null;
+  const userPhone = optUser.phone || req.query.phone || null;
+  const isAdmin = optUser.role === 'admin';
+  const isSeller = optUser.role === 'seller';
+
+  const isReadFilter = req.query.is_read !== undefined
+    ? parseInt(req.query.is_read, 10)
+    : ((req.query.unread === '1' || req.query.unread === 'true') ? 0 : null);
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
   const offset = (page - 1) * limit;
 
   try {
     await ensureOrdersTables(pool);
-    const whereClauses = ['(user_id = ? OR buyer_phone = ?)'];
-    const params = [userId, userPhone || ''];
+    const whereClauses = [];
+    const params = [];
+
+    if (isAdmin && !req.query.force_user) {
+      if (req.query.role) {
+        whereClauses.push('recipient_role = ?');
+        params.push(req.query.role);
+      }
+    } else if (isSeller && userId) {
+      whereClauses.push('(user_id = ? OR (recipient_role = "seller" AND (data LIKE ? OR user_id IS NULL)))');
+      params.push(userId, `%"seller_id":${userId}%`);
+    } else if (userId && userPhone) {
+      whereClauses.push('(user_id = ? OR buyer_phone = ?)');
+      params.push(userId, userPhone);
+    } else if (userId) {
+      whereClauses.push('user_id = ?');
+      params.push(userId);
+    } else if (userPhone) {
+      whereClauses.push('buyer_phone = ?');
+      params.push(userPhone);
+    }
 
     if (isReadFilter !== null && !isNaN(isReadFilter)) {
       whereClauses.push('is_read = ?');
       params.push(isReadFilter);
     }
 
-    const whereSql = 'WHERE ' + whereClauses.join(' AND ');
+    if (req.query.order_id) {
+      whereClauses.push('order_id = ?');
+      params.push(parseInt(req.query.order_id, 10));
+    }
+
+    const whereSql = whereClauses.length ? ('WHERE ' + whereClauses.join(' AND ')) : '';
     const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM notifications ${whereSql}`, params);
-    const [[{ unread_count }]] = await pool.query(`SELECT COUNT(*) AS unread_count FROM notifications WHERE (user_id = ? OR buyer_phone = ?) AND is_read = 0`, [userId, userPhone || '']);
+
+    const unreadClauses = whereClauses.filter(c => !c.startsWith('is_read'));
+    unreadClauses.push('is_read = 0');
+    const unreadSql = 'WHERE ' + unreadClauses.join(' AND ');
+    const unParams = params.filter((p, i) => !whereClauses[i]?.startsWith('is_read'));
+    const [[{ unread_count }]] = await pool.query(`SELECT COUNT(*) AS unread_count FROM notifications ${unreadSql}`, unParams);
 
     const [rows] = await pool.query(
       `SELECT * FROM notifications ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`,
@@ -8603,6 +8894,7 @@ const handleGetNotifications = async (req, res) => {
         ...r,
         id: Number(r.id),
         user_id: r.user_id ? Number(r.user_id) : null,
+        order_id: r.order_id ? Number(r.order_id) : null,
         is_read: Boolean(r.is_read),
         data: parsedData
       };
@@ -8617,7 +8909,16 @@ const handleGetNotifications = async (req, res) => {
       last_page: Math.ceil(total / limit) || 1
     });
   } catch (err) {
-    const userNotifs = fallbackNotifications.filter(n => n.user_id === userId || (userPhone && n.buyer_phone === userPhone));
+    let userNotifs = fallbackNotifications.filter(n => {
+      if (isAdmin && !req.query.force_user) return true;
+      if (isSeller && userId) return n.user_id === userId || (n.recipient_role === 'seller' && JSON.stringify(n.data || '').includes(`"seller_id":${userId}`));
+      if (userId && n.user_id === userId) return true;
+      if (userPhone && n.buyer_phone === userPhone) return true;
+      return false;
+    });
+    if (isReadFilter !== null && !isNaN(isReadFilter)) {
+      userNotifs = userNotifs.filter(n => (isReadFilter === 1 ? n.is_read : !n.is_read));
+    }
     const unreadCount = userNotifs.filter(n => !n.is_read).length;
     res.json({
       notifications: userNotifs,
@@ -8630,15 +8931,27 @@ const handleGetNotifications = async (req, res) => {
   }
 };
 
+const handleGetUnreadNotifications = async (req, res) => {
+  req.query.is_read = '0';
+  return handleGetNotifications(req, res);
+};
+
 const handleGetUnreadNotificationsCount = async (req, res) => {
-  const optUser = req.user || getOptionalUser(req);
+  let optUser = req.user || getOptionalUser(req);
+  if (!optUser) {
+    if (req.query.seller_id || req.headers['x-seller-id']) {
+      optUser = { id: parseInt(req.query.seller_id || req.headers['x-seller-id'], 10), role: 'seller' };
+    } else if (req.query.phone || req.headers['x-buyer-phone']) {
+      optUser = { phone: req.query.phone || req.headers['x-buyer-phone'], role: 'buyer' };
+    }
+  }
   if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
 
   try {
     await ensureOrdersTables(pool);
     const [[{ unread_count }]] = await pool.query(
       'SELECT COUNT(*) AS unread_count FROM notifications WHERE (user_id = ? OR buyer_phone = ?) AND is_read = 0',
-      [optUser.id, optUser.phone || '']
+      [optUser.id || null, optUser.phone || '']
     );
     res.json({ unread_count: Number(unread_count) || 0 });
   } catch (err) {
@@ -8649,12 +8962,27 @@ const handleGetUnreadNotificationsCount = async (req, res) => {
 
 const handleMarkNotificationRead = async (req, res) => {
   const notifId = parseInt(req.params.id, 10);
-  const optUser = req.user || getOptionalUser(req);
+  let optUser = req.user || getOptionalUser(req);
+  if (!optUser) {
+    if (req.query.seller_id || req.headers['x-seller-id']) {
+      optUser = { id: parseInt(req.query.seller_id || req.headers['x-seller-id'], 10), role: 'seller' };
+    } else if (req.query.phone || req.headers['x-buyer-phone']) {
+      optUser = { phone: req.query.phone || req.headers['x-buyer-phone'], role: 'buyer' };
+    }
+  }
   if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
 
   try {
     await ensureOrdersTables(pool);
-    await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND (user_id = ? OR user_id IS NULL)', [notifId, optUser.id]);
+    if (optUser.role === 'admin') {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ?', [notifId]);
+    } else if (optUser.id && optUser.phone) {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND (user_id = ? OR buyer_phone = ? OR user_id IS NULL)', [notifId, optUser.id, optUser.phone]);
+    } else if (optUser.id) {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND (user_id = ? OR user_id IS NULL)', [notifId, optUser.id]);
+    } else {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND buyer_phone = ?', [notifId, optUser.phone]);
+    }
     const idx = fallbackNotifications.findIndex(n => n.id === notifId);
     if (idx !== -1) fallbackNotifications[idx].is_read = 1;
     res.json({ success: true, message: 'Notification marked as read.' });
@@ -8666,14 +8994,29 @@ const handleMarkNotificationRead = async (req, res) => {
 };
 
 const handleMarkAllNotificationsRead = async (req, res) => {
-  const optUser = req.user || getOptionalUser(req);
+  let optUser = req.user || getOptionalUser(req);
+  if (!optUser) {
+    if (req.query.seller_id || req.headers['x-seller-id']) {
+      optUser = { id: parseInt(req.query.seller_id || req.headers['x-seller-id'], 10), role: 'seller' };
+    } else if (req.query.phone || req.headers['x-buyer-phone']) {
+      optUser = { phone: req.query.phone || req.headers['x-buyer-phone'], role: 'buyer' };
+    }
+  }
   if (!optUser) return res.status(401).json({ message: 'Authentication required.' });
 
   try {
     await ensureOrdersTables(pool);
-    await pool.query('UPDATE notifications SET is_read = 1 WHERE user_id = ? OR buyer_phone = ?', [optUser.id, optUser.phone || '']);
+    if (optUser.role === 'admin' && !req.query.force_user) {
+      await pool.query('UPDATE notifications SET is_read = 1');
+    } else if (optUser.id && optUser.phone) {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE user_id = ? OR buyer_phone = ?', [optUser.id, optUser.phone]);
+    } else if (optUser.id) {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE user_id = ?', [optUser.id]);
+    } else {
+      await pool.query('UPDATE notifications SET is_read = 1 WHERE buyer_phone = ?', [optUser.phone]);
+    }
     for (const n of fallbackNotifications) {
-      if (n.user_id === optUser.id || (optUser.phone && n.buyer_phone === optUser.phone)) {
+      if (optUser.role === 'admin' || n.user_id === optUser.id || (optUser.phone && n.buyer_phone === optUser.phone)) {
         n.is_read = 1;
       }
     }
@@ -8685,6 +9028,53 @@ const handleMarkAllNotificationsRead = async (req, res) => {
       }
     }
     res.json({ success: true, message: 'All notifications marked as read.' });
+  }
+};
+
+const handleDeleteNotification = async (req, res) => {
+  const notifId = parseInt(req.params.id, 10);
+  let optUser = req.user || getOptionalUser(req);
+  const simSellerId = req.headers['x-seller-id'] ? parseInt(req.headers['x-seller-id'], 10) : (req.query.seller_id ? parseInt(req.query.seller_id, 10) : 0);
+  const phone = req.query.phone || (req.headers['x-buyer-phone'] || (optUser ? optUser.phone : null));
+  if (!optUser && simSellerId > 0) {
+    optUser = { id: simSellerId, role: 'seller' };
+  }
+  if (!optUser && !phone) {
+    return res.status(401).json({ message: 'Authentication required.' });
+  }
+  const isAdmin = optUser && optUser.role === 'admin';
+
+  try {
+    await ensureOrdersTables(pool);
+    const [rows] = await pool.query('SELECT * FROM notifications WHERE id = ?', [notifId]);
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ message: 'Notification not found.' });
+    }
+    const notif = rows[0];
+    if (!isAdmin) {
+      const isOwner = (optUser && notif.user_id === optUser.id) || (phone && notif.buyer_phone === phone);
+      if (!isOwner) {
+        return res.status(403).json({ message: 'Access denied. You can only delete your own notifications.' });
+      }
+    }
+    await pool.query('DELETE FROM notifications WHERE id = ?', [notifId]);
+    const idx = fallbackNotifications.findIndex(n => n.id === notifId);
+    if (idx !== -1) fallbackNotifications.splice(idx, 1);
+    return res.json({ success: true, message: 'Notification deleted successfully.' });
+  } catch (err) {
+    const idx = fallbackNotifications.findIndex(n => n.id === notifId);
+    if (idx !== -1) {
+      const notif = fallbackNotifications[idx];
+      if (!isAdmin) {
+        const isOwner = (optUser && notif.user_id === optUser.id) || (phone && notif.buyer_phone === phone);
+        if (!isOwner) {
+          return res.status(403).json({ message: 'Access denied. You can only delete your own notifications.' });
+        }
+      }
+      fallbackNotifications.splice(idx, 1);
+      return res.json({ success: true, message: 'Notification deleted successfully.' });
+    }
+    return res.status(404).json({ message: 'Notification not found.' });
   }
 };
 
@@ -8788,13 +9178,70 @@ app.get([
   return handleGetSellerOrders(req, res);
 });
 
-app.get(['/api/seller/notifications', '/api/notifications'], authenticateToken, handleGetNotifications);
-app.get(['/api/seller/notifications/unread-count', '/api/notifications/unread-count'], authenticateToken, handleGetUnreadNotificationsCount);
-app.put(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
-app.post(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], authenticateToken, handleMarkNotificationRead);
-app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
-app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], authenticateToken, handleMarkAllNotificationsRead);
-app.post(['/api/seller/fcm-token', '/api/fcm-token', '/api/device-token', '/api/notifications/token'], authenticateToken, handleRegisterDeviceToken);
+const optionalAuthForNotifs = (req, res, next) => {
+  req.user = req.user || getOptionalUser(req);
+  next();
+};
+
+app.get(['/api/seller/notifications', '/api/notifications'], optionalAuthForNotifs, handleGetNotifications);
+app.get(['/api/seller/notifications/unread', '/api/notifications/unread'], optionalAuthForNotifs, handleGetUnreadNotifications);
+app.get(['/api/seller/notifications/unread-count', '/api/notifications/unread-count'], optionalAuthForNotifs, handleGetUnreadNotificationsCount);
+app.put(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], optionalAuthForNotifs, handleMarkNotificationRead);
+app.post(['/api/seller/notifications/:id/read', '/api/notifications/:id/read'], optionalAuthForNotifs, handleMarkNotificationRead);
+app.delete(['/api/seller/notifications/:id', '/api/notifications/:id'], optionalAuthForNotifs, handleDeleteNotification);
+app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], optionalAuthForNotifs, handleMarkAllNotificationsRead);
+app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], optionalAuthForNotifs, handleMarkAllNotificationsRead);
+app.post(['/api/seller/fcm-token', '/api/fcm-token', '/api/device-token', '/api/notifications/token'], optionalAuthForNotifs, handleRegisterDeviceToken);
+
+// Internal Notification Dispatch Endpoint for PHP Backend
+app.post('/api/internal/dispatch-notification', express.json(), async (req, res) => {
+  const secret = req.headers['x-internal-secret'] || req.query.secret;
+  const expectedSecret = process.env.INTERNAL_SERVICE_SECRET || 'vendor_internal_secret_key_2026';
+  if (secret !== expectedSecret) {
+    return res.status(403).json({ error: 'Unauthorized internal service call' });
+  }
+
+  const payload = req.body || {};
+  if (!payload.title || !payload.message) {
+    return res.status(422).json({ error: 'title and message are required' });
+  }
+
+  try {
+    deliverRealtimeNotification(payload);
+
+    sendPushNotification({
+      userId: payload.user_id,
+      phone: payload.buyer_phone || payload.phone,
+      title: payload.title,
+      message: payload.message,
+      data: payload.data
+    }).catch(() => {});
+
+    if (payload.id && !fallbackNotifications.some(n => n.id === payload.id)) {
+      fallbackNotifications.unshift({
+        id: payload.id,
+        user_id: payload.user_id ? Number(payload.user_id) : null,
+        buyer_phone: payload.buyer_phone || payload.phone || null,
+        recipient_role: payload.recipient_role || null,
+        order_id: payload.order_id ? Number(payload.order_id) : null,
+        title: payload.title,
+        message: payload.message,
+        type: payload.type || 'order',
+        data: typeof payload.data === 'string' ? payload.data : JSON.stringify(payload.data || {}),
+        is_read: payload.is_read ? 1 : 0,
+        created_at: payload.created_at || new Date().toISOString()
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Notification dispatched to realtime socket and push channels.',
+      id: payload.id
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to dispatch notification: ' + err.message });
+  }
+});
 
 app.post(['/api/seller/orders/:id/accept', '/api/sellers/:seller_id/orders/:id/accept'], authenticateToken, handleSellerAcceptOrder);
 app.put(['/api/seller/orders/:id/accept', '/api/sellers/:seller_id/orders/:id/accept'], authenticateToken, handleSellerAcceptOrder);
@@ -8823,6 +9270,479 @@ app.put(['/api/seller/orders/:id/process', '/api/seller/orders/:id/pack', '/api/
   req.body.order_status = statusMap[action] || action;
   return handleOrderUpdate(req, res);
 });
+
+// ==========================================
+// Order Activities, Tracking, Cancellation & Admin Handlers
+// ==========================================
+const handleOrderActivities = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT id, order_number FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT id, order_number FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const orderId = Number(rows[0].id);
+    const activities = await getOrderActivitiesNode(pool, orderId);
+    return res.json({ order_id: orderId, order_number: rows[0].order_number, activities });
+  } catch (err) {
+    return res.json({ order_id: isNumeric ? numId : 0, order_number: rawParam, activities: [] });
+  }
+};
+
+const handleOrderTracking = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = rows[0];
+    const orderId = Number(order.id);
+    const activities = await getOrderActivitiesNode(pool, orderId);
+    const st = String(order.order_status || 'pending').toLowerCase();
+    return res.json({
+      order_id: orderId,
+      order_number: order.order_number,
+      order_status: st,
+      carrier: order.carrier || null,
+      tracking_number: order.tracking_number || null,
+      shipped_at: order.shipped_at || null,
+      delivered_at: order.delivered_at || null,
+      can_cancel: ['pending', 'confirmed', 'processing'].includes(st),
+      can_return: st === 'delivered',
+      activities
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleCancelOrder = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const optUser = req.user || getOptionalUser(req);
+  const body = req.body || {};
+  const reason = String(body.cancellation_reason || body.reason || body.notes || 'Order cancelled by user request').trim();
+
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = rows[0];
+    const orderId = Number(order.id);
+    const currentStatus = String(order.order_status || 'pending').toLowerCase();
+
+    if (['delivered', 'returned', 'return_requested'].includes(currentStatus)) {
+      return res.status(400).json({ message: 'Delivered orders cannot be cancelled. Please use the return process instead.' });
+    }
+    if (currentStatus === 'cancelled') {
+      return res.status(400).json({ message: 'Order is already cancelled.' });
+    }
+    if (currentStatus === 'rejected') {
+      return res.status(400).json({ message: 'Order is already rejected.' });
+    }
+
+    const actorRole = (optUser && optUser.role) ? optUser.role : 'buyer';
+    const actorName = (optUser && (optUser.name || optUser.seller_name)) ? (optUser.name || optUser.seller_name) : (order.buyer_name || 'Buyer');
+    const actorId = optUser ? Number(optUser.id) : null;
+
+    if (actorRole === 'seller') {
+      const sellerId = Number(optUser.id);
+      const [sItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, sellerId]);
+      if (sItems.length === 0) {
+        return res.status(403).json({ message: 'Access denied. You do not own any products in this order.' });
+      }
+    }
+
+    const isBuyer = ['buyer', 'customer'].includes(actorRole) || !optUser || !optUser.role;
+    if (isBuyer) {
+      if (currentStatus === 'shipped') {
+        return res.status(400).json({ message: 'Shipped orders cannot be cancelled directly while in transit.' });
+      }
+      if (currentStatus === 'cancellation_requested') {
+        return res.status(400).json({ message: 'A cancellation request is already pending review for this order.' });
+      }
+      if (currentStatus === 'processing') {
+        await pool.query('UPDATE orders SET order_status = "cancellation_requested", cancellation_reason = ? WHERE id = ?', [reason, orderId]);
+        await logOrderActivityNode(pool, orderId, 'cancellation_requested', 'processing', 'cancellation_requested', {
+          actorId, actorRole: 'buyer', actorName, notes: reason
+        });
+        try {
+          await createNotification(pool, {
+            phone: order.buyer_phone,
+            title: 'Cancellation Requested ⏳',
+            message: `Your cancellation request for order #${order.order_number} is under review.`,
+            type: 'cancellation_requested',
+            data: { order_id: orderId, order_number: order.order_number, reason }
+          });
+        } catch (e) {}
+        return res.json({
+          success: true,
+          message: 'Cancellation request submitted for seller/admin review.',
+          order_id: orderId,
+          order_number: order.order_number,
+          order_status: 'cancellation_requested',
+          requires_approval: true
+        });
+      }
+      if (!['pending', 'confirmed', 'accepted'].includes(currentStatus)) {
+        return res.status(400).json({ message: `Orders with status '${currentStatus}' cannot be cancelled.` });
+      }
+    }
+
+    // Immediate cancellation
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [itms] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+      for (const it of itms) {
+        if (it.product_id) {
+          try { await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [it.quantity, it.product_id]); } catch (e) {}
+        }
+      }
+      await conn.query('UPDATE orders SET order_status = "cancelled", cancellation_reason = ? WHERE id = ?', [reason, orderId]);
+      await conn.query('UPDATE order_items SET item_status = "cancelled" WHERE order_id = ?', [orderId]);
+      await conn.commit();
+      conn.release();
+    } catch (txErr) {
+      await conn.rollback();
+      conn.release();
+      throw txErr;
+    }
+
+    await logOrderActivityNode(pool, orderId, 'cancelled', currentStatus, 'cancelled', {
+      actorId, actorRole, actorName, notes: reason
+    });
+
+    try {
+      await createNotification(pool, {
+        phone: order.buyer_phone,
+        title: 'Order Cancelled 🚫',
+        message: `Order #${order.order_number} has been cancelled.`,
+        type: 'order_cancelled',
+        data: { order_id: orderId, order_number: order.order_number }
+      });
+    } catch (e) {}
+
+    return res.json({
+      success: true,
+      message: 'Order cancelled successfully.',
+      order_id: orderId,
+      order_number: order.order_number,
+      order_status: 'cancelled'
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleApproveCancellation = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const user = req.user;
+  const body = req.body || {};
+  const notes = String(body.notes || body.reason || 'Cancellation request approved').trim();
+
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = rows[0];
+    const orderId = Number(order.id);
+    const currentStatus = String(order.order_status || 'pending').toLowerCase();
+
+    if (user.role === 'seller') {
+      const [sItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, Number(user.id)]);
+      if (sItems.length === 0) {
+        return res.status(403).json({ message: 'Access denied. You do not own any products in this order.' });
+      }
+    } else if (user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied. Only sellers or admins can approve cancellation requests.' });
+    }
+
+    if (currentStatus !== 'cancellation_requested') {
+      return res.status(400).json({ message: `Cannot approve cancellation: order status is '${currentStatus}', expected 'cancellation_requested'.` });
+    }
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [itms] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [orderId]);
+      for (const it of itms) {
+        if (it.product_id) {
+          try { await conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [it.quantity, it.product_id]); } catch (e) {}
+        }
+      }
+      await conn.query('UPDATE orders SET order_status = "cancelled" WHERE id = ?', [orderId]);
+      await conn.query('UPDATE order_items SET item_status = "cancelled" WHERE order_id = ?', [orderId]);
+      await conn.commit();
+      conn.release();
+    } catch (txErr) {
+      await conn.rollback();
+      conn.release();
+      throw txErr;
+    }
+
+    await logOrderActivityNode(pool, orderId, 'cancellation_approved', 'cancellation_requested', 'cancelled', {
+      actorId: user.id, actorRole: user.role, actorName: user.name || user.seller_name || 'Seller', notes
+    });
+
+    try {
+      await createNotification(pool, {
+        phone: order.buyer_phone,
+        title: 'Order Cancelled 🚫',
+        message: `Your cancellation request for order #${order.order_number} has been approved.`,
+        type: 'cancellation_approved',
+        data: { order_id: orderId, order_number: order.order_number }
+      });
+    } catch (e) {}
+
+    return res.json({
+      success: true,
+      message: 'Cancellation request approved. Order has been cancelled.',
+      order_id: orderId,
+      order_number: order.order_number,
+      order_status: 'cancelled'
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleRejectCancellation = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const user = req.user;
+  const body = req.body || {};
+  const reason = String(body.rejection_reason || body.reason || body.notes || 'Order is already being processed/prepared and cannot be cancelled.').trim();
+
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = rows[0];
+    const orderId = Number(order.id);
+    const currentStatus = String(order.order_status || 'pending').toLowerCase();
+
+    if (user.role === 'seller') {
+      const [sItems] = await pool.query('SELECT 1 FROM order_items WHERE order_id = ? AND seller_id = ? LIMIT 1', [orderId, Number(user.id)]);
+      if (sItems.length === 0) {
+        return res.status(403).json({ message: 'Access denied. You do not own any products in this order.' });
+      }
+    } else if (user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied. Only sellers or admins can reject cancellation requests.' });
+    }
+
+    if (currentStatus !== 'cancellation_requested') {
+      return res.status(400).json({ message: `Cannot reject cancellation: order status is '${currentStatus}', expected 'cancellation_requested'.` });
+    }
+
+    const toStatus = 'processing';
+    await pool.query('UPDATE orders SET order_status = ? WHERE id = ?', [toStatus, orderId]);
+    await pool.query('UPDATE order_items SET item_status = ? WHERE order_id = ?', [toStatus, orderId]);
+
+    await logOrderActivityNode(pool, orderId, 'cancellation_rejected', 'cancellation_requested', toStatus, {
+      actorId: user.id, actorRole: user.role, actorName: user.name || user.seller_name || 'Seller', notes: reason
+    });
+
+    try {
+      await createNotification(pool, {
+        phone: order.buyer_phone,
+        title: 'Cancellation Request Declined ⚠️',
+        message: `Your cancellation request for order #${order.order_number} was declined. Reason: ${reason}`,
+        type: 'cancellation_rejected',
+        data: { order_id: orderId, order_number: order.order_number, reason }
+      });
+    } catch (e) {}
+
+    return res.json({
+      success: true,
+      message: 'Cancellation request has been declined. Order resumed to ' + toStatus + '.',
+      order_id: orderId,
+      order_number: order.order_number,
+      order_status: toStatus,
+      rejection_reason: reason
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleReturnOrder = async (req, res) => {
+  const rawParam = String(req.params.id || '').trim();
+  const numId = parseInt(rawParam, 10);
+  const isNumeric = !isNaN(numId) && String(numId) === rawParam;
+  const optUser = req.user || getOptionalUser(req);
+  const body = req.body || {};
+  const reason = String(body.return_reason || body.reason || body.notes || 'Product return requested by buyer.').trim();
+
+  try {
+    await ensureOrdersTables(pool);
+    let rows;
+    if (isNumeric) {
+      [rows] = await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [numId, rawParam]);
+    } else {
+      [rows] = await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [rawParam]);
+    }
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+    const order = rows[0];
+    const orderId = Number(order.id);
+    const currentStatus = String(order.order_status || 'pending').toLowerCase();
+
+    if (currentStatus !== 'delivered') {
+      return res.status(400).json({ message: 'Return can only be requested for delivered orders.' });
+    }
+
+    await pool.query('UPDATE orders SET order_status = "return_requested" WHERE id = ?', [orderId]);
+
+    const actorRole = (optUser && optUser.role) ? optUser.role : 'buyer';
+    const actorName = (optUser && (optUser.name || optUser.seller_name)) ? (optUser.name || optUser.seller_name) : (order.buyer_name || 'Buyer');
+    const actorId = optUser ? Number(optUser.id) : null;
+
+    await logOrderActivityNode(pool, orderId, 'return_requested', 'delivered', 'return_requested', {
+      actorId, actorRole, actorName, notes: reason
+    });
+
+    try {
+      await createNotification(pool, {
+        phone: order.buyer_phone,
+        title: 'Return Requested 📦',
+        message: `Your return request for order #${order.order_number} has been submitted.`,
+        type: 'return_requested',
+        data: { order_id: orderId, order_number: order.order_number, reason }
+      });
+    } catch (e) {}
+
+    return res.json({
+      success: true,
+      message: 'Return request submitted successfully.',
+      order_id: orderId,
+      order_number: order.order_number,
+      order_status: 'return_requested'
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleAdminGetOrders = async (req, res) => {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Access denied. Administrator privileges required.' });
+  }
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  const offset = (page - 1) * limit;
+
+  try {
+    await ensureOrdersTables(pool);
+    let whereClauses = [];
+    let params = [];
+
+    if (req.query.cancellation_requests_only === 'true') {
+      whereClauses.push("o.order_status = 'cancellation_requested'");
+    } else if (req.query.status) {
+      whereClauses.push('o.order_status = ?');
+      params.push(String(req.query.status).trim().toLowerCase());
+    }
+
+    if (req.query.search) {
+      const s = `%${String(req.query.search).trim()}%`;
+      whereClauses.push('(o.order_number LIKE ? OR o.buyer_name LIKE ? OR o.buyer_phone LIKE ?)');
+      params.push(s, s, s);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const [countRows] = await pool.query(`SELECT COUNT(*) AS total FROM orders o ${whereSql}`, params);
+    const total = Number(countRows[0].total || 0);
+
+    const [crRows] = await pool.query("SELECT COUNT(*) AS cr_total FROM orders WHERE order_status = 'cancellation_requested'");
+    const crCount = Number(crRows[0].cr_total || 0);
+
+    const [orders] = await pool.query(
+      `SELECT o.*, COALESCE(u.seller_name, u.name, 'Verified Seller') AS seller_name
+       FROM orders o
+       LEFT JOIN users u ON o.seller_id = u.id
+       ${whereSql}
+       ORDER BY o.id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    return res.json({
+      orders: {
+        current_page: page,
+        data: orders.map(o => ({ ...o, id: Number(o.id), total_amount: parseFloat(o.total_amount) || 0 })),
+        total,
+        per_page: limit,
+        last_page: Math.ceil(total / limit) || 1
+      },
+      metrics: {
+        total_cancellation_requests: crCount
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+const handleAdminUpdateOrderStatus = async (req, res) => {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Access denied. Administrator privileges required.' });
+  }
+  return handleOrderUpdate(req, res);
+};
+
+app.post(['/api/orders/:id/cancel', '/api/orders/:id/cancellation-request', '/api/orders/:id/request-cancellation'], handleCancelOrder);
+app.post(['/api/seller/orders/:id/cancellation/approve', '/api/orders/:id/cancellation/approve'], authenticateToken, handleApproveCancellation);
+app.post(['/api/seller/orders/:id/cancellation/reject', '/api/orders/:id/cancellation/reject'], authenticateToken, handleRejectCancellation);
+app.post(['/api/orders/:id/return', '/api/orders/:id/request-return'], handleReturnOrder);
+app.get(['/api/orders/:id/activities', '/api/order/:id/activities'], handleOrderActivities);
+app.get(['/api/orders/:id/tracking', '/api/order/:id/tracking'], handleOrderTracking);
+app.get('/api/admin/orders', authenticateToken, handleAdminGetOrders);
+app.put(['/api/admin/orders/:id/status', '/api/admin/orders/:id'], authenticateToken, handleAdminUpdateOrderStatus);
+app.post(['/api/admin/orders/:id/status'], authenticateToken, handleAdminUpdateOrderStatus);
 
 app.get(['/api/seller/orders', '/api/sellers/orders', '/api/sellers/:seller_id/orders', '/api/seller/:seller_id/orders'], authenticateToken, handleGetSellerOrders);
 app.get(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleGetOrderDetail);
@@ -16274,9 +17194,11 @@ app.__deletionTestContext = {
 
 // Start server
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Vendor App Server running on port ${PORT} (https://knowlipop.shop)`);
+  server.listen(PORT, () => {
+    console.log(`Vendor App Server running on port ${PORT} with Socket.IO realtime notifications (https://knowlipop.shop)`);
   });
 }
 
+app.server = server;
+app.io = io;
 module.exports = app;

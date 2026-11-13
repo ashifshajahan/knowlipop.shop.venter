@@ -30,6 +30,16 @@ if (str_starts_with($requestUri, '/index.php')) {
 // 1. Web & Admin Routes
 // ==========================================
 
+if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
+    header('Content-Type: text/html; charset=utf-8');
+    if (file_exists(__DIR__ . '/test-buyer.html')) {
+        readfile(__DIR__ . '/test-buyer.html');
+    } else {
+        echo 'Buyer test module file not found.';
+    }
+    exit;
+}
+
 // Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /storage/app/public/, /public/storage/, /images/, /products/, double-URLs)
 $imgMatch = [];
 $hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $requestUri, $imgMatch);
@@ -122,10 +132,18 @@ if ($requestUri === '/' || $requestUri === '') {
             <p>High-performance, zero-dependency REST API for Vendor marketplace.</p>
             <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
                 <a href="/admin/login" class="btn">Admin Dashboard</a>
+                <a href="/test-buyer" class="btn" style="background: #0284c7;">Buyer Checkout &amp; Orders Hub</a>
             </div>
             <div class="endpoints">
                 <strong>Available Endpoints:</strong><br>
+                • GET /test-buyer (Interactive Buyer Hub &amp; Razorpay Checkout)<br>
                 • GET /invoice/{id} (Downloadable Provider Tax Invoice)<br>
+                • POST /api/payment/razorpay/create-order (Create Razorpay Order)<br>
+                • POST /api/payment/verify (Verify Razorpay Payment Signature)<br>
+                • POST /api/payment/webhook (Razorpay Webhooks)<br>
+                • GET /api/payment/status/{id} (Check Payment Status)<br>
+                • POST /api/payment/refund (Full &amp; Partial Refunds)<br>
+                • GET /api/admin/payment-transactions (Admin Transactions Manager)<br>
                 • GET /api/orders<br>
                 • POST /api/orders<br>
                 • GET /api/orders/{id}<br>
@@ -195,6 +213,12 @@ if ($requestUri === '/admin/gst-verifications') {
 
 if ($requestUri === '/admin/categories') {
     $_GET['tab'] = $_GET['tab'] ?? 'categories';
+    require __DIR__ . '/admin/dashboard.php';
+    exit;
+}
+
+if ($requestUri === '/admin/transactions' || $requestUri === '/admin/payments') {
+    $_GET['tab'] = $_GET['tab'] ?? 'transactions';
     require __DIR__ . '/admin/dashboard.php';
     exit;
 }
@@ -464,6 +488,14 @@ if ($requestUri === '/api/seller/notifications' || $requestUri === '/api/notific
     }
 }
 
+if ($requestUri === '/api/seller/notifications/unread' || $requestUri === '/api/notifications/unread') {
+    if ($method === 'GET') {
+        apiGetUnreadNotifications($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 if ($requestUri === '/api/seller/notifications/unread-count' || $requestUri === '/api/notifications/unread-count') {
     if ($method === 'GET') {
         apiGetUnreadNotificationsCount($pdo);
@@ -484,6 +516,15 @@ if (preg_match('#^/(?:api/seller/notifications|api/notifications)/(\d+)/read$#',
     $notifId = (int)$matches[1];
     if ($method === 'PUT' || $method === 'POST') {
         apiMarkNotificationRead($pdo, $notifId);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/(?:api/seller/notifications|api/notifications)/(\d+)$#', $requestUri, $matches)) {
+    $notifId = (int)$matches[1];
+    if ($method === 'DELETE') {
+        apiDeleteNotification($pdo, $notifId);
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }
@@ -526,6 +567,20 @@ if (preg_match('#^/api/seller/orders/([^/]+)/(accept|reject|cancel|status|proces
         $input['order_status'] = $st;
         $GLOBALS['_CUSTOM_JSON_INPUT'] = $input;
         apiUpdateOrder($pdo, $orderParam);
+    }
+}
+
+// Seller Cancellation Request Approve / Reject: /api/seller/orders/{order_id}/cancellation/(approve|reject)
+if (preg_match('#^/api/seller/orders/([^/]+)/cancellation/(approve|reject)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    $act = strtolower(trim($matches[2]));
+    if ($method !== 'POST' && $method !== 'PUT') {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+    if ($act === 'approve') {
+        apiApproveCancellation($pdo, $orderParam);
+    } else {
+        apiRejectCancellation($pdo, $orderParam);
     }
 }
 
@@ -599,6 +654,88 @@ if ($requestUri === '/api/seller/payouts') {
 if ($requestUri === '/api/marketplace/commission-preview') {
     if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
     apiCommissionPreview($pdo);
+}
+
+// ==========================================
+// Razorpay Payment Gateway Routes
+// ==========================================
+
+// Razorpay Order Creation
+if ($requestUri === '/api/payment/razorpay/create-order' || $requestUri === '/api/payment/create-order') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiRazorpayCreateOrder($pdo);
+}
+
+if (preg_match('#^/api/orders?/([^/]+)/(?:razorpay-order|create-payment)$#', $requestUri, $matches)) {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiRazorpayCreateOrder($pdo, trim($matches[1]));
+}
+
+// Razorpay Payment Signature Verification
+if ($requestUri === '/api/payment/razorpay/verify' || $requestUri === '/api/payment/verify') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiRazorpayVerify($pdo);
+}
+
+// Razorpay Webhooks
+if ($requestUri === '/api/payment/webhook' || $requestUri === '/api/payment/razorpay/webhook' || $requestUri === '/api/webhooks/razorpay') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiRazorpayWebhook($pdo);
+}
+
+// Payment Status
+if (preg_match('#^/api/orders?/([^/]+)/payment-status$#', $requestUri, $matches)) {
+    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentStatus($pdo, trim($matches[1]));
+}
+
+if (preg_match('#^/api/payment/status/([^/]+)$#', $requestUri, $matches)) {
+    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentStatus($pdo, trim($matches[1]));
+}
+
+if ($requestUri === '/api/payment/status') {
+    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentStatus($pdo);
+}
+
+// Payment Refunds (Full & Partial)
+if ($requestUri === '/api/payment/refund') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentRefund($pdo);
+}
+
+if (preg_match('#^/api/orders?/([^/]+)/refund$#', $requestUri, $matches)) {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentRefund($pdo, trim($matches[1]));
+}
+
+// Client Payment Failed reporting
+if ($requestUri === '/api/payment/failed') {
+    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
+    apiPaymentFailed($pdo);
+}
+
+// Admin Payment Transactions Management
+if ($requestUri === '/api/admin/payment-transactions' || $requestUri === '/api/admin/payments') {
+    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
+    apiAdminPaymentTransactions($pdo);
+}
+
+if (preg_match('#^/api/admin/payment-transactions/(\d+)$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiAdminPaymentTransactionDetail($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/payment-transactions/(\d+)/refund$#', $requestUri, $matches)) {
+    if ($method === 'POST') {
+        apiAdminPaymentTransactionRefund($pdo, (int) $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
 // ==========================================
@@ -1066,6 +1203,81 @@ if ($requestUri === '/api/admin/email/send') {
     errorResponse((string) ($res['error'] ?? $res['reason'] ?? 'Failed to send email via Hostinger SMTP.'), ['result' => $res], !empty($res['skipped']) ? 422 : 502);
 }
 
+// ==========================================
+// Admin Orders & Cancellation Routes
+// ==========================================
+
+if ($requestUri === '/api/admin/orders') {
+    if ($method === 'GET') {
+        apiAdminGetOrders($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/admin/orders/([^/]+)/status$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'PUT' || $method === 'POST' || $method === 'PATCH') {
+        apiAdminUpdateOrderStatus($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Order Activities Timeline: /api/orders/{id}/activities or /api/order/{id}/activities
+if (preg_match('#^/api/orders?/([^/]+)/activities$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'GET') {
+        apiGetOrderActivities($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Order Tracking: /api/orders/{id}/tracking or /api/order/{id}/tracking
+if (preg_match('#^/api/orders?/([^/]+)/tracking$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'GET') {
+        apiGetOrderTracking($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Order Cancellation: /api/orders/{id}/cancel, /api/orders/{id}/cancellation-request, /api/orders/{id}/request-cancellation
+if (preg_match('#^/api/orders?/([^/]+)/(?:cancel|cancellation-request|request-cancellation)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'POST' || $method === 'PUT') {
+        apiCancelOrder($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Order Cancellation Approval/Rejection: /api/orders/{id}/cancellation/(approve|reject)
+if (preg_match('#^/api/orders?/([^/]+)/cancellation/(approve|reject)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    $act = strtolower(trim($matches[2]));
+    if ($method !== 'POST' && $method !== 'PUT') {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+    if ($act === 'approve') {
+        apiApproveCancellation($pdo, $orderParam);
+    } else {
+        apiRejectCancellation($pdo, $orderParam);
+    }
+}
+
+// Order Return: /api/orders/{id}/return, /api/orders/{id}/request-return
+if (preg_match('#^/api/orders?/([^/]+)/(?:return|request-return)$#', $requestUri, $matches)) {
+    $orderParam = trim($matches[1]);
+    if ($method === 'POST' || $method === 'PUT') {
+        apiReturnOrder($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 // Buyer Orders & Order Items CRUD (supports /api/orders and /api/order)
 if ($requestUri === '/api/orders' || $requestUri === '/api/order') {
     if ($method === 'GET') {
@@ -1090,7 +1302,7 @@ if (preg_match('#^(?:/api/orders?/([^/]+)/invoice|/invoice/([^/]+))$#', $request
 // Payment capture verification & Customer Dispute creation on an order
 if (preg_match('#^/api/orders?/([^/]+)/payment-verify$#', $requestUri, $matches)) {
     if ($method === 'POST') {
-        apiOrderPaymentVerify($pdo, trim($matches[1]));
+        apiRazorpayVerify($pdo, trim($matches[1]));
     } else {
         errorResponse('Method Not Allowed', [], 405);
     }

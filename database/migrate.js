@@ -101,6 +101,59 @@ async function runMigration() {
   await ensureColumn('users', 'deleted_by', '`deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `deleted_at`');
   await ensureColumn('users', 'token_version', '`token_version` INT NOT NULL DEFAULT 1 AFTER `deleted_by`');
 
+  await ensureColumn('orders', 'carrier', '`carrier` VARCHAR(100) NULL DEFAULT NULL');
+  await ensureColumn('orders', 'tracking_number', '`tracking_number` VARCHAR(100) NULL DEFAULT NULL');
+  await ensureColumn('orders', 'cancellation_reason', '`cancellation_reason` TEXT NULL DEFAULT NULL');
+  await ensureColumn('orders', 'rejection_reason', '`rejection_reason` TEXT NULL DEFAULT NULL');
+  await ensureColumn('order_items', 'item_status', '`item_status` VARCHAR(40) NOT NULL DEFAULT "pending"');
+  await ensureColumn('order_items', 'rejection_reason', '`rejection_reason` TEXT NULL DEFAULT NULL');
+
+  await ensureColumn('notifications', 'recipient_role', '`recipient_role` VARCHAR(40) NULL DEFAULT NULL AFTER `buyer_phone`');
+  await ensureColumn('notifications', 'order_id', '`order_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `recipient_role`');
+
+  // Ensure order_activities table exists
+  try {
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS \`order_activities\` (
+        \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        \`order_id\` BIGINT UNSIGNED NOT NULL,
+        \`actor_id\` BIGINT UNSIGNED NULL DEFAULT NULL,
+        \`actor_role\` VARCHAR(40) NOT NULL DEFAULT 'system',
+        \`actor_name\` VARCHAR(150) NULL DEFAULT NULL,
+        \`action\` VARCHAR(60) NOT NULL,
+        \`from_status\` VARCHAR(40) NULL DEFAULT NULL,
+        \`to_status\` VARCHAR(40) NULL DEFAULT NULL,
+        \`notes\` TEXT NULL DEFAULT NULL,
+        \`tracking_number\` VARCHAR(100) NULL DEFAULT NULL,
+        \`carrier\` VARCHAR(100) NULL DEFAULT NULL,
+        \`metadata\` LONGTEXT NULL DEFAULT NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        INDEX \`idx_oa_order\` (\`order_id\`),
+        INDEX \`idx_oa_action\` (\`action\`),
+        INDEX \`idx_oa_created\` (\`created_at\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  } catch (e) {}
+
+  // Ensure orders table has payment columns
+  await ensureColumn('orders', 'payment_gateway', '`payment_gateway` VARCHAR(40) NULL DEFAULT NULL AFTER `payment_status`');
+  await ensureColumn('orders', 'gateway_order_id', '`gateway_order_id` VARCHAR(120) NULL DEFAULT NULL AFTER `payment_gateway`');
+  await ensureColumn('orders', 'gateway_payment_id', '`gateway_payment_id` VARCHAR(120) NULL DEFAULT NULL AFTER `gateway_order_id`');
+  await ensureColumn('orders', 'captured_amount', '`captured_amount` DECIMAL(10,2) NULL DEFAULT NULL AFTER `gateway_payment_id`');
+  await ensureColumn('orders', 'refunded_amount', '`refunded_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `captured_amount`');
+
+  // Ensure payment_transactions table has enhanced metadata columns
+  await ensureColumn('payment_transactions', 'commission_rate', '`commission_rate` DECIMAL(5,4) NOT NULL DEFAULT 0.0500 AFTER `status`');
+  await ensureColumn('payment_transactions', 'commission_amount', '`commission_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission_rate`');
+  await ensureColumn('payment_transactions', 'net_seller_amount', '`net_seller_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER `commission_amount`');
+  await ensureColumn('payment_transactions', 'buyer_phone', '`buyer_phone` VARCHAR(30) NULL DEFAULT NULL AFTER `net_seller_amount`');
+  await ensureColumn('payment_transactions', 'buyer_name', '`buyer_name` VARCHAR(150) NULL DEFAULT NULL AFTER `buyer_phone`');
+  await ensureColumn('payment_transactions', 'refund_id', '`refund_id` VARCHAR(120) NULL DEFAULT NULL AFTER `buyer_name`');
+  await ensureColumn('payment_transactions', 'idempotency_key', '`idempotency_key` VARCHAR(120) NULL DEFAULT NULL AFTER `refund_id`');
+  await ensureColumn('payment_transactions', 'error_code', '`error_code` VARCHAR(100) NULL DEFAULT NULL AFTER `idempotency_key`');
+  await ensureColumn('payment_transactions', 'error_description', '`error_description` TEXT NULL DEFAULT NULL AFTER `error_code`');
+
   // Non-destructive backfill & duplicate audit for normalized_phone before adding UNIQUE index
   try {
     const [phoneRows] = await conn.query(

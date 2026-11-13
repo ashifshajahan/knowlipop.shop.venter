@@ -22,6 +22,10 @@ function handleCors(): void
 function jsonResponse(mixed $data, int $statusCode = 200): void
 {
     http_response_code($statusCode);
+    if (isset($GLOBALS['__TEST_RESPONSE_HANDLER']) && is_callable($GLOBALS['__TEST_RESPONSE_HANDLER'])) {
+        ($GLOBALS['__TEST_RESPONSE_HANDLER'])($data, $statusCode);
+        return;
+    }
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;

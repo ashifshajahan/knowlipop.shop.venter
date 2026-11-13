@@ -25,6 +25,8 @@ return [
     'app_url' => $env['APP_URL'] ?? 'https://knowlipop.shop',
 
     'db' => [
+        'connection' => $env['DB_CONNECTION'] ?? getenv('DB_CONNECTION') ?: 'mysql',
+        'sqlite_path' => $env['SQLITE_DB_PATH'] ?? getenv('SQLITE_DB_PATH') ?: (__DIR__ . '/database/database.sqlite'),
         'host' => $env['DB_HOST'] ?? '127.0.0.1',
         'port' => $env['DB_PORT'] ?? '3306',
         'name' => $env['DB_DATABASE'] ?? 'u999617803_knowlipop1',
