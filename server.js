@@ -8247,6 +8247,21 @@ async function ensureOrdersTables(p) {
     } catch (e) {}
 
     try {
+      const [cols] = await p.query('SHOW COLUMNS FROM users LIKE "is_online"');
+      if (cols.length === 0) await p.query('ALTER TABLE users ADD COLUMN is_online TINYINT(1) NOT NULL DEFAULT 0');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM users LIKE "last_login_at"');
+      if (cols.length === 0) await p.query('ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM users LIKE "last_active_at"');
+      if (cols.length === 0) await p.query('ALTER TABLE users ADD COLUMN last_active_at DATETIME NULL DEFAULT NULL');
+    } catch (e) {}
+
+    try {
       const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "carrier"');
       if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN carrier VARCHAR(100) NULL DEFAULT NULL');
     } catch (e) {}
@@ -9676,14 +9691,14 @@ const handleFcmDiagnostics = async (req, res) => {
     try {
       const [tRows] = await pool.query(
         `SELECT dt.id, dt.user_id, dt.phone, dt.token, dt.platform, dt.created_at, dt.updated_at,
-                u.name AS user_name, u.role AS user_role, u.fcm_token AS user_fcm_token, u.is_online
+                u.name AS user_name, u.role AS user_role, u.fcm_token AS user_fcm_token
          FROM device_tokens dt
          LEFT JOIN users u ON dt.user_id = u.id
          ORDER BY dt.id DESC LIMIT 25`
       );
       dbTokens = tRows;
       const [sRows] = await pool.query(
-        `SELECT id, name, phone, email, role, fcm_token, is_online, last_login_at
+        `SELECT id, name, phone, email, role, fcm_token
          FROM users
          WHERE role = 'seller' OR fcm_token IS NOT NULL
          ORDER BY id ASC LIMIT 25`
