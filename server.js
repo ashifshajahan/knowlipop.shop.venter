@@ -8375,6 +8375,277 @@ const handleBankAccountDiagnostics = async (req, res) => {
   });
 };
 
+const DB_MASTER_SCHEMA = {
+  users: [
+    { name: 'seller_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'phone', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'normalized_phone', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'address', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'landmark', def: 'VARCHAR(200) NULL DEFAULT NULL' },
+    { name: 'state', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'country', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'avatar_url', def: 'LONGTEXT NULL DEFAULT NULL' },
+    { name: 'role', def: "VARCHAR(20) NOT NULL DEFAULT 'seller'" },
+    { name: 'account_status', def: "VARCHAR(40) NOT NULL DEFAULT 'ACTIVE'" },
+    { name: 'deletion_requested_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'deleted_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'deleted_by', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'token_version', def: 'INT NOT NULL DEFAULT 1' },
+    { name: 'last_login_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'last_active_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'is_online', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+    { name: 'bank_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'account_number', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+    { name: 'bank_account', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+    { name: 'ifsc_code', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'account_holder_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+    { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
+    { name: 'bank_verified', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'pending'" },
+    { name: 'fcm_token', def: 'VARCHAR(255) NULL DEFAULT NULL' }
+  ],
+  products: [
+    { name: 'seller_id', def: 'BIGINT UNSIGNED NOT NULL' },
+    { name: 'name', def: 'VARCHAR(150) NOT NULL' },
+    { name: 'sku', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'category', def: "VARCHAR(100) NULL DEFAULT 'General'" },
+    { name: 'category_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'brand', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'description', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'seller_price', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'commission', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'delivery_charge', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'gst', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'other_charges', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'mrp', def: 'DECIMAL(10,2) NULL DEFAULT NULL' },
+    { name: 'price', def: 'DECIMAL(10,2) NOT NULL' },
+    { name: 'stock', def: 'INT NOT NULL DEFAULT 0' },
+    { name: 'rating', def: 'DECIMAL(3,2) NOT NULL DEFAULT 4.50' },
+    { name: 'ratings_count', def: 'INT NOT NULL DEFAULT 1' },
+    { name: 'image_url', def: 'LONGTEXT NULL DEFAULT NULL' },
+    { name: 'images', def: 'LONGTEXT NULL DEFAULT NULL' },
+    { name: 'is_active', def: 'TINYINT(1) NOT NULL DEFAULT 1' }
+  ],
+  orders: [
+    { name: 'idempotency_key', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'seller_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'order_number', def: 'VARCHAR(60) NOT NULL' },
+    { name: 'buyer_name', def: 'VARCHAR(150) NOT NULL' },
+    { name: 'buyer_phone', def: 'VARCHAR(30) NOT NULL' },
+    { name: 'shipping_address', def: 'TEXT NOT NULL' },
+    { name: 'landmark', def: 'VARCHAR(200) NULL DEFAULT NULL' },
+    { name: 'city', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'state', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'pincode', def: 'VARCHAR(20) NULL DEFAULT NULL' },
+    { name: 'order_status', def: "VARCHAR(40) NOT NULL DEFAULT 'pending'" },
+    { name: 'payment_method', def: "VARCHAR(40) NOT NULL DEFAULT 'cod'" },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'unpaid'" },
+    { name: 'subtotal', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'delivery_fee', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'discount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'total_amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'carrier', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'tracking_number', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'notes', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'rejection_reason', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'cancellation_reason', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'shipped_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'delivered_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'payment_gateway', def: 'VARCHAR(40) NULL DEFAULT NULL' },
+    { name: 'gateway_order_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'gateway_payment_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'captured_amount', def: 'DECIMAL(10,2) NULL DEFAULT NULL' },
+    { name: 'refunded_amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'return_window_ends_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'settled_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'acknowledged_at', def: 'TIMESTAMP NULL DEFAULT NULL' }
+  ],
+  order_items: [
+    { name: 'product_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'seller_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'product_name', def: 'VARCHAR(150) NOT NULL' },
+    { name: 'product_image', def: 'LONGTEXT NULL DEFAULT NULL' },
+    { name: 'price', def: 'DECIMAL(10,2) NOT NULL' },
+    { name: 'quantity', def: 'INT NOT NULL DEFAULT 1' },
+    { name: 'subtotal', def: 'DECIMAL(10,2) NOT NULL' },
+    { name: 'item_status', def: "VARCHAR(40) NOT NULL DEFAULT 'pending'" },
+    { name: 'rejection_reason', def: 'TEXT NULL DEFAULT NULL' }
+  ],
+  order_activities: [
+    { name: 'order_id', def: 'BIGINT UNSIGNED NOT NULL' },
+    { name: 'actor_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'actor_role', def: "VARCHAR(40) NOT NULL DEFAULT 'system'" },
+    { name: 'actor_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+    { name: 'action', def: 'VARCHAR(60) NOT NULL' },
+    { name: 'from_status', def: 'VARCHAR(40) NULL DEFAULT NULL' },
+    { name: 'to_status', def: 'VARCHAR(40) NULL DEFAULT NULL' },
+    { name: 'notes', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'tracking_number', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'carrier', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'metadata', def: 'LONGTEXT NULL DEFAULT NULL' }
+  ],
+  notifications: [
+    { name: 'user_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'buyer_phone', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'recipient_role', def: 'VARCHAR(40) NULL DEFAULT NULL' },
+    { name: 'order_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'title', def: 'VARCHAR(255) NOT NULL' },
+    { name: 'message', def: 'TEXT NOT NULL' },
+    { name: 'type', def: "VARCHAR(50) NOT NULL DEFAULT 'order'" },
+    { name: 'data', def: 'JSON NULL DEFAULT NULL' },
+    { name: 'is_read', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+    { name: 'delivery_status', def: "VARCHAR(40) NOT NULL DEFAULT 'delivered'" },
+    { name: 'read_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'delivered_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'dedup_key', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'action_url', def: 'VARCHAR(255) NULL DEFAULT NULL' }
+  ],
+  device_tokens: [
+    { name: 'user_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'phone', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'token', def: 'VARCHAR(255) NOT NULL' },
+    { name: 'platform', def: "VARCHAR(20) NOT NULL DEFAULT 'android'" }
+  ],
+  seller_payment_accounts: [
+    { name: 'provider', def: "VARCHAR(50) NOT NULL DEFAULT 'razorpay'" },
+    { name: 'account_reference', def: "VARCHAR(255) NOT NULL DEFAULT ''" },
+    { name: 'account_holder_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+    { name: 'account_number', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+    { name: 'ifsc_code', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'bank_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
+    { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+    { name: 'data', def: 'LONGTEXT NULL DEFAULT NULL' }
+  ],
+  seller_bank_accounts: [
+    { name: 'provider', def: "VARCHAR(50) NOT NULL DEFAULT 'razorpay'" },
+    { name: 'account_reference', def: "VARCHAR(255) NOT NULL DEFAULT ''" },
+    { name: 'account_holder_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+    { name: 'account_number', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+    { name: 'ifsc_code', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'bank_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
+    { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+    { name: 'data', def: 'LONGTEXT NULL DEFAULT NULL' }
+  ],
+  payment_transactions: [
+    { name: 'order_id', def: 'BIGINT UNSIGNED NOT NULL' },
+    { name: 'seller_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'gateway', def: "VARCHAR(40) NOT NULL DEFAULT 'razorpay'" },
+    { name: 'gateway_order_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'gateway_payment_id', def: 'VARCHAR(120) NOT NULL' },
+    { name: 'transaction_type', def: "VARCHAR(40) NOT NULL DEFAULT 'capture'" },
+    { name: 'amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'currency', def: "VARCHAR(10) NOT NULL DEFAULT 'INR'" },
+    { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'captured'" },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'captured'" },
+    { name: 'commission_rate', def: 'DECIMAL(5,4) NOT NULL DEFAULT 0.0500' },
+    { name: 'commission_amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'net_seller_amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'buyer_phone', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+    { name: 'buyer_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+    { name: 'refund_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'idempotency_key', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'error_code', def: 'VARCHAR(100) NULL DEFAULT NULL' },
+    { name: 'error_description', def: 'TEXT NULL DEFAULT NULL' },
+    { name: 'gateway_payload', def: 'LONGTEXT NULL DEFAULT NULL' },
+    { name: 'settled_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'acknowledged_at', def: 'TIMESTAMP NULL DEFAULT NULL' }
+  ],
+  seller_payouts: [
+    { name: 'seller_id', def: 'BIGINT UNSIGNED NOT NULL' },
+    { name: 'deletion_request_id', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'commission_deducted', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'refund_recovery_deducted', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'net_amount', def: 'DECIMAL(10,2) NOT NULL DEFAULT 0.00' },
+    { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'PENDING'" },
+    { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'PENDING'" },
+    { name: 'payout_reference', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'gateway_payout_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+    { name: 'settled_by', def: 'BIGINT UNSIGNED NULL DEFAULT NULL' },
+    { name: 'settled_at', def: 'TIMESTAMP NULL DEFAULT NULL' },
+    { name: 'notes', def: 'TEXT NULL DEFAULT NULL' }
+  ]
+};
+
+const handleDatabaseAudit = async (req, res) => {
+  if (!pool) {
+    return res.status(500).json({ error: 'Database connection pool is not available.' });
+  }
+
+  const autoFix = req.query.fix !== '0';
+  const report = {
+    success: true,
+    auto_fixed: autoFix,
+    total_tables_checked: Object.keys(DB_MASTER_SCHEMA).length,
+    missing_fields_added: [],
+    verified_tables: {}
+  };
+
+  try {
+    for (const [tableName, expectedCols] of Object.entries(DB_MASTER_SCHEMA)) {
+      // Check if table exists
+      const [tableRows] = await pool.query(`SHOW TABLES LIKE '${tableName}'`);
+      if (tableRows.length === 0) {
+        report.verified_tables[tableName] = { exists: false, error: 'Table does not exist' };
+        continue;
+      }
+
+      // Check existing columns
+      const [existingCols] = await pool.query(`SHOW COLUMNS FROM \`${tableName}\``);
+      const existingNames = existingCols.map(c => c.Field.toLowerCase());
+
+      const missing = [];
+      const added = [];
+
+      for (const col of expectedCols) {
+        if (!existingNames.includes(col.name.toLowerCase())) {
+          missing.push(col);
+          if (autoFix) {
+            try {
+              await pool.query(`ALTER TABLE \`${tableName}\` ADD COLUMN \`${col.name}\` ${col.def}`);
+              added.push(col.name);
+              report.missing_fields_added.push({ table: tableName, column: col.name, definition: col.def });
+            } catch (alterErr) {
+              // Ignore or report
+            }
+          }
+        }
+      }
+
+      report.verified_tables[tableName] = {
+        exists: true,
+        total_columns: existingCols.length + added.length,
+        missing_count: missing.length,
+        added: added,
+        all_columns: existingCols.map(c => c.Field).concat(added)
+      };
+    }
+
+    return res.json(report);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+app.get(
+  [
+    '/api/database/audit',
+    '/api/database/inspect-all',
+    '/api/database/schema-check'
+  ],
+  handleDatabaseAudit
+);
+
 app.all(
   [
     '/api/seller/bank-account/onboarding',
