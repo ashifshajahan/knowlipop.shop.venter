@@ -312,8 +312,8 @@ function getFirebaseServiceAccountPhp(): ?array {
     $envPath = getenv('FIREBASE_SERVICE_ACCOUNT_PATH') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_PATH'] ?? null);
     if (!empty($envPath)) {
         $searchedPaths[] = $envPath;
-        if (file_exists($envPath) && is_readable($envPath)) {
-            $parsed = json_decode((string)file_get_contents($envPath), true);
+        if (file_exists($envPath)) {
+            $parsed = json_decode((string)@file_get_contents($envPath), true);
             if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
                 $sa = $parsed;
                 $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $envPath;
@@ -326,8 +326,8 @@ function getFirebaseServiceAccountPhp(): ?array {
     $googleCreds = getenv('GOOGLE_APPLICATION_CREDENTIALS') ?: ($_ENV['GOOGLE_APPLICATION_CREDENTIALS'] ?? null);
     if (!empty($googleCreds)) {
         $searchedPaths[] = $googleCreds;
-        if (file_exists($googleCreds) && is_readable($googleCreds)) {
-            $parsed = json_decode((string)file_get_contents($googleCreds), true);
+        if (file_exists($googleCreds)) {
+            $parsed = json_decode((string)@file_get_contents($googleCreds), true);
             if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
                 $sa = $parsed;
                 $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $googleCreds;
@@ -388,7 +388,7 @@ function getFirebaseServiceAccountPhp(): ?array {
             if (!in_array($fullPath, $searchedPaths, true)) {
                 $searchedPaths[] = $fullPath;
             }
-            if (file_exists($fullPath) && is_readable($fullPath)) {
+            if (file_exists($fullPath)) {
                 $content = @file_get_contents($fullPath);
                 if ($content) {
                     $parsed = json_decode($content, true);
@@ -413,7 +413,7 @@ function getFirebaseServiceAccountPhp(): ?array {
                     if (!in_array($fullPath, $searchedPaths, true)) {
                         $searchedPaths[] = $fullPath;
                     }
-                    if (file_exists($fullPath) && is_readable($fullPath)) {
+                    if (file_exists($fullPath)) {
                         $content = @file_get_contents($fullPath);
                         if ($content) {
                             $parsed = json_decode($content, true);

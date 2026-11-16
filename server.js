@@ -181,34 +181,70 @@ serviceAccount = findFirebaseServiceAccount();
 
 let firebaseAdminInitialized = false;
 let firebaseAdminHasCert = false;
+let firebaseApp = null;
+let firebaseMessaging = null;
 
 try {
   if (serviceAccount) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      projectId: serviceAccount.project_id || 'vendor-app-18b18'
+    let certFn = admin.cert;
+    if (!certFn && admin.credential && typeof admin.credential.cert === 'function') {
+      certFn = admin.credential.cert;
+    }
+    if (!certFn) {
+      try { certFn = require('firebase-admin/app').cert; } catch (e) {}
+    }
+    const credential = certFn ? certFn(serviceAccount) : null;
+    firebaseApp = admin.initializeApp({
+      credential,
+      projectId: serviceAccount.project_id || 'knowlipop-vendor'
     });
     firebaseAdminInitialized = true;
     firebaseAdminHasCert = true;
     console.log(`[FIREBASE ADMIN] ✅ Successfully initialized Firebase Admin SDK with service account from: ${loadedServiceAccountPath}`);
-    console.log(`[FIREBASE ADMIN] Project ID: ${serviceAccount.project_id || 'vendor-app-18b18'} | Client Email: ${serviceAccount.client_email}`);
+    console.log(`[FIREBASE ADMIN] Project ID: ${serviceAccount.project_id || 'knowlipop-vendor'} | Client Email: ${serviceAccount.client_email}`);
   } else if (process.env.FIREBASE_PROJECT_ID) {
-    admin.initializeApp({
-      projectId: process.env.FIREBASE_PROJECT_ID || 'vendor-app-18b18'
+    firebaseApp = admin.initializeApp({
+      projectId: process.env.FIREBASE_PROJECT_ID || 'knowlipop-vendor'
     });
     firebaseAdminInitialized = true;
     firebaseAdminHasCert = false;
     console.warn('[FIREBASE ADMIN] ⚠️ Initialized Firebase Admin SDK with project ID only (NO private key cert). Push notifications will fail without credentials.');
   } else {
-    admin.initializeApp({
-      projectId: 'vendor-app-18b18'
+    firebaseApp = admin.initializeApp({
+      projectId: 'knowlipop-vendor'
     });
     firebaseAdminInitialized = true;
     firebaseAdminHasCert = false;
-    console.warn('[FIREBASE ADMIN] ⚠️ Initialized Firebase Admin SDK with fallback project ID vendor-app-18b18 (NO credentials file loaded).');
+    console.warn('[FIREBASE ADMIN] ⚠️ Initialized Firebase Admin SDK with fallback project ID knowlipop-vendor (NO credentials file loaded).');
   }
 } catch (fbInitErr) {
   console.warn('[FIREBASE ADMIN] Notice during Firebase Admin initialization:', fbInitErr.message);
+}
+
+function getFirebaseMessagingClient() {
+  if (firebaseMessaging) return firebaseMessaging;
+  try {
+    const { getMessaging } = require('firebase-admin/messaging');
+    firebaseMessaging = getMessaging(firebaseApp || admin.app());
+    return firebaseMessaging;
+  } catch (e) {
+    if (typeof admin.messaging === 'function') {
+      firebaseMessaging = admin.messaging();
+      return firebaseMessaging;
+    }
+  }
+  return null;
+}
+
+async function sendFirebaseMessage(message) {
+  const client = getFirebaseMessagingClient();
+  if (client && typeof client.send === 'function') {
+    return await client.send(message);
+  }
+  if (typeof admin.messaging === 'function') {
+    return await admin.messaging().send(message);
+  }
+  throw new Error('Firebase Messaging is not initialized. Ensure service account is loaded.');
 }
 
 if (!firebaseAdminHasCert) {
@@ -8311,7 +8347,7 @@ async function sendOrderNotificationToSeller(sellerFcmToken, order) {
     }
   };
   try {
-    const response = await admin.messaging().send(message);
+    const response = await sendFirebaseMessage(message);
     console.log(`[FIREBASE PUSH] ✅ Successfully sent push notification to seller (token: ${sellerFcmToken.slice(0, 16)}...):`, response);
     return response;
   } catch (error) {
@@ -8389,7 +8425,7 @@ async function sendPushNotification({ userId, phone, title, message, data, prior
     };
 
     try {
-      const response = await admin.messaging().send(fcmMessage);
+      const response = await sendFirebaseMessage(fcmMessage);
       deliveredCount++;
       console.log(`[FIREBASE ADMIN] ✅ Push delivered to token ${token.slice(0, 14)}...:`, response);
     } catch (error) {
@@ -9734,7 +9770,7 @@ const handleFcmTestPush = async (req, res) => {
   };
 
   try {
-    const fcmRes = await admin.messaging().send(message);
+    const fcmRes = await sendFirebaseMessage(message);
     console.log(`[FIREBASE TEST PUSH] ✅ Push sent successfully:`, fcmRes);
     return res.json({
       status: true,
