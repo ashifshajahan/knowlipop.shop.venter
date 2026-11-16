@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS `users` (
   `deleted_at` TIMESTAMP NULL DEFAULT NULL,
   `deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL,
   `token_version` INT NOT NULL DEFAULT 1,
+  `last_login_at` TIMESTAMP NULL DEFAULT NULL,
+  `last_active_at` TIMESTAMP NULL DEFAULT NULL,
+  `is_online` TINYINT(1) NOT NULL DEFAULT 0,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
@@ -152,6 +155,7 @@ ON DUPLICATE KEY UPDATE `seller_id` = VALUES(`seller_id`), `name` = VALUES(`name
 
 CREATE TABLE IF NOT EXISTS `orders` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `idempotency_key` VARCHAR(120) NULL DEFAULT NULL,
   `seller_id` BIGINT UNSIGNED NULL DEFAULT NULL,
   `order_number` VARCHAR(60) NOT NULL UNIQUE,
   `buyer_name` VARCHAR(150) NOT NULL,
@@ -182,9 +186,11 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `refunded_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
   `return_window_ends_at` TIMESTAMP NULL DEFAULT NULL,
   `settled_at` TIMESTAMP NULL DEFAULT NULL,
+  `acknowledged_at` TIMESTAMP NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_orders_idempotency` (`idempotency_key`),
   INDEX `idx_orders_seller` (`seller_id`),
   INDEX `idx_orders_status` (`order_status`),
   INDEX `idx_orders_phone` (`buyer_phone`),
@@ -232,6 +238,22 @@ CREATE TABLE IF NOT EXISTS `order_activities` (
   INDEX `idx_oa_created` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `order_idempotency_keys` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `idempotency_key` VARCHAR(120) NOT NULL,
+  `order_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+  `order_number` VARCHAR(60) NULL DEFAULT NULL,
+  `request_hash` VARCHAR(64) NULL DEFAULT NULL,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'completed',
+  `response_payload` LONGTEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_order_idempotency_key` (`idempotency_key`),
+  INDEX `idx_oik_order` (`order_id`),
+  INDEX `idx_oik_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `notifications` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
@@ -243,6 +265,11 @@ CREATE TABLE IF NOT EXISTS `notifications` (
   `type` VARCHAR(50) NOT NULL DEFAULT 'order',
   `data` JSON NULL DEFAULT NULL,
   `is_read` TINYINT(1) NOT NULL DEFAULT 0,
+  `delivery_status` VARCHAR(40) NOT NULL DEFAULT 'delivered',
+  `read_at` TIMESTAMP NULL DEFAULT NULL,
+  `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+  `dedup_key` VARCHAR(120) NULL DEFAULT NULL,
+  `action_url` VARCHAR(255) NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
@@ -250,7 +277,9 @@ CREATE TABLE IF NOT EXISTS `notifications` (
   INDEX `idx_notifications_phone` (`buyer_phone`),
   INDEX `idx_notifications_read` (`is_read`),
   INDEX `idx_notifications_order` (`order_id`),
-  INDEX `idx_notifications_role` (`recipient_role`)
+  INDEX `idx_notifications_role` (`recipient_role`),
+  INDEX `idx_notifications_delivery` (`delivery_status`),
+  INDEX `idx_notifications_dedup` (`dedup_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `device_tokens` (
@@ -380,6 +409,7 @@ CREATE TABLE IF NOT EXISTS `payment_transactions` (
   `error_description` TEXT NULL DEFAULT NULL,
   `gateway_payload` LONGTEXT NULL DEFAULT NULL,
   `settled_at` TIMESTAMP NULL DEFAULT NULL,
+  `acknowledged_at` TIMESTAMP NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

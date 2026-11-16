@@ -101,6 +101,35 @@ async function runMigration() {
   await ensureColumn('users', 'deleted_by', '`deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `deleted_at`');
   await ensureColumn('users', 'token_version', '`token_version` INT NOT NULL DEFAULT 1 AFTER `deleted_by`');
 
+  await ensureColumn('orders', 'idempotency_key', '`idempotency_key` VARCHAR(120) NULL DEFAULT NULL AFTER `order_number`');
+  try {
+    const [idempIdx] = await conn.query('SHOW INDEX FROM orders WHERE Key_name = "uniq_orders_idempotency"');
+    if (idempIdx.length === 0) {
+      await conn.query('ALTER TABLE orders ADD UNIQUE KEY uniq_orders_idempotency (idempotency_key)');
+    }
+  } catch (e) {}
+
+  // Ensure order_idempotency_keys table
+  try {
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS \`order_idempotency_keys\` (
+        \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        \`idempotency_key\` VARCHAR(120) NOT NULL,
+        \`order_id\` BIGINT UNSIGNED NULL DEFAULT NULL,
+        \`order_number\` VARCHAR(60) NULL DEFAULT NULL,
+        \`request_hash\` VARCHAR(64) NULL DEFAULT NULL,
+        \`status\` VARCHAR(30) NOT NULL DEFAULT 'completed',
+        \`response_payload\` LONGTEXT NULL DEFAULT NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`uniq_order_idempotency_key\` (\`idempotency_key\`),
+        INDEX \`idx_oik_order\` (\`order_id\`),
+        INDEX \`idx_oik_status\` (\`status\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  } catch (e) {}
+
   await ensureColumn('orders', 'carrier', '`carrier` VARCHAR(100) NULL DEFAULT NULL');
   await ensureColumn('orders', 'tracking_number', '`tracking_number` VARCHAR(100) NULL DEFAULT NULL');
   await ensureColumn('orders', 'cancellation_reason', '`cancellation_reason` TEXT NULL DEFAULT NULL');
@@ -110,6 +139,15 @@ async function runMigration() {
 
   await ensureColumn('notifications', 'recipient_role', '`recipient_role` VARCHAR(40) NULL DEFAULT NULL AFTER `buyer_phone`');
   await ensureColumn('notifications', 'order_id', '`order_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `recipient_role`');
+  await ensureColumn('notifications', 'delivery_status', '`delivery_status` VARCHAR(40) NOT NULL DEFAULT "delivered" AFTER `is_read`');
+  await ensureColumn('notifications', 'read_at', '`read_at` TIMESTAMP NULL DEFAULT NULL AFTER `delivery_status`');
+  await ensureColumn('notifications', 'delivered_at', '`delivered_at` TIMESTAMP NULL DEFAULT NULL AFTER `read_at`');
+  await ensureColumn('notifications', 'dedup_key', '`dedup_key` VARCHAR(120) NULL DEFAULT NULL AFTER `delivered_at`');
+  await ensureColumn('notifications', 'action_url', '`action_url` VARCHAR(255) NULL DEFAULT NULL AFTER `dedup_key`');
+  await ensureColumn('users', 'last_login_at', '`last_login_at` TIMESTAMP NULL DEFAULT NULL');
+  await ensureColumn('users', 'last_active_at', '`last_active_at` TIMESTAMP NULL DEFAULT NULL');
+  await ensureColumn('users', 'is_online', '`is_online` TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumn('orders', 'acknowledged_at', '`acknowledged_at` TIMESTAMP NULL DEFAULT NULL');
 
   // Ensure order_activities table exists
   try {

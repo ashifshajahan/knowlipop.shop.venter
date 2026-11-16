@@ -40,6 +40,16 @@ if ($requestUri === '/test-buyer' || $requestUri === '/buyer') {
     exit;
 }
 
+if ($requestUri === '/test-seller' || $requestUri === '/vendor-dashboard' || $requestUri === '/seller-dashboard') {
+    header('Content-Type: text/html; charset=utf-8');
+    if (file_exists(__DIR__ . '/test-seller.html')) {
+        readfile(__DIR__ . '/test-seller.html');
+    } else {
+        echo 'Vendor test module file not found.';
+    }
+    exit;
+}
+
 // Static uploaded files handler & Omni-route image resolver (/uploads/, /api/images/, /api/uploads/, /storage/, /storage/app/public/, /public/storage/, /images/, /products/, double-URLs)
 $imgMatch = [];
 $hasImgFile = preg_match('/(prod_\d+_[a-f0-9]+\.(?:jpg|jpeg|jfif|png|webp|gif|bmp|tif|tiff|avif|heic|heif|ico|svg)|placeholder\.(?:jpg|jpeg|png)|avatar_\d+_[a-f0-9]+\.(?:jpg|jpeg|png|webp|gif|svg))/i', $requestUri, $imgMatch);
@@ -479,6 +489,34 @@ if (preg_match('#^/(?:api/sellers?)/(\d+)/(?:dashboard|stats|analytics)$#', $req
     }
 }
 
+// Seller Offline Synchronization: /api/seller/sync or /api/sync
+if ($requestUri === '/api/seller/sync' || $requestUri === '/api/sync') {
+    if ($method === 'GET') {
+        apiGetSellerSync($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Missed Orders: /api/seller/missed-orders
+if ($requestUri === '/api/seller/missed-orders' || $requestUri === '/api/seller/missed') {
+    if ($method === 'GET') {
+        apiGetSellerMissedOrders($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+// Seller Order Acknowledgment: /api/seller/orders/{id}/acknowledge
+if (preg_match('#^/(?:api/seller/orders|api/orders)/([^/]+)/acknowledge$#', $requestUri, $matches)) {
+    $orderParam = $matches[1];
+    if ($method === 'POST') {
+        apiAcknowledgeSellerOrder($pdo, $orderParam);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 // Notifications Endpoints
 if ($requestUri === '/api/seller/notifications' || $requestUri === '/api/notifications') {
     if ($method === 'GET') {
@@ -636,24 +674,57 @@ if (preg_match('#^/(?:api/sellers?|api/seller/profile)/(\d+)$#', $requestUri, $m
 }
 
 // Seller Bank Account & Payments
-if ($requestUri === '/api/seller/bank-account/onboarding') {
-    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
-    apiBankOnboarding($pdo);
+$bankOnboardingRoutes = [
+    '/api/seller/bank-account/onboarding',
+    '/api/sellers/bank-account/onboarding',
+    '/seller/bank-account/onboarding',
+    '/sellers/bank-account/onboarding',
+    '/api/seller/bank-account',
+    '/api/sellers/bank-account',
+    '/seller/bank-account',
+    '/sellers/bank-account',
+];
+if (in_array($requestUri, $bankOnboardingRoutes, true) || str_ends_with($requestUri, '/bank-account/onboarding')) {
+    if ($method === 'GET') {
+        apiBankStatus($pdo);
+    } elseif (in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+        apiBankOnboarding($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
-if ($requestUri === '/api/seller/bank-account/status') {
-    if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
-    apiBankStatus($pdo);
+$bankStatusRoutes = [
+    '/api/seller/bank-account/status',
+    '/api/sellers/bank-account/status',
+    '/seller/bank-account/status',
+    '/sellers/bank-account/status'
+];
+if (in_array($requestUri, $bankStatusRoutes, true) || str_ends_with($requestUri, '/bank-account/status')) {
+    if (in_array($method, ['GET', 'POST'], true)) {
+        apiBankStatus($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
-if ($requestUri === '/api/seller/payouts') {
+if ($requestUri === '/api/seller/payouts' || $requestUri === '/seller/payouts') {
     if ($method !== 'GET') errorResponse('Method Not Allowed', [], 405);
     apiPayouts($pdo);
 }
 
-if ($requestUri === '/api/marketplace/commission-preview') {
-    if ($method !== 'POST') errorResponse('Method Not Allowed', [], 405);
-    apiCommissionPreview($pdo);
+$commPreviewRoutes = [
+    '/api/marketplace/commission-preview',
+    '/marketplace/commission-preview',
+    '/api/commission-preview',
+    '/commission-preview'
+];
+if (in_array($requestUri, $commPreviewRoutes, true) || str_contains($requestUri, 'commission-preview')) {
+    if (in_array($method, ['GET', 'POST', 'PUT'], true)) {
+        apiCommissionPreview($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
 }
 
 // ==========================================

@@ -2848,7 +2848,10 @@
 
       const primarySellerId = (items.length > 0 && items[0].seller_id) ? items[0].seller_id : 1;
 
+      const checkoutIdempotencyKey = 'idemp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+
       const payload = {
+        idempotency_key: checkoutIdempotencyKey,
         seller_id: primarySellerId,
         buyer_name: document.getElementById('buyer-name').value.trim(),
         buyer_phone: document.getElementById('buyer-phone').value.trim(),
@@ -2868,13 +2871,20 @@
       try {
         const res = await fetch('/api/orders', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': checkoutIdempotencyKey
+          },
           body: JSON.stringify(payload)
         });
 
         const data = await res.json();
         if (res.ok && data.order) {
-          showToast(`🎉 Order Placed: #${data.order.order_number}`, 'success');
+          if (data.already_created || data.existing) {
+            showToast(`ℹ️ Order Already Created: #${data.order.order_number}`, 'info');
+          } else {
+            showToast(`🎉 Order Placed: #${data.order.order_number}`, 'success');
+          }
           clearCartDraft();
           await fetchProductsCatalog();
           await refreshOrdersList();

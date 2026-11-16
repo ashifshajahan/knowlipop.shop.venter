@@ -42,6 +42,11 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                     type TEXT NOT NULL DEFAULT 'order',
                     data TEXT NULL DEFAULT NULL,
                     is_read INTEGER NOT NULL DEFAULT 0,
+                    delivery_status TEXT NOT NULL DEFAULT 'delivered',
+                    read_at DATETIME NULL DEFAULT NULL,
+                    delivered_at DATETIME NULL DEFAULT NULL,
+                    dedup_key TEXT NULL DEFAULT NULL,
+                    action_url TEXT NULL DEFAULT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
@@ -50,6 +55,8 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(is_read);
                 CREATE INDEX IF NOT EXISTS idx_notifications_order ON notifications(order_id);
                 CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role);
+                CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(delivery_status);
+                CREATE INDEX IF NOT EXISTS idx_notifications_dedup ON notifications(dedup_key);
 
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,7 +65,11 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                     phone TEXT NULL,
                     seller_name TEXT NULL,
                     role TEXT NOT NULL DEFAULT 'seller',
+                    account_status TEXT NOT NULL DEFAULT 'active',
                     fcm_token TEXT NULL,
+                    is_online INTEGER NOT NULL DEFAULT 0,
+                    last_login_at DATETIME NULL DEFAULT NULL,
+                    last_active_at DATETIME NULL DEFAULT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
@@ -75,6 +86,29 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                 CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);
                 CREATE INDEX IF NOT EXISTS idx_device_tokens_phone ON device_tokens(phone);
             ");
+
+            // Check SQLite columns on existing tables
+            $sqliteAdd = function(string $table, string $col, string $def) use ($pdo): void {
+                try {
+                    $cols = $pdo->query("PRAGMA table_info({$table})")->fetchAll(PDO::FETCH_ASSOC);
+                    $names = array_map(fn($c) => strtolower((string)$c['name']), $cols);
+                    if (!in_array(strtolower($col), $names, true)) {
+                        $pdo->exec("ALTER TABLE `{$table}` ADD COLUMN {$def}");
+                    }
+                } catch (Throwable $e) {}
+            };
+            $sqliteAdd('notifications', 'recipient_role', "recipient_role TEXT NULL DEFAULT NULL");
+            $sqliteAdd('notifications', 'order_id', "order_id INTEGER NULL DEFAULT NULL");
+            $sqliteAdd('notifications', 'delivery_status', "delivery_status TEXT NOT NULL DEFAULT 'delivered'");
+            $sqliteAdd('notifications', 'read_at', "read_at DATETIME NULL DEFAULT NULL");
+            $sqliteAdd('notifications', 'delivered_at', "delivered_at DATETIME NULL DEFAULT NULL");
+            $sqliteAdd('notifications', 'dedup_key', "dedup_key TEXT NULL DEFAULT NULL");
+            $sqliteAdd('notifications', 'action_url', "action_url TEXT NULL DEFAULT NULL");
+            $sqliteAdd('users', 'account_status', "account_status TEXT NOT NULL DEFAULT 'active'");
+            $sqliteAdd('users', 'is_online', "is_online INTEGER NOT NULL DEFAULT 0");
+            $sqliteAdd('users', 'last_login_at', "last_login_at DATETIME NULL DEFAULT NULL");
+            $sqliteAdd('users', 'last_active_at', "last_active_at DATETIME NULL DEFAULT NULL");
+            $sqliteAdd('orders', 'acknowledged_at', "acknowledged_at DATETIME NULL DEFAULT NULL");
         } else {
             $pdo->exec("
                 CREATE TABLE IF NOT EXISTS `notifications` (
@@ -88,6 +122,11 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                     `type` VARCHAR(50) NOT NULL DEFAULT 'order',
                     `data` JSON NULL DEFAULT NULL,
                     `is_read` TINYINT(1) NOT NULL DEFAULT 0,
+                    `delivery_status` VARCHAR(40) NOT NULL DEFAULT 'delivered',
+                    `read_at` TIMESTAMP NULL DEFAULT NULL,
+                    `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+                    `dedup_key` VARCHAR(120) NULL DEFAULT NULL,
+                    `action_url` VARCHAR(255) NULL DEFAULT NULL,
                     `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
@@ -95,7 +134,9 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                     INDEX `idx_notifications_phone` (`buyer_phone`),
                     INDEX `idx_notifications_read` (`is_read`),
                     INDEX `idx_notifications_order` (`order_id`),
-                    INDEX `idx_notifications_role` (`recipient_role`)
+                    INDEX `idx_notifications_role` (`recipient_role`),
+                    INDEX `idx_notifications_delivery` (`delivery_status`),
+                    INDEX `idx_notifications_dedup` (`dedup_key`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
                 CREATE TABLE IF NOT EXISTS `device_tokens` (
@@ -113,19 +154,37 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             ");
 
-            // Ensure recipient_role column
+            $mysqlAdd = function(string $table, string $col, string $def) use ($pdo): void {
+                try {
+                    $chk = $pdo->query("SHOW COLUMNS FROM `{$table}` LIKE '{$col}'")->fetchAll();
+                    if (empty($chk)) {
+                        $pdo->exec("ALTER TABLE `{$table}` ADD COLUMN {$def}");
+                    }
+                } catch (Throwable $e) {}
+            };
+
+            $mysqlAdd('notifications', 'recipient_role', "`recipient_role` VARCHAR(40) NULL DEFAULT NULL AFTER `buyer_phone`");
+            $mysqlAdd('notifications', 'order_id', "`order_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `recipient_role`");
+            $mysqlAdd('notifications', 'delivery_status', "`delivery_status` VARCHAR(40) NOT NULL DEFAULT 'delivered' AFTER `is_read`");
+            $mysqlAdd('notifications', 'read_at', "`read_at` TIMESTAMP NULL DEFAULT NULL AFTER `delivery_status`");
+            $mysqlAdd('notifications', 'delivered_at', "`delivered_at` TIMESTAMP NULL DEFAULT NULL AFTER `read_at`");
+            $mysqlAdd('notifications', 'dedup_key', "`dedup_key` VARCHAR(120) NULL DEFAULT NULL AFTER `delivered_at`");
+            $mysqlAdd('notifications', 'action_url', "`action_url` VARCHAR(255) NULL DEFAULT NULL AFTER `dedup_key`");
+            $mysqlAdd('users', 'is_online', "`is_online` TINYINT(1) NOT NULL DEFAULT 0");
+            $mysqlAdd('users', 'last_login_at', "`last_login_at` TIMESTAMP NULL DEFAULT NULL");
+            $mysqlAdd('users', 'last_active_at', "`last_active_at` TIMESTAMP NULL DEFAULT NULL");
+            $mysqlAdd('orders', 'acknowledged_at', "`acknowledged_at` TIMESTAMP NULL DEFAULT NULL");
+
             try {
-                $colStmt = $pdo->query("SHOW COLUMNS FROM `notifications` LIKE 'recipient_role'");
-                if (!$colStmt->fetch()) {
-                    $pdo->exec("ALTER TABLE `notifications` ADD COLUMN `recipient_role` VARCHAR(40) NULL DEFAULT NULL AFTER `buyer_phone`");
+                $idxChk = $pdo->query("SHOW INDEX FROM `notifications` WHERE Key_name = 'idx_notifications_delivery'")->fetchAll();
+                if (empty($idxChk)) {
+                    $pdo->exec("ALTER TABLE `notifications` ADD INDEX `idx_notifications_delivery` (`delivery_status`)");
                 }
             } catch (Throwable $e) {}
-
-            // Ensure order_id column
             try {
-                $colStmt = $pdo->query("SHOW COLUMNS FROM `notifications` LIKE 'order_id'");
-                if (!$colStmt->fetch()) {
-                    $pdo->exec("ALTER TABLE `notifications` ADD COLUMN `order_id` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `recipient_role`");
+                $idxChk2 = $pdo->query("SHOW INDEX FROM `notifications` WHERE Key_name = 'idx_notifications_dedup'")->fetchAll();
+                if (empty($idxChk2)) {
+                    $pdo->exec("ALTER TABLE `notifications` ADD INDEX `idx_notifications_dedup` (`dedup_key`)");
                 }
             } catch (Throwable $e) {}
         }
@@ -149,6 +208,30 @@ function pruneInvalidDeviceTokenPhp(PDO $pdo, string $token): void
 
         $updUser = $pdo->prepare("UPDATE `users` SET fcm_token = NULL WHERE fcm_token = :token");
         $updUser->execute([':token' => $token]);
+    } catch (Throwable $e) {}
+}
+
+/**
+ * Register or update an FCM device token for a user/seller
+ */
+function registerDeviceTokenPhp(PDO $pdo, ?int $userId, string $token, string $platform = 'android', ?string $phone = null): void
+{
+    ensureNotificationSchemaPhp($pdo);
+    try {
+        $chk = $pdo->prepare("SELECT id FROM device_tokens WHERE token = :token LIMIT 1");
+        $chk->execute([':token' => $token]);
+        $ex = $chk->fetch(PDO::FETCH_ASSOC);
+        if ($ex) {
+            $upd = $pdo->prepare("UPDATE device_tokens SET user_id = :uid, phone = :phone, platform = :plat, updated_at = CURRENT_TIMESTAMP WHERE id = :id");
+            $upd->execute([':uid' => $userId, ':phone' => $phone, ':plat' => $platform, ':id' => $ex['id']]);
+        } else {
+            $ins = $pdo->prepare("INSERT INTO device_tokens (user_id, phone, token, platform, created_at, updated_at) VALUES (:uid, :phone, :token, :plat, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            $ins->execute([':uid' => $userId, ':phone' => $phone, ':token' => $token, ':plat' => $platform]);
+        }
+        if ($userId) {
+            $uStmt = $pdo->prepare("UPDATE `users` SET fcm_token = :token WHERE id = :uid");
+            $uStmt->execute([':token' => $token, ':uid' => $userId]);
+        }
     } catch (Throwable $e) {}
 }
 
@@ -217,10 +300,116 @@ function triggerNodeNotificationPhp(array $notification): bool
 }
 
 /**
- * Dispatch Firebase Cloud Messaging (FCM) Push Notifications
+ * Helper to load Firebase Service Account JSON
  */
-function sendPushNotificationPhp(PDO $pdo, ?int $userId, ?string $phone, string $title, string $message, mixed $data = null): array
-{
+function getFirebaseServiceAccountPhp(): ?array {
+    static $sa = null;
+    if ($sa !== null) return $sa;
+
+    $candidates = array_filter([
+        getenv('FIREBASE_SERVICE_ACCOUNT_PATH') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_PATH'] ?? null),
+        __DIR__ . '/../knowlipop-vendor-firebase-adminsdk.json',
+        __DIR__ . '/../config/knowlipop-vendor-firebase-adminsdk.json',
+        __DIR__ . '/../firebase-service-account.json',
+        __DIR__ . '/../config/firebase-service-account.json'
+    ]);
+
+    foreach ($candidates as $path) {
+        if (file_exists($path) && is_readable($path)) {
+            $content = file_get_contents($path);
+            $parsed = json_decode($content, true);
+            if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
+                $sa = $parsed;
+                return $sa;
+            }
+        }
+    }
+
+    $rawEnv = getenv('FIREBASE_SERVICE_ACCOUNT_JSON') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_JSON'] ?? null);
+    if (!empty($rawEnv)) {
+        $parsed = json_decode($rawEnv, true);
+        if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
+            $sa = $parsed;
+            return $sa;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Generate Google OAuth2 Bearer Access Token using Service Account Private Key
+ */
+function getFirebaseAccessTokenPhp(array $sa): ?string {
+    static $tokenCache = null;
+    static $tokenExpiry = 0;
+
+    if ($tokenCache && time() < ($tokenExpiry - 120)) {
+        return $tokenCache;
+    }
+
+    $now = time();
+    $header = base64_encode(json_encode(['alg' => 'RS256', 'typ' => 'JWT']));
+    $claims = base64_encode(json_encode([
+        'iss' => $sa['client_email'],
+        'scope' => 'https://www.googleapis.com/auth/firebase.messaging',
+        'aud' => 'https://oauth2.googleapis.com/token',
+        'exp' => $now + 3600,
+        'iat' => $now
+    ]));
+
+    $header = str_replace(['+', '/', '='], ['-', '_', ''], $header);
+    $claims = str_replace(['+', '/', '='], ['-', '_', ''], $claims);
+    $toSign = $header . '.' . $claims;
+
+    $signature = '';
+    if (!function_exists('openssl_sign') || !openssl_sign($toSign, $signature, $sa['private_key'], OPENSSL_ALGO_SHA256)) {
+        return null;
+    }
+
+    $jwt = $toSign . '.' . str_replace(['+', '/', '='], ['-', '_', ''], base64_encode($signature));
+
+    if (!function_exists('curl_init')) return null;
+
+    $ch = curl_init('https://oauth2.googleapis.com/token');
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+        'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        'assertion' => $jwt
+    ]));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+
+    $res = curl_exec($ch);
+    curl_close($ch);
+
+    if ($res) {
+        $data = json_decode($res, true);
+        if (!empty($data['access_token'])) {
+            $tokenCache = $data['access_token'];
+            $tokenExpiry = $now + (int)($data['expires_in'] ?? 3600);
+            return $tokenCache;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Dispatch Firebase Cloud Messaging (FCM) Push Notifications
+ * Uses High Priority and 3-Day TTL (259200s) for offline delivery.
+ */
+function sendPushNotificationPhp(
+    PDO $pdo,
+    ?int $userId,
+    ?string $phone,
+    string $title,
+    string $message,
+    mixed $data = null,
+    string $priority = 'high',
+    int $ttlSeconds = 259200
+): array {
     ensureNotificationSchemaPhp($pdo);
     $tokens = [];
 
@@ -252,35 +441,101 @@ function sendPushNotificationPhp(PDO $pdo, ?int $userId, ?string $phone, string 
         return ['ok' => true, 'sent' => 0, 'tokens_count' => 0, 'reason' => 'No registered device tokens'];
     }
 
-    // Check FCM Server Key from env or configuration
-    $fcmServerKey = getenv('FCM_SERVER_KEY') ?: ($_ENV['FCM_SERVER_KEY'] ?? '');
-    if (empty($fcmServerKey)) {
-        // FCM not configured or running in simulated mode
+    $sa = getFirebaseServiceAccountPhp();
+    $accessToken = $sa ? getFirebaseAccessTokenPhp($sa) : null;
+    $projectId = $sa['project_id'] ?? (getenv('FIREBASE_PROJECT_ID') ?: 'vendor-app-18b18');
+
+    // 1. Try FCM v1 HTTP API if Service Account is available
+    if ($accessToken && function_exists('curl_init')) {
+        $sentCount = 0;
+        $invalidTokens = [];
+
+        // Prepare string-only data map for FCM v1
+        $stringData = [];
+        $rawArray = is_array($data) ? $data : (is_string($data) ? json_decode($data, true) : []);
+        if (is_array($rawArray)) {
+            foreach ($rawArray as $k => $v) {
+                $stringData[(string)$k] = is_scalar($v) ? (string)$v : json_encode($v);
+            }
+        }
+
+        foreach ($tokens as $token) {
+            $fcmV1Payload = [
+                'message' => [
+                    'token' => $token,
+                    'notification' => [
+                        'title' => $title,
+                        'body' => $message,
+                    ],
+                    'data' => !empty($stringData) ? $stringData : ['type' => 'general'],
+                    'android' => [
+                        'priority' => 'high',
+                        'ttl' => "{$ttlSeconds}s",
+                        'notification' => [
+                            'channel_id' => 'seller_orders_channel',
+                            'sound' => 'default',
+                            'default_sound' => true
+                        ]
+                    ]
+                ]
+            ];
+
+            $ch = curl_init("https://fcm.googleapis.com/v1/projects/{$projectId}/messages:send");
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($fcmV1Payload));
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 4);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Authorization: Bearer ' . $accessToken,
+                'Content-Type: application/json'
+            ]);
+
+            $rawRes = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($httpCode === 200) {
+                $sentCount++;
+            } else if ($httpCode === 404 || str_contains((string)$rawRes, 'UNREGISTERED')) {
+                $invalidTokens[] = $token;
+            }
+        }
+
+        // Prune invalid tokens
+        foreach ($invalidTokens as $badToken) {
+            pruneExpiredDeviceTokenPhp($pdo, $badToken);
+        }
+
         return [
             'ok' => true,
-            'simulated' => true,
-            'sent' => count($tokens),
+            'api' => 'fcm_v1_admin_sdk',
+            'sent' => $sentCount,
             'tokens_count' => count($tokens),
-            'message' => 'FCM push simulated (FCM_SERVER_KEY not set)'
+            'pruned_tokens' => count($invalidTokens)
         ];
     }
 
-    $invalidTokens = [];
-    $sentCount = 0;
+    // 2. Legacy FCM Server Key fallback
+    $fcmServerKey = getenv('FCM_SERVER_KEY') ?: ($_ENV['FCM_SERVER_KEY'] ?? '');
+    if (!empty($fcmServerKey) && function_exists('curl_init')) {
+        $invalidTokens = [];
+        $sentCount = 0;
+        $dataPayload = is_array($data) ? $data : ['payload' => is_string($data) ? $data : json_encode($data)];
 
-    foreach ($tokens as $token) {
-        $body = [
-            'to' => $token,
-            'notification' => [
-                'title' => $title,
-                'body' => $message,
-                'sound' => 'default',
-            ],
-            'data' => is_array($data) ? $data : ['payload' => is_string($data) ? $data : json_encode($data)],
-            'priority' => 'high'
-        ];
+        foreach ($tokens as $token) {
+            $body = [
+                'to' => $token,
+                'priority' => $priority,
+                'time_to_live' => $ttlSeconds,
+                'notification' => [
+                    'title' => $title,
+                    'body' => $message,
+                    'sound' => 'default',
+                    'channel_id' => 'seller_orders_channel'
+                ],
+                'data' => $dataPayload
+            ];
 
-        if (function_exists('curl_init')) {
             $ch = curl_init('https://fcm.googleapis.com/fcm/send');
             curl_setopt($ch, CURLOPT_POST, true);
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
@@ -305,26 +560,33 @@ function sendPushNotificationPhp(PDO $pdo, ?int $userId, ?string $phone, string 
                 }
             }
         }
+
+        foreach ($invalidTokens as $badToken) {
+            pruneExpiredDeviceTokenPhp($pdo, $badToken);
+        }
+
+        return ['ok' => true, 'sent' => $sentCount, 'tokens_count' => count($tokens)];
     }
 
-    // Prune invalid tokens
-    foreach ($invalidTokens as $badToken) {
-        pruneInvalidDeviceTokenPhp($pdo, $badToken);
-    }
-
+    // 3. Simulated / Logged mode
     return [
         'ok' => true,
-        'sent' => $sentCount,
+        'simulated' => true,
+        'sent' => count($tokens),
         'tokens_count' => count($tokens),
-        'pruned_tokens' => count($invalidTokens)
+        'priority' => $priority,
+        'time_to_live' => $ttlSeconds,
+        'message' => 'FCM push simulated (Firebase service account or server key not loaded, token stored for delivery)'
     ];
 }
 
 /**
  * Core Notification Creator:
- * 1. Persists notification in MySQL notifications table
- * 2. Fires non-blocking HTTP dispatch to Node.js Socket.IO realtime layer
- * 3. Dispatches FCM mobile push notifications to registered devices
+ * 1. Checks deduplication key (prevents duplicate notification records on repeat events)
+ * 2. Determines delivery status ('delivered' if user online, 'offline' if user offline / app closed)
+ * 3. Persists notification record permanently in MySQL
+ * 4. Fires non-blocking HTTP dispatch to Node.js Socket.IO realtime layer
+ * 5. Dispatches FCM mobile push notification with high priority and 3-day TTL
  */
 function createNotificationPhp(
     PDO $pdo,
@@ -335,17 +597,67 @@ function createNotificationPhp(
     string $type = 'order',
     mixed $data = null,
     ?string $recipientRole = null,
-    ?int $orderId = null
+    ?int $orderId = null,
+    ?string $dedupKey = null,
+    ?string $actionUrl = null
 ): int {
     ensureNotificationSchemaPhp($pdo);
+
+    // Extract dedup key or action url from data array if not explicitly passed
+    if ($dedupKey === null && is_array($data) && !empty($data['dedup_key'])) {
+        $dedupKey = (string)$data['dedup_key'];
+    }
+    if ($actionUrl === null && is_array($data) && !empty($data['action_url'])) {
+        $actionUrl = (string)$data['action_url'];
+    }
+    if ($actionUrl === null && is_array($data) && !empty($data['url'])) {
+        $actionUrl = (string)$data['url'];
+    }
+
+    // 1. Deduplication check: if dedupKey provided, check if already recorded
+    if ($dedupKey !== null && trim($dedupKey) !== '') {
+        try {
+            $chkDedup = $pdo->prepare("SELECT id FROM `notifications` WHERE dedup_key = :dk LIMIT 1");
+            $chkDedup->execute([':dk' => trim($dedupKey)]);
+            $exId = $chkDedup->fetchColumn();
+            if ($exId) {
+                // Existing notification found: return without creating duplicate
+                return (int)$exId;
+            }
+        } catch (Throwable $e) {}
+    }
+
+    // 2. Check seller/user presence for delivery_status
+    $deliveryStatus = 'delivered';
+    $deliveredAt = date('Y-m-d H:i:s');
+    if ($userId) {
+        try {
+            $uStmt = $pdo->prepare("SELECT is_online FROM `users` WHERE id = :uid LIMIT 1");
+            $uStmt->execute([':uid' => $userId]);
+            $uRow = $uStmt->fetch(PDO::FETCH_ASSOC);
+            if ($uRow) {
+                $isOnline = ((int)($uRow['is_online'] ?? 0) === 1);
+                if (!$isOnline) {
+                    $deliveryStatus = 'offline';
+                    $deliveredAt = null;
+                }
+            }
+        } catch (Throwable $e) {}
+    }
 
     $dataStr = is_string($data) ? $data : ($data !== null ? json_encode($data, JSON_UNESCAPED_UNICODE) : null);
     $notifId = 0;
 
+    // 3. Persist in notifications table
     try {
         $stmt = $pdo->prepare("
-            INSERT INTO `notifications` (user_id, buyer_phone, recipient_role, order_id, title, message, type, data, is_read)
-            VALUES (:uid, :phone, :role, :oid, :title, :msg, :type, :data, 0)
+            INSERT INTO `notifications` (
+                user_id, buyer_phone, recipient_role, order_id, title, message,
+                type, data, is_read, delivery_status, delivered_at, dedup_key, action_url
+            ) VALUES (
+                :uid, :phone, :role, :oid, :title, :msg,
+                :type, :data, 0, :status, :deliv_at, :dedup, :action_url
+            )
         ");
         $stmt->execute([
             ':uid' => $userId ?: null,
@@ -356,10 +668,14 @@ function createNotificationPhp(
             ':msg' => $message,
             ':type' => $type,
             ':data' => $dataStr,
+            ':status' => $deliveryStatus,
+            ':deliv_at' => $deliveredAt,
+            ':dedup' => $dedupKey ?: null,
+            ':action_url' => $actionUrl ?: null,
         ]);
         $notifId = (int)$pdo->lastInsertId();
     } catch (Throwable $e) {
-        // Fallback in case columns differ
+        // Fallback in case table has fewer columns
         try {
             $stmt = $pdo->prepare("
                 INSERT INTO `notifications` (user_id, buyer_phone, title, message, type, data, is_read)
@@ -379,7 +695,12 @@ function createNotificationPhp(
         }
     }
 
-    // Build realtime payload
+    // Build payload for real-time and push
+    $payloadData = is_string($data) ? json_decode($data, true) : (is_array($data) ? $data : []);
+    if ($actionUrl && !isset($payloadData['action_url'])) {
+        $payloadData['action_url'] = $actionUrl;
+    }
+
     $payload = [
         'id' => $notifId,
         'user_id' => $userId,
@@ -389,19 +710,22 @@ function createNotificationPhp(
         'title' => $title,
         'message' => $message,
         'type' => $type,
-        'data' => is_string($data) ? json_decode($data, true) : $data,
+        'delivery_status' => $deliveryStatus,
+        'dedup_key' => $dedupKey,
+        'action_url' => $actionUrl,
+        'data' => $payloadData,
         'is_read' => false,
         'created_at' => date('Y-m-d H:i:s'),
     ];
 
-    // Trigger Node.js real-time Socket.IO dispatch
+    // 4. Trigger Node.js real-time Socket.IO dispatch
     try {
         triggerNodeNotificationPhp($payload);
     } catch (Throwable $e) {}
 
-    // Dispatch Push Notification (FCM)
+    // 5. Dispatch Push Notification (FCM) even when seller is offline
     try {
-        sendPushNotificationPhp($pdo, $userId, $phone, $title, $message, $data);
+        sendPushNotificationPhp($pdo, $userId, $phone, $title, $message, $payloadData, 'high', 259200);
     } catch (Throwable $e) {}
 
     return $notifId;
@@ -415,6 +739,268 @@ if (!function_exists('createNotification')) {
     {
         createNotificationPhp($pdo, $userId, $phone, $title, $message, $type, $data);
     }
+}
+
+/**
+ * Dispatch Seller Product, Account & Payout Event Notifications
+ */
+function dispatchSellerEventNotificationPhp(PDO $pdo, int $sellerId, string $event, array $extra = []): int
+{
+    ensureNotificationSchemaPhp($pdo);
+
+    $title = 'Seller Notification';
+    $message = 'Important update regarding your seller account.';
+    $type = $event;
+    $actionUrl = '/seller/dashboard';
+    $screen = 'dashboard';
+    $dedupKey = null;
+
+    switch ($event) {
+        case 'product_stock_low':
+            $pName = (string)($extra['product_name'] ?? 'Product');
+            $stock = (int)($extra['stock'] ?? 0);
+            $pid = (int)($extra['product_id'] ?? 0);
+            $title = 'Low Stock Alert ⚠️';
+            $message = "Stock for '{$pName}' has fallen to {$stock}. Please restock soon.";
+            $actionUrl = "/seller/products/{$pid}";
+            $screen = 'product_details';
+            $dedupKey = "seller_{$sellerId}_prod_{$pid}_stock_low";
+            break;
+
+        case 'product_approved':
+        case 'product_status_change':
+            $pName = (string)($extra['product_name'] ?? 'Product');
+            $status = (string)($extra['status'] ?? 'approved');
+            $pid = (int)($extra['product_id'] ?? 0);
+            $title = 'Product Status Updated 📦';
+            $message = "Your product '{$pName}' status is now {$status}.";
+            $actionUrl = "/seller/products/{$pid}";
+            $screen = 'product_details';
+            $dedupKey = "seller_{$sellerId}_prod_{$pid}_{$status}";
+            break;
+
+        case 'account_security_alert':
+        case 'account_updated':
+            $title = 'Account Security Notice 🔐';
+            $message = (string)($extra['message'] ?? 'Your seller account profile details were updated.');
+            $actionUrl = '/seller/profile';
+            $screen = 'profile';
+            $dedupKey = "seller_{$sellerId}_acc_update_" . date('YmdH');
+            break;
+
+        case 'payout_processed':
+            $amtPaise = (float)($extra['amount'] ?? 0);
+            $amtFmt = number_format($amtPaise, 2);
+            $title = 'Payout Processed 💰';
+            $message = "Seller payout of ₹{$amtFmt} has been initiated to your registered bank account.";
+            $actionUrl = '/seller/payouts';
+            $screen = 'payouts';
+            $payoutId = $extra['payout_id'] ?? date('Ymd');
+            $dedupKey = "seller_{$sellerId}_payout_{$payoutId}";
+            break;
+
+        default:
+            $title = (string)($extra['title'] ?? 'Seller Alert');
+            $message = (string)($extra['message'] ?? 'You have a new seller notification.');
+            $actionUrl = (string)($extra['action_url'] ?? '/seller/dashboard');
+            $screen = (string)($extra['screen'] ?? 'dashboard');
+            break;
+    }
+
+    $notifData = array_merge($extra, [
+        'seller_id' => $sellerId,
+        'screen' => $screen,
+        'action_url' => $actionUrl,
+        'dedup_key' => $dedupKey,
+    ]);
+
+    return createNotificationPhp(
+        $pdo,
+        $sellerId,
+        null,
+        $title,
+        $message,
+        $type,
+        $notifData,
+        'seller',
+        !empty($extra['order_id']) ? (int)$extra['order_id'] : null,
+        $dedupKey,
+        $actionUrl
+    );
+}
+
+/**
+ * Get Seller Synchronization Data:
+ * Returns unread notifications, missed orders requiring seller action, and dashboard summary counters.
+ * Guarantees a seller never loses access to actions even after days offline.
+ */
+function getSellerSyncDataPhp(PDO $pdo, int $sellerId): array
+{
+    ensureNotificationSchemaPhp($pdo);
+
+    // 1. Fetch unread notifications for this seller
+    $notifStmt = $pdo->prepare("
+        SELECT id, user_id, buyer_phone, recipient_role, order_id, title, message,
+               type, data, is_read, delivery_status, read_at, delivered_at, action_url, created_at
+        FROM `notifications`
+        WHERE (user_id = :sid OR (recipient_role = 'seller' AND (data LIKE :sidMatch OR user_id IS NULL)))
+          AND is_read = 0
+        ORDER BY id DESC
+        LIMIT 50
+    ");
+    $notifStmt->execute([
+        ':sid' => $sellerId,
+        ':sidMatch' => '%"seller_id":' . $sellerId . '%',
+    ]);
+    $unreadNotifs = $notifStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($unreadNotifs as &$n) {
+        $n['id'] = (int)$n['id'];
+        $n['user_id'] = !empty($n['user_id']) ? (int)$n['user_id'] : null;
+        $n['order_id'] = !empty($n['order_id']) ? (int)$n['order_id'] : null;
+        $n['is_read'] = (bool)$n['is_read'];
+        $decoded = !empty($n['data']) ? (is_array($n['data']) ? $n['data'] : json_decode($n['data'], true)) : [];
+        $n['data'] = $decoded;
+        $n['screen'] = $decoded['screen'] ?? ($n['order_id'] ? 'seller_order_details' : 'dashboard');
+        $n['action_url'] = $n['action_url'] ?: ($decoded['action_url'] ?? ($n['order_id'] ? "/seller/orders/{$n['order_id']}" : "/seller/dashboard"));
+    }
+    unset($n);
+
+    // 2. Fetch Missed Orders / Actionable Orders for this seller
+    // Orders in status: pending, cancellation_requested, confirmed, accepted, processing, return_requested
+    $missedStmt = $pdo->prepare("
+        SELECT DISTINCT o.id, o.order_number, o.order_status, o.payment_method, o.payment_status,
+               o.total_amount, o.buyer_name, o.buyer_phone, o.shipping_address, o.city, o.pincode,
+               o.acknowledged_at, o.cancellation_reason, o.created_at, o.updated_at
+        FROM `orders` o
+        INNER JOIN `order_items` oi ON o.id = oi.order_id
+        WHERE oi.seller_id = :sid
+          AND o.order_status IN ('pending', 'cancellation_requested', 'confirmed', 'accepted', 'processing', 'return_requested')
+        ORDER BY o.id DESC
+    ");
+    $missedStmt->execute([':sid' => $sellerId]);
+    $rawMissedOrders = $missedStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Fetch this seller's specific items for each missed order
+    $missedOrders = [];
+    $pendingOrdersCount = 0;
+    $cancellationRequestsCount = 0;
+
+    foreach ($rawMissedOrders as $order) {
+        $oid = (int)$order['id'];
+        $st = strtolower(trim((string)$order['order_status']));
+
+        if ($st === 'pending') {
+            $pendingOrdersCount++;
+            $pendingAction = 'accept_or_reject';
+            $actionLabel = 'Order Pending Acceptance';
+            $actionUrl = "/seller/orders/{$oid}";
+        } elseif ($st === 'cancellation_requested') {
+            $cancellationRequestsCount++;
+            $pendingAction = 'review_cancellation';
+            $actionLabel = 'Cancellation Review Required';
+            $actionUrl = "/seller/orders/{$oid}/cancellation";
+        } elseif (in_array($st, ['confirmed', 'accepted', 'processing'], true)) {
+            $pendingAction = 'ship_order';
+            $actionLabel = 'Awaiting Dispatch & Shipment';
+            $actionUrl = "/seller/orders/{$oid}";
+        } elseif ($st === 'return_requested') {
+            $pendingAction = 'review_return';
+            $actionLabel = 'Return Request Pending';
+            $actionUrl = "/seller/orders/{$oid}/returns";
+        } else {
+            $pendingAction = 'view';
+            $actionLabel = 'View Order';
+            $actionUrl = "/seller/orders/{$oid}";
+        }
+
+        // Fetch seller items
+        $iStmt = $pdo->prepare("
+            SELECT id, product_id, product_name, price, quantity, subtotal
+            FROM `order_items`
+            WHERE order_id = :oid AND seller_id = :sid
+        ");
+        $iStmt->execute([':oid' => $oid, ':sid' => $sellerId]);
+        $sItems = $iStmt->fetchAll(PDO::FETCH_ASSOC);
+        $sSubtotal = 0.0;
+        foreach ($sItems as &$it) {
+            $it['id'] = (int)$it['id'];
+            $it['product_id'] = (int)($it['product_id'] ?? 0);
+            $it['price'] = (float)$it['price'];
+            $it['quantity'] = (int)$it['quantity'];
+            $it['subtotal'] = (float)$it['subtotal'];
+            $sSubtotal += $it['subtotal'];
+        }
+        unset($it);
+
+        $missedOrders[] = [
+            'order_id' => $oid,
+            'id' => $oid,
+            'order_number' => $order['order_number'],
+            'order_status' => $st,
+            'payment_method' => $order['payment_method'],
+            'payment_status' => $order['payment_status'],
+            'buyer_name' => $order['buyer_name'],
+            'buyer_phone' => $order['buyer_phone'],
+            'shipping_address' => $order['shipping_address'],
+            'city' => $order['city'],
+            'pincode' => $order['pincode'],
+            'cancellation_reason' => $order['cancellation_reason'],
+            'created_at' => $order['created_at'],
+            'acknowledged_at' => $order['acknowledged_at'],
+            'is_acknowledged' => !empty($order['acknowledged_at']),
+            'pending_action' => $pendingAction,
+            'action_label' => $actionLabel,
+            'action_url' => $actionUrl,
+            'seller_items' => $sItems,
+            'seller_subtotal' => $sSubtotal,
+            'seller_subtotal_formatted' => '₹' . number_format($sSubtotal, 2),
+        ];
+    }
+
+    $summary = [
+        'seller_id' => $sellerId,
+        'missed_orders_count' => count($missedOrders),
+        'pending_orders_count' => $pendingOrdersCount,
+        'cancellation_requests_count' => $cancellationRequestsCount,
+        'pending_actions_count' => count($missedOrders),
+        'unread_notifications_count' => count($unreadNotifs),
+        'last_sync_at' => date('c'),
+    ];
+
+    return [
+        'status' => 'success',
+        'seller_id' => $sellerId,
+        'last_sync_at' => date('c'),
+        'summary' => $summary,
+        'missed_orders' => $missedOrders,
+        'pending_orders' => $missedOrders,
+        'unread_notifications' => $unreadNotifs,
+        'notifications' => $unreadNotifs,
+    ];
+}
+
+/**
+ * Acknowledge Seller Order
+ */
+function acknowledgeSellerOrderPhp(PDO $pdo, int $orderId, int $sellerId): bool
+{
+    ensureNotificationSchemaPhp($pdo);
+
+    // Verify seller is linked to this order
+    $chkStmt = $pdo->prepare("
+        SELECT 1 FROM `order_items` WHERE order_id = :oid AND seller_id = :sid
+        UNION
+        SELECT 1 FROM `orders` WHERE id = :oid2 AND seller_id = :sid2
+        LIMIT 1
+    ");
+    $chkStmt->execute([':oid' => $orderId, ':sid' => $sellerId, ':oid2' => $orderId, ':sid2' => $sellerId]);
+    if (!$chkStmt->fetch()) {
+        return false;
+    }
+
+    $upd = $pdo->prepare("UPDATE `orders` SET acknowledged_at = CURRENT_TIMESTAMP WHERE id = :oid");
+    return $upd->execute([':oid' => $orderId]);
 }
 
 /**
@@ -502,9 +1088,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order Placed! 🎉',
                     "Thank you for your order #{$orderNum}. Total amount: {$totalFormatted}.",
                     'order',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount']],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount'], 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_created",
+                    "/orders/{$orderId}"
                 );
 
                 // 2. Multi-Vendor isolated seller notifications
@@ -527,9 +1115,14 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                             'seller_id' => $sid,
                             'seller_subtotal' => $sSubtotal,
                             'items' => $items, // STRICT VENDOR ISOLATION: Only this seller's items
+                            'screen' => 'seller_order_details',
+                            'action_url' => "/seller/orders/{$orderId}",
+                            'action_required' => 'accept_or_reject',
                         ],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_created",
+                        "/seller/orders/{$orderId}"
                     );
                 }
 
@@ -544,9 +1137,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                             'New Marketplace Order Placed 📢',
                             "New order #{$orderNum} placed. Total: {$totalFormatted} across " . count($sellerItemMap) . " vendor(s).",
                             'admin_order_alert',
-                            ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount']],
+                            ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount'], 'screen' => 'admin_orders', 'action_url' => "/admin/orders/{$orderId}"],
                             'admin',
-                            $orderId
+                            $orderId,
+                            "admin_{$aid}_ord_{$orderId}_created",
+                            "/admin/orders/{$orderId}"
                         );
                     }
                 } else {
@@ -557,9 +1152,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'New Marketplace Order Placed 📢',
                         "New order #{$orderNum} placed. Total: {$totalFormatted}.",
                         'admin_order_alert',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount']],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'total_amount' => (float)$order['total_amount'], 'screen' => 'admin_orders', 'action_url' => "/admin/orders/{$orderId}"],
                         'admin',
-                        $orderId
+                        $orderId,
+                        "admin_ord_{$orderId}_created",
+                        "/admin/orders/{$orderId}"
                     );
                 }
                 break;
@@ -573,9 +1170,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order Confirmed! ✅',
                     "Your order #{$orderNum} has been accepted and confirmed by the seller.",
                     'order_confirmed',
-                    ['order_id' => $orderId, 'order_number' => $orderNum],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_confirmed",
+                    "/orders/{$orderId}"
                 );
                 break;
 
@@ -587,9 +1186,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order In Progress 📦',
                     "Your order #{$orderNum} is now being processed and packed for dispatch.",
                     'order_processing',
-                    ['order_id' => $orderId, 'order_number' => $orderNum],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_processing",
+                    "/orders/{$orderId}"
                 );
                 break;
 
@@ -607,10 +1208,14 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'order_id' => $orderId,
                         'order_number' => $orderNum,
                         'tracking_number' => $extra['tracking_number'] ?? null,
-                        'carrier' => $extra['carrier'] ?? null
+                        'carrier' => $extra['carrier'] ?? null,
+                        'screen' => 'order_tracking',
+                        'action_url' => "/orders/{$orderId}",
                     ],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_shipped",
+                    "/orders/{$orderId}"
                 );
                 break;
 
@@ -622,9 +1227,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order Delivered! 🎁',
                     "Your order #{$orderNum} has been delivered. Thank you for shopping with us!",
                     'order_delivered',
-                    ['order_id' => $orderId, 'order_number' => $orderNum],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_delivered",
+                    "/orders/{$orderId}"
                 );
                 foreach (array_keys($sellerItemMap) as $sid) {
                     createNotificationPhp(
@@ -634,9 +1241,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Order Delivered 📬',
                         "Order #{$orderNum} was marked delivered to buyer.",
                         'order_delivered',
-                        ['order_id' => $orderId, 'order_number' => $orderNum],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'seller_order_details', 'action_url' => "/seller/orders/{$orderId}"],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_delivered",
+                        "/seller/orders/{$orderId}"
                     );
                 }
                 break;
@@ -651,9 +1260,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Cancellation Requested ⏳',
                     "Your cancellation request for order #{$orderNum} is under review.",
                     'cancellation_requested',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_cancel_req",
+                    "/orders/{$orderId}"
                 );
 
                 // Sellers notification
@@ -671,9 +1282,14 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                             'seller_id' => $sid,
                             'reason' => $extra['reason'] ?? '',
                             'items' => $items,
+                            'screen' => 'cancellation_review',
+                            'action_url' => "/seller/orders/{$orderId}/cancellation",
+                            'action_required' => 'review_cancellation',
                         ],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_cancel_req",
+                        "/seller/orders/{$orderId}/cancellation"
                     );
                 }
 
@@ -688,9 +1304,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                             'Action Required: Cancellation Request ⚠️',
                             "Cancellation requested for order #{$orderNum}{$reason}",
                             'admin_cancellation_alert',
-                            ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                            ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'admin_cancellations', 'action_url' => "/admin/orders/{$orderId}"],
                             'admin',
-                            $orderId
+                            $orderId,
+                            "admin_{$aid}_ord_{$orderId}_cancel_req",
+                            "/admin/orders/{$orderId}"
                         );
                     }
                 } else {
@@ -701,9 +1319,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Action Required: Cancellation Request ⚠️',
                         "Cancellation requested for order #{$orderNum}{$reason}",
                         'admin_cancellation_alert',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'admin_cancellations', 'action_url' => "/admin/orders/{$orderId}"],
                         'admin',
-                        $orderId
+                        $orderId,
+                        "admin_ord_{$orderId}_cancel_req",
+                        "/admin/orders/{$orderId}"
                     );
                 }
                 break;
@@ -721,9 +1341,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order Cancelled 🚫',
                     "Order #{$orderNum} has been cancelled.{$refundMsg}",
                     'order_cancelled',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'refunded' => !empty($extra['refunded'])],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'refunded' => !empty($extra['refunded']), 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_cancelled",
+                    "/orders/{$orderId}"
                 );
 
                 foreach ($sellerItemMap as $sid => $items) {
@@ -734,9 +1356,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Order Cancelled ❌',
                         "Order #{$orderNum} was approved for cancellation.",
                         'order_cancelled',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'seller_id' => $sid],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'seller_id' => $sid, 'screen' => 'seller_order_details', 'action_url' => "/seller/orders/{$orderId}"],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_cancelled",
+                        "/seller/orders/{$orderId}"
                     );
                 }
                 break;
@@ -750,9 +1374,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Cancellation Request Declined ⚠️',
                     "Your cancellation request for order #{$orderNum} was declined.{$expl}",
                     'cancellation_rejected',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_cancel_rej",
+                    "/orders/{$orderId}"
                 );
                 break;
 
@@ -770,10 +1396,14 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'order_id' => $orderId,
                         'order_number' => $orderNum,
                         'payment_id' => $extra['payment_id'] ?? null,
-                        'amount' => $extra['amount'] ?? null
+                        'amount' => $extra['amount'] ?? null,
+                        'screen' => 'order_details',
+                        'action_url' => "/orders/{$orderId}",
                     ],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_pay_succ",
+                    "/orders/{$orderId}"
                 );
 
                 foreach ($sellerItemMap as $sid => $items) {
@@ -786,9 +1416,18 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Payment Confirmed 💰',
                         "Payment for order #{$orderNum} was confirmed. Your item total: {$sSubtotalFmt}.",
                         'payment_success',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'seller_id' => $sid, 'seller_subtotal' => $sSubtotal],
+                        [
+                            'order_id' => $orderId,
+                            'order_number' => $orderNum,
+                            'seller_id' => $sid,
+                            'seller_subtotal' => $sSubtotal,
+                            'screen' => 'seller_order_details',
+                            'action_url' => "/seller/orders/{$orderId}",
+                        ],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_pay_succ",
+                        "/seller/orders/{$orderId}"
                     );
                 }
                 break;
@@ -802,9 +1441,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Payment Failed ❌',
                     "Payment for order #{$orderNum} could not be processed{$failReason} Please retry checkout.",
                     'payment_failed',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['error_description'] ?? ''],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['error_description'] ?? '', 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_pay_fail",
+                    "/orders/{$orderId}"
                 );
 
                 // Admin notification on payment failure
@@ -817,9 +1458,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Payment Failure Alert ⚠️',
                         "Payment failed for order #{$orderNum}{$failReason}",
                         'admin_payment_alert',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['error_description'] ?? ''],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['error_description'] ?? '', 'screen' => 'admin_orders', 'action_url' => "/admin/orders/{$orderId}"],
                         'admin',
-                        $orderId
+                        $orderId,
+                        "admin_{$aid}_ord_{$orderId}_pay_fail",
+                        "/admin/orders/{$orderId}"
                     );
                 }
                 break;
@@ -833,9 +1476,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Refund Processed 💳',
                     "A refund of {$amt} for order #{$orderNum} has been processed successfully.",
                     'refund_processed',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'amount' => $extra['amount'] ?? null],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'amount' => $extra['amount'] ?? null, 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_refund_proc",
+                    "/orders/{$orderId}"
                 );
                 foreach (array_keys($sellerItemMap) as $sid) {
                     createNotificationPhp(
@@ -845,9 +1490,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Refund Logged',
                         "Refund of {$amt} logged for order #{$orderNum}.",
                         'refund_processed',
-                        ['order_id' => $orderId, 'order_number' => $orderNum],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'seller_order_details', 'action_url' => "/seller/orders/{$orderId}"],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_refund_proc",
+                        "/seller/orders/{$orderId}"
                     );
                 }
                 break;
@@ -863,9 +1510,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Critical: Gateway Refund Failed 🚨',
                         "Automated refund failed for order #{$orderNum}{$reason} Manual review required.",
                         'admin_refund_alert',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'admin_orders', 'action_url' => "/admin/orders/{$orderId}"],
                         'admin',
-                        $orderId
+                        $orderId,
+                        "admin_{$aid}_ord_{$orderId}_refund_fail",
+                        "/admin/orders/{$orderId}"
                     );
                 }
                 break;
@@ -879,9 +1528,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Order Rejected ❌',
                     "Your order #{$orderNum} could not be accepted by the seller{$reason}",
                     'order_rejected',
-                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? ''],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'reason' => $extra['reason'] ?? '', 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_rejected",
+                    "/orders/{$orderId}"
                 );
                 break;
 
@@ -894,9 +1545,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                     'Return Requested 📦',
                     "Your return request for order #{$orderNum} has been submitted.",
                     'return_requested',
-                    ['order_id' => $orderId, 'order_number' => $orderNum],
+                    ['order_id' => $orderId, 'order_number' => $orderNum, 'screen' => 'order_details', 'action_url' => "/orders/{$orderId}"],
                     'buyer',
-                    $orderId
+                    $orderId,
+                    "buyer_ord_{$orderId}_ret_req",
+                    "/orders/{$orderId}"
                 );
                 foreach ($sellerItemMap as $sid => $items) {
                     createNotificationPhp(
@@ -906,9 +1559,11 @@ function dispatchOrderNotificationPhp(PDO $pdo, int $orderId, string $event, arr
                         'Return Request Received ⚠️',
                         "Return requested for order #{$orderNum}{$reason}",
                         'return_requested',
-                        ['order_id' => $orderId, 'order_number' => $orderNum, 'seller_id' => $sid, 'items' => $items],
+                        ['order_id' => $orderId, 'order_number' => $orderNum, 'seller_id' => $sid, 'items' => $items, 'screen' => 'seller_order_details', 'action_url' => "/seller/orders/{$orderId}"],
                         'seller',
-                        $orderId
+                        $orderId,
+                        "seller_{$sid}_ord_{$orderId}_ret_req",
+                        "/seller/orders/{$orderId}"
                     );
                 }
                 break;

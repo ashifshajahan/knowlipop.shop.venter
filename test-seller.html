@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vendor Dashboard — Offline Notifications & Missed Orders Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- Socket.IO Realtime Client SDK -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    if (typeof io === 'undefined') {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.socket.io/4.8.1/socket.io.min.js';
+      document.head.appendChild(s);
+    }
+  </script>
+
+  <style>
+    :root {
+      --primary: #10b981;
+      --primary-hover: #059669;
+      --primary-light: rgba(16, 185, 129, 0.15);
+      --primary-glow: rgba(16, 185, 129, 0.35);
+      --bg: #0b131e;
+      --surface: #111e2e;
+      --surface-light: #1a2a40;
+      --surface-card: #152438;
+      --border: #223752;
+      --border-light: #2d4563;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --success: #10b981;
+      --success-light: rgba(16, 185, 129, 0.15);
+      --warning: #f59e0b;
+      --warning-light: rgba(245, 158, 11, 0.15);
+      --danger: #ef4444;
+      --danger-light: rgba(239, 68, 68, 0.15);
+      --accent: #38bdf8;
+      --accent-light: rgba(56, 189, 248, 0.12);
+      --purple: #8b5cf6;
+      --purple-light: rgba(139, 92, 246, 0.15);
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --font-main: 'Plus Jakarta Sans', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font-main);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+      padding-bottom: 80px;
+    }
+
+    header {
+      background: rgba(17, 30, 46, 0.9);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .nav-container {
+      max-width: 1350px;
+      margin: 0 auto;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      color: #fff;
+    }
+
+    .brand-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 4px 14px var(--primary-glow);
+    }
+
+    .brand-title {
+      font-weight: 800;
+      font-size: 1.15rem;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-subtitle {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .presence-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s ease;
+    }
+
+    .presence-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 10px var(--success);
+    }
+
+    .presence-badge.offline .presence-dot {
+      background: var(--danger);
+      box-shadow: 0 0 8px var(--danger);
+    }
+
+    .notif-bell-btn {
+      position: relative;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 18px;
+      transition: all 0.2s ease;
+    }
+
+    .notif-bell-btn:hover {
+      border-color: var(--primary);
+      background: var(--surface-light);
+    }
+
+    .notif-badge-count {
+      position: absolute;
+      top: -4px;
+      right: -4px;
+      background: var(--danger);
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 800;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 4px;
+      border-radius: 9999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 6px rgba(239, 68, 68, 0.5);
+    }
+
+    .container {
+      max-width: 1350px;
+      margin: 24px auto;
+      padding: 0 24px;
+    }
+
+    /* Tabs */
+    .tabs-header {
+      display: flex;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+      overflow-x: auto;
+      padding-bottom: 8px;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 10px 18px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+      background: var(--surface);
+    }
+
+    .tab-btn.active {
+      color: var(--primary);
+      background: var(--primary-light);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .tab-pill {
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: var(--surface-light);
+      color: var(--text);
+    }
+
+    .tab-btn.active .tab-pill {
+      background: var(--primary);
+      color: #0b131e;
+      font-weight: 700;
+    }
+
+    /* Metric Cards */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .metric-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .metric-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+    }
+
+    .metric-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 1.8rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .metric-sub {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-top: 4px;
+    }
+
+    /* Cards */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .panel-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* Missed Orders Banner */
+    .missed-alert-banner {
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(239, 68, 68, 0.1));
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      border-radius: var(--radius-md);
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .missed-alert-banner.empty {
+      background: var(--surface);
+      border-color: var(--border);
+    }
+
+    .missed-alert-info {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .missed-alert-icon {
+      font-size: 28px;
+    }
+
+    /* Orders Table */
+    .orders-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    .orders-table th {
+      text-align: left;
+      padding: 12px 14px;
+      background: var(--surface-light);
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .orders-table td {
+      padding: 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    .orders-table tr:hover {
+      background: var(--surface-light);
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: capitalize;
+    }
+
+    .status-pending { background: var(--warning-light); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .status-processing { background: var(--accent-light); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
+    .status-shipped { background: var(--purple-light); color: var(--purple); border: 1px solid rgba(139, 92, 246, 0.3); }
+    .status-delivered { background: var(--success-light); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .status-cancelled, .status-rejected { background: var(--danger-light); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    /* Action Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .btn-primary { background: var(--primary); color: #0b131e; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-secondary { background: var(--surface-light); color: var(--text); border-color: var(--border); }
+    .btn-secondary:hover { background: var(--border); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { opacity: 0.9; }
+    .btn-warning { background: var(--warning); color: #0b131e; }
+    .btn-sm { padding: 5px 10px; font-size: 0.78rem; border-radius: 6px; }
+
+    /* Forms */
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .form-label {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .form-control {
+      background: var(--surface-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 0.9rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .form-control:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+    }
+
+    /* Notifications List */
+    .notif-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      padding: 16px;
+      background: var(--surface-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      margin-bottom: 10px;
+      transition: all 0.2s;
+    }
+
+    .notif-item.unread {
+      border-left: 4px solid var(--primary);
+      background: rgba(16, 185, 129, 0.04);
+    }
+
+    .notif-icon {
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    .notif-content {
+      flex: 1;
+    }
+
+    .notif-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+
+    .notif-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+    }
+
+    .notif-time {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+
+    .notif-msg {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    .delivery-pill {
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      display: inline-block;
+      margin-top: 6px;
+    }
+
+    .delivery-delivered { background: var(--success-light); color: var(--success); }
+    .delivery-offline { background: var(--warning-light); color: var(--warning); }
+
+    /* Commission Calculator */
+    .calc-box {
+      background: var(--surface-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .calc-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 12px;
+      border-bottom: 1px dashed var(--border);
+      font-size: 0.95rem;
+    }
+
+    .calc-row:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+      font-size: 1.15rem;
+      font-weight: 800;
+      color: var(--primary);
+    }
+
+    /* Modal / Drawer */
+    .drawer {
+      position: fixed;
+      top: 0; right: -420px;
+      width: 420px;
+      max-width: 100vw;
+      height: 100vh;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      z-index: 200;
+      display: flex;
+      flex-direction: column;
+      transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: -10px 0 30px rgba(0,0,0,0.5);
+    }
+
+    .drawer.open {
+      right: 0;
+    }
+
+    .drawer-header {
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .drawer-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 150;
+      display: none;
+    }
+
+    .overlay.open {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation -->
+  <header>
+    <div class="nav-container">
+      <div class="brand">
+        <div class="brand-icon">🏪</div>
+        <div>
+          <div class="brand-title">Vendor Central</div>
+          <div class="brand-subtitle">Offline Sync & Missed Orders</div>
+        </div>
+      </div>
+
+      <div class="nav-actions">
+        <!-- Seller ID Selector -->
+        <select id="sellerSelect" class="form-control" style="width: auto; padding: 6px 12px;" onchange="switchSeller(this.value)">
+          <option value="1">Seller #1 (Primary Store)</option>
+          <option value="2">Seller #2 (Fashion Boutique)</option>
+          <option value="3">Seller #3 (Electronics Hub)</option>
+        </select>
+
+        <!-- Presence Toggle (Online / Offline / Logged Out Simulator) -->
+        <div id="presenceBadge" class="presence-badge" onclick="togglePresence()" title="Click to toggle Online/Offline state">
+          <div class="presence-dot"></div>
+          <span id="presenceLabel">Online</span>
+        </div>
+
+        <!-- Notifications Bell -->
+        <button class="notif-bell-btn" onclick="toggleNotificationsDrawer()" title="View Notifications">
+          🔔
+          <span id="notifBadgeCount" class="notif-badge-count" style="display: none;">0</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <div class="container">
+
+    <!-- Missed Orders Banner -->
+    <div id="missedOrdersBanner" class="missed-alert-banner">
+      <div class="missed-alert-info">
+        <div class="missed-alert-icon">⚡</div>
+        <div>
+          <strong id="missedOrdersHeadline" style="font-size: 1.05rem;">Checking missed orders...</strong>
+          <p id="missedOrdersSubtext" style="font-size: 0.82rem; color: var(--text-muted); margin-top: 2px;">
+            Orders placed while you were offline are synchronized automatically.
+          </p>
+        </div>
+      </div>
+      <div>
+        <button class="btn btn-primary btn-sm" onclick="syncSellerData()">🔄 Sync Now</button>
+      </div>
+    </div>
+
+    <!-- Metrics Cards -->
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-title">Missed / Pending Orders</div>
+        <div id="metricPendingOrders" class="metric-value">0</div>
+        <div class="metric-sub">Awaiting confirmation</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Cancellation Requests</div>
+        <div id="metricCancellations" class="metric-value" style="color: var(--danger);">0</div>
+        <div class="metric-sub">Action required</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Ready to Dispatch</div>
+        <div id="metricReadyShip" class="metric-value" style="color: var(--accent);">0</div>
+        <div class="metric-sub">Pack & ship today</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Unread Notifications</div>
+        <div id="metricUnreadNotifs" class="metric-value" style="color: var(--warning);">0</div>
+        <div class="metric-sub">Saved in database</div>
+      </div>
+    </div>
+
+    <!-- Tabs Navigation -->
+    <div class="tabs-header">
+      <button class="tab-btn active" onclick="showTab('missed-orders')">
+        🚨 Missed Orders & Actions <span id="tabMissedCount" class="tab-pill">0</span>
+      </button>
+      <button class="tab-btn" onclick="showTab('all-orders')">
+        📦 All Seller Orders <span id="tabAllCount" class="tab-pill">0</span>
+      </button>
+      <button class="tab-btn" onclick="showTab('bank-onboarding')">
+        🏦 Bank Account Onboarding
+      </button>
+      <button class="tab-btn" onclick="showTab('commission-preview')">
+        💰 Commission Preview
+      </button>
+      <button class="tab-btn" onclick="showTab('fcm-simulator')">
+        📲 Firebase Push (FCM) Simulator
+      </button>
+    </div>
+
+    <!-- TAB 1: Missed Orders -->
+    <div id="tab-missed-orders" class="tab-content">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <span>🚨 Orders Requiring Immediate Seller Attention</span>
+          </div>
+          <div>
+            <button class="btn btn-secondary btn-sm" onclick="fetchOrders()">Refresh Orders</button>
+          </div>
+        </div>
+
+        <div style="overflow-x: auto;">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Date / Time</th>
+                <th>Customer</th>
+                <th>Items & Total</th>
+                <th>Status</th>
+                <th>Missed Flag</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="missedOrdersTableBody">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 30px;">Loading missed orders...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: All Seller Orders -->
+    <div id="tab-all-orders" class="tab-content" style="display: none;">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">📦 Complete Order History</div>
+          <div style="display: flex; gap: 8px;">
+            <select id="filterStatus" class="form-control" style="width: auto; padding: 6px 12px;" onchange="fetchOrders()">
+              <option value="">All Statuses</option>
+              <option value="pending">Pending</option>
+              <option value="confirmed">Confirmed</option>
+              <option value="processing">Processing</option>
+              <option value="shipped">Shipped</option>
+              <option value="delivered">Delivered</option>
+              <option value="cancellation_requested">Cancellation Requested</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" onclick="fetchOrders()">Filter</button>
+          </div>
+        </div>
+
+        <div style="overflow-x: auto;">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Date</th>
+                <th>Buyer</th>
+                <th>Amount</th>
+                <th>Payment</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="allOrdersTableBody">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 30px;">Loading order history...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: Bank Account Onboarding -->
+    <div id="tab-bank-onboarding" class="tab-content" style="display: none;">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">🏦 Seller Bank Account & Payout Setup</div>
+          <div id="bankStatusBadge" class="status-badge status-pending">Checking Status...</div>
+        </div>
+
+        <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 20px;">
+          Connect your bank account to receive automated sales payouts and settlements via Razorpay Route.
+        </p>
+
+        <!-- Current Bank Info Card -->
+        <div id="currentBankCard" style="display: none; background: var(--surface-card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 18px; margin-bottom: 24px;">
+          <h4 style="margin-bottom: 12px; color: var(--primary);">✅ Linked Bank Details</h4>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; font-size: 0.88rem;">
+            <div><span style="color: var(--text-dim);">Account Holder:</span> <strong id="cardHolderName">-</strong></div>
+            <div><span style="color: var(--text-dim);">Account Number:</span> <strong id="cardAccNumber">-</strong></div>
+            <div><span style="color: var(--text-dim);">Bank Name:</span> <strong id="cardBankName">-</strong></div>
+            <div><span style="color: var(--text-dim);">IFSC Code:</span> <strong id="cardIfscCode">-</strong></div>
+            <div><span style="color: var(--text-dim);">UPI ID:</span> <strong id="cardUpiId">-</strong></div>
+          </div>
+        </div>
+
+        <!-- Onboarding Form -->
+        <form id="bankOnboardingForm" onsubmit="submitBankOnboarding(event)">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Account Holder Name *</label>
+              <input type="text" id="bankHolderName" class="form-control" placeholder="e.g. John Doe" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Account Number *</label>
+              <input type="text" id="bankAccNum" class="form-control" placeholder="e.g. 123456789012" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">IFSC Code *</label>
+              <input type="text" id="bankIfsc" class="form-control" placeholder="e.g. HDFC0001234" required style="text-transform: uppercase;">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bank Name *</label>
+              <input type="text" id="bankName" class="form-control" placeholder="e.g. HDFC Bank" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Branch Name</label>
+              <input type="text" id="bankBranch" class="form-control" placeholder="e.g. Indiranagar Branch">
+            </div>
+            <div class="form-group">
+              <label class="form-label">UPI ID / VPA (Optional)</label>
+              <input type="text" id="bankUpi" class="form-control" placeholder="e.g. seller@okhdfcbank">
+            </div>
+          </div>
+
+          <div style="margin-top: 24px; display: flex; gap: 12px;">
+            <button type="submit" class="btn btn-primary">💾 Save & Link Bank Account</button>
+            <button type="button" class="btn btn-secondary" onclick="fetchBankStatus()">🔄 Refresh Status</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- TAB 4: Commission Preview -->
+    <div id="tab-commission-preview" class="tab-content" style="display: none;">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">💰 Marketplace Commission & Net Payout Calculator</div>
+        </div>
+
+        <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 20px;">
+          Live preview of marketplace commission deduction and seller net earnings per order.
+        </p>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start;">
+          <div>
+            <div class="form-group" style="margin-bottom: 16px;">
+              <label class="form-label">Enter Order Amount (₹)</label>
+              <input type="number" id="previewAmountInput" class="form-control" value="1500" min="1" step="1" oninput="calculateCommission(this.value)">
+            </div>
+            <input type="range" min="100" max="20000" step="50" value="1500" style="width: 100%; accent-color: var(--primary);" oninput="document.getElementById('previewAmountInput').value = this.value; calculateCommission(this.value);">
+          </div>
+
+          <div class="calc-box">
+            <div class="calc-row">
+              <span>Gross Order Amount</span>
+              <strong id="calcGross">₹1,500.00</strong>
+            </div>
+            <div class="calc-row">
+              <span>Platform Commission (<span id="calcRate">5%</span>)</span>
+              <span id="calcCommission" style="color: var(--danger);">- ₹75.00</span>
+            </div>
+            <div class="calc-row">
+              <span>Seller Net Payout</span>
+              <span id="calcNet">₹1,425.00</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 5: FCM Simulator -->
+    <div id="tab-fcm-simulator" class="tab-content" style="display: none;">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">📲 Firebase Cloud Messaging (FCM) Push Simulator</div>
+        </div>
+
+        <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 20px;">
+          Tests the Firebase Admin SDK connection and device token registration.
+        </p>
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="form-label">Active FCM Device Registration Token</label>
+            <input type="text" id="fcmTokenInput" class="form-control" value="mock_seller_token_fcm_admin_2026_test">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Notification Title</label>
+            <input type="text" id="fcmTitleInput" class="form-control" value="🛍️ New Order Received!">
+          </div>
+          <div class="form-group" style="grid-column: span 2;">
+            <label class="form-label">Notification Body</label>
+            <input type="text" id="fcmBodyInput" class="form-control" value="Order #ORD-9999 for ₹1,500 placed by Jane Doe">
+          </div>
+        </div>
+
+        <div style="margin-top: 20px; display: flex; gap: 12px;">
+          <button class="btn btn-primary" onclick="simulateFcmPush()">🚀 Send Test Push Notification</button>
+          <button class="btn btn-secondary" onclick="registerDeviceToken()">📱 Register Device Token</button>
+        </div>
+
+        <div id="fcmConsole" style="margin-top: 20px; background: #000; color: #10b981; font-family: var(--font-mono); font-size: 0.8rem; padding: 14px; border-radius: var(--radius-sm); max-height: 180px; overflow-y: auto;">
+          [FCM Console Ready] Firebase Admin SDK active.
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Notifications Drawer -->
+  <div id="drawerOverlay" class="overlay" onclick="toggleNotificationsDrawer()"></div>
+  <div id="notificationsDrawer" class="drawer">
+    <div class="drawer-header">
+      <div style="font-weight: 700; font-size: 1.1rem; display: flex; align-items: center; gap: 8px;">
+        <span>🔔 Notifications</span>
+        <span id="drawerUnreadCount" class="tab-pill" style="background: var(--primary-light); color: var(--primary);">0</span>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-secondary btn-sm" onclick="markAllNotificationsRead()">Mark all read</button>
+        <button class="btn btn-secondary btn-sm" onclick="toggleNotificationsDrawer()">✕</button>
+      </div>
+    </div>
+    <div id="drawerNotificationsList" class="drawer-body">
+      <div style="text-align: center; color: var(--text-dim); padding: 40px 0;">Loading notifications...</div>
+    </div>
+  </div>
+
+  <script>
+    let currentSellerId = 1;
+    let isSellerOnline = true;
+    let ordersData = [];
+    let notificationsData = [];
+    let socket = null;
+
+    // Initialize Dashboard
+    window.addEventListener('DOMContentLoaded', () => {
+      initSocket();
+      syncSellerData();
+      fetchBankStatus();
+      calculateCommission(1500);
+    });
+
+    // Socket.IO Realtime Connection
+    function initSocket() {
+      try {
+        socket = io();
+        socket.on('connect', () => {
+          console.log('[Socket] Connected');
+          socket.emit('join', { room: `seller_${currentSellerId}`, role: 'seller', seller_id: currentSellerId });
+        });
+
+        socket.on('notification', (data) => {
+          console.log('[Socket Notif Received]', data);
+          showToast(`🔔 ${data.title}: ${data.message}`);
+          syncSellerData();
+        });
+
+        socket.on('order_created', (data) => {
+          console.log('[Socket Order Received]', data);
+          showToast(`🛍️ New Order #${data.order_number || data.id} received!`);
+          syncSellerData();
+        });
+      } catch (e) {
+        console.warn('Socket.IO not available:', e.message);
+      }
+    }
+
+    // Switch active seller
+    function switchSeller(newId) {
+      currentSellerId = parseInt(newId, 10);
+      if (socket && socket.connected) {
+        socket.emit('leave', { room: `seller_${currentSellerId}` });
+        socket.emit('join', { room: `seller_${currentSellerId}`, role: 'seller', seller_id: currentSellerId });
+      }
+      syncSellerData();
+      fetchBankStatus();
+    }
+
+    // Toggle Presence (Online/Offline simulator)
+    async function togglePresence() {
+      isSellerOnline = !isSellerOnline;
+      const badge = document.getElementById('presenceBadge');
+      const label = document.getElementById('presenceLabel');
+
+      if (isSellerOnline) {
+        badge.classList.remove('offline');
+        label.innerText = 'Online';
+        showToast('🟢 Seller is ONLINE. Synchronizing missed orders & notifications...');
+        await syncSellerData();
+      } else {
+        badge.classList.add('offline');
+        label.innerText = 'Offline (Simulated)';
+        showToast('🔴 Seller is OFFLINE. New orders will be stored in MySQL for later sync.');
+      }
+    }
+
+    // Sync Seller Data (Calls dashboard / sync API)
+    async function syncSellerData() {
+      try {
+        const res = await fetch(`/api/seller/dashboard?seller_id=${currentSellerId}`);
+        const data = await res.json();
+
+        // Update metrics
+        const pendingCount = data.pending_orders_count || 0;
+        const cancelCount = data.cancellation_requests_count || 0;
+        const readyCount = data.ready_to_ship_count || 0;
+        const unreadNotifs = data.unread_notifications_count || 0;
+
+        document.getElementById('metricPendingOrders').innerText = pendingCount;
+        document.getElementById('metricCancellations').innerText = cancelCount;
+        document.getElementById('metricReadyShip').innerText = readyCount;
+        document.getElementById('metricUnreadNotifs').innerText = unreadNotifs;
+        document.getElementById('notifBadgeCount').innerText = unreadNotifs;
+        document.getElementById('notifBadgeCount').style.display = unreadNotifs > 0 ? 'flex' : 'none';
+        document.getElementById('drawerUnreadCount').innerText = unreadNotifs;
+
+        // Banner update
+        const missedBanner = document.getElementById('missedOrdersBanner');
+        const missedHeadline = document.getElementById('missedOrdersHeadline');
+        const totalMissed = pendingCount + cancelCount;
+
+        document.getElementById('tabMissedCount').innerText = totalMissed;
+
+        if (totalMissed > 0) {
+          missedBanner.classList.remove('empty');
+          missedHeadline.innerText = `⚠️ You have ${totalMissed} pending action(s) (${pendingCount} new order(s), ${cancelCount} cancellation request(s))`;
+        } else {
+          missedBanner.classList.add('empty');
+          missedHeadline.innerText = `✅ All caught up! No pending missed orders.`;
+        }
+
+        // Fetch Orders and Notifications
+        await fetchOrders();
+        await fetchNotifications();
+      } catch (err) {
+        console.error('Failed to sync seller data:', err);
+      }
+    }
+
+    // Fetch Seller Orders
+    async function fetchOrders() {
+      try {
+        const status = document.getElementById('filterStatus').value;
+        let url = `/api/seller/orders?seller_id=${currentSellerId}`;
+        if (status) url += `&status=${status}`;
+
+        const res = await fetch(url);
+        const data = await res.json();
+        ordersData = data.orders || data.data || [];
+
+        renderOrdersTable();
+      } catch (err) {
+        console.error('Failed to fetch orders:', err);
+      }
+    }
+
+    // Render Orders Tables
+    function renderOrdersTable() {
+      const missedTbody = document.getElementById('missedOrdersTableBody');
+      const allTbody = document.getElementById('allOrdersTableBody');
+
+      document.getElementById('tabAllCount').innerText = ordersData.length;
+
+      const missedList = ordersData.filter(o =>
+        ['pending', 'cancellation_requested'].includes(o.order_status)
+      );
+
+      // 1. Missed Orders Table
+      if (missedList.length === 0) {
+        missedTbody.innerHTML = `
+          <tr>
+            <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 30px;">
+              🎉 No missed orders or pending actions for Seller #${currentSellerId}.
+            </td>
+          </tr>
+        `;
+      } else {
+        missedTbody.innerHTML = missedList.map(o => `
+          <tr>
+            <td><strong>#${o.order_number || o.id}</strong></td>
+            <td>${o.created_at ? new Date(o.created_at).toLocaleString() : 'Recent'}</td>
+            <td>${o.buyer_name || 'Customer'}<br><small style="color: var(--text-dim);">${o.buyer_phone || ''}</small></td>
+            <td><strong>₹${Number(o.total_amount || 0).toFixed(2)}</strong></td>
+            <td><span class="status-badge status-${o.order_status}">${o.order_status}</span></td>
+            <td><span class="delivery-pill delivery-offline">Missed Order</span></td>
+            <td>
+              <div style="display: flex; gap: 6px;">
+                ${o.order_status === 'pending' ? `
+                  <button class="btn btn-primary btn-sm" onclick="updateOrderStatus(${o.id}, 'confirmed')">Accept</button>
+                  <button class="btn btn-danger btn-sm" onclick="updateOrderStatus(${o.id}, 'rejected')">Reject</button>
+                ` : ''}
+                ${o.order_status === 'cancellation_requested' ? `
+                  <button class="btn btn-danger btn-sm" onclick="approveCancellation(${o.id})">Approve Cancel</button>
+                  <button class="btn btn-secondary btn-sm" onclick="rejectCancellation(${o.id})">Reject Cancel</button>
+                ` : ''}
+              </div>
+            </td>
+          </tr>
+        `).join('');
+      }
+
+      // 2. All Orders Table
+      if (ordersData.length === 0) {
+        allTbody.innerHTML = `<tr><td colspan="7" style="text-align: center; padding: 30px; color: var(--text-dim);">No orders found.</td></tr>`;
+      } else {
+        allTbody.innerHTML = ordersData.map(o => `
+          <tr>
+            <td><strong>#${o.order_number || o.id}</strong></td>
+            <td>${o.created_at ? new Date(o.created_at).toLocaleDateString() : 'Recent'}</td>
+            <td>${o.buyer_name || 'Customer'}</td>
+            <td><strong>₹${Number(o.total_amount || 0).toFixed(2)}</strong></td>
+            <td>${o.payment_status || 'unpaid'}</td>
+            <td><span class="status-badge status-${o.order_status}">${o.order_status}</span></td>
+            <td>
+              <div style="display: flex; gap: 4px;">
+                ${o.order_status === 'confirmed' ? `<button class="btn btn-secondary btn-sm" onclick="updateOrderStatus(${o.id}, 'processing')">Process</button>` : ''}
+                ${o.order_status === 'processing' ? `<button class="btn btn-secondary btn-sm" onclick="updateOrderStatus(${o.id}, 'shipped')">Ship</button>` : ''}
+                ${o.order_status === 'shipped' ? `<button class="btn btn-primary btn-sm" onclick="updateOrderStatus(${o.id}, 'delivered')">Deliver</button>` : ''}
+              </div>
+            </td>
+          </tr>
+        `).join('');
+      }
+    }
+
+    // Update Order Status
+    async function updateOrderStatus(orderId, newStatus) {
+      try {
+        const res = await fetch(`/api/orders/${orderId}/status?seller_id=${currentSellerId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: newStatus, order_status: newStatus })
+        });
+        const d = await res.json();
+        showToast(`Order status updated to "${newStatus}"`);
+        syncSellerData();
+      } catch (e) {
+        showToast('Error updating status: ' + e.message);
+      }
+    }
+
+    // Approve Cancellation
+    async function approveCancellation(orderId) {
+      try {
+        const res = await fetch(`/api/orders/${orderId}/cancellation/approve?seller_id=${currentSellerId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        showToast('Cancellation approved & refund scheduled');
+        syncSellerData();
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
+
+    // Reject Cancellation
+    async function rejectCancellation(orderId) {
+      const reason = prompt('Enter rejection reason:', 'Order has already been prepared and packaged.');
+      if (!reason) return;
+      try {
+        const res = await fetch(`/api/orders/${orderId}/cancellation/reject?seller_id=${currentSellerId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason })
+        });
+        showToast('Cancellation request rejected');
+        syncSellerData();
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
+
+    // Fetch Notifications
+    async function fetchNotifications() {
+      try {
+        const res = await fetch(`/api/seller/notifications?seller_id=${currentSellerId}`);
+        const d = await res.json();
+        notificationsData = d.notifications || d.data || [];
+
+        renderNotificationsList();
+      } catch (err) {
+        console.error('Failed to fetch notifications:', err);
+      }
+    }
+
+    // Render Notifications Drawer
+    function renderNotificationsList() {
+      const list = document.getElementById('drawerNotificationsList');
+      if (notificationsData.length === 0) {
+        list.innerHTML = `<div style="text-align: center; color: var(--text-dim); padding: 40px 0;">No notifications found.</div>`;
+        return;
+      }
+
+      list.innerHTML = notificationsData.map(n => `
+        <div class="notif-item ${!n.is_read ? 'unread' : ''}" onclick="openNotification(${n.id}, ${n.order_id})">
+          <div class="notif-icon">📦</div>
+          <div class="notif-content">
+            <div class="notif-header">
+              <span class="notif-title">${n.title}</span>
+              <span class="notif-time">${n.created_at ? new Date(n.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : ''}</span>
+            </div>
+            <div class="notif-msg">${n.message}</div>
+            <span class="delivery-pill ${n.delivery_status === 'offline' ? 'delivery-offline' : 'delivery-delivered'}">
+              ${n.delivery_status === 'offline' ? '💾 Stored in MySQL (Offline)' : '🚀 Delivered'}
+            </span>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // Open Notification & Mark Read
+    async function openNotification(id, orderId) {
+      try {
+        await fetch(`/api/seller/notifications/${id}/read?seller_id=${currentSellerId}`, { method: 'POST' });
+        syncSellerData();
+        if (orderId) {
+          showTab('all-orders');
+          toggleNotificationsDrawer();
+        }
+      } catch (e) {}
+    }
+
+    // Mark All Read
+    async function markAllNotificationsRead() {
+      try {
+        await fetch(`/api/seller/notifications/mark-all-read?seller_id=${currentSellerId}`, { method: 'POST' });
+        showToast('All notifications marked as read.');
+        syncSellerData();
+      } catch (e) {}
+    }
+
+    // Fetch Bank Account Status
+    async function fetchBankStatus() {
+      try {
+        const res = await fetch(`/api/seller/bank-account/onboarding?seller_id=${currentSellerId}`);
+        const d = await res.json();
+
+        const badge = document.getElementById('bankStatusBadge');
+        const card = document.getElementById('currentBankCard');
+
+        if (d.linked) {
+          badge.className = 'status-badge status-delivered';
+          badge.innerText = '✅ Account Linked';
+          card.style.display = 'block';
+
+          document.getElementById('cardHolderName').innerText = d.account_holder_name || d.name || '-';
+          document.getElementById('cardAccNumber').innerText = d.account_number_masked || d.account_number || '-';
+          document.getElementById('cardBankName').innerText = d.bank_name || '-';
+          document.getElementById('cardIfscCode').innerText = d.ifsc_code || '-';
+          document.getElementById('cardUpiId').innerText = d.upi_id || 'N/A';
+        } else {
+          badge.className = 'status-badge status-pending';
+          badge.innerText = '⚠️ Not Linked';
+          card.style.display = 'none';
+        }
+      } catch (err) {
+        console.error('Failed to fetch bank status:', err);
+      }
+    }
+
+    // Submit Bank Account Onboarding
+    async function submitBankOnboarding(e) {
+      e.preventDefault();
+      const payload = {
+        seller_id: currentSellerId,
+        account_holder_name: document.getElementById('bankHolderName').value.trim(),
+        account_number: document.getElementById('bankAccNum').value.trim(),
+        ifsc_code: document.getElementById('bankIfsc').value.trim(),
+        bank_name: document.getElementById('bankName').value.trim(),
+        branch_name: document.getElementById('bankBranch').value.trim(),
+        upi_id: document.getElementById('bankUpi').value.trim()
+      };
+
+      try {
+        const res = await fetch('/api/seller/bank-account/onboarding', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await res.json();
+        if (d.success) {
+          showToast('✅ Bank account linked successfully!');
+          fetchBankStatus();
+        } else {
+          showToast('❌ Error: ' + (d.message || 'Failed to save bank details'));
+        }
+      } catch (err) {
+        showToast('❌ Error: ' + err.message);
+      }
+    }
+
+    // Calculate Marketplace Commission Preview
+    async function calculateCommission(amount) {
+      const gross = parseFloat(amount) || 1000;
+      try {
+        const res = await fetch(`/api/marketplace/commission-preview?amount=${gross}`);
+        const d = await res.json();
+
+        document.getElementById('calcGross').innerText = `₹${gross.toFixed(2)}`;
+        document.getElementById('calcRate').innerText = d.commission_percentage || '5%';
+        document.getElementById('calcCommission').innerText = `- ₹${Number(d.commission_amount || 0).toFixed(2)}`;
+        document.getElementById('calcNet').innerText = `₹${Number(d.seller_receives_paise ? d.seller_receives_paise / 100 : d.net_payout || 0).toFixed(2)}`;
+      } catch (e) {
+        console.error('Failed to preview commission:', e);
+      }
+    }
+
+    // FCM Simulation
+    async function simulateFcmPush() {
+      const token = document.getElementById('fcmTokenInput').value.trim();
+      const title = document.getElementById('fcmTitleInput').value.trim();
+      const body = document.getElementById('fcmBodyInput').value.trim();
+      const consoleLog = document.getElementById('fcmConsole');
+
+      consoleLog.innerHTML += `<br>[${new Date().toLocaleTimeString()}] Dispatching FCM via Firebase Admin SDK to token: ${token.slice(0, 18)}...`;
+
+      try {
+        const res = await fetch('/api/internal/dispatch-notification?secret=vendor_internal_secret_key_2026', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: currentSellerId,
+            recipient_role: 'seller',
+            title,
+            message: body,
+            type: 'order_created',
+            data: { order_id: 9999, order_number: 'ORD-9999', total: '1500.00' }
+          })
+        });
+        const d = await res.json();
+        consoleLog.innerHTML += `<br>[SUCCESS] Response: ${JSON.stringify(d)}`;
+        showToast('🚀 FCM Push simulated successfully!');
+      } catch (e) {
+        consoleLog.innerHTML += `<br>[ERROR] ${e.message}`;
+      }
+    }
+
+    // Register Device Token
+    async function registerDeviceToken() {
+      const token = document.getElementById('fcmTokenInput').value.trim();
+      try {
+        const res = await fetch('/api/seller/fcm-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, seller_id: currentSellerId })
+        });
+        const d = await res.json();
+        showToast('📱 Device token registered for offline push notifications.');
+      } catch (e) {
+        showToast('Error registering token: ' + e.message);
+      }
+    }
+
+    // Navigation & Tabs
+    function showTab(tabId) {
+      document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+
+      const activeContent = document.getElementById(`tab-${tabId}`);
+      if (activeContent) activeContent.style.display = 'block';
+
+      const clickedBtn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.getAttribute('onclick').includes(tabId));
+      if (clickedBtn) clickedBtn.classList.add('active');
+    }
+
+    function toggleNotificationsDrawer() {
+      const drawer = document.getElementById('notificationsDrawer');
+      const overlay = document.getElementById('drawerOverlay');
+      drawer.classList.toggle('open');
+      overlay.classList.toggle('open');
+    }
+
+    // Toast notification
+    function showToast(msg) {
+      const div = document.createElement('div');
+      div.innerText = msg;
+      div.style.position = 'fixed';
+      div.style.bottom = '24px';
+      div.style.right = '24px';
+      div.style.background = '#10b981';
+      div.style.color = '#0b131e';
+      div.style.fontWeight = '700';
+      div.style.padding = '12px 20px';
+      div.style.borderRadius = '10px';
+      div.style.zIndex = '99999';
+      div.style.boxShadow = '0 6px 20px rgba(0,0,0,0.4)';
+      document.body.appendChild(div);
+      setTimeout(() => div.remove(), 4000);
+    }
+  </script>
+</body>
+</html>
+

@@ -7,6 +7,7 @@
 
 require_once __DIR__ . '/response.php';
 require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/notification.php';
 
 function getSellerDeletionConfigPhp(): array
 {
@@ -119,29 +120,10 @@ function ensureSellerDeletionSchemaPhp(PDO $pdo): void
     $addCol('order_items', 'item_status', "`item_status` VARCHAR(40) NOT NULL DEFAULT 'pending'", "`item_status` TEXT NOT NULL DEFAULT 'pending'");
     $addCol('order_items', 'rejection_reason', "`rejection_reason` TEXT NULL DEFAULT NULL", "`rejection_reason` TEXT NULL DEFAULT NULL");
 
+    ensureNotificationSchemaPhp($pdo);
+
     if ($isSqlite) {
         $pdo->exec("
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NULL,
-                buyer_phone TEXT NULL,
-                title TEXT NOT NULL,
-                message TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'order',
-                data TEXT NULL,
-                is_read INTEGER NOT NULL DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS device_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NULL,
-                phone TEXT NULL,
-                token TEXT NOT NULL UNIQUE,
-                platform TEXT NOT NULL DEFAULT 'android',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
             CREATE TABLE IF NOT EXISTS payment_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id INTEGER NOT NULL,

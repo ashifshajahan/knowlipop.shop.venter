@@ -672,12 +672,66 @@ function apiLogin(PDO $pdo): void
     $userPhone = isset($user['phone']) && trim((string)$user['phone']) !== '' ? trim((string)$user['phone']) : null;
     $token = createToken($pdo, (int) $user['id'], $userPhone, 'vendor-app', $publicEmail, $role, (int) ($user['token_version'] ?? 1));
 
-    jsonResponse([
+    // Update user login timestamps and set online status
+    try {
+        $pdo->prepare("UPDATE `users` SET is_online = 1, last_login_at = CURRENT_TIMESTAMP, last_active_at = CURRENT_TIMESTAMP WHERE id = :uid")
+            ->execute([':uid' => (int)$user['id']]);
+    } catch (Throwable $e) {}
+
+    // Register FCM / Device Token if provided in login payload
+    $reqFcmToken = trim((string)($input['fcm_token'] ?? ($input['device_token'] ?? ($input['token'] ?? ''))));
+    if ($reqFcmToken !== '') {
+        $platform = strtolower(trim((string)($input['platform'] ?? 'android')));
+        try {
+            $pdo->prepare("UPDATE `users` SET fcm_token = :tok WHERE id = :uid")
+                ->execute([':tok' => $reqFcmToken, ':uid' => (int)$user['id']]);
+
+            $isSqlite = (strtolower((string)$pdo->getAttribute(PDO::ATTR_DRIVER_NAME)) === 'sqlite');
+            if ($isSqlite) {
+                $pdo->prepare("INSERT INTO device_tokens (user_id, phone, token, platform, created_at, updated_at)
+                    VALUES (:uid, :ph, :tok, :plat, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(token) DO UPDATE SET user_id = :uid2, phone = :ph2, updated_at = CURRENT_TIMESTAMP")
+                    ->execute([
+                        ':uid' => (int)$user['id'], ':ph' => $userPhone, ':tok' => $reqFcmToken, ':plat' => $platform,
+                        ':uid2' => (int)$user['id'], ':ph2' => $userPhone
+                    ]);
+            } else {
+                $pdo->prepare("INSERT INTO device_tokens (user_id, phone, token, platform, created_at, updated_at)
+                    VALUES (:uid, :ph, :tok, :plat, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON DUPLICATE KEY UPDATE user_id = :uid2, phone = :ph2, updated_at = CURRENT_TIMESTAMP")
+                    ->execute([
+                        ':uid' => (int)$user['id'], ':ph' => $userPhone, ':tok' => $reqFcmToken, ':plat' => $platform,
+                        ':uid2' => (int)$user['id'], ':ph2' => $userPhone
+                    ]);
+            }
+        } catch (Throwable $e) {}
+    }
+
+    // Auto-synchronize unread notifications and pending orders on seller login
+    $syncData = null;
+    if ($role === 'seller') {
+        require_once __DIR__ . '/../helpers/notification.php';
+        try {
+            $syncData = getSellerSyncDataPhp($pdo, (int)$user['id']);
+        } catch (Throwable $e) {}
+    }
+
+    $responsePayload = [
         'message' => 'Login successful.',
         'user' => safeSeller($user),
         'token' => $token,
         'token_type' => 'Bearer',
-    ]);
+    ];
+
+    if ($syncData !== null) {
+        $responsePayload['sync'] = $syncData;
+        $responsePayload['missed_orders'] = $syncData['missed_orders'] ?? [];
+        $responsePayload['missed_orders_count'] = $syncData['summary']['missed_orders_count'] ?? 0;
+        $responsePayload['unread_notifications'] = $syncData['unread_notifications'] ?? [];
+        $responsePayload['unread_count'] = $syncData['summary']['unread_notifications_count'] ?? 0;
+    }
+
+    jsonResponse($responsePayload);
 }
 
 function apiMe(PDO $pdo): void
@@ -691,7 +745,7 @@ function apiLogout(PDO $pdo): void
     $user = authenticateUser($pdo);
     deleteCurrentToken($pdo, (int) $user['token_id']);
     try {
-        $pdo->prepare("UPDATE users SET token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
+        $pdo->prepare("UPDATE users SET is_online = 0, last_active_at = CURRENT_TIMESTAMP, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = :id")
             ->execute([':id' => (int) $user['id']]);
     } catch (Throwable $e) {
     }

@@ -5,3 +5,5 @@ Thumbs.db
 *.zip
 node_modules/
 *.sqlite
+*firebase*.json
+*-adminsdk*.json

@@ -48,6 +48,7 @@ function ensureOrdersSchema(PDO $pdo): void
                     discount REAL NOT NULL DEFAULT 0.00,
                     total_amount REAL NOT NULL DEFAULT 0.00,
                     notes TEXT NULL DEFAULT NULL,
+                    acknowledged_at DATETIME NULL DEFAULT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
@@ -73,6 +74,7 @@ function ensureOrdersSchema(PDO $pdo): void
                     `discount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
                     `total_amount` DECIMAL(10,2) NOT NULL DEFAULT 0.00,
                     `notes` TEXT NULL DEFAULT NULL,
+                    `acknowledged_at` TIMESTAMP NULL DEFAULT NULL,
                     `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
@@ -133,6 +135,60 @@ function ensureOrdersSchema(PDO $pdo): void
     } catch (Throwable $e) {}
 
     try {
+        if (!dbHasColumnPhp($pdo, 'orders', 'idempotency_key')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `orders` ADD COLUMN `idempotency_key` TEXT NULL DEFAULT NULL"
+                : "ALTER TABLE `orders` ADD COLUMN `idempotency_key` VARCHAR(120) NULL DEFAULT NULL AFTER `order_number`");
+        }
+        if ($isSqlite) {
+            $pdo->exec("CREATE UNIQUE INDEX IF NOT EXISTS uniq_orders_idempotency ON orders(idempotency_key)");
+        } else {
+            $idxChk = $pdo->query("SHOW INDEX FROM `orders` WHERE `Key_name` = 'uniq_orders_idempotency'")->fetchAll();
+            if (empty($idxChk)) {
+                $pdo->exec("ALTER TABLE `orders` ADD UNIQUE KEY `uniq_orders_idempotency` (`idempotency_key`)");
+            }
+        }
+    } catch (Throwable $e) {}
+
+    try {
+        if ($isSqlite) {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS order_idempotency_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    order_id INTEGER NULL DEFAULT NULL,
+                    order_number TEXT NULL DEFAULT NULL,
+                    request_hash TEXT NULL DEFAULT NULL,
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    response_payload TEXT NULL DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_oik_order ON order_idempotency_keys(order_id);
+                CREATE INDEX IF NOT EXISTS idx_oik_status ON order_idempotency_keys(status);
+            ");
+        } else {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS `order_idempotency_keys` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `idempotency_key` VARCHAR(120) NOT NULL,
+                    `order_id` BIGINT UNSIGNED NULL DEFAULT NULL,
+                    `order_number` VARCHAR(60) NULL DEFAULT NULL,
+                    `request_hash` VARCHAR(64) NULL DEFAULT NULL,
+                    `status` VARCHAR(30) NOT NULL DEFAULT 'completed',
+                    `response_payload` LONGTEXT NULL DEFAULT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uniq_order_idempotency_key` (`idempotency_key`),
+                    INDEX `idx_oik_order` (`order_id`),
+                    INDEX `idx_oik_status` (`status`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            ");
+        }
+    } catch (Throwable $e) {}
+
+    try {
         if (!dbHasColumnPhp($pdo, 'orders', 'rejection_reason')) {
             $pdo->exec("ALTER TABLE `orders` ADD COLUMN `rejection_reason` TEXT NULL DEFAULT NULL");
         }
@@ -161,6 +217,14 @@ function ensureOrdersSchema(PDO $pdo): void
     } catch (Throwable $e) {}
 
     try {
+        if (!dbHasColumnPhp($pdo, 'orders', 'acknowledged_at')) {
+            $pdo->exec($isSqlite
+                ? "ALTER TABLE `orders` ADD COLUMN `acknowledged_at` DATETIME NULL DEFAULT NULL"
+                : "ALTER TABLE `orders` ADD COLUMN `acknowledged_at` TIMESTAMP NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {}
+
+    try {
         if (!dbHasColumnPhp($pdo, 'order_items', 'seller_id')) {
             $pdo->exec($isSqlite
                 ? "ALTER TABLE `order_items` ADD COLUMN `seller_id` INTEGER NULL DEFAULT NULL"
@@ -183,41 +247,7 @@ function ensureOrdersSchema(PDO $pdo): void
     } catch (Throwable $e) {}
 
     try {
-        if ($isSqlite) {
-            $pdo->exec("
-                CREATE TABLE IF NOT EXISTS notifications (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NULL DEFAULT NULL,
-                    buyer_phone TEXT NULL DEFAULT NULL,
-                    title TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    type TEXT NOT NULL DEFAULT 'order',
-                    data TEXT NULL DEFAULT NULL,
-                    is_read INTEGER NOT NULL DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-            ");
-        } else {
-            $pdo->exec("
-                CREATE TABLE IF NOT EXISTS `notifications` (
-                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    `user_id` BIGINT UNSIGNED NULL DEFAULT NULL,
-                    `buyer_phone` VARCHAR(30) NULL DEFAULT NULL,
-                    `title` VARCHAR(255) NOT NULL,
-                    `message` TEXT NOT NULL,
-                    `type` VARCHAR(50) NOT NULL DEFAULT 'order',
-                    `data` JSON NULL DEFAULT NULL,
-                    `is_read` TINYINT(1) NOT NULL DEFAULT 0,
-                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (`id`),
-                    INDEX `idx_notifications_user` (`user_id`),
-                    INDEX `idx_notifications_phone` (`buyer_phone`),
-                    INDEX `idx_notifications_read` (`is_read`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-            ");
-        }
+        ensureNotificationSchemaPhp($pdo);
     } catch (Throwable $e) {}
 
     try {
@@ -1086,10 +1116,180 @@ function apiGetOrder(PDO $pdo, mixed $idOrNumber, ?int $routeSellerId = null): v
 }
 
 /**
+ * Fetch full order representation with normalized order items and seller details
+ */
+function fetchOrderFullDetailsPhp(PDO $pdo, int $orderId): ?array
+{
+    $stmt = $pdo->prepare("SELECT * FROM `orders` WHERE id = :id LIMIT 1");
+    $stmt->execute([':id' => $orderId]);
+    $order = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$order) {
+        return null;
+    }
+
+    $iStmt = $pdo->prepare("
+        SELECT oi.*, p.name AS catalog_name, p.image_url AS catalog_image, p.images AS catalog_images, u.seller_name, u.name AS fallback_seller_name
+        FROM `order_items` oi
+        LEFT JOIN `products` p ON oi.product_id = p.id
+        LEFT JOIN `users` u ON oi.seller_id = u.id
+        WHERE oi.order_id = :oid
+        ORDER BY oi.id ASC
+    ");
+    $iStmt->execute([':oid' => $orderId]);
+    $rawItems = $iStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $items = [];
+    foreach ($rawItems as $ri) {
+        $pName = $ri['product_name'] ?: ($ri['catalog_name'] ?: 'Product');
+        $pImg = $ri['product_image'] ?: ($ri['catalog_image'] ?: null);
+        if (empty($pImg) && !empty($ri['catalog_images'])) {
+            $dec = json_decode($ri['catalog_images'], true);
+            if (is_array($dec) && !empty($dec[0])) {
+                $pImg = $dec[0];
+            }
+        }
+        $price = (float)($ri['price'] ?? 0);
+        $qty = (int)($ri['quantity'] ?? 1);
+        $subtotal = round($price * $qty, 2);
+        $items[] = [
+            'id' => (int)$ri['id'],
+            'order_id' => $orderId,
+            'product_id' => !empty($ri['product_id']) ? (int)$ri['product_id'] : null,
+            'seller_id' => !empty($ri['seller_id']) ? (int)$ri['seller_id'] : (!empty($order['seller_id']) ? (int)$order['seller_id'] : 1),
+            'seller_name' => $ri['seller_name'] ?: ($ri['fallback_seller_name'] ?: 'Verified Seller'),
+            'product_name' => $pName,
+            'name' => $pName,
+            'product_image' => $pImg,
+            'image_url' => $pImg,
+            'price' => $price,
+            'unit_price' => $price,
+            'product_price' => $price,
+            'quantity' => $qty,
+            'qty' => $qty,
+            'subtotal' => $subtotal,
+            'line_total' => $subtotal,
+            'total' => $subtotal,
+            'total_price' => $subtotal,
+            'item_status' => $ri['item_status'] ?? 'pending',
+            'rejection_reason' => $ri['rejection_reason'] ?? null,
+            'created_at' => $ri['created_at'] ?? null,
+        ];
+    }
+
+    $subtotal = (float)($order['subtotal'] ?? 0);
+    $deliveryFee = (float)($order['delivery_fee'] ?? 0);
+    $discount = (float)($order['discount'] ?? 0);
+    $totalAmount = (float)($order['total_amount'] ?? 0);
+    $primarySellerId = !empty($order['seller_id']) ? (int)$order['seller_id'] : 1;
+
+    $sellerName = 'Verified Seller';
+    try {
+        $sStmt = $pdo->prepare("SELECT seller_name, name FROM `users` WHERE id = :sid LIMIT 1");
+        $sStmt->execute([':sid' => $primarySellerId]);
+        $sRow = $sStmt->fetch(PDO::FETCH_ASSOC);
+        if ($sRow) {
+            $sellerName = $sRow['seller_name'] ?: ($sRow['name'] ?: 'Verified Seller');
+        }
+    } catch (Throwable $e) {}
+
+    return [
+        'id' => (int)$order['id'],
+        'seller_id' => $primarySellerId,
+        'seller_name' => $sellerName,
+        'order_number' => (string)$order['order_number'],
+        'idempotency_key' => $order['idempotency_key'] ?? null,
+        'buyer_name' => (string)$order['buyer_name'],
+        'buyer_phone' => (string)$order['buyer_phone'],
+        'shipping_address' => (string)$order['shipping_address'],
+        'delivery_address' => (string)$order['shipping_address'],
+        'address' => (string)$order['shipping_address'],
+        'landmark' => $order['landmark'] ?? null,
+        'city' => $order['city'] ?? null,
+        'state' => $order['state'] ?? null,
+        'pincode' => $order['pincode'] ?? null,
+        'notes' => $order['notes'] ?? null,
+        'order_status' => (string)$order['order_status'],
+        'status' => (string)$order['order_status'],
+        'payment_method' => (string)$order['payment_method'],
+        'payment_status' => (string)$order['payment_status'],
+        'subtotal' => $subtotal,
+        'items_subtotal' => $subtotal,
+        'seller_subtotal' => $subtotal,
+        'delivery_fee' => $deliveryFee,
+        'shipping_fee' => $deliveryFee,
+        'discount' => $discount,
+        'total_amount' => $totalAmount,
+        'total_price' => $totalAmount,
+        'grand_total' => $totalAmount,
+        'total' => $totalAmount,
+        'order_price' => $totalAmount,
+        'price' => $totalAmount,
+        'amount' => $totalAmount,
+        'carrier' => $order['carrier'] ?? null,
+        'tracking_number' => $order['tracking_number'] ?? null,
+        'rejection_reason' => $order['rejection_reason'] ?? null,
+        'cancellation_reason' => $order['cancellation_reason'] ?? null,
+        'shipped_at' => $order['shipped_at'] ?? null,
+        'delivered_at' => $order['delivered_at'] ?? null,
+        'payment_gateway' => $order['payment_gateway'] ?? null,
+        'gateway_order_id' => $order['gateway_order_id'] ?? null,
+        'gateway_payment_id' => $order['gateway_payment_id'] ?? null,
+        'captured_amount' => isset($order['captured_amount']) ? (float)$order['captured_amount'] : null,
+        'refunded_amount' => (float)($order['refunded_amount'] ?? 0),
+        'items' => $items,
+        'order_items' => $items,
+        'items_count' => count($items),
+        'total_quantity' => (int)array_sum(array_column($items, 'quantity')),
+        'created_at' => $order['created_at'] ?? date('Y-m-d H:i:s'),
+        'updated_at' => $order['updated_at'] ?? date('Y-m-d H:i:s'),
+    ];
+}
+
+/**
+ * Deterministically resolve an idempotency key from request headers, JSON body,
+ * or payload fingerprint hash (to handle 50ms double-click bursts even if client omitted header).
+ */
+function resolveOrderPlacementIdempotencyKey(array $input, float $totalAmount, array $processedItems): string
+{
+    // 1. Client header: Idempotency-Key or X-Idempotency-Key
+    $headerKey = $_SERVER['HTTP_IDEMPOTENCY_KEY'] ?? ($_SERVER['HTTP_X_IDEMPOTENCY_KEY'] ?? null);
+    if (!empty($headerKey) && is_string($headerKey) && trim($headerKey) !== '') {
+        return substr(trim($headerKey), 0, 120);
+    }
+
+    // 2. Request body / JSON: idempotency_key or checkout_token
+    if (!empty($input['idempotency_key']) && is_string($input['idempotency_key']) && trim($input['idempotency_key']) !== '') {
+        return substr(trim($input['idempotency_key']), 0, 120);
+    }
+    if (!empty($input['checkout_token']) && is_string($input['checkout_token']) && trim($input['checkout_token']) !== '') {
+        return substr(trim($input['checkout_token']), 0, 120);
+    }
+
+    // 3. Fallback: Request Fingerprint Hash
+    // Protects against 50ms rapid double-clicks and instant network retries even when client omitted header
+    $buyerPhone = trim((string)($input['buyer_phone'] ?? ($input['customer_phone'] ?? ($input['phone'] ?? ''))));
+    $buyerName = trim((string)($input['buyer_name'] ?? ($input['customer_name'] ?? ($input['name'] ?? ''))));
+    $address = trim((string)($input['shipping_address'] ?? ($input['delivery_address'] ?? ($input['address'] ?? ''))));
+    $itemSignatures = [];
+    foreach ($processedItems as $it) {
+        $pid = $it['product_id'] ?? 0;
+        $qty = $it['quantity'] ?? 1;
+        $pr = number_format((float)($it['price'] ?? 0), 2, '.', '');
+        $itemSignatures[] = "{$pid}:{$qty}:{$pr}";
+    }
+    sort($itemSignatures);
+    // 60-second sliding time window
+    $window = floor(time() / 60);
+    $rawHash = hash('sha256', $buyerPhone . '|' . $buyerName . '|' . $address . '|' . number_format($totalAmount, 2, '.', '') . '|' . implode(',', $itemSignatures) . '|' . $window);
+    return 'fp_' . substr($rawHash, 0, 32);
+}
+
+/**
  * Place Order:
  * POST /api/orders
  * Stores seller_id and product_id for every order item.
  * Automatically routes each order item to its respective seller based on product_id.
+ * Enforces strict idempotency and duplicate order protection against concurrent requests (<50ms).
  */
 function apiCreateOrder(PDO $pdo): void
 {
@@ -1214,18 +1414,57 @@ function apiCreateOrder(PDO $pdo): void
     $discount = max(0, (float)($input['discount'] ?? 0));
     $totalAmount = max(0, round($subtotal + $deliveryFee - $discount, 2));
 
+    // Resolve Idempotency Key (client header/body or deterministic request fingerprint)
+    $idempotencyKey = resolveOrderPlacementIdempotencyKey($input, $totalAmount, $processedItems);
+
+    // 1. Fast-path check: Return existing order if already created with this idempotency key
+    try {
+        $fastStmt = $pdo->prepare("SELECT id, order_number FROM `orders` WHERE `idempotency_key` = :ikey LIMIT 1");
+        $fastStmt->execute([':ikey' => $idempotencyKey]);
+        $existingOrderRow = $fastStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($existingOrderRow) {
+            $existingOrderData = fetchOrderFullDetailsPhp($pdo, (int)$existingOrderRow['id']);
+            $resp = [
+                'success' => true,
+                'message' => 'Order already created',
+                'order_id' => (string)$existingOrderRow['id'],
+                'order_number' => $existingOrderRow['order_number'],
+                'already_created' => true,
+                'existing' => true,
+                'order' => $existingOrderData,
+            ];
+            if (in_array(strtolower($paymentMethod), ['razorpay', 'online', 'card', 'upi', 'netbanking'], true)) {
+                $rzpRes = razorpayCreateOrderPhp($pdo, (int)$existingOrderRow['id']);
+                if (!empty($rzpRes['ok']) && !empty($rzpRes['data'])) {
+                    $resp['razorpay'] = $rzpRes['data'];
+                    $resp['razorpay_order_id'] = $rzpRes['data']['razorpay_order_id'] ?? null;
+                    $resp['razorpay_key_id'] = $rzpRes['data']['razorpay_key_id'] ?? null;
+                    $resp['amount_in_paise'] = $rzpRes['data']['amount_in_paise'] ?? null;
+                    $resp['currency'] = $rzpRes['data']['currency'] ?? 'INR';
+                    if (isset($resp['order'])) {
+                        $resp['order']['gateway_order_id'] = $rzpRes['data']['razorpay_order_id'] ?? null;
+                        $resp['order']['payment_gateway'] = 'razorpay';
+                    }
+                }
+            }
+            jsonResponse($resp, 200);
+            return;
+        }
+    } catch (Throwable $e) {}
+
     $orderNumber = 'ORD-' . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 5));
 
     $pdo->beginTransaction();
     try {
         $stmt = $pdo->prepare("
             INSERT INTO `orders` (
-                seller_id, order_number, buyer_name, buyer_phone,
+                idempotency_key, seller_id, order_number, buyer_name, buyer_phone,
                 shipping_address, landmark, city, state, pincode,
                 order_status, payment_method, payment_status,
                 subtotal, delivery_fee, discount, total_amount, notes
             ) VALUES (
-                :seller_id, :order_number, :buyer_name, :buyer_phone,
+                :idempotency_key, :seller_id, :order_number, :buyer_name, :buyer_phone,
                 :shipping_address, :landmark, :city, :state, :pincode,
                 'pending', :payment_method, 'unpaid',
                 :subtotal, :delivery_fee, :discount, :total_amount, :notes
@@ -1233,6 +1472,7 @@ function apiCreateOrder(PDO $pdo): void
         ");
 
         $stmt->execute([
+            ':idempotency_key' => $idempotencyKey,
             ':seller_id' => $primarySellerId,
             ':order_number' => $orderNumber,
             ':buyer_name' => $buyerName,
@@ -1294,6 +1534,18 @@ function apiCreateOrder(PDO $pdo): void
         }
         unset($pi);
 
+        // Record in order_idempotency_keys table
+        try {
+            $pdo->prepare("
+                INSERT INTO `order_idempotency_keys` (idempotency_key, order_id, order_number, status, created_at, updated_at)
+                VALUES (:ikey, :oid, :onum, 'completed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ")->execute([
+                ':ikey' => $idempotencyKey,
+                ':oid' => $orderId,
+                ':onum' => $orderNumber
+            ]);
+        } catch (Throwable $e) {}
+
         $pdo->commit();
 
         logOrderActivityPhp($pdo, $orderId, 'created', null, 'pending', [
@@ -1302,6 +1554,31 @@ function apiCreateOrder(PDO $pdo): void
             'notes' => "Order placed via " . strtoupper($paymentMethod) . " for ₹" . number_format((float)$totalAmount, 2)
         ]);
         dispatchOrderNotificationPhp($pdo, $orderId, 'order_created');
+
+        // Check product inventory after order creation for low stock alerts (stock <= 5)
+        foreach ($processedItems as $item) {
+            if (!empty($item['product_id'])) {
+                try {
+                    $chkSt = $pdo->prepare("SELECT stock, name, seller_id FROM `products` WHERE id = :pid LIMIT 1");
+                    $chkSt->execute([':pid' => (int)$item['product_id']]);
+                    $pData = $chkSt->fetch(PDO::FETCH_ASSOC);
+                    if ($pData && (int)$pData['stock'] <= 5) {
+                        $targetSid = !empty($pData['seller_id']) ? (int)$pData['seller_id'] : (!empty($item['seller_id']) ? (int)$item['seller_id'] : $primarySellerId);
+                        dispatchSellerEventNotificationPhp(
+                            $pdo,
+                            $targetSid,
+                            'product_stock_low',
+                            [
+                                'product_id' => (int)$item['product_id'],
+                                'product_name' => $pData['name'] ?? $item['product_name'],
+                                'stock' => (int)$pData['stock'],
+                                'order_id' => $orderId,
+                            ]
+                        );
+                    }
+                } catch (Throwable $e) {}
+            }
+        }
 
         $sellerName = 'Verified Seller';
         try {
@@ -1318,6 +1595,7 @@ function apiCreateOrder(PDO $pdo): void
             'seller_id' => $primarySellerId,
             'seller_name' => $sellerName,
             'order_number' => $orderNumber,
+            'idempotency_key' => $idempotencyKey,
             'buyer_name' => $buyerName,
             'buyer_phone' => $buyerPhone,
             'shipping_address' => $shippingAddress,
@@ -1353,7 +1631,10 @@ function apiCreateOrder(PDO $pdo): void
         ];
 
         $resp = [
-            'message' => 'Order created successfully.',
+            'success' => true,
+            'message' => 'Order placed successfully',
+            'order_id' => (string)$orderId,
+            'order_number' => $orderNumber,
             'order' => $orderData,
         ];
 
@@ -1376,6 +1657,57 @@ function apiCreateOrder(PDO $pdo): void
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
         }
+
+        $errMsg = $e->getMessage();
+        $isDuplicate = (
+            str_contains($errMsg, '1062') ||
+            str_contains($errMsg, 'Duplicate entry') ||
+            str_contains($errMsg, 'uniq_orders_idempotency') ||
+            str_contains($errMsg, 'UNIQUE constraint failed: orders.idempotency_key') ||
+            ($e instanceof PDOException && $e->getCode() === '23000')
+        );
+
+        if ($isDuplicate) {
+            // Concurrent request within 50ms won the race! Fetch the existing committed order.
+            $existing = null;
+            for ($attempt = 0; $attempt < 3; $attempt++) {
+                $cStmt = $pdo->prepare("SELECT id, order_number FROM `orders` WHERE `idempotency_key` = :ikey LIMIT 1");
+                $cStmt->execute([':ikey' => $idempotencyKey]);
+                $existing = $cStmt->fetch(PDO::FETCH_ASSOC);
+                if ($existing) break;
+                usleep(15000); // 15ms wait
+            }
+
+            if ($existing) {
+                $existingOrderData = fetchOrderFullDetailsPhp($pdo, (int)$existing['id']);
+                $resp = [
+                    'success' => true,
+                    'message' => 'Order already created',
+                    'order_id' => (string)$existing['id'],
+                    'order_number' => $existing['order_number'],
+                    'already_created' => true,
+                    'existing' => true,
+                    'order' => $existingOrderData,
+                ];
+                if (in_array(strtolower($paymentMethod), ['razorpay', 'online', 'card', 'upi', 'netbanking'], true)) {
+                    $rzpRes = razorpayCreateOrderPhp($pdo, (int)$existing['id']);
+                    if (!empty($rzpRes['ok']) && !empty($rzpRes['data'])) {
+                        $resp['razorpay'] = $rzpRes['data'];
+                        $resp['razorpay_order_id'] = $rzpRes['data']['razorpay_order_id'] ?? null;
+                        $resp['razorpay_key_id'] = $rzpRes['data']['razorpay_key_id'] ?? null;
+                        $resp['amount_in_paise'] = $rzpRes['data']['amount_in_paise'] ?? null;
+                        $resp['currency'] = $rzpRes['data']['currency'] ?? 'INR';
+                        if (isset($resp['order'])) {
+                            $resp['order']['gateway_order_id'] = $rzpRes['data']['razorpay_order_id'] ?? null;
+                            $resp['order']['payment_gateway'] = 'razorpay';
+                        }
+                    }
+                }
+                jsonResponse($resp, 200);
+                return;
+            }
+        }
+
         errorResponse('Failed to create order: ' . $e->getMessage(), [], 500);
     }
 }
@@ -2718,6 +3050,23 @@ function apiGetSellerDashboard(PDO $pdo, ?int $routeSellerId = null): void
     $sUser = $sStmt->fetch(PDO::FETCH_ASSOC);
     $sellerName = $sUser['seller_name'] ?? $sUser['name'] ?? 'Verified Seller';
 
+    // Synchronize offline/missed orders and notifications for this seller
+    $syncData = [];
+    $missedOrders = [];
+    $missedOrdersCount = 0;
+    $pendingActionsCount = 0;
+    $cancellationRequestsCount = 0;
+    $unreadNotificationsCount = 0;
+
+    try {
+        $syncData = getSellerSyncDataPhp($pdo, $targetSellerId);
+        $missedOrders = $syncData['missed_orders'] ?? [];
+        $missedOrdersCount = count($missedOrders);
+        $pendingActionsCount = $syncData['summary']['pending_actions_count'] ?? $missedOrdersCount;
+        $cancellationRequestsCount = $syncData['summary']['cancellation_requests_count'] ?? 0;
+        $unreadNotificationsCount = $syncData['summary']['unread_notifications_count'] ?? 0;
+    } catch (Throwable $e) {}
+
     $dashboardData = [
         'seller_id' => $targetSellerId,
         'seller_name' => $sellerName,
@@ -2740,6 +3089,13 @@ function apiGetSellerDashboard(PDO $pdo, ?int $routeSellerId = null): void
         'total_sales_formatted' => '₹' . number_format($totalSales, 2),
         'pending_payments_formatted' => '₹' . number_format($pendingPayments, 2),
         'completed_payments_formatted' => '₹' . number_format($completedPayments, 2),
+        // Missed orders section and action counts
+        'missed_orders' => $missedOrders,
+        'missed_orders_count' => $missedOrdersCount,
+        'pending_actions_count' => $pendingActionsCount,
+        'cancellation_requests_count' => $cancellationRequestsCount,
+        'unread_notifications_count' => $unreadNotificationsCount,
+        'sync' => $syncData,
     ];
 
     jsonResponse(array_merge([
@@ -2839,7 +3195,17 @@ function apiGetNotifications(PDO $pdo): void
         $r['user_id'] = !empty($r['user_id']) ? (int)$r['user_id'] : null;
         $r['order_id'] = !empty($r['order_id']) ? (int)$r['order_id'] : null;
         $r['is_read'] = (bool)$r['is_read'];
-        $r['data'] = !empty($r['data']) ? (is_array($r['data']) ? $r['data'] : json_decode($r['data'], true)) : null;
+        $r['delivery_status'] = $r['delivery_status'] ?? 'delivered';
+        $r['read_at'] = $r['read_at'] ?? null;
+        $r['delivered_at'] = $r['delivered_at'] ?? null;
+        $r['dedup_key'] = $r['dedup_key'] ?? null;
+        $r['action_url'] = $r['action_url'] ?? null;
+        $decoded = !empty($r['data']) ? (is_array($r['data']) ? $r['data'] : json_decode($r['data'], true)) : null;
+        $r['data'] = $decoded;
+        if (empty($r['action_url']) && !empty($decoded['action_url'])) {
+            $r['action_url'] = $decoded['action_url'];
+        }
+        $r['screen'] = $decoded['screen'] ?? ($r['order_id'] ? 'order_details' : 'notifications');
     }
     unset($r);
 
@@ -2896,19 +3262,19 @@ function apiMarkNotificationRead(PDO $pdo, int $id): void
     $isAdmin = !empty($_SESSION['admin_logged_in']) || ($user && ($user['role'] ?? '') === 'admin');
 
     if ($isAdmin) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE id = :id");
         $stmt->execute([':id' => $id]);
     } elseif ($userId && $phone) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id AND (user_id = :uid OR buyer_phone = :phone OR user_id IS NULL)");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE id = :id AND (user_id = :uid OR buyer_phone = :phone OR user_id IS NULL)");
         $stmt->execute([':id' => $id, ':uid' => $userId, ':phone' => $phone]);
     } elseif ($userId) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id AND (user_id = :uid OR user_id IS NULL)");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE id = :id AND (user_id = :uid OR user_id IS NULL)");
         $stmt->execute([':id' => $id, ':uid' => $userId]);
     } elseif ($phone) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id AND buyer_phone = :phone");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE id = :id AND buyer_phone = :phone");
         $stmt->execute([':id' => $id, ':phone' => $phone]);
     } else {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE id = :id");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE id = :id");
         $stmt->execute([':id' => $id]);
     }
 
@@ -2925,16 +3291,16 @@ function apiMarkAllNotificationsRead(PDO $pdo): void
     $isAdmin = !empty($_SESSION['admin_logged_in']) || ($user && ($user['role'] ?? '') === 'admin');
 
     if ($isAdmin && empty($_GET['force_user'])) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)");
         $stmt->execute();
     } elseif ($userId && $phone) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE user_id = :uid OR buyer_phone = :phone");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE user_id = :uid OR buyer_phone = :phone");
         $stmt->execute([':uid' => $userId, ':phone' => $phone]);
     } elseif ($userId) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE user_id = :uid");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE user_id = :uid");
         $stmt->execute([':uid' => $userId]);
     } elseif ($phone) {
-        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1 WHERE buyer_phone = :phone");
+        $stmt = $pdo->prepare("UPDATE `notifications` SET is_read = 1, read_at = CURRENT_TIMESTAMP, delivery_status = 'delivered', delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE buyer_phone = :phone");
         $stmt->execute([':phone' => $phone]);
     } else {
         errorResponse('Authentication or phone identification required.', [], 401);
@@ -2942,6 +3308,78 @@ function apiMarkAllNotificationsRead(PDO $pdo): void
     }
 
     jsonResponse(['success' => true, 'message' => 'All notifications marked as read.']);
+}
+
+/**
+ * Seller Synchronization API: GET /api/seller/sync
+ */
+function apiGetSellerSync(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $sellerId = ($user['role'] ?? '') === 'admin' && !empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : (int)$user['id'];
+
+    $sync = getSellerSyncDataPhp($pdo, $sellerId);
+    jsonResponse($sync);
+}
+
+/**
+ * Seller Missed Orders API: GET /api/seller/missed-orders
+ */
+function apiGetSellerMissedOrders(PDO $pdo): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $sellerId = ($user['role'] ?? '') === 'admin' && !empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : (int)$user['id'];
+
+    $sync = getSellerSyncDataPhp($pdo, $sellerId);
+    jsonResponse([
+        'status' => 'success',
+        'seller_id' => $sellerId,
+        'missed_orders' => $sync['missed_orders'] ?? [],
+        'missed_orders_count' => count($sync['missed_orders'] ?? []),
+        'summary' => $sync['summary'] ?? [],
+    ]);
+}
+
+/**
+ * Acknowledge Seller Order API: POST /api/seller/orders/{id}/acknowledge
+ */
+function apiAcknowledgeSellerOrder(PDO $pdo, mixed $orderId): void
+{
+    ensureOrdersSchema($pdo);
+    $user = authenticateUser($pdo);
+    $sellerId = (int)$user['id'];
+
+    $oid = is_numeric($orderId) ? (int)$orderId : 0;
+    if ($oid <= 0) {
+        $st = $pdo->prepare("SELECT id FROM `orders` WHERE order_number = :num LIMIT 1");
+        $st->execute([':num' => (string)$orderId]);
+        $oid = (int)$st->fetchColumn();
+    }
+
+    if ($oid <= 0) {
+        errorResponse('Order not found.', [], 404);
+        return;
+    }
+
+    $ok = acknowledgeSellerOrderPhp($pdo, $oid, $sellerId);
+    if (!$ok && ($user['role'] ?? '') === 'admin') {
+        $upd = $pdo->prepare("UPDATE `orders` SET acknowledged_at = CURRENT_TIMESTAMP WHERE id = :oid");
+        $ok = $upd->execute([':oid' => $oid]);
+    }
+
+    if (!$ok) {
+        errorResponse('Order not found or not assigned to this seller.', [], 403);
+        return;
+    }
+
+    jsonResponse([
+        'success' => true,
+        'message' => 'Order acknowledged successfully.',
+        'order_id' => $oid,
+        'acknowledged_at' => date('Y-m-d H:i:s'),
+    ]);
 }
 
 function apiDeleteNotification(PDO $pdo, int $id): void

@@ -41,12 +41,27 @@ function getBearerToken(): ?string
         $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
     } elseif (isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
         $authHeader = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+    } elseif (isset($_SERVER['HTTP_X_AUTHORIZATION'])) {
+        $authHeader = $_SERVER['HTTP_X_AUTHORIZATION'];
+    } elseif (isset($_SERVER['X_AUTHORIZATION'])) {
+        $authHeader = $_SERVER['X_AUTHORIZATION'];
+    } elseif (isset($_SERVER['HTTP_TOKEN'])) {
+        $authHeader = $_SERVER['HTTP_TOKEN'];
+    } elseif (function_exists('getallheaders')) {
+        $headers = getallheaders();
+        foreach (['Authorization', 'authorization', 'X-Authorization', 'x-authorization'] as $h) {
+            if (isset($headers[$h])) {
+                $authHeader = $headers[$h];
+                break;
+            }
+        }
     } elseif (function_exists('apache_request_headers')) {
         $headers = apache_request_headers();
-        if (isset($headers['Authorization'])) {
-            $authHeader = $headers['Authorization'];
-        } elseif (isset($headers['authorization'])) {
-            $authHeader = $headers['authorization'];
+        foreach (['Authorization', 'authorization', 'X-Authorization', 'x-authorization'] as $h) {
+            if (isset($headers[$h])) {
+                $authHeader = $headers[$h];
+                break;
+            }
         }
     }
 
@@ -56,6 +71,8 @@ function getBearerToken(): ?string
         return trim($authHeader);
     } elseif (!empty($_GET['token'])) {
         return trim($_GET['token']);
+    } elseif (!empty($_POST['token'])) {
+        return trim($_POST['token']);
     } elseif (!empty($_COOKIE['admin_token'])) {
         return trim($_COOKIE['admin_token']);
     } elseif (!empty($_COOKIE['token'])) {

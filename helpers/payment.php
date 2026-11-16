@@ -367,6 +367,36 @@ function razorpayCreateOrderPhp(PDO $pdo, mixed $orderIdOrData): array
     $orderNumber = (string) $order['order_number'];
     $orderId = (int) $order['id'];
 
+    // Prevent duplicate Razorpay order creation: Reuse existing gateway_order_id if already generated
+    if (!empty($order['gateway_order_id'])) {
+        $rzpOrderId = (string) $order['gateway_order_id'];
+        return [
+            'ok' => true,
+            'statusCode' => 200,
+            'data' => [
+                'success' => true,
+                'message' => 'Existing Razorpay order retrieved.',
+                'order_id' => $orderId,
+                'order_number' => $orderNumber,
+                'razorpay_order_id' => $rzpOrderId,
+                'razorpay_key_id' => $cfg['key_id'],
+                'amount_in_paise' => $amountPaise,
+                'amount' => $totalAmount,
+                'amount_formatted' => '₹' . number_format($totalAmount, 2),
+                'currency' => 'INR',
+                'buyer_name' => $order['buyer_name'] ?? '',
+                'buyer_phone' => $order['buyer_phone'] ?? '',
+                'notes' => [
+                    'order_id' => (string) $orderId,
+                    'order_number' => $orderNumber,
+                    'buyer_name' => (string) ($order['buyer_name'] ?? ''),
+                    'buyer_phone' => (string) ($order['buyer_phone'] ?? ''),
+                ],
+                'already_created' => true,
+            ]
+        ];
+    }
+
     $rzpOrderId = null;
     $rzpOrderPayload = [
         'amount' => $amountPaise,
