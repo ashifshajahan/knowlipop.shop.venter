@@ -1869,6 +1869,24 @@ function requireActiveSellerForMutation(req, res, next) {
   next();
 }
 
+function getOptionalUser(req) {
+  if (req.user) return req.user;
+  const authHeader = req.headers['authorization'] || req.headers['x-authorization'] || req.headers['http_authorization'];
+  if (!authHeader) return null;
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return null;
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return null;
+  }
+}
+
+function optionalAuthForNotifs(req, res, next) {
+  req.user = req.user || getOptionalUser(req);
+  next();
+}
+
 // Middleware: Protect Admin Dashboard UI routes with valid Admin JWT cookie or Bearer token
 async function requireAdminDashboardAuth(req, res, next) {
   const token = extractTokenFromReq(req);
@@ -7789,19 +7807,6 @@ let fallbackOrders = [
 let fallbackNotifications = [];
 let fallbackDeviceTokens = [];
 
-function getOptionalUser(req) {
-  if (req.user) return req.user;
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) return null;
-  const token = authHeader.replace(/^Bearer\s+/i, '');
-  if (!token) return null;
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch (e) {
-    return null;
-  }
-}
-
 async function ensureOrdersTables(p) {
   try {
     await p.query(`
@@ -9447,11 +9452,6 @@ app.get([
   req.query.history = 'true';
   return handleGetSellerOrders(req, res);
 });
-
-const optionalAuthForNotifs = (req, res, next) => {
-  req.user = req.user || getOptionalUser(req);
-  next();
-};
 
 app.get(['/api/seller/notifications', '/api/notifications'], optionalAuthForNotifs, handleGetNotifications);
 app.get(['/api/seller/notifications/unread', '/api/notifications/unread'], optionalAuthForNotifs, handleGetUnreadNotifications);
