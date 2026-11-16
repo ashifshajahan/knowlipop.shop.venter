@@ -108,6 +108,15 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
             $sqliteAdd('users', 'is_online', "is_online INTEGER NOT NULL DEFAULT 0");
             $sqliteAdd('users', 'last_login_at', "last_login_at DATETIME NULL DEFAULT NULL");
             $sqliteAdd('users', 'last_active_at', "last_active_at DATETIME NULL DEFAULT NULL");
+            $sqliteAdd('users', 'bank_name', "bank_name TEXT NULL");
+            $sqliteAdd('users', 'account_number', "account_number TEXT NULL");
+            $sqliteAdd('users', 'bank_account', "bank_account TEXT NULL");
+            $sqliteAdd('users', 'ifsc_code', "ifsc_code TEXT NULL");
+            $sqliteAdd('users', 'account_holder_name', "account_holder_name TEXT NULL");
+            $sqliteAdd('users', 'branch_name', "branch_name TEXT NULL");
+            $sqliteAdd('users', 'upi_id', "upi_id TEXT NULL");
+            $sqliteAdd('users', 'account_type', "account_type TEXT DEFAULT 'savings'");
+            $sqliteAdd('users', 'bank_verified', "bank_verified INTEGER NOT NULL DEFAULT 0");
             $sqliteAdd('orders', 'acknowledged_at', "acknowledged_at DATETIME NULL DEFAULT NULL");
         } else {
             $pdo->exec("
@@ -173,6 +182,15 @@ function ensureNotificationSchemaPhp(PDO $pdo): void
             $mysqlAdd('users', 'is_online', "`is_online` TINYINT(1) NOT NULL DEFAULT 0");
             $mysqlAdd('users', 'last_login_at', "`last_login_at` TIMESTAMP NULL DEFAULT NULL");
             $mysqlAdd('users', 'last_active_at', "`last_active_at` TIMESTAMP NULL DEFAULT NULL");
+            $mysqlAdd('users', 'bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'bank_account', "`bank_account` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'ifsc_code', "`ifsc_code` VARCHAR(30) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_holder_name', "`account_holder_name` VARCHAR(150) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+            $mysqlAdd('users', 'bank_verified', "`bank_verified` TINYINT(1) NOT NULL DEFAULT 0");
             $mysqlAdd('orders', 'acknowledged_at', "`acknowledged_at` TIMESTAMP NULL DEFAULT NULL");
 
             try {

@@ -1682,6 +1682,119 @@ let pool = mysql.createPool({
   keepAliveInitialDelay: 0
 });
 
+let sellerBankAccountsSchemaEnsured = false;
+async function ensureSellerBankAccountsSchema(p) {
+  if (sellerBankAccountsSchemaEnsured || !p) return;
+  try {
+    // 1. Ensure seller_payment_accounts table exists with full schema
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS seller_payment_accounts (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        seller_id BIGINT UNSIGNED NOT NULL,
+        provider VARCHAR(50) NOT NULL DEFAULT 'razorpay',
+        account_reference VARCHAR(255) NOT NULL,
+        account_holder_name VARCHAR(150) NULL DEFAULT NULL,
+        account_number VARCHAR(60) NULL DEFAULT NULL,
+        ifsc_code VARCHAR(30) NULL DEFAULT NULL,
+        bank_name VARCHAR(120) NULL DEFAULT NULL,
+        branch_name VARCHAR(120) NULL DEFAULT NULL,
+        upi_id VARCHAR(120) NULL DEFAULT NULL,
+        account_type VARCHAR(50) NULL DEFAULT 'savings',
+        status VARCHAR(40) NOT NULL DEFAULT 'created',
+        data LONGTEXT NULL DEFAULT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_spa_seller (seller_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    // Ensure all columns exist on seller_payment_accounts
+    const paymentCols = [
+      { name: 'provider', def: "VARCHAR(50) NOT NULL DEFAULT 'razorpay'" },
+      { name: 'account_reference', def: "VARCHAR(255) NOT NULL DEFAULT ''" },
+      { name: 'account_holder_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+      { name: 'account_number', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+      { name: 'ifsc_code', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+      { name: 'bank_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
+      { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+      { name: 'data', def: 'LONGTEXT NULL DEFAULT NULL' }
+    ];
+    for (const col of paymentCols) {
+      try {
+        const [cRows] = await p.query(`SHOW COLUMNS FROM seller_payment_accounts LIKE '${col.name}'`);
+        if (cRows.length === 0) {
+          await p.query(`ALTER TABLE seller_payment_accounts ADD COLUMN ${col.name} ${col.def}`);
+          console.log(`✅ [Vendor DB] Added ${col.name} column to seller_payment_accounts`);
+        }
+      } catch (ce) {}
+    }
+
+    // 2. Ensure seller_bank_accounts table exists (alias/direct table)
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS seller_bank_accounts (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        seller_id BIGINT UNSIGNED NOT NULL,
+        provider VARCHAR(50) NOT NULL DEFAULT 'razorpay',
+        account_reference VARCHAR(255) NOT NULL,
+        account_holder_name VARCHAR(150) NULL DEFAULT NULL,
+        account_number VARCHAR(60) NULL DEFAULT NULL,
+        ifsc_code VARCHAR(30) NULL DEFAULT NULL,
+        bank_name VARCHAR(120) NULL DEFAULT NULL,
+        branch_name VARCHAR(120) NULL DEFAULT NULL,
+        upi_id VARCHAR(120) NULL DEFAULT NULL,
+        account_type VARCHAR(50) NULL DEFAULT 'savings',
+        status VARCHAR(40) NOT NULL DEFAULT 'created',
+        data LONGTEXT NULL DEFAULT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_sba_seller (seller_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    for (const col of paymentCols) {
+      try {
+        const [cRows] = await p.query(`SHOW COLUMNS FROM seller_bank_accounts LIKE '${col.name}'`);
+        if (cRows.length === 0) {
+          await p.query(`ALTER TABLE seller_bank_accounts ADD COLUMN ${col.name} ${col.def}`);
+          console.log(`✅ [Vendor DB] Added ${col.name} column to seller_bank_accounts`);
+        }
+      } catch (ce) {}
+    }
+
+    // 3. Ensure bank account columns exist on the users table!
+    const userBankCols = [
+      { name: 'bank_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'account_number', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+      { name: 'bank_account', def: 'VARCHAR(60) NULL DEFAULT NULL' },
+      { name: 'ifsc_code', def: 'VARCHAR(30) NULL DEFAULT NULL' },
+      { name: 'account_holder_name', def: 'VARCHAR(150) NULL DEFAULT NULL' },
+      { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
+      { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
+      { name: 'bank_verified', def: 'TINYINT(1) NOT NULL DEFAULT 0' }
+    ];
+    for (const col of userBankCols) {
+      try {
+        const [cRows] = await p.query(`SHOW COLUMNS FROM users LIKE '${col.name}'`);
+        if (cRows.length === 0) {
+          await p.query(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`);
+          console.log(`✅ [Vendor DB] Added ${col.name} column to users table`);
+        }
+      } catch (ce) {}
+    }
+
+    sellerBankAccountsSchemaEnsured = true;
+    console.log('✅ [Vendor DB] Ensured seller_payment_accounts, seller_bank_accounts, and seller bank account fields in users table');
+  } catch (err) {
+    console.warn('[Vendor DB] ensureSellerBankAccountsSchema notice:', err.message);
+  }
+}
+
 async function autoMigrateIfEmpty(p) {
   try {
     const [tables] = await p.query('SHOW TABLES');
@@ -1723,14 +1836,15 @@ async function autoMigrateIfEmpty(p) {
       // Already exists or ignore
     }
 
-    // Ensure orders, order_items, GST, and Seller Deletion Management tables exist
+    // Ensure orders, order_items, GST, Seller Bank Accounts, and Seller Deletion Management tables exist
     try {
       await ensureOrdersTables(p);
       await ensureProductPriceColumns(p);
       await ensureGstTables(p);
+      await ensureSellerBankAccountsSchema(p);
       await ensureSellerDeletionSchemaNode(p);
       await ensureNormalizedPhoneSchemaNode(p);
-      console.log('✅ [Vendor DB] Ensured orders, order_items, GST, Seller Deletion tables, normalized_phone index, and product pricing columns exist');
+      console.log('✅ [Vendor DB] Ensured orders, order_items, GST, Seller Bank Accounts, Seller Deletion tables, normalized_phone index, and product pricing columns exist');
     } catch (e) {
       // ignore
     }
@@ -1857,6 +1971,19 @@ function safeSeller(user) {
     deletion_requested_at: user.deletion_requested_at || null,
     deleted_at: user.deleted_at || null
   };
+
+  const accNumStr = user.account_number || user.bank_account || null;
+  const maskedAcc = accNumStr ? (accNumStr.length > 4 ? '••••'.repeat(Math.max(1, Math.floor((accNumStr.length - 4) / 4))) + accNumStr.slice(-4) : accNumStr) : null;
+  data.bank_name = user.bank_name || null;
+  data.account_number = accNumStr;
+  data.account_number_masked = maskedAcc;
+  data.bank_account = accNumStr;
+  data.ifsc_code = user.ifsc_code || null;
+  data.account_holder_name = user.account_holder_name || null;
+  data.branch_name = user.branch_name || null;
+  data.upi_id = user.upi_id || null;
+  data.account_type = user.account_type || 'savings';
+  data.bank_verified = Boolean(user.bank_verified);
 
   if (user.role) {
     data.role = user.role;
@@ -3390,6 +3517,15 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
   const dialCode = phoneParts.dialCode;
   const email = (extractField(body, ['email', 'email_address']) || '').trim();
 
+  // Bank account fields
+  const bankName = extractField(body, ['bank_name', 'bank', 'bankName']);
+  const accountNumber = extractField(body, ['account_number', 'account_num', 'account_no', 'bank_account_number', 'bank_account', 'accountNumber']);
+  const ifscCode = (extractField(body, ['ifsc_code', 'ifsc', 'ifscCode']) || '').toUpperCase().trim();
+  const accountHolderName = extractField(body, ['account_holder_name', 'holder_name', 'beneficiary_name', 'accountHolderName']);
+  const branchName = extractField(body, ['branch_name', 'branch', 'branchName']);
+  const upiId = extractField(body, ['upi_id', 'upi', 'vpa', 'upiId']);
+  const accountType = extractField(body, ['account_type', 'accountType']);
+
   const currentPassword = extractField(body, ['current_password', 'currentPassword', 'old_password', 'oldPassword']);
   const newPassword = extractField(body, ['new_password', 'newPassword', 'password']);
   const confirmPassword = extractConfirmPassword(body, newPassword);
@@ -3524,6 +3660,39 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
     updates.push('email = ?');
     params.push(email.toLowerCase());
   }
+
+  // Update bank details in users table
+  if (bankName !== undefined && bankName !== null) {
+    updates.push('bank_name = ?');
+    params.push(bankName);
+  }
+  if (accountNumber !== undefined && accountNumber !== null) {
+    updates.push('account_number = ?', 'bank_account = ?');
+    params.push(accountNumber, accountNumber);
+  }
+  if (ifscCode) {
+    updates.push('ifsc_code = ?');
+    params.push(ifscCode);
+  }
+  if (accountHolderName !== undefined && accountHolderName !== null) {
+    updates.push('account_holder_name = ?');
+    params.push(accountHolderName);
+  }
+  if (branchName !== undefined && branchName !== null) {
+    updates.push('branch_name = ?');
+    params.push(branchName);
+  }
+  if (upiId !== undefined && upiId !== null) {
+    updates.push('upi_id = ?');
+    params.push(upiId);
+  }
+  if (accountType !== undefined && accountType !== null) {
+    updates.push('account_type = ?');
+    params.push(accountType);
+  }
+  if (accountNumber || bankName || ifscCode) {
+    updates.push('bank_verified = 1');
+  }
   let hashedNewPassword = null;
   if (newPassword) {
     hashedNewPassword = await bcrypt.hash(newPassword, 10);
@@ -3551,6 +3720,57 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       }
       const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
       sellerData = safeSeller(refreshed[0]);
+
+      // Sync bank account to seller_payment_accounts and seller_bank_accounts
+      if (bankName || accountNumber || ifscCode || accountHolderName || upiId) {
+        try {
+          await ensureSellerBankAccountsSchema(pool);
+          const ref = accountNumber || upiId || `acc_${sellerId}`;
+          const bParams = [
+            sellerId,
+            ref,
+            accountHolderName || refreshed[0]?.account_holder_name || null,
+            accountNumber || refreshed[0]?.account_number || null,
+            ifscCode || refreshed[0]?.ifsc_code || null,
+            bankName || refreshed[0]?.bank_name || null,
+            branchName || refreshed[0]?.branch_name || null,
+            upiId || refreshed[0]?.upi_id || null,
+            accountType || refreshed[0]?.account_type || 'savings'
+          ];
+          await pool.query(
+            `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
+             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+             ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
+                                     account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
+                                     account_number = COALESCE(VALUES(account_number), account_number),
+                                     ifsc_code = COALESCE(VALUES(ifsc_code), ifsc_code),
+                                     bank_name = COALESCE(VALUES(bank_name), bank_name),
+                                     branch_name = COALESCE(VALUES(branch_name), branch_name),
+                                     upi_id = COALESCE(VALUES(upi_id), upi_id),
+                                     account_type = VALUES(account_type),
+                                     status = 'created',
+                                     updated_at = NOW()`,
+            bParams
+          );
+          await pool.query(
+            `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
+             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+             ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
+                                     account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
+                                     account_number = COALESCE(VALUES(account_number), account_number),
+                                     ifsc_code = COALESCE(VALUES(ifsc_code), ifsc_code),
+                                     bank_name = COALESCE(VALUES(bank_name), bank_name),
+                                     branch_name = COALESCE(VALUES(branch_name), branch_name),
+                                     upi_id = COALESCE(VALUES(upi_id), upi_id),
+                                     account_type = VALUES(account_type),
+                                     status = 'created',
+                                     updated_at = NOW()`,
+            bParams
+          ).catch(() => {});
+        } catch (bErr) {
+          console.warn('[Bank Sync] Failed syncing to seller_payment_accounts:', bErr.message);
+        }
+      }
 
       // Register FCM / Device Token if present in profile update payload
       const reqFcmToken = (extractField(body, ['fcm_token', 'fcmToken', 'device_token', 'deviceToken', 'token']) || '').trim();
@@ -7811,64 +8031,157 @@ app.delete('/api/products/:id', authenticateToken, requireActiveSellerForMutatio
 
 const fallbackBankAccounts = {};
 
+async function getSellerBankData(sellerId) {
+  let pRow = null;
+  let uRow = null;
+  if (pool) {
+    try {
+      await ensureSellerBankAccountsSchema(pool);
+      const [pRows] = await pool.query('SELECT * FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
+      if (pRows.length > 0) pRow = pRows[0];
+    } catch (e) {}
+    try {
+      const [uRows] = await pool.query('SELECT bank_name, account_number, bank_account, ifsc_code, account_holder_name, branch_name, upi_id, account_type, bank_verified FROM users WHERE id = ? LIMIT 1', [sellerId]);
+      if (uRows.length > 0) uRow = uRows[0];
+    } catch (e) {}
+  }
+
+  const fb = fallbackBankAccounts[sellerId] || null;
+  const effectiveAccNum = (pRow && pRow.account_number) || (uRow && (uRow.account_number || uRow.bank_account)) || (fb && fb.account_number) || null;
+  const effectiveHolder = (pRow && pRow.account_holder_name) || (uRow && uRow.account_holder_name) || (fb && fb.account_holder_name) || null;
+  const effectiveIfsc = (pRow && pRow.ifsc_code) || (uRow && uRow.ifsc_code) || (fb && fb.ifsc_code) || null;
+  const effectiveBank = (pRow && pRow.bank_name) || (uRow && uRow.bank_name) || (fb && fb.bank_name) || null;
+  const effectiveBranch = (pRow && pRow.branch_name) || (uRow && uRow.branch_name) || (fb && fb.branch_name) || null;
+  const effectiveUpi = (pRow && pRow.upi_id) || (uRow && uRow.upi_id) || (fb && fb.upi_id) || null;
+  const effectiveType = (pRow && pRow.account_type) || (uRow && uRow.account_type) || (fb && fb.account_type) || 'savings';
+  const effectiveRef = (pRow && pRow.account_reference) || effectiveAccNum || effectiveUpi || (fb && fb.account_reference) || null;
+
+  const isLinked = Boolean(effectiveAccNum || effectiveUpi || (pRow && pRow.account_reference) || effectiveBank);
+
+  if (!isLinked) {
+    return {
+      success: true,
+      linked: false,
+      status: 'not_linked',
+      verification_status: 'unverified',
+      message: 'No payment account linked yet.'
+    };
+  }
+
+  const accNumStr = String(effectiveAccNum || '');
+  const masked = accNumStr.length > 4 ? '••••'.repeat(Math.max(1, Math.floor((accNumStr.length - 4) / 4))) + accNumStr.slice(-4) : accNumStr;
+
+  const accountData = {
+    id: pRow ? pRow.id : 1,
+    seller_id: sellerId,
+    provider: (pRow && pRow.provider) || 'razorpay',
+    account_reference: effectiveRef,
+    account_holder_name: effectiveHolder,
+    account_number: effectiveAccNum,
+    account_number_masked: masked,
+    bank_account: effectiveAccNum,
+    ifsc_code: effectiveIfsc,
+    bank_name: effectiveBank,
+    branch_name: effectiveBranch,
+    upi_id: effectiveUpi,
+    account_type: effectiveType,
+    status: (pRow && pRow.status) || 'created',
+    verification_status: 'verified',
+    linked: true,
+    created_at: (pRow && pRow.created_at) || new Date().toISOString(),
+    updated_at: (pRow && pRow.updated_at) || new Date().toISOString()
+  };
+
+  return {
+    success: true,
+    linked: true,
+    verification_status: 'verified',
+    account: accountData,
+    bank_account: accountData,
+    data: accountData,
+    ...accountData
+  };
+}
+
 const handleBankOnboarding = async (req, res) => {
   const optUser = req.user || getOptionalUser(req);
   const sellerId = optUser ? Number(optUser.id) : (Number(req.body?.seller_id || req.query?.seller_id) || 1);
 
   if (req.method === 'GET') {
-    try {
-      const [rows] = await pool.query('SELECT * FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
-      if (rows.length === 0) {
-        if (fallbackBankAccounts[sellerId]) {
-          return res.json({ success: true, status: 'created', linked: true, ...fallbackBankAccounts[sellerId] });
-        }
-        return res.json({ success: true, status: 'not_linked', linked: false, message: 'No payment account linked yet.' });
-      }
-      return res.json({ success: true, linked: true, verification_status: 'verified', ...rows[0] });
-    } catch (e) {
-      if (fallbackBankAccounts[sellerId]) {
-        return res.json({ success: true, status: 'created', linked: true, ...fallbackBankAccounts[sellerId] });
-      }
-      return res.json({ success: true, status: 'not_linked', linked: false, message: 'No payment account linked yet.' });
-    }
+    const data = await getSellerBankData(sellerId);
+    return res.json(data);
   }
 
   const body = req.body || {};
-  const account_reference = body.account_reference || body.account_number || body.upi_id || `acc_${Date.now()}`;
-  const account_holder_name = body.account_holder_name || body.holder_name || body.name || null;
-  const account_number = body.account_number || null;
-  const ifsc_code = body.ifsc_code ? String(body.ifsc_code).toUpperCase() : null;
-  const bank_name = body.bank_name || null;
-  const branch_name = body.branch_name || null;
-  const upi_id = body.upi_id || null;
-  const account_type = body.account_type || 'savings';
+  const account_number = extractField(body, ['account_number', 'account_num', 'account_no', 'bank_account_number', 'bank_account', 'accountNumber']) || null;
+  const account_holder_name = extractField(body, ['account_holder_name', 'holder_name', 'beneficiary_name', 'name', 'accountHolderName']) || null;
+  const ifsc_code = (extractField(body, ['ifsc_code', 'ifsc', 'ifscCode']) || '').toUpperCase().trim() || null;
+  const bank_name = extractField(body, ['bank_name', 'bank', 'bankName']) || null;
+  const branch_name = extractField(body, ['branch_name', 'branch', 'branchName']) || null;
+  const upi_id = extractField(body, ['upi_id', 'upi', 'vpa', 'upiId']) || null;
+  const account_type = extractField(body, ['account_type', 'type', 'accountType']) || 'savings';
+  const account_reference = extractField(body, ['account_reference', 'reference', 'ref']) || account_number || upi_id || `acc_${Date.now()}`;
 
-  try {
-    await pool.query(
-      `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
-       VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
-       ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
-                               account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
-                               account_number = COALESCE(VALUES(account_number), account_number),
-                               ifsc_code = COALESCE(VALUES(ifsc_code), ifsc_code),
-                               bank_name = COALESCE(VALUES(bank_name), bank_name),
-                               branch_name = COALESCE(VALUES(branch_name), branch_name),
-                               upi_id = COALESCE(VALUES(upi_id), upi_id),
-                               account_type = VALUES(account_type),
-                               status = 'created',
-                               updated_at = NOW()`,
-      [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type]
-    );
-  } catch (e) {
+  if (pool) {
     try {
+      await ensureSellerBankAccountsSchema(pool);
+
+      // 1. Save to seller_payment_accounts
       await pool.query(
-        `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, status, created_at, updated_at)
-         VALUES (?, 'razorpay', ?, 'created', NOW(), NOW())
-         ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference), status = 'created', updated_at = NOW()`,
-        [sellerId, account_reference]
+        `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
+         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+         ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
+                                 account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
+                                 account_number = COALESCE(VALUES(account_number), account_number),
+                                 ifsc_code = COALESCE(VALUES(ifsc_code), ifsc_code),
+                                 bank_name = COALESCE(VALUES(bank_name), bank_name),
+                                 branch_name = COALESCE(VALUES(branch_name), branch_name),
+                                 upi_id = COALESCE(VALUES(upi_id), upi_id),
+                                 account_type = VALUES(account_type),
+                                 status = 'created',
+                                 updated_at = NOW()`,
+        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type]
       );
-    } catch (e2) {}
+
+      // 2. Save to seller_bank_accounts
+      await pool.query(
+        `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
+         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+         ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
+                                 account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
+                                 account_number = COALESCE(VALUES(account_number), account_number),
+                                 ifsc_code = COALESCE(VALUES(ifsc_code), ifsc_code),
+                                 bank_name = COALESCE(VALUES(bank_name), bank_name),
+                                 branch_name = COALESCE(VALUES(branch_name), branch_name),
+                                 upi_id = COALESCE(VALUES(upi_id), upi_id),
+                                 account_type = VALUES(account_type),
+                                 status = 'created',
+                                 updated_at = NOW()`,
+        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type]
+      ).catch(() => {});
+
+      // 3. Update users table with bank account fields
+      await pool.query(
+        `UPDATE users
+         SET bank_name = COALESCE(?, bank_name),
+             account_number = COALESCE(?, account_number),
+             bank_account = COALESCE(?, bank_account),
+             ifsc_code = COALESCE(?, ifsc_code),
+             account_holder_name = COALESCE(?, account_holder_name),
+             branch_name = COALESCE(?, branch_name),
+             upi_id = COALESCE(?, upi_id),
+             account_type = COALESCE(?, account_type),
+             bank_verified = 1
+         WHERE id = ?`,
+        [bank_name, account_number, account_number, ifsc_code, account_holder_name, branch_name, upi_id, account_type, sellerId]
+      ).catch(() => {});
+    } catch (e) {
+      console.warn('[Bank Onboarding] Error updating bank account in DB:', e.message);
+    }
   }
+
+  const accNumStr = String(account_number || '');
+  const masked = accNumStr.length > 4 ? '••••'.repeat(Math.max(1, Math.floor((accNumStr.length - 4) / 4))) + accNumStr.slice(-4) : accNumStr;
 
   const accountData = {
     seller_id: sellerId,
@@ -7876,6 +8189,8 @@ const handleBankOnboarding = async (req, res) => {
     account_reference,
     account_holder_name,
     account_number,
+    account_number_masked: masked,
+    bank_account: account_number,
     ifsc_code,
     bank_name,
     branch_name,
@@ -7883,6 +8198,7 @@ const handleBankOnboarding = async (req, res) => {
     account_type,
     status: 'created',
     verification_status: 'verified',
+    linked: true,
     updated_at: new Date().toISOString()
   };
 
@@ -7891,34 +8207,47 @@ const handleBankOnboarding = async (req, res) => {
   res.json({
     success: true,
     status: 'success',
+    linked: true,
+    verification_status: 'verified',
     message: 'Bank account reference stored successfully.',
     account: accountData,
     bank_account: accountData,
-    data: accountData
+    data: accountData,
+    ...accountData
   });
 };
 
-app.all(['/api/seller/bank-account/onboarding', '/api/seller/bank-account'], optionalAuthForNotifs, handleBankOnboarding);
-
-app.all('/api/seller/bank-account/status', optionalAuthForNotifs, async (req, res) => {
+const handleBankStatus = async (req, res) => {
   const optUser = req.user || getOptionalUser(req);
   const sellerId = optUser ? Number(optUser.id) : (Number(req.query?.seller_id || req.body?.seller_id) || 1);
-  try {
-    const [rows] = await pool.query('SELECT * FROM seller_payment_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
-    if (rows.length === 0) {
-      if (fallbackBankAccounts[sellerId]) {
-        return res.json({ success: true, linked: true, verification_status: 'verified', ...fallbackBankAccounts[sellerId] });
-      }
-      return res.json({ success: true, status: 'not_linked', linked: false, message: 'No payment account linked yet.' });
-    }
-    res.json({ success: true, linked: true, verification_status: 'verified', ...rows[0] });
-  } catch (err) {
-    if (fallbackBankAccounts[sellerId]) {
-      return res.json({ success: true, linked: true, verification_status: 'verified', ...fallbackBankAccounts[sellerId] });
-    }
-    res.json({ success: true, status: 'verified', provider: 'razorpay', account_reference: 'ACC-9876543210' });
-  }
-});
+  const data = await getSellerBankData(sellerId);
+  return res.json(data);
+};
+
+app.all(
+  [
+    '/api/seller/bank-account/onboarding',
+    '/api/seller/bank-account',
+    '/api/seller/bank',
+    '/api/seller/bank-details',
+    '/api/bank-account',
+    '/api/bank-details',
+    '/api/seller/bank_account'
+  ],
+  optionalAuthForNotifs,
+  handleBankOnboarding
+);
+
+app.all(
+  [
+    '/api/seller/bank-account/status',
+    '/api/seller/bank/status',
+    '/api/seller/bank-status',
+    '/api/bank-status'
+  ],
+  optionalAuthForNotifs,
+  handleBankStatus
+);
 
 app.get('/api/seller/payouts', authenticateToken, async (req, res) => {
   const sellerId = (req.user.role === 'admin' && req.query.seller_id)

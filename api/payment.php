@@ -64,6 +64,26 @@ function ensureSellerPaymentAccountsTablePhp(PDO $pdo): void
             $sqliteAdd('upi_id', 'upi_id TEXT NULL');
             $sqliteAdd('account_type', "account_type TEXT DEFAULT 'savings'");
             $sqliteAdd('data', 'data TEXT NULL');
+
+            // SQLite users table bank columns
+            $sqliteUserAdd = function(string $col, string $def) use ($pdo): void {
+                try {
+                    $cols = $pdo->query("PRAGMA table_info(users)")->fetchAll(PDO::FETCH_ASSOC);
+                    $names = array_map(fn($c) => strtolower((string)$c['name']), $cols);
+                    if (!in_array(strtolower($col), $names, true)) {
+                        $pdo->exec("ALTER TABLE users ADD COLUMN {$def}");
+                    }
+                } catch (Throwable $e) {}
+            };
+            $sqliteUserAdd('bank_name', 'bank_name TEXT NULL');
+            $sqliteUserAdd('account_number', 'account_number TEXT NULL');
+            $sqliteUserAdd('bank_account', 'bank_account TEXT NULL');
+            $sqliteUserAdd('ifsc_code', 'ifsc_code TEXT NULL');
+            $sqliteUserAdd('account_holder_name', 'account_holder_name TEXT NULL');
+            $sqliteUserAdd('branch_name', 'branch_name TEXT NULL');
+            $sqliteUserAdd('upi_id', 'upi_id TEXT NULL');
+            $sqliteUserAdd('account_type', "account_type TEXT DEFAULT 'savings'");
+            $sqliteUserAdd('bank_verified', "bank_verified INTEGER NOT NULL DEFAULT 0");
         } else {
             $pdo->exec("
                 CREATE TABLE IF NOT EXISTS `seller_payment_accounts` (
@@ -85,23 +105,53 @@ function ensureSellerPaymentAccountsTablePhp(PDO $pdo): void
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uniq_spa_seller` (`seller_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE IF NOT EXISTS `seller_bank_accounts` (
+                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `seller_id` BIGINT UNSIGNED NOT NULL,
+                    `provider` VARCHAR(50) NOT NULL DEFAULT 'razorpay',
+                    `account_reference` VARCHAR(255) NOT NULL,
+                    `account_holder_name` VARCHAR(150) NULL DEFAULT NULL,
+                    `account_number` VARCHAR(60) NULL DEFAULT NULL,
+                    `ifsc_code` VARCHAR(30) NULL DEFAULT NULL,
+                    `bank_name` VARCHAR(120) NULL DEFAULT NULL,
+                    `branch_name` VARCHAR(120) NULL DEFAULT NULL,
+                    `upi_id` VARCHAR(120) NULL DEFAULT NULL,
+                    `account_type` VARCHAR(50) NULL DEFAULT 'savings',
+                    `status` VARCHAR(40) NOT NULL DEFAULT 'created',
+                    `data` TEXT NULL DEFAULT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uniq_sba_seller` (`seller_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             ");
-            $mysqlAdd = function(string $col, string $def) use ($pdo): void {
+            $mysqlAdd = function(string $table, string $col, string $def) use ($pdo): void {
                 try {
-                    $chk = $pdo->query("SHOW COLUMNS FROM `seller_payment_accounts` LIKE '{$col}'")->fetchAll();
+                    $chk = $pdo->query("SHOW COLUMNS FROM `{$table}` LIKE '{$col}'")->fetchAll();
                     if (empty($chk)) {
-                        $pdo->exec("ALTER TABLE `seller_payment_accounts` ADD COLUMN {$def}");
+                        $pdo->exec("ALTER TABLE `{$table}` ADD COLUMN {$def}");
                     }
                 } catch (Throwable $e) {}
             };
-            $mysqlAdd('account_holder_name', "`account_holder_name` VARCHAR(150) NULL DEFAULT NULL");
-            $mysqlAdd('account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
-            $mysqlAdd('ifsc_code', "`ifsc_code` VARCHAR(30) NULL DEFAULT NULL");
-            $mysqlAdd('bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
-            $mysqlAdd('branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
-            $mysqlAdd('upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
-            $mysqlAdd('account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
-            $mysqlAdd('data', "`data` TEXT NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'account_holder_name', "`account_holder_name` VARCHAR(150) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'ifsc_code', "`ifsc_code` VARCHAR(30) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_payment_accounts', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+            $mysqlAdd('seller_payment_accounts', 'data', "`data` TEXT NULL DEFAULT NULL");
+
+            $mysqlAdd('users', 'bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'bank_account', "`bank_account` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'ifsc_code', "`ifsc_code` VARCHAR(30) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_holder_name', "`account_holder_name` VARCHAR(150) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('users', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+            $mysqlAdd('users', 'bank_verified', "`bank_verified` TINYINT(1) NOT NULL DEFAULT 0");
         }
         $ensured = true;
     } catch (Throwable $e) {}
@@ -201,6 +251,61 @@ function apiBankOnboarding(PDO $pdo): void
         ]);
     }
 
+    // Sync to seller_bank_accounts table
+    try {
+        $sba = $pdo->prepare("
+            INSERT INTO seller_bank_accounts (
+                seller_id, provider, account_reference, account_holder_name,
+                account_number, ifsc_code, bank_name, branch_name, upi_id, account_type,
+                status, data, created_at, updated_at
+            ) VALUES (
+                :seller_id, 'razorpay', :ref, :holder,
+                :acc_num, :ifsc, :bank, :branch, :upi, :acc_type,
+                'created', :data, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        ");
+        $sba->execute([
+            ':seller_id' => $sellerId,
+            ':ref' => $ref,
+            ':holder' => $holderName ?: null,
+            ':acc_num' => $accNum ?: null,
+            ':ifsc' => $ifsc ?: null,
+            ':bank' => $bankName ?: null,
+            ':branch' => $branchName ?: null,
+            ':upi' => $upiId ?: null,
+            ':acc_type' => $accType,
+            ':data' => $jsonPayload
+        ]);
+    } catch (Throwable $e) {}
+
+    // Sync to users table
+    try {
+        $uUpd = $pdo->prepare("
+            UPDATE users
+            SET bank_name = COALESCE(:bank, bank_name),
+                account_number = COALESCE(:acc_num, account_number),
+                bank_account = COALESCE(:bank_acc, bank_account),
+                ifsc_code = COALESCE(:ifsc, ifsc_code),
+                account_holder_name = COALESCE(:holder, account_holder_name),
+                branch_name = COALESCE(:branch, branch_name),
+                upi_id = COALESCE(:upi, upi_id),
+                account_type = COALESCE(:acc_type, account_type),
+                bank_verified = 1
+            WHERE id = :seller_id
+        ");
+        $uUpd->execute([
+            ':bank' => $bankName ?: null,
+            ':acc_num' => $accNum ?: null,
+            ':bank_acc' => $accNum ?: null,
+            ':ifsc' => $ifsc ?: null,
+            ':holder' => $holderName ?: null,
+            ':branch' => $branchName ?: null,
+            ':upi' => $upiId ?: null,
+            ':acc_type' => $accType,
+            ':seller_id' => $sellerId
+        ]);
+    } catch (Throwable $e) {}
+
     $accNumStr = (string)$accNum;
     $masked = strlen($accNumStr) > 4 ? str_repeat('•', max(0, strlen($accNumStr) - 4)) . substr($accNumStr, -4) : $accNumStr;
 
@@ -257,9 +362,26 @@ function apiBankStatus(PDO $pdo): void
 
     $stmt = $pdo->prepare("SELECT * FROM seller_payment_accounts WHERE seller_id = :seller_id LIMIT 1");
     $stmt->execute([':seller_id' => $sellerId]);
-    $account = $stmt->fetch(PDO::FETCH_ASSOC);
+    $account = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
-    if (!$account) {
+    // Also check users table
+    $uRow = [];
+    try {
+        $uStmt = $pdo->prepare("SELECT bank_name, account_number, bank_account, ifsc_code, account_holder_name, branch_name, upi_id, account_type, bank_verified FROM users WHERE id = :id LIMIT 1");
+        $uStmt->execute([':id' => $sellerId]);
+        $uRow = $uStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {}
+
+    $effAccNum = $account['account_number'] ?? ($uRow['account_number'] ?? ($uRow['bank_account'] ?? null));
+    $effHolder = $account['account_holder_name'] ?? ($uRow['account_holder_name'] ?? null);
+    $effIfsc = $account['ifsc_code'] ?? ($uRow['ifsc_code'] ?? null);
+    $effBank = $account['bank_name'] ?? ($uRow['bank_name'] ?? null);
+    $effBranch = $account['branch_name'] ?? ($uRow['branch_name'] ?? null);
+    $effUpi = $account['upi_id'] ?? ($uRow['upi_id'] ?? null);
+    $effType = $account['account_type'] ?? ($uRow['account_type'] ?? 'savings');
+    $effRef = $account['account_reference'] ?? ($effAccNum ?: ($effUpi ?: null));
+
+    if (empty($account) && empty($effAccNum) && empty($effUpi) && empty($effBank)) {
         jsonResponse([
             'success' => true,
             'status' => 'not_linked',
@@ -271,23 +393,25 @@ function apiBankStatus(PDO $pdo): void
         return;
     }
 
-    $accNumStr = (string)($account['account_number'] ?? '');
+    $accNumStr = (string)($effAccNum ?? '');
     $masked = strlen($accNumStr) > 4 ? str_repeat('•', max(0, strlen($accNumStr) - 4)) . substr($accNumStr, -4) : $accNumStr;
 
     $accountData = [
         'seller_id' => (int)$sellerId,
         'provider' => $account['provider'] ?? 'razorpay',
-        'account_reference' => $account['account_reference'] ?? '',
-        'account_holder_name' => $account['account_holder_name'] ?? null,
-        'account_number' => $account['account_number'] ?? null,
+        'account_reference' => $effRef ?? '',
+        'account_holder_name' => $effHolder,
+        'account_number' => $effAccNum,
         'account_number_masked' => $masked,
-        'ifsc_code' => $account['ifsc_code'] ?? null,
-        'bank_name' => $account['bank_name'] ?? null,
-        'branch_name' => $account['branch_name'] ?? null,
-        'upi_id' => $account['upi_id'] ?? null,
-        'account_type' => $account['account_type'] ?? 'savings',
+        'bank_account' => $effAccNum,
+        'ifsc_code' => $effIfsc,
+        'bank_name' => $effBank,
+        'branch_name' => $effBranch,
+        'upi_id' => $effUpi,
+        'account_type' => $effType,
         'status' => $account['status'] ?? 'created',
         'verification_status' => 'verified',
+        'linked' => true,
         'updated_at' => $account['updated_at'] ?? null,
     ];
 

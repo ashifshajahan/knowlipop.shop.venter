@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS `users` (
   `last_login_at` TIMESTAMP NULL DEFAULT NULL,
   `last_active_at` TIMESTAMP NULL DEFAULT NULL,
   `is_online` TINYINT(1) NOT NULL DEFAULT 0,
+  `bank_name` VARCHAR(120) NULL DEFAULT NULL,
+  `account_number` VARCHAR(60) NULL DEFAULT NULL,
+  `bank_account` VARCHAR(60) NULL DEFAULT NULL,
+  `ifsc_code` VARCHAR(30) NULL DEFAULT NULL,
+  `account_holder_name` VARCHAR(150) NULL DEFAULT NULL,
+  `branch_name` VARCHAR(120) NULL DEFAULT NULL,
+  `upi_id` VARCHAR(120) NULL DEFAULT NULL,
+  `account_type` VARCHAR(50) NULL DEFAULT 'savings',
+  `bank_verified` TINYINT(1) NOT NULL DEFAULT 0,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
@@ -574,6 +583,46 @@ CREATE TABLE IF NOT EXISTS `seller_deletion_audit_logs` (
   INDEX `idx_sdal_del` (`deletion_request_id`),
   INDEX `idx_sdal_seller` (`seller_id`),
   INDEX `idx_sdal_action` (`action`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_payment_accounts` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `provider` VARCHAR(50) NOT NULL DEFAULT 'razorpay',
+  `account_reference` VARCHAR(255) NOT NULL,
+  `account_holder_name` VARCHAR(150) NULL DEFAULT NULL,
+  `account_number` VARCHAR(60) NULL DEFAULT NULL,
+  `ifsc_code` VARCHAR(30) NULL DEFAULT NULL,
+  `bank_name` VARCHAR(120) NULL DEFAULT NULL,
+  `branch_name` VARCHAR(120) NULL DEFAULT NULL,
+  `upi_id` VARCHAR(120) NULL DEFAULT NULL,
+  `account_type` VARCHAR(50) NULL DEFAULT 'savings',
+  `status` VARCHAR(40) NOT NULL DEFAULT 'created',
+  `data` LONGTEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_spa_seller` (`seller_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `seller_bank_accounts` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `seller_id` BIGINT UNSIGNED NOT NULL,
+  `provider` VARCHAR(50) NOT NULL DEFAULT 'razorpay',
+  `account_reference` VARCHAR(255) NOT NULL,
+  `account_holder_name` VARCHAR(150) NULL DEFAULT NULL,
+  `account_number` VARCHAR(60) NULL DEFAULT NULL,
+  `ifsc_code` VARCHAR(30) NULL DEFAULT NULL,
+  `bank_name` VARCHAR(120) NULL DEFAULT NULL,
+  `branch_name` VARCHAR(120) NULL DEFAULT NULL,
+  `upi_id` VARCHAR(120) NULL DEFAULT NULL,
+  `account_type` VARCHAR(50) NULL DEFAULT 'savings',
+  `status` VARCHAR(40) NOT NULL DEFAULT 'created',
+  `data` LONGTEXT NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_sba_seller` (`seller_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

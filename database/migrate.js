@@ -100,6 +100,25 @@ async function runMigration() {
   await ensureColumn('users', 'deleted_at', '`deleted_at` TIMESTAMP NULL DEFAULT NULL AFTER `deletion_requested_at`');
   await ensureColumn('users', 'deleted_by', '`deleted_by` BIGINT UNSIGNED NULL DEFAULT NULL AFTER `deleted_at`');
   await ensureColumn('users', 'token_version', '`token_version` INT NOT NULL DEFAULT 1 AFTER `deleted_by`');
+  await ensureColumn('users', 'bank_name', '`bank_name` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('users', 'account_number', '`account_number` VARCHAR(60) NULL DEFAULT NULL');
+  await ensureColumn('users', 'bank_account', '`bank_account` VARCHAR(60) NULL DEFAULT NULL');
+  await ensureColumn('users', 'ifsc_code', '`ifsc_code` VARCHAR(30) NULL DEFAULT NULL');
+  await ensureColumn('users', 'account_holder_name', '`account_holder_name` VARCHAR(150) NULL DEFAULT NULL');
+  await ensureColumn('users', 'branch_name', '`branch_name` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('users', 'upi_id', '`upi_id` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('users', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+  await ensureColumn('users', 'bank_verified', '`bank_verified` TINYINT(1) NOT NULL DEFAULT 0');
+
+  // Bank account columns for seller_payment_accounts
+  await ensureColumn('seller_payment_accounts', 'account_holder_name', '`account_holder_name` VARCHAR(150) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'account_number', '`account_number` VARCHAR(60) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'ifsc_code', '`ifsc_code` VARCHAR(30) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'bank_name', '`bank_name` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'branch_name', '`branch_name` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'upi_id', '`upi_id` VARCHAR(120) NULL DEFAULT NULL');
+  await ensureColumn('seller_payment_accounts', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+  await ensureColumn('seller_payment_accounts', 'data', '`data` LONGTEXT NULL DEFAULT NULL');
 
   await ensureColumn('orders', 'idempotency_key', '`idempotency_key` VARCHAR(120) NULL DEFAULT NULL AFTER `order_number`');
   try {
