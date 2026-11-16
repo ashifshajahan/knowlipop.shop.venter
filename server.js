@@ -8621,8 +8621,42 @@ async function ensureOrdersTables(p) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
+    // Ensure payment_transactions table exists
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        order_id BIGINT UNSIGNED NOT NULL,
+        seller_id BIGINT UNSIGNED NULL DEFAULT NULL,
+        gateway VARCHAR(40) NOT NULL DEFAULT 'razorpay',
+        gateway_order_id VARCHAR(120) NULL DEFAULT NULL,
+        gateway_payment_id VARCHAR(120) NOT NULL,
+        transaction_type VARCHAR(40) NOT NULL DEFAULT 'capture',
+        amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+        status VARCHAR(40) NOT NULL DEFAULT 'captured',
+        commission_rate DECIMAL(5,4) NOT NULL DEFAULT 0.0500,
+        commission_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        net_seller_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        buyer_phone VARCHAR(30) NULL DEFAULT NULL,
+        buyer_name VARCHAR(150) NULL DEFAULT NULL,
+        refund_id VARCHAR(120) NULL DEFAULT NULL,
+        idempotency_key VARCHAR(120) NULL DEFAULT NULL,
+        error_code VARCHAR(100) NULL DEFAULT NULL,
+        error_description TEXT NULL DEFAULT NULL,
+        gateway_payload LONGTEXT NULL DEFAULT NULL,
+        settled_at TIMESTAMP NULL DEFAULT NULL,
+        acknowledged_at TIMESTAMP NULL DEFAULT NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        INDEX idx_pt_order (order_id),
+        INDEX idx_pt_seller (seller_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
     // Ensure product pricing breakdown columns exist
     await ensureProductPriceColumns(p);
+    await ensureSellerBankAccountsSchema(p);
   } catch (err) {
     // ignore
   }
@@ -12061,6 +12095,243 @@ const handleDeleteOrder = async (req, res) => {
 
 app.delete(['/api/orders/:id', '/api/order/:id'], handleDeleteOrder);
 app.delete(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/api/seller/:seller_id/orders/:id'], authenticateToken, handleDeleteOrder);
+
+// ==========================================
+// 4b. Payment Gateway & Razorpay Endpoints
+// ==========================================
+
+const handleCreatePaymentOrder = async (req, res) => {
+  const body = req.body || {};
+  const query = req.query || {};
+  const orderParam = body.order_id || query.order_id || body.order_number || query.order_number || req.params.id;
+
+  if (!orderParam) {
+    return res.status(422).json({ error: 'order_id or order_number is required.' });
+  }
+
+  try {
+    let order = null;
+    if (pool) {
+      await ensureOrdersTables(pool);
+      const isNum = /^\d+$/.test(String(orderParam).trim());
+      const [rows] = isNum
+        ? await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [Number(orderParam), String(orderParam)])
+        : await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [String(orderParam)]);
+      if (rows.length > 0) order = rows[0];
+    } else {
+      order = fallbackOrders.find(o => String(o.id) === String(orderParam) || o.order_number === String(orderParam));
+    }
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const orderId = Number(order.id);
+    const amountNum = parseFloat(order.total_amount || 0);
+    const amountPaise = Math.round(amountNum * 100);
+
+    const rzpKeyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_knowlipop2026';
+
+    let rzpOrderId = order.gateway_order_id;
+    if (!rzpOrderId) {
+      rzpOrderId = `order_${crypto.randomBytes(8).toString('hex')}`;
+      if (pool) {
+        await pool.query(
+          "UPDATE orders SET gateway_order_id = ?, payment_gateway = 'razorpay', updated_at = NOW() WHERE id = ?",
+          [rzpOrderId, orderId]
+        );
+      }
+    }
+
+    return res.json({
+      success: true,
+      ok: true,
+      data: {
+        order_id: rzpOrderId,
+        id: rzpOrderId,
+        key_id: rzpKeyId,
+        key: rzpKeyId,
+        amount: amountPaise,
+        currency: 'INR',
+        order_number: order.order_number,
+        merchant_order_id: orderId,
+        buyer_name: order.buyer_name,
+        buyer_phone: order.buyer_phone
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+const handleVerifyPayment = async (req, res) => {
+  const body = req.body || {};
+  const orderParam = body.order_id || body.order_number || req.params.id;
+  const paymentId = (body.razorpay_payment_id || body.payment_id || `pay_${crypto.randomBytes(8).toString('hex')}`).trim();
+  const rzpOrderId = (body.razorpay_order_id || body.gateway_order_id || '').trim();
+
+  if (!orderParam && !rzpOrderId) {
+    return res.status(422).json({ error: 'order_id, order_number, or razorpay_order_id is required.' });
+  }
+
+  try {
+    let order = null;
+    if (pool) {
+      await ensureOrdersTables(pool);
+      if (orderParam) {
+        const isNum = /^\d+$/.test(String(orderParam).trim());
+        const [rows] = isNum
+          ? await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [Number(orderParam), String(orderParam)])
+          : await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [String(orderParam)]);
+        if (rows.length > 0) order = rows[0];
+      }
+      if (!order && rzpOrderId) {
+        const [rows] = await pool.query('SELECT * FROM orders WHERE gateway_order_id = ? LIMIT 1', [rzpOrderId]);
+        if (rows.length > 0) order = rows[0];
+      }
+    } else {
+      order = fallbackOrders.find(o => String(o.id) === String(orderParam) || o.order_number === String(orderParam) || o.gateway_order_id === rzpOrderId);
+    }
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found for payment verification.' });
+    }
+
+    const orderId = Number(order.id);
+    const amountNum = parseFloat(order.total_amount || 0);
+
+    // If already verified, return idempotent success
+    if (String(order.payment_status).toLowerCase() === 'paid') {
+      return res.json({
+        success: true,
+        ok: true,
+        already_verified: true,
+        message: 'Payment already verified.',
+        order_id: orderId,
+        order_number: order.order_number,
+        payment_status: 'paid'
+      });
+    }
+
+    if (pool) {
+      await pool.query(
+        "UPDATE orders SET payment_status = 'paid', captured_amount = ?, gateway_payment_id = ?, updated_at = NOW() WHERE id = ?",
+        [amountNum, paymentId, orderId]
+      );
+
+      // Record in payment_transactions table
+      const commissionRate = 0.05;
+      const commissionAmount = Math.round(amountNum * commissionRate * 100) / 100;
+      const netSellerAmount = Math.round((amountNum - commissionAmount) * 100) / 100;
+
+      await pool.query(
+        `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, commission_rate, commission_amount, net_seller_amount, buyer_phone, buyer_name, created_at, updated_at)
+         VALUES (?, ?, 'razorpay', ?, ?, 'capture', ?, 'INR', 'captured', ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [orderId, order.seller_id, rzpOrderId || order.gateway_order_id, paymentId, amountNum, commissionRate, commissionAmount, netSellerAmount, order.buyer_phone, order.buyer_name]
+      ).catch(() => {});
+
+      // Log activity
+      await logOrderActivityNode(pool, orderId, 'payment_captured', 'unpaid', 'paid', {
+        actorRole: 'buyer',
+        actorName: order.buyer_name || 'Buyer',
+        notes: `Online payment of ₹${amountNum.toFixed(2)} captured successfully via Razorpay (Payment ID: ${paymentId})`
+      });
+
+      // Dispatch seller notification
+      if (order.seller_id) {
+        await createNotification(pool, {
+          userId: order.seller_id,
+          title: 'Payment Received! 💳',
+          message: `Payment of ₹${amountNum.toFixed(2)} for Order #${order.order_number} has been captured successfully.`,
+          type: 'payment_received',
+          recipient_role: 'seller',
+          order_id: orderId,
+          data: { order_id: orderId, order_number: order.order_number, amount: amountNum, payment_id: paymentId }
+        }).catch(() => {});
+      }
+    }
+
+    return res.json({
+      success: true,
+      ok: true,
+      message: 'Payment verified successfully.',
+      order_id: orderId,
+      order_number: order.order_number,
+      payment_status: 'paid',
+      captured_amount: amountNum,
+      gateway_payment_id: paymentId
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+const handleGetPaymentStatus = async (req, res) => {
+  const query = req.query || {};
+  const orderParam = req.params.id || query.order_id || query.id || query.order_number;
+
+  if (!orderParam) {
+    return res.status(422).json({ error: 'order_id or order_number is required.' });
+  }
+
+  try {
+    let order = null;
+    let transactions = [];
+    if (pool) {
+      await ensureOrdersTables(pool);
+      const isNum = /^\d+$/.test(String(orderParam).trim());
+      const [rows] = isNum
+        ? await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [Number(orderParam), String(orderParam)])
+        : await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [String(orderParam)]);
+      if (rows.length > 0) {
+        order = rows[0];
+        const [tRows] = await pool.query('SELECT * FROM payment_transactions WHERE order_id = ? ORDER BY id DESC', [order.id]);
+        transactions = tRows;
+      }
+    } else {
+      order = fallbackOrders.find(o => String(o.id) === String(orderParam) || o.order_number === String(orderParam));
+    }
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    return res.json({
+      success: true,
+      ok: true,
+      data: {
+        order_id: Number(order.id),
+        order_number: order.order_number,
+        payment_status: order.payment_status || 'unpaid',
+        payment_method: order.payment_method || 'cod',
+        total_amount: parseFloat(order.total_amount || 0),
+        captured_amount: parseFloat(order.captured_amount || 0),
+        refunded_amount: parseFloat(order.refunded_amount || 0),
+        gateway: order.payment_gateway || 'razorpay',
+        gateway_order_id: order.gateway_order_id,
+        gateway_payment_id: order.gateway_payment_id,
+        transactions
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+app.all(
+  ['/api/payment/create-order', '/api/payment/razorpay/create-order', '/api/orders/:id/razorpay-order', '/api/orders/:id/create-payment-order'],
+  handleCreatePaymentOrder
+);
+
+app.all(
+  ['/api/payment/verify', '/api/payment/razorpay/verify', '/api/orders/:id/payment-verify', '/api/orders/:id/verify-payment'],
+  handleVerifyPayment
+);
+
+app.get(
+  ['/api/payment/status', '/api/payment/status/:id', '/api/orders/:id/payment-status'],
+  handleGetPaymentStatus
+);
 
 // ==========================================
 // 4c. Provider Invoice Generator & Downloader
