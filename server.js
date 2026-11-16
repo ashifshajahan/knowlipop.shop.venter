@@ -174,6 +174,34 @@ function findFirebaseServiceAccount() {
     } catch (e) {}
   }
 
+  // 4. Bundled Base64 Credential Provider (config/firebase_credentials.js or config/firebase-service-account.b64)
+  try {
+    const credProvider = require('./config/firebase_credentials');
+    const bundledCreds = credProvider && typeof credProvider.getServiceAccount === 'function' ? credProvider.getServiceAccount() : null;
+    if (bundledCreds && bundledCreds.private_key && bundledCreds.client_email) {
+      loadedServiceAccountPath = 'Bundled Base64 Credentials (config/firebase_credentials.js)';
+      // Auto-extract JSON to disk so other processes (PHP, CLI, etc.) have it directly available
+      const autoSaveTargets = [
+        path.join(__dirname, 'knowlipop-vendor-firebase-adminsdk.json'),
+        path.join(process.cwd(), 'knowlipop-vendor-firebase-adminsdk.json'),
+        '/home/u999617803/domains/knowlipop.shop/public_html/knowlipop-vendor-firebase-adminsdk.json',
+        '/home/u999617803/domains/knowlipop.shop/knowlipop-vendor-firebase-adminsdk.json'
+      ];
+      for (const target of autoSaveTargets) {
+        try {
+          const targetDir = path.dirname(target);
+          if (fs.existsSync(targetDir) && !fs.existsSync(target)) {
+            fs.writeFileSync(target, JSON.stringify(bundledCreds, null, 2), 'utf8');
+            console.log(`[FIREBASE ADMIN] 💾 Automatically generated ${target} from bundled credentials.`);
+          }
+        } catch (we) {}
+      }
+      return bundledCreds;
+    }
+  } catch (be) {
+    console.warn('[FIREBASE ADMIN] Could not load bundled base64 credentials:', be.message);
+  }
+
   return null;
 }
 

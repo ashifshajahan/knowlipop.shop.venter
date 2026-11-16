@@ -430,6 +430,38 @@ function getFirebaseServiceAccountPhp(): ?array {
         } catch (Throwable $e) {}
     }
 
+    // 4. Bundled Base64 Credential Provider (config/firebase-service-account.b64)
+    $b64Candidates = [
+        __DIR__ . '/../config/firebase-service-account.b64',
+        dirname(__DIR__) . '/config/firebase-service-account.b64',
+        '/home/u999617803/domains/knowlipop.shop/public_html/config/firebase-service-account.b64',
+        '/home/u999617803/domains/knowlipop.shop/config/firebase-service-account.b64'
+    ];
+    foreach ($b64Candidates as $b64Path) {
+        if (file_exists($b64Path)) {
+            $rawB64 = @file_get_contents($b64Path);
+            if ($rawB64) {
+                $decoded = json_decode(base64_decode(trim($rawB64)), true);
+                if (is_array($decoded) && !empty($decoded['client_email']) && !empty($decoded['private_key'])) {
+                    // Auto-write JSON file so future calls don't even need base64 decoding
+                    $writeTargets = [
+                        dirname($b64Path) . '/knowlipop-vendor-firebase-adminsdk.json',
+                        dirname(__DIR__) . '/knowlipop-vendor-firebase-adminsdk.json',
+                        '/home/u999617803/domains/knowlipop.shop/public_html/knowlipop-vendor-firebase-adminsdk.json'
+                    ];
+                    foreach ($writeTargets as $wt) {
+                        if (!file_exists($wt) && is_dir(dirname($wt))) {
+                            @file_put_contents($wt, json_encode($decoded, JSON_PRETTY_PRINT));
+                        }
+                    }
+                    $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = 'Bundled Base64 Credentials (' . $b64Path . ')';
+                    $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
+                    return $decoded;
+                }
+            }
+        }
+    }
+
     $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
     return null;
 }
