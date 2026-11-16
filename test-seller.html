@@ -885,13 +885,14 @@
           </div>
         </div>
 
-        <div style="margin-top: 20px; display: flex; gap: 12px;">
+        <div style="margin-top: 20px; display: flex; gap: 12px; flex-wrap: wrap;">
           <button class="btn btn-primary" onclick="simulateFcmPush()">🚀 Send Test Push Notification</button>
           <button class="btn btn-secondary" onclick="registerDeviceToken()">📱 Register Device Token</button>
+          <button class="btn btn-secondary" onclick="checkFcmDiagnostics()" style="background: #3b82f6; color: #fff;">🔍 Run Diagnostics &amp; Check Tokens</button>
         </div>
 
-        <div id="fcmConsole" style="margin-top: 20px; background: #000; color: #10b981; font-family: var(--font-mono); font-size: 0.8rem; padding: 14px; border-radius: var(--radius-sm); max-height: 180px; overflow-y: auto;">
-          [FCM Console Ready] Firebase Admin SDK active.
+        <div id="fcmConsole" style="margin-top: 20px; background: #000; color: #10b981; font-family: var(--font-mono); font-size: 0.8rem; padding: 14px; border-radius: var(--radius-sm); max-height: 240px; overflow-y: auto;">
+          [FCM Console Ready] Click "Run Diagnostics" to check Firebase credentials and database tokens.
         </div>
       </div>
     </div>
@@ -1296,39 +1297,51 @@
       }
     }
 
-    // FCM Simulation
+    // FCM Simulation & Push Testing
     async function simulateFcmPush() {
       const token = document.getElementById('fcmTokenInput').value.trim();
       const title = document.getElementById('fcmTitleInput').value.trim();
       const body = document.getElementById('fcmBodyInput').value.trim();
       const consoleLog = document.getElementById('fcmConsole');
 
-      consoleLog.innerHTML += `<br>[${new Date().toLocaleTimeString()}] Dispatching FCM via Firebase Admin SDK to token: ${token.slice(0, 18)}...`;
+      consoleLog.innerHTML += `<br>[${new Date().toLocaleTimeString()}] Dispatching FCM Push to token: ${token.slice(0, 18)}...`;
 
       try {
-        const res = await fetch('/api/internal/dispatch-notification?secret=vendor_internal_secret_key_2026', {
+        const res = await fetch('/api/fcm/test-push', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            user_id: currentSellerId,
-            recipient_role: 'seller',
+            token,
+            seller_id: currentSellerId,
             title,
-            message: body,
-            type: 'order_created',
-            data: { order_id: 9999, order_number: 'ORD-9999', total: '1500.00' }
+            body
           })
         });
         const d = await res.json();
-        consoleLog.innerHTML += `<br>[SUCCESS] Response: ${JSON.stringify(d)}`;
-        showToast('🚀 FCM Push simulated successfully!');
+        if (d.status) {
+          consoleLog.innerHTML += `<br><span style="color: #34d399;">[SUCCESS] Push dispatched! Response: ${JSON.stringify(d.fcm_response || d.result || d)}</span>`;
+          showToast('🚀 FCM Push sent successfully!');
+        } else {
+          consoleLog.innerHTML += `<br><span style="color: #f87171;">[FAILED] Error: ${d.message || d.error} (Code: ${d.error_code || 'N/A'})</span>`;
+          if (d.searched_paths) {
+            consoleLog.innerHTML += `<br><span style="color: #fbbf24;">[INFO] Searched ${d.searched_paths.length} locations on server.</span>`;
+          }
+          showToast('FCM send failed: ' + (d.message || d.error));
+        }
       } catch (e) {
-        consoleLog.innerHTML += `<br>[ERROR] ${e.message}`;
+        consoleLog.innerHTML += `<br><span style="color: #f87171;">[NETWORK ERROR] ${e.message}</span>`;
+        showToast('Network error: ' + e.message);
       }
     }
 
     // Register Device Token
     async function registerDeviceToken() {
       const token = document.getElementById('fcmTokenInput').value.trim();
+      const consoleLog = document.getElementById('fcmConsole');
+      if (!token) {
+        showToast('Please enter an FCM device token.');
+        return;
+      }
       try {
         const res = await fetch('/api/seller/fcm-token', {
           method: 'POST',
@@ -1336,9 +1349,57 @@
           body: JSON.stringify({ token, seller_id: currentSellerId })
         });
         const d = await res.json();
-        showToast('📱 Device token registered for offline push notifications.');
+        if (d.success) {
+          consoleLog.innerHTML += `<br><span style="color: #34d399;">[REGISTERED] Device token registered in MySQL for Seller #${currentSellerId}: ${token.slice(0, 18)}...</span>`;
+          showToast('📱 Device token registered for offline push notifications.');
+        } else {
+          consoleLog.innerHTML += `<br><span style="color: #f87171;">[REGISTER FAILED] ${d.message}</span>`;
+          showToast('Failed to register: ' + d.message);
+        }
       } catch (e) {
+        consoleLog.innerHTML += `<br><span style="color: #f87171;">[ERROR] ${e.message}</span>`;
         showToast('Error registering token: ' + e.message);
+      }
+    }
+
+    // Check FCM & Database Diagnostics
+    async function checkFcmDiagnostics() {
+      const consoleLog = document.getElementById('fcmConsole');
+      consoleLog.innerHTML += `<br>[${new Date().toLocaleTimeString()}] Fetching diagnostics from /api/fcm/diagnostics ...`;
+      try {
+        const res = await fetch('/api/fcm/diagnostics');
+        const d = await res.json();
+        consoleLog.innerHTML += `<br><strong>=== FCM & DATABASE DIAGNOSTICS ===</strong>`;
+        consoleLog.innerHTML += `<br>Backend Server: <strong>${d.server}</strong>`;
+        consoleLog.innerHTML += `<br>Firebase Service Account Loaded: <strong style="color: ${d.firebase?.service_account_found ? '#34d399' : '#f87171'}">${d.firebase?.service_account_found ? 'YES (Active)' : 'NO (Missing File)'}</strong>`;
+        if (d.firebase?.loaded_path) {
+          consoleLog.innerHTML += `<br>Credential File Path: <code>${d.firebase.loaded_path}</code>`;
+          consoleLog.innerHTML += `<br>Project ID: <code>${d.firebase.project_id}</code> | Email: <code>${d.firebase.client_email}</code>`;
+        } else {
+          consoleLog.innerHTML += `<br>Searched Locations: ${d.searched_locations_count || 0} candidate paths checked.`;
+        }
+        const devTokens = d.database?.device_tokens || [];
+        consoleLog.innerHTML += `<br>Total Registered Device Tokens: <strong>${devTokens.length}</strong>`;
+        if (devTokens.length > 0) {
+          const sellerTokens = devTokens.filter(t => Number(t.user_id) === Number(currentSellerId));
+          if (sellerTokens.length > 0) {
+            consoleLog.innerHTML += `<br>Active Token for Current Seller #${currentSellerId}: <span style="color: #38bdf8;">${sellerTokens[0].token_preview || sellerTokens[0].token}</span>`;
+            if (sellerTokens[0].token) {
+              document.getElementById('fcmTokenInput').value = sellerTokens[0].token;
+            }
+          } else {
+            consoleLog.innerHTML += `<br><span style="color: #fbbf24;">Current Seller #${currentSellerId} has NO token registered yet! (Using latest token from DB: ${devTokens[0].token_preview})</span>`;
+            if (devTokens[0].token) {
+              document.getElementById('fcmTokenInput').value = devTokens[0].token;
+            }
+          }
+        } else {
+          consoleLog.innerHTML += `<br><span style="color: #fbbf24;">⚠️ Database has 0 registered device tokens. Push notifications cannot be delivered until a phone registers.</span>`;
+        }
+        consoleLog.innerHTML += `<br><em>${d.instructions}</em>`;
+        showToast(d.firebase?.service_account_found ? '✅ Firebase credentials active!' : '⚠️ Firebase credentials missing.');
+      } catch (e) {
+        consoleLog.innerHTML += `<br><span style="color: #f87171;">[ERROR] Failed to fetch diagnostics: ${e.message}</span>`;
       }
     }
 

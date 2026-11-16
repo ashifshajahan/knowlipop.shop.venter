@@ -306,34 +306,131 @@ function getFirebaseServiceAccountPhp(): ?array {
     static $sa = null;
     if ($sa !== null) return $sa;
 
-    $candidates = array_filter([
-        getenv('FIREBASE_SERVICE_ACCOUNT_PATH') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_PATH'] ?? null),
-        __DIR__ . '/../knowlipop-vendor-firebase-adminsdk.json',
-        __DIR__ . '/../config/knowlipop-vendor-firebase-adminsdk.json',
-        __DIR__ . '/../firebase-service-account.json',
-        __DIR__ . '/../config/firebase-service-account.json'
-    ]);
+    $searchedPaths = [];
 
-    foreach ($candidates as $path) {
-        if (file_exists($path) && is_readable($path)) {
-            $content = file_get_contents($path);
-            $parsed = json_decode($content, true);
+    // 1. Check explicit environment paths
+    $envPath = getenv('FIREBASE_SERVICE_ACCOUNT_PATH') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_PATH'] ?? null);
+    if (!empty($envPath)) {
+        $searchedPaths[] = $envPath;
+        if (file_exists($envPath) && is_readable($envPath)) {
+            $parsed = json_decode((string)file_get_contents($envPath), true);
             if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
                 $sa = $parsed;
+                $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $envPath;
+                $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
                 return $sa;
             }
         }
     }
 
+    $googleCreds = getenv('GOOGLE_APPLICATION_CREDENTIALS') ?: ($_ENV['GOOGLE_APPLICATION_CREDENTIALS'] ?? null);
+    if (!empty($googleCreds)) {
+        $searchedPaths[] = $googleCreds;
+        if (file_exists($googleCreds) && is_readable($googleCreds)) {
+            $parsed = json_decode((string)file_get_contents($googleCreds), true);
+            if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
+                $sa = $parsed;
+                $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $googleCreds;
+                $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
+                return $sa;
+            }
+        }
+    }
+
+    // 2. Direct JSON in environment
     $rawEnv = getenv('FIREBASE_SERVICE_ACCOUNT_JSON') ?: ($_ENV['FIREBASE_SERVICE_ACCOUNT_JSON'] ?? null);
     if (!empty($rawEnv)) {
         $parsed = json_decode($rawEnv, true);
         if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
             $sa = $parsed;
+            $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = 'FIREBASE_SERVICE_ACCOUNT_JSON (env)';
+            $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
             return $sa;
         }
     }
 
+    // 3. Search directories (Hostinger structure, public_html, and parent directories)
+    $candidateDirs = [
+        __DIR__,
+        __DIR__ . '/..',
+        __DIR__ . '/../config',
+        __DIR__ . '/config',
+        __DIR__ . '/../..',
+        __DIR__ . '/../../..',
+        __DIR__ . '/../../../..',
+        '/home/u999617803/domains/knowlipop.shop/public_html',
+        '/home/u999617803/domains/knowlipop.shop/public_html/config',
+        '/home/u999617803/domains/knowlipop.shop/public_html/api',
+        '/home/u999617803/domains/knowlipop.shop',
+        '/home/u999617803/domains/knowlipop.shop/config',
+        '/home/u999617803',
+        '/home/u999617803/config',
+        '/home/u999617803/venter_uploads',
+        '/home/u999617803/hbuilds'
+    ];
+
+    $candidateFileNames = [
+        'knowlipop-vendor-firebase-adminsdk.json',
+        'firebase-service-account.json',
+        'serviceAccountKey.json',
+        'firebase-credentials.json',
+        'vendor-app-18b18-firebase-adminsdk.json'
+    ];
+
+    $uniqueDirs = array_unique(array_filter(array_map('realpath', $candidateDirs)));
+
+    foreach ($uniqueDirs as $dir) {
+        if (!is_dir($dir)) continue;
+
+        // Check specific file names
+        foreach ($candidateFileNames as $fn) {
+            $fullPath = $dir . DIRECTORY_SEPARATOR . $fn;
+            if (!in_array($fullPath, $searchedPaths, true)) {
+                $searchedPaths[] = $fullPath;
+            }
+            if (file_exists($fullPath) && is_readable($fullPath)) {
+                $content = @file_get_contents($fullPath);
+                if ($content) {
+                    $parsed = json_decode($content, true);
+                    if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
+                        $sa = $parsed;
+                        $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $fullPath;
+                        $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
+                        return $sa;
+                    }
+                }
+            }
+        }
+
+        // Dynamic directory scan for any matching json
+        try {
+            $files = @scandir($dir) ?: [];
+            foreach ($files as $f) {
+                if (!str_ends_with(strtolower($f), '.json')) continue;
+                $low = strtolower($f);
+                if (str_contains($low, 'adminsdk') || str_contains($low, 'firebase') || str_contains($low, 'vendor-app-18b18') || str_contains($low, 'knowlipop-vendor')) {
+                    $fullPath = $dir . DIRECTORY_SEPARATOR . $f;
+                    if (!in_array($fullPath, $searchedPaths, true)) {
+                        $searchedPaths[] = $fullPath;
+                    }
+                    if (file_exists($fullPath) && is_readable($fullPath)) {
+                        $content = @file_get_contents($fullPath);
+                        if ($content) {
+                            $parsed = json_decode($content, true);
+                            if (!empty($parsed['client_email']) && !empty($parsed['private_key'])) {
+                                $sa = $parsed;
+                                $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] = $fullPath;
+                                $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
+                                return $sa;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {}
+    }
+
+    $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] = $searchedPaths;
     return null;
 }
 
@@ -378,11 +475,33 @@ function getFirebaseAccessTokenPhp(array $sa): ?string {
         'assertion' => $jwt
     ]));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 6);
     curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
 
     $res = curl_exec($ch);
+    $curlErrNo = curl_errno($ch);
+    $curlErrMsg = curl_error($ch);
     curl_close($ch);
+
+    // SSL certificate error 60 fallback (common on shared cPanel/Hostinger)
+    if ($curlErrNo === 60) {
+        error_log("[FCM OAuth2] SSL verification error (errno 60), retrying with SSL_VERIFYPEER disabled...");
+        $ch2 = curl_init('https://oauth2.googleapis.com/token');
+        curl_setopt($ch2, CURLOPT_POST, true);
+        curl_setopt($ch2, CURLOPT_POSTFIELDS, http_build_query([
+            'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'assertion' => $jwt
+        ]));
+        curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch2, CURLOPT_TIMEOUT, 6);
+        curl_setopt($ch2, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+        curl_setopt($ch2, CURLOPT_SSL_VERIFYPEER, false);
+        $res = curl_exec($ch2);
+        curl_close($ch2);
+    } else if ($curlErrNo !== 0) {
+        error_log("[FCM OAuth2] cURL error ({$curlErrNo}): {$curlErrMsg}");
+    }
 
     if ($res) {
         $data = json_decode($res, true);
@@ -390,6 +509,8 @@ function getFirebaseAccessTokenPhp(array $sa): ?string {
             $tokenCache = $data['access_token'];
             $tokenExpiry = $now + (int)($data['expires_in'] ?? 3600);
             return $tokenCache;
+        } else if (!empty($data['error'])) {
+            error_log("[FCM OAuth2] Google Token error: " . ($data['error_description'] ?? $data['error']));
         }
     }
 
@@ -438,10 +559,16 @@ function sendPushNotificationPhp(
 
     $tokens = array_values(array_unique(array_filter($tokens)));
     if (empty($tokens)) {
+        error_log("[FCM PUSH] ⚠️ No registered device tokens for user #" . ($userId ?? 'guest'));
         return ['ok' => true, 'sent' => 0, 'tokens_count' => 0, 'reason' => 'No registered device tokens'];
     }
 
+    error_log("[FCM PUSH] Dispatching push to " . count($tokens) . " device token(s) for user #" . ($userId ?? 'guest') . " ('{$title}')");
+
     $sa = getFirebaseServiceAccountPhp();
+    if (empty($sa)) {
+        error_log("[FCM PUSH] ⚠️ Firebase service account file was not found on server. Checked " . count($GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] ?? []) . " locations.");
+    }
     $accessToken = $sa ? getFirebaseAccessTokenPhp($sa) : null;
     $projectId = $sa['project_id'] ?? (getenv('FIREBASE_PROJECT_ID') ?: 'vendor-app-18b18');
 
@@ -484,25 +611,49 @@ function sendPushNotificationPhp(
             curl_setopt($ch, CURLOPT_POST, true);
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($fcmV1Payload));
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 4);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 6);
             curl_setopt($ch, CURLOPT_HTTPHEADER, [
                 'Authorization: Bearer ' . $accessToken,
                 'Content-Type: application/json'
             ]);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
 
             $rawRes = curl_exec($ch);
+            $curlErrNo = curl_errno($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
 
+            // SSL error 60 retry
+            if ($curlErrNo === 60) {
+                $ch2 = curl_init("https://fcm.googleapis.com/v1/projects/{$projectId}/messages:send");
+                curl_setopt($ch2, CURLOPT_POST, true);
+                curl_setopt($ch2, CURLOPT_POSTFIELDS, json_encode($fcmV1Payload));
+                curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch2, CURLOPT_TIMEOUT, 6);
+                curl_setopt($ch2, CURLOPT_HTTPHEADER, [
+                    'Authorization: Bearer ' . $accessToken,
+                    'Content-Type: application/json'
+                ]);
+                curl_setopt($ch2, CURLOPT_SSL_VERIFYPEER, false);
+                $rawRes = curl_exec($ch2);
+                $httpCode = curl_getinfo($ch2, CURLINFO_HTTP_CODE);
+                curl_close($ch2);
+            }
+
             if ($httpCode === 200) {
                 $sentCount++;
-            } else if ($httpCode === 404 || str_contains((string)$rawRes, 'UNREGISTERED')) {
-                $invalidTokens[] = $token;
+                error_log("[FCM PUSH] ✅ Delivered to token " . substr($token, 0, 14) . "... (HTTP 200)");
+            } else {
+                error_log("[FCM PUSH] ❌ Error (HTTP {$httpCode}) for token " . substr($token, 0, 14) . "... Response: " . substr((string)$rawRes, 0, 180));
+                if ($httpCode === 404 || str_contains((string)$rawRes, 'UNREGISTERED') || str_contains((string)$rawRes, 'NOT_FOUND')) {
+                    $invalidTokens[] = $token;
+                }
             }
         }
 
         // Prune invalid tokens
         foreach ($invalidTokens as $badToken) {
+            error_log("[FCM PUSH] 🧹 Pruning unregistered/invalid token from MySQL: " . substr($badToken, 0, 14) . "...");
             pruneExpiredDeviceTokenPhp($pdo, $badToken);
         }
 

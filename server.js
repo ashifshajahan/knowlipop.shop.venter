@@ -58,57 +58,163 @@ require('dotenv').config();
 const admin = require("firebase-admin");
 
 let serviceAccount = null;
-const candidateServiceAccountPaths = [
-  process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
-  path.join(__dirname, "knowlipop-vendor-firebase-adminsdk.json"),
-  path.join(__dirname, "config", "knowlipop-vendor-firebase-adminsdk.json"),
-  path.join(__dirname, "firebase-service-account.json"),
-  path.join(__dirname, "config", "firebase-service-account.json"),
-  path.join(process.cwd(), "knowlipop-vendor-firebase-adminsdk.json")
-].filter(Boolean);
+let loadedServiceAccountPath = null;
+const searchedServiceAccountPaths = [];
 
-for (const saPath of candidateServiceAccountPaths) {
-  if (fs.existsSync(saPath)) {
-    try {
-      serviceAccount = require(path.resolve(saPath));
-      console.log(`[FIREBASE ADMIN] Found service account file at: ${saPath}`);
-      break;
-    } catch (e) {
-      console.error(`[FIREBASE ADMIN] Error reading service account file at ${saPath}:`, e.message);
+function findFirebaseServiceAccount() {
+  // 1. Direct environment variable paths
+  const envPaths = [
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
+    process.env.GOOGLE_APPLICATION_CREDENTIALS
+  ].filter(Boolean);
+
+  for (const ep of envPaths) {
+    searchedServiceAccountPaths.push(ep);
+    if (fs.existsSync(ep)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(ep, 'utf8'));
+        if (parsed.private_key && parsed.client_email) {
+          loadedServiceAccountPath = path.resolve(ep);
+          return parsed;
+        }
+      } catch (e) {
+        console.warn(`[FIREBASE ADMIN] Failed reading credentials from env path ${ep}:`, e.message);
+      }
     }
   }
+
+  // 2. Inline JSON string from environment
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      if (parsed.private_key && parsed.client_email) {
+        loadedServiceAccountPath = 'FIREBASE_SERVICE_ACCOUNT_JSON (Environment Variable)';
+        return parsed;
+      }
+    } catch (e) {
+      console.warn('[FIREBASE ADMIN] Error parsing FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
+    }
+  }
+
+  // 3. Search directories (including Hostinger root, public_html, and parent directories)
+  const candidateDirs = [
+    __dirname,
+    path.join(__dirname, 'config'),
+    process.cwd(),
+    path.join(process.cwd(), 'config'),
+    path.resolve(__dirname, '..'),
+    path.resolve(__dirname, '../..'),
+    path.resolve(__dirname, '../../..'),
+    path.resolve(__dirname, '../../../..'),
+    path.resolve(__dirname, '../../../../..'),
+    '/home/u999617803/domains/knowlipop.shop/public_html',
+    '/home/u999617803/domains/knowlipop.shop/public_html/config',
+    '/home/u999617803/domains/knowlipop.shop/public_html/api',
+    '/home/u999617803/domains/knowlipop.shop',
+    '/home/u999617803/domains/knowlipop.shop/config',
+    '/home/u999617803',
+    '/home/u999617803/config',
+    '/home/u999617803/venter_uploads',
+    '/home/u999617803/hbuilds'
+  ];
+
+  // Specific preferred file names to test
+  const candidateFileNames = [
+    'knowlipop-vendor-firebase-adminsdk.json',
+    'firebase-service-account.json',
+    'serviceAccountKey.json',
+    'firebase-credentials.json',
+    'vendor-app-18b18-firebase-adminsdk.json'
+  ];
+
+  const uniqueDirs = [...new Set(candidateDirs.map(d => path.resolve(d)).filter(Boolean))];
+
+  for (const dir of uniqueDirs) {
+    if (!fs.existsSync(dir)) continue;
+
+    // Check specific file names first
+    for (const fileName of candidateFileNames) {
+      const fullPath = path.join(dir, fileName);
+      if (!searchedServiceAccountPaths.includes(fullPath)) {
+        searchedServiceAccountPaths.push(fullPath);
+      }
+      if (fs.existsSync(fullPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+          if (parsed.private_key && parsed.client_email) {
+            loadedServiceAccountPath = fullPath;
+            return parsed;
+          }
+        } catch (e) {
+          console.warn(`[FIREBASE ADMIN] Error reading file ${fullPath}:`, e.message);
+        }
+      }
+    }
+
+    // Dynamic scan: look for any JSON file matching firebase / adminsdk / knowlipop / vendor-app
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const lower = file.toLowerCase();
+        if (lower.includes('adminsdk') || lower.includes('firebase') || lower.includes('vendor-app-18b18') || lower.includes('knowlipop-vendor')) {
+          const fullPath = path.join(dir, file);
+          if (!searchedServiceAccountPaths.includes(fullPath)) {
+            searchedServiceAccountPaths.push(fullPath);
+          }
+          try {
+            const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+            if (parsed.private_key && parsed.client_email) {
+              loadedServiceAccountPath = fullPath;
+              return parsed;
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  }
+
+  return null;
 }
 
-if (!serviceAccount && process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    console.log('[FIREBASE ADMIN] Loaded service account from FIREBASE_SERVICE_ACCOUNT_JSON env variable');
-  } catch (e) {
-    console.error('[FIREBASE ADMIN] Error parsing FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
-  }
-}
+serviceAccount = findFirebaseServiceAccount();
 
 let firebaseAdminInitialized = false;
+let firebaseAdminHasCert = false;
+
 try {
   if (serviceAccount) {
     admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
+      credential: admin.credential.cert(serviceAccount),
+      projectId: serviceAccount.project_id || 'vendor-app-18b18'
     });
     firebaseAdminInitialized = true;
-    console.log('[FIREBASE ADMIN] Successfully initialized Firebase Admin SDK with service account');
+    firebaseAdminHasCert = true;
+    console.log(`[FIREBASE ADMIN] ✅ Successfully initialized Firebase Admin SDK with service account from: ${loadedServiceAccountPath}`);
+    console.log(`[FIREBASE ADMIN] Project ID: ${serviceAccount.project_id || 'vendor-app-18b18'} | Client Email: ${serviceAccount.client_email}`);
   } else if (process.env.FIREBASE_PROJECT_ID) {
     admin.initializeApp({
       projectId: process.env.FIREBASE_PROJECT_ID || 'vendor-app-18b18'
     });
     firebaseAdminInitialized = true;
-    console.log('[FIREBASE ADMIN] Initialized Firebase Admin SDK with project ID:', process.env.FIREBASE_PROJECT_ID);
+    firebaseAdminHasCert = false;
+    console.warn('[FIREBASE ADMIN] ⚠️ Initialized Firebase Admin SDK with project ID only (NO private key cert). Push notifications will fail without credentials.');
   } else {
-    admin.initializeApp();
+    admin.initializeApp({
+      projectId: 'vendor-app-18b18'
+    });
     firebaseAdminInitialized = true;
-    console.log('[FIREBASE ADMIN] Initialized Firebase Admin SDK with default credentials');
+    firebaseAdminHasCert = false;
+    console.warn('[FIREBASE ADMIN] ⚠️ Initialized Firebase Admin SDK with fallback project ID vendor-app-18b18 (NO credentials file loaded).');
   }
 } catch (fbInitErr) {
   console.warn('[FIREBASE ADMIN] Notice during Firebase Admin initialization:', fbInitErr.message);
+}
+
+if (!firebaseAdminHasCert) {
+  console.warn('[FIREBASE ADMIN] ⚠️ WARNING: No valid Firebase service account JSON credentials were found.');
+  console.warn(`[FIREBASE ADMIN] Searched ${searchedServiceAccountPaths.length} paths including project roots, Hostinger public_html, and domains folders.`);
+  console.warn('[FIREBASE ADMIN] To enable FCM push notifications, please place knowlipop-vendor-firebase-adminsdk.json into your public_html or project folder.');
 }
 
 // Auto-detect Hostinger production environment
@@ -3110,6 +3216,33 @@ app.post(['/api/login', '/api/auth/login'], async (req, res) => {
     { expiresIn: '30d' }
   );
 
+  // Update online status and timestamps
+  if (dbActive && pool) {
+    try {
+      await pool.query('UPDATE users SET is_online = 1, last_login_at = CURRENT_TIMESTAMP, last_active_at = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
+    } catch (e) {}
+  }
+
+  // Register FCM / Device Token if provided in login payload
+  const loginFcmToken = (body.fcm_token || body.fcmToken || body.device_token || body.deviceToken || body.token || '').trim();
+  if (loginFcmToken && loginFcmToken.length > 10) {
+    const platform = (body.platform || 'android').toLowerCase().trim();
+    if (dbActive && pool) {
+      try {
+        await pool.query('UPDATE users SET fcm_token = ? WHERE id = ?', [loginFcmToken, user.id]);
+        await pool.query(
+          `INSERT INTO device_tokens (user_id, phone, token, platform)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
+          [user.id, user.phone || null, loginFcmToken, platform]
+        );
+        console.log(`[FCM] Registered device token for User #${user.id} on login: ${loginFcmToken.slice(0, 16)}...`);
+      } catch (tokErr) {
+        console.warn(`[FCM] Error storing token on login for User #${user.id}:`, tokErr.message);
+      }
+    }
+  }
+
   return res.json({
     message: 'Login successful.',
     user: safeSeller(user),
@@ -3315,6 +3448,24 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
       }
       const [refreshed] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [sellerId]);
       sellerData = safeSeller(refreshed[0]);
+
+      // Register FCM / Device Token if present in profile update payload
+      const reqFcmToken = (extractField(body, ['fcm_token', 'fcmToken', 'device_token', 'deviceToken', 'token']) || '').trim();
+      if (reqFcmToken && reqFcmToken.length > 10) {
+        const platform = (body.platform || 'android').toLowerCase().trim();
+        try {
+          await pool.query('UPDATE users SET fcm_token = ? WHERE id = ?', [reqFcmToken, sellerId]);
+          await pool.query(
+            `INSERT INTO device_tokens (user_id, phone, token, platform)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
+            [sellerId, phone || refreshed[0]?.phone || null, reqFcmToken, platform]
+          );
+          console.log(`[FCM] Registered token for seller #${sellerId} on profile update: ${reqFcmToken.slice(0, 16)}...`);
+        } catch (tokErr) {
+          console.warn('[FCM] Failed to update token during profile update:', tokErr.message);
+        }
+      }
     } catch (err) {
       if (isDuplicateKeyErrorNode(err)) {
         const msgLower = String(err.message || '').toLowerCase();
@@ -8092,7 +8243,16 @@ async function getOrderActivitiesNode(p, orderId) {
 // Order Push Notification to Seller (Firebase Admin SDK)
 // ========================================================
 async function sendOrderNotificationToSeller(sellerFcmToken, order) {
-  if (!sellerFcmToken) return null;
+  if (!sellerFcmToken) {
+    console.warn(`[FIREBASE PUSH] ⚠️ sendOrderNotificationToSeller: No FCM token provided for order #${order?.order_number || order?.id || 'unknown'}`);
+    return null;
+  }
+
+  if (!firebaseAdminHasCert && !serviceAccount) {
+    console.warn(`[FIREBASE PUSH] ⚠️ Cannot send push notification to seller: Firebase Admin SDK is NOT initialized with valid credentials (serviceAccount was null). Checked ${searchedServiceAccountPaths.length} paths.`);
+    return null;
+  }
+
   const message = {
     token: sellerFcmToken,
     notification: {
@@ -8113,12 +8273,16 @@ async function sendOrderNotificationToSeller(sellerFcmToken, order) {
   };
   try {
     const response = await admin.messaging().send(message);
-    console.log("Successfully sent push notification to seller:", response);
+    console.log(`[FIREBASE PUSH] ✅ Successfully sent push notification to seller (token: ${sellerFcmToken.slice(0, 16)}...):`, response);
     return response;
   } catch (error) {
-    console.error("Error sending push notification:", error.message || error);
+    console.error(`[FIREBASE PUSH] ❌ Error sending push notification to seller:`, error.message || error);
+    if (error.code) {
+      console.error(`[FIREBASE PUSH] Google error code: ${error.code}`);
+    }
     if (error.code === 'messaging/registration-token-not-registered' || error.code === 'messaging/invalid-registration-token') {
       try {
+        console.warn(`[FIREBASE PUSH] 🧹 Pruning expired or unregistered device token from database: ${sellerFcmToken.slice(0, 16)}...`);
         if (pool) {
           await pool.query('DELETE FROM device_tokens WHERE token = ?', [sellerFcmToken]).catch(() => {});
           await pool.query('UPDATE users SET fcm_token = NULL WHERE fcm_token = ?', [sellerFcmToken]).catch(() => {});
@@ -8149,7 +8313,13 @@ async function sendPushNotification({ userId, phone, title, message, data, prior
 
   tokens = [...new Set(tokens.filter(Boolean))];
   if (tokens.length === 0) {
+    console.warn(`[FIREBASE PUSH] ⚠️ No registered device tokens found for target ${userId ? 'User #' + userId : (phone || 'All')}`);
     return { success: true, delivered: 0, reason: 'No registered device tokens' };
+  }
+
+  if (!firebaseAdminHasCert && !serviceAccount) {
+    console.warn(`[FIREBASE PUSH] ⚠️ Firebase Admin SDK lacks service account credentials. Push skipped for ${tokens.length} token(s).`);
+    return { success: false, delivered: 0, reason: 'Firebase credentials not configured' };
   }
 
   // Format data payload: values in Firebase Admin SDK data must all be strings
@@ -8182,11 +8352,11 @@ async function sendPushNotification({ userId, phone, title, message, data, prior
     try {
       const response = await admin.messaging().send(fcmMessage);
       deliveredCount++;
-      console.log(`[FIREBASE ADMIN] Push delivered to token ${token.slice(0, 12)}...:`, response);
+      console.log(`[FIREBASE ADMIN] ✅ Push delivered to token ${token.slice(0, 14)}...:`, response);
     } catch (error) {
-      console.error("[FIREBASE ADMIN] Error sending push notification:", error.message || error);
+      console.error(`[FIREBASE ADMIN] ❌ Error sending push notification to token ${token.slice(0, 14)}...:`, error.message || error);
       if (error.code === 'messaging/registration-token-not-registered' || error.code === 'messaging/invalid-registration-token') {
-        console.log(`[FCM] Pruning expired/invalid device token: ${token}`);
+        console.log(`[FCM] 🧹 Pruning expired/invalid device token: ${token.slice(0, 14)}...`);
         if (pool) {
           await pool.query('DELETE FROM device_tokens WHERE token = ?', [token]).catch(() => {});
           await pool.query('UPDATE users SET fcm_token = NULL WHERE fcm_token = ?', [token]).catch(() => {});
@@ -9359,32 +9529,189 @@ const handleRegisterDeviceToken = async (req, res) => {
   const token = (body.token || body.fcm_token || body.device_token || '').trim();
   const platform = (body.platform || 'android').toLowerCase().trim();
   const phone = body.phone || optUser?.phone || null;
-  const userId = optUser ? optUser.id : (body.user_id ? parseInt(body.user_id, 10) : null);
+  const userId = optUser ? optUser.id : (body.user_id ? parseInt(body.user_id, 10) : (body.seller_id ? parseInt(body.seller_id, 10) : null));
+
+  console.log(`[FCM] Device token registration request: userId=${userId}, phone=${phone}, platform=${platform}, token=${token ? token.slice(0, 16) + '...' : 'EMPTY'}`);
 
   if (!token) {
-    return res.status(422).json({ message: 'Device token is required.' });
+    return res.status(422).json({ success: false, message: 'Device token is required.' });
   }
 
   try {
     await ensureOrdersTables(pool);
-    await pool.query(
-      `INSERT INTO device_tokens (user_id, phone, token, platform)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
-      [userId, phone, token, platform]
-    );
-    if (userId) {
-      await pool.query('UPDATE users SET fcm_token = ? WHERE id = ?', [token, userId]);
+    if (pool) {
+      await pool.query(
+        `INSERT INTO device_tokens (user_id, phone, token, platform)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), phone = VALUES(phone), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
+        [userId, phone, token, platform]
+      );
+      if (userId) {
+        await pool.query('UPDATE users SET fcm_token = ? WHERE id = ?', [token, userId]);
+      }
     }
-    res.json({ success: true, message: 'Device push token registered successfully.' });
+    console.log(`[FCM] ✅ Device token registered in MySQL for user ${userId || 'guest'}: ${token.slice(0, 16)}...`);
+    res.json({ success: true, message: 'Device push token registered successfully.', token, user_id: userId });
   } catch (err) {
+    console.warn(`[FCM] Saving to fallback device tokens list: ${err.message}`);
     const existingIdx = fallbackDeviceTokens.findIndex(d => d.token === token);
     if (existingIdx !== -1) {
       fallbackDeviceTokens[existingIdx] = { user_id: userId, phone, token, platform };
     } else {
       fallbackDeviceTokens.push({ user_id: userId, phone, token, platform });
     }
-    res.json({ success: true, message: 'Device push token registered successfully (fallback mode).' });
+    res.json({ success: true, message: 'Device push token registered successfully (fallback mode).', token, user_id: userId });
+  }
+};
+
+const handleFcmDiagnostics = async (req, res) => {
+  let dbTokens = [];
+  let dbSellers = [];
+  let dbReachable = false;
+  if (pool) {
+    try {
+      const [tRows] = await pool.query(
+        `SELECT dt.id, dt.user_id, dt.phone, dt.token, dt.platform, dt.created_at, dt.updated_at,
+                u.name AS user_name, u.role AS user_role, u.fcm_token AS user_fcm_token, u.is_online
+         FROM device_tokens dt
+         LEFT JOIN users u ON dt.user_id = u.id
+         ORDER BY dt.id DESC LIMIT 25`
+      );
+      dbTokens = tRows;
+      const [sRows] = await pool.query(
+        `SELECT id, name, phone, email, role, fcm_token, is_online, last_login_at
+         FROM users
+         WHERE role = 'seller' OR fcm_token IS NOT NULL
+         ORDER BY id ASC LIMIT 25`
+      );
+      dbSellers = sRows;
+      dbReachable = true;
+    } catch (e) {
+      dbReachable = false;
+    }
+  }
+
+  res.json({
+    status: true,
+    server: 'Node.js (knowlipop.shop)',
+    firebase: {
+      service_account_found: Boolean(serviceAccount),
+      loaded_path: loadedServiceAccountPath,
+      project_id: (serviceAccount && serviceAccount.project_id) || process.env.FIREBASE_PROJECT_ID || 'vendor-app-18b18',
+      client_email: serviceAccount ? serviceAccount.client_email : null,
+      has_private_key: Boolean(serviceAccount && serviceAccount.private_key),
+      initialized_with_cert: firebaseAdminHasCert,
+      admin_sdk_initialized: firebaseAdminInitialized
+    },
+    searched_locations_count: searchedServiceAccountPaths.length,
+    searched_locations_preview: searchedServiceAccountPaths.slice(0, 10),
+    database: {
+      db_connected: dbReachable,
+      total_registered_device_tokens: dbTokens.length,
+      device_tokens: dbTokens.map(d => ({
+        ...d,
+        token_preview: d.token ? `${d.token.slice(0, 14)}...${d.token.slice(-6)}` : null
+      })),
+      sellers: dbSellers.map(s => ({
+        ...s,
+        fcm_token_preview: s.fcm_token ? `${s.fcm_token.slice(0, 14)}...${s.fcm_token.slice(-6)}` : null
+      }))
+    },
+    instructions: serviceAccount
+      ? 'Firebase Admin credentials loaded successfully. Push notifications are operational.'
+      : 'Please upload knowlipop-vendor-firebase-adminsdk.json to /home/u999617803/domains/knowlipop.shop/public_html/ or your project folder.'
+  });
+};
+
+const handleFcmTestPush = async (req, res) => {
+  const body = req.body || {};
+  const query = req.query || {};
+  let targetToken = (body.token || query.token || '').trim();
+  const sellerId = body.seller_id ? parseInt(body.seller_id, 10) : (query.seller_id ? parseInt(query.seller_id, 10) : null);
+  const title = (body.title || query.title || '🛍️ New Order Received!').trim();
+  const pushBody = (body.body || query.body || 'Order #ORD-TEST for ₹999.00 placed by Test Buyer').trim();
+
+  if (!targetToken && sellerId && pool) {
+    try {
+      const [tRows] = await pool.query('SELECT token FROM device_tokens WHERE user_id = ? UNION SELECT fcm_token AS token FROM users WHERE id = ? AND fcm_token IS NOT NULL LIMIT 1', [sellerId, sellerId]);
+      if (tRows.length > 0 && tRows[0].token) {
+        targetToken = tRows[0].token;
+      }
+    } catch (e) {}
+  }
+
+  if (!targetToken && pool) {
+    try {
+      const [tRows] = await pool.query('SELECT token FROM device_tokens ORDER BY id DESC LIMIT 1');
+      if (tRows.length > 0 && tRows[0].token) {
+        targetToken = tRows[0].token;
+      } else {
+        const [uRows] = await pool.query('SELECT fcm_token FROM users WHERE fcm_token IS NOT NULL AND fcm_token != "" LIMIT 1');
+        if (uRows.length > 0 && uRows[0].fcm_token) {
+          targetToken = uRows[0].fcm_token;
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (!targetToken) {
+    return res.status(404).json({
+      status: false,
+      error: 'NO_DEVICE_TOKEN_FOUND',
+      message: 'No device token found in database. Register phone token via Vendor App login or POST /api/seller/fcm-token.',
+      tip: 'You can pass ?token=YOUR_FCM_TOKEN in the query string to test sending directly to your token.'
+    });
+  }
+
+  if (!serviceAccount || !firebaseAdminHasCert) {
+    return res.status(500).json({
+      status: false,
+      error: 'NO_SERVICE_ACCOUNT',
+      message: 'Firebase service account file (knowlipop-vendor-firebase-adminsdk.json) is not loaded.',
+      searched_paths: searchedServiceAccountPaths
+    });
+  }
+
+  const message = {
+    token: targetToken,
+    notification: {
+      title,
+      body: pushBody
+    },
+    data: {
+      order_id: '9999',
+      type: 'new_order'
+    },
+    android: {
+      priority: 'high',
+      notification: {
+        channelId: 'seller_orders_channel',
+        sound: 'default'
+      }
+    }
+  };
+
+  try {
+    const fcmRes = await admin.messaging().send(message);
+    console.log(`[FIREBASE TEST PUSH] ✅ Push sent successfully:`, fcmRes);
+    return res.json({
+      status: true,
+      message: 'Push notification sent to Firebase successfully!',
+      fcm_response: fcmRes,
+      target_token_preview: `${targetToken.slice(0, 16)}...`,
+      seller_id: sellerId
+    });
+  } catch (error) {
+    console.error(`[FIREBASE TEST PUSH] ❌ Error sending test push:`, error.message || error);
+    return res.status(500).json({
+      status: false,
+      error: error.message || String(error),
+      error_code: error.code || 'FIREBASE_SEND_ERROR',
+      target_token_preview: `${targetToken.slice(0, 16)}...`,
+      tip: error.code === 'messaging/registration-token-not-registered'
+        ? 'The device token has expired or is invalid. Open the Flutter app on your phone to obtain a fresh token.'
+        : 'Check Firebase credentials and network connectivity.'
+    });
   }
 };
 
@@ -9462,6 +9789,8 @@ app.delete(['/api/seller/notifications/:id', '/api/notifications/:id'], optional
 app.put(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], optionalAuthForNotifs, handleMarkAllNotificationsRead);
 app.post(['/api/seller/notifications/mark-all-read', '/api/notifications/read-all', '/api/seller/notifications/read-all', '/api/notifications/mark-all-read'], optionalAuthForNotifs, handleMarkAllNotificationsRead);
 app.post(['/api/seller/fcm-token', '/api/fcm-token', '/api/device-token', '/api/notifications/token'], optionalAuthForNotifs, handleRegisterDeviceToken);
+app.get(['/api/fcm/diagnostics', '/api/seller/fcm/diagnostics', '/api/fcm-diagnostics'], handleFcmDiagnostics);
+app.all(['/api/fcm/test-push', '/api/seller/fcm/test-push', '/api/fcm-test'], handleFcmTestPush);
 
 // Internal Notification Dispatch Endpoint for PHP Backend
 app.post('/api/internal/dispatch-notification', express.json(), async (req, res) => {
@@ -9494,15 +9823,22 @@ app.post('/api/internal/dispatch-notification', express.json(), async (req, res)
           const [tRows] = await pool.query('SELECT token FROM device_tokens WHERE user_id = ? UNION SELECT fcm_token AS token FROM users WHERE id = ? AND fcm_token IS NOT NULL', [payload.user_id, payload.user_id]);
           sellerTokens = tRows.map(r => r.token).filter(Boolean);
         }
-        for (const sTok of sellerTokens) {
-          sendOrderNotificationToSeller(sTok, {
-            id: payload.order_id || (payload.data && payload.data.order_id) || 0,
-            order_number: (payload.data && payload.data.order_number) || (payload.order_id ? '#' + payload.order_id : 'New'),
-            total_amount: (payload.data && (payload.data.total || payload.data.subtotal)) || '0.00',
-            buyer_name: (payload.data && payload.data.buyer_name) || payload.buyer_name || 'Customer'
-          }).catch(() => {});
+        if (sellerTokens.length === 0) {
+          console.warn(`[FIREBASE PUSH] ⚠️ Internal dispatch: No registered tokens found in DB for Seller #${payload.user_id}`);
+        } else {
+          console.log(`[FIREBASE PUSH] Internal dispatch: Found ${sellerTokens.length} token(s) for Seller #${payload.user_id}. Sending push notifications...`);
+          for (const sTok of sellerTokens) {
+            sendOrderNotificationToSeller(sTok, {
+              id: payload.order_id || (payload.data && payload.data.order_id) || 0,
+              order_number: (payload.data && payload.data.order_number) || (payload.order_id ? '#' + payload.order_id : 'New'),
+              total_amount: (payload.data && (payload.data.total || payload.data.subtotal)) || '0.00',
+              buyer_name: (payload.data && payload.data.buyer_name) || payload.buyer_name || 'Customer'
+            }).catch(e => console.error('[FIREBASE PUSH] Internal dispatch send error:', e.message));
+          }
         }
-      } catch (fcmErr) {}
+      } catch (fcmErr) {
+        console.error('[FIREBASE PUSH] Exception during internal dispatch push:', fcmErr.message);
+      }
     }
 
     if (payload.id && !fallbackNotifications.some(n => n.id === payload.id)) {
@@ -10340,9 +10676,13 @@ const handleCreateOrder = async (req, res) => {
                 'SELECT token FROM device_tokens WHERE user_id = ? UNION SELECT fcm_token AS token FROM users WHERE id = ? AND fcm_token IS NOT NULL',
                 [sid, sid]
               );
-              for (const tokRow of tokens) {
-                if (tokRow && tokRow.token) {
-                  await sendOrderNotificationToSeller(tokRow.token, {
+              const validTokens = (tokens || []).map(r => r && r.token).filter(Boolean);
+              if (validTokens.length === 0) {
+                console.warn(`[FIREBASE PUSH] ⚠️ Seller #${sid} has NO device tokens or fcm_token registered in the database! (Offline push cannot be sent until seller registers a device token).`);
+              } else {
+                console.log(`[FIREBASE PUSH] Found ${validTokens.length} token(s) for Seller #${sid}. Dispatching push notification for Order #${orderNumber}...`);
+                for (const tok of validTokens) {
+                  await sendOrderNotificationToSeller(tok, {
                     id: newOrderId,
                     order_number: orderNumber,
                     total_amount: sSubtotal.toFixed(2),
@@ -10350,7 +10690,9 @@ const handleCreateOrder = async (req, res) => {
                   });
                 }
               }
-            } catch (fcmErr) {}
+            } catch (fcmErr) {
+              console.error(`[FIREBASE PUSH] Exception sending order push notifications for Seller #${sid}:`, fcmErr.message || fcmErr);
+            }
           }
           await createNotification(pool, {
             userId: body.buyer_id || null,

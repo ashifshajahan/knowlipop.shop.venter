@@ -576,6 +576,137 @@ if ($requestUri === '/api/seller/fcm-token' || $requestUri === '/api/fcm-token' 
     }
 }
 
+// FCM Diagnostics Endpoint
+if ($requestUri === '/api/fcm/diagnostics' || $requestUri === '/api/seller/fcm/diagnostics' || $requestUri === '/api/fcm-diagnostics') {
+    require_once __DIR__ . '/helpers/notification.php';
+    ensureNotificationSchemaPhp($pdo);
+
+    $sa = getFirebaseServiceAccountPhp();
+    $loadedPath = $GLOBALS['FCM_SERVICE_ACCOUNT_LOADED_PATH'] ?? null;
+    $searchedPaths = $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] ?? [];
+
+    $accessToken = $sa ? getFirebaseAccessTokenPhp($sa) : null;
+
+    $deviceTokens = [];
+    try {
+        $tokensStmt = $pdo->query("
+            SELECT dt.id, dt.user_id, dt.phone, dt.token, dt.platform, dt.created_at, dt.updated_at,
+                   u.name AS user_name, u.role AS user_role, u.fcm_token AS user_fcm_token, u.is_online
+            FROM device_tokens dt
+            LEFT JOIN users u ON dt.user_id = u.id
+            ORDER BY dt.id DESC LIMIT 25
+        ");
+        $deviceTokens = $tokensStmt ? $tokensStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+    } catch (Throwable $e) {}
+
+    $sellers = [];
+    try {
+        $sellersStmt = $pdo->query("
+            SELECT id, name, phone, email, role, fcm_token, is_online, last_login_at
+            FROM users
+            WHERE role = 'seller' OR fcm_token IS NOT NULL
+            ORDER BY id ASC LIMIT 25
+        ");
+        $sellers = $sellersStmt ? $sellersStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+    } catch (Throwable $e) {}
+
+    jsonResponse([
+        'status' => true,
+        'server' => 'PHP (knowlipop.shop)',
+        'firebase' => [
+            'service_account_found' => !empty($sa),
+            'loaded_path' => $loadedPath,
+            'project_id' => $sa['project_id'] ?? (getenv('FIREBASE_PROJECT_ID') ?: 'vendor-app-18b18'),
+            'client_email' => $sa['client_email'] ?? null,
+            'has_private_key' => !empty($sa['private_key']),
+            'oauth2_access_token_ready' => !empty($accessToken),
+            'ssl_curl_supported' => function_exists('curl_init') && function_exists('openssl_sign'),
+        ],
+        'searched_locations_count' => count($searchedPaths),
+        'searched_locations_preview' => array_slice($searchedPaths, 0, 10),
+        'database' => [
+            'total_registered_device_tokens' => count($deviceTokens),
+            'device_tokens' => array_map(function($d) {
+                $tok = $d['token'] ?? '';
+                $d['token_preview'] = strlen($tok) > 16 ? (substr($tok, 0, 14) . '...' . substr($tok, -6)) : $tok;
+                return $d;
+            }, $deviceTokens),
+            'sellers' => array_map(function($s) {
+                $tok = $s['fcm_token'] ?? '';
+                $s['fcm_token_preview'] = strlen($tok) > 16 ? (substr($tok, 0, 14) . '...' . substr($tok, -6)) : $tok;
+                return $s;
+            }, $sellers),
+        ],
+        'instructions' => !empty($sa)
+            ? 'Firebase Admin credentials loaded successfully. Push notifications are operational.'
+            : 'Please upload knowlipop-vendor-firebase-adminsdk.json to /home/u999617803/domains/knowlipop.shop/public_html/ or your project folder.'
+    ]);
+}
+
+// FCM Test Push Endpoint
+if ($requestUri === '/api/fcm/test-push' || $requestUri === '/api/seller/fcm/test-push' || $requestUri === '/api/fcm-test') {
+    require_once __DIR__ . '/helpers/notification.php';
+    ensureNotificationSchemaPhp($pdo);
+
+    $input = getJsonInput();
+    $targetToken = trim((string)($input['token'] ?? ($_GET['token'] ?? '')));
+    $sellerId = !empty($input['seller_id']) ? (int)$input['seller_id'] : (!empty($_GET['seller_id']) ? (int)$_GET['seller_id'] : null);
+    $title = (string)($input['title'] ?? ($_GET['title'] ?? '🛍️ New Order Received!'));
+    $body = (string)($input['body'] ?? ($_GET['body'] ?? 'Order #ORD-TEST for ₹999.00 placed by Test Buyer'));
+
+    if (empty($targetToken) && $sellerId) {
+        $st = $pdo->prepare("SELECT token FROM device_tokens WHERE user_id = :uid UNION SELECT fcm_token FROM users WHERE id = :uid AND fcm_token IS NOT NULL LIMIT 1");
+        $st->execute([':uid' => $sellerId]);
+        $targetToken = (string)$st->fetchColumn();
+    }
+
+    if (empty($targetToken)) {
+        // Pick first available token
+        $st = $pdo->query("SELECT token FROM device_tokens ORDER BY id DESC LIMIT 1");
+        $targetToken = (string)($st ? $st->fetchColumn() : '');
+        if (empty($targetToken)) {
+            $uSt = $pdo->query("SELECT fcm_token FROM users WHERE fcm_token IS NOT NULL AND fcm_token != '' LIMIT 1");
+            $targetToken = (string)($uSt ? $uSt->fetchColumn() : '');
+        }
+    }
+
+    if (empty($targetToken)) {
+        jsonResponse([
+            'status' => false,
+            'error' => 'NO_DEVICE_TOKEN_FOUND',
+            'message' => 'No device token found in database. Please register your phone token via Vendor App login or POST /api/seller/fcm-token.',
+            'tip' => 'You can pass ?token=YOUR_FCM_TOKEN in the URL query string to test sending directly to your token.'
+        ], 404);
+    }
+
+    $sa = getFirebaseServiceAccountPhp();
+    if (empty($sa)) {
+        jsonResponse([
+            'status' => false,
+            'error' => 'NO_SERVICE_ACCOUNT',
+            'message' => 'Firebase service account file (knowlipop-vendor-firebase-adminsdk.json) not found on server.',
+            'searched_paths' => $GLOBALS['FCM_SERVICE_ACCOUNT_SEARCHED_PATHS'] ?? []
+        ], 500);
+    }
+
+    $res = sendPushNotificationPhp(
+        $pdo,
+        $sellerId,
+        null,
+        $title,
+        $body,
+        ['order_id' => '9999', 'type' => 'new_order', 'screen' => 'seller_order_details']
+    );
+
+    jsonResponse([
+        'status' => true,
+        'message' => 'Push test dispatched.',
+        'target_token' => substr($targetToken, 0, 16) . '...',
+        'seller_id' => $sellerId,
+        'result' => $res
+    ]);
+}
+
 // Seller Orders History: /api/seller/orders/history or /api/sellers/orders/history
 if ($requestUri === '/api/seller/orders/history' || $requestUri === '/api/sellers/orders/history') {
     if ($method === 'GET') {
