@@ -1677,37 +1677,76 @@ async function autoMigrateIfEmpty(p) {
 
 // Probe database candidates on startup
 (async function probeDatabase() {
-  for (const c of candidateConfigs) {
-    try {
-      const conn = await mysql.createConnection({
-        host: dbHost,
-        port: parseInt(process.env.DB_PORT || '3306', 10),
-        user: c.user,
-        password: c.password,
-        database: c.database,
-        connectTimeout: 3000
-      });
-      await conn.query('SELECT 1');
-      await conn.end();
+  const hostCandidates = [...new Set([dbHost, 'localhost', '127.0.0.1'].filter(Boolean))];
+  const socketCandidates = ['/var/run/mysqld/mysqld.sock', '/tmp/mysql.sock'];
 
-      console.log(`✅ [Vendor DB] Connected to Hostinger DB: ${c.database} (user: ${c.user})`);
-      dbAvailable = true;
-      activeConfig = c;
-      pool = mysql.createPool({
-        host: dbHost,
-        port: parseInt(process.env.DB_PORT || '3306', 10),
-        user: c.user,
-        password: c.password,
-        database: c.database,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        multipleStatements: true
-      });
-      await autoMigrateIfEmpty(pool);
-      return;
-    } catch (e) {
-      // try next candidate
+  for (const c of candidateConfigs) {
+    for (const h of hostCandidates) {
+      try {
+        const conn = await mysql.createConnection({
+          host: h,
+          port: parseInt(process.env.DB_PORT || '3306', 10),
+          user: c.user,
+          password: c.password,
+          database: c.database,
+          connectTimeout: 3000
+        });
+        await conn.query('SELECT 1');
+        await conn.end();
+
+        console.log(`✅ [Vendor DB] Connected to Hostinger DB: ${c.database} (user: ${c.user}, host: ${h})`);
+        dbAvailable = true;
+        activeConfig = c;
+        pool = mysql.createPool({
+          host: h,
+          port: parseInt(process.env.DB_PORT || '3306', 10),
+          user: c.user,
+          password: c.password,
+          database: c.database,
+          waitForConnections: true,
+          connectionLimit: 10,
+          queueLimit: 0,
+          multipleStatements: true
+        });
+        await autoMigrateIfEmpty(pool);
+        return;
+      } catch (e) {
+        // try next host
+      }
+    }
+
+    // Try socket candidates if on Linux
+    if (process.platform === 'linux') {
+      for (const sock of socketCandidates) {
+        if (!fs.existsSync(sock)) continue;
+        try {
+          const conn = await mysql.createConnection({
+            socketPath: sock,
+            user: c.user,
+            password: c.password,
+            database: c.database,
+            connectTimeout: 3000
+          });
+          await conn.query('SELECT 1');
+          await conn.end();
+
+          console.log(`✅ [Vendor DB] Connected to Hostinger DB via socket: ${sock} (db: ${c.database})`);
+          dbAvailable = true;
+          activeConfig = c;
+          pool = mysql.createPool({
+            socketPath: sock,
+            user: c.user,
+            password: c.password,
+            database: c.database,
+            waitForConnections: true,
+            connectionLimit: 10,
+            queueLimit: 0,
+            multipleStatements: true
+          });
+          await autoMigrateIfEmpty(pool);
+          return;
+        } catch (e) {}
+      }
     }
   }
   dbAvailable = false;
@@ -9568,6 +9607,7 @@ const handleFcmDiagnostics = async (req, res) => {
   let dbTokens = [];
   let dbSellers = [];
   let dbReachable = false;
+  let dbError = null;
   if (pool) {
     try {
       const [tRows] = await pool.query(
@@ -9588,6 +9628,7 @@ const handleFcmDiagnostics = async (req, res) => {
       dbReachable = true;
     } catch (e) {
       dbReachable = false;
+      dbError = e.message;
     }
   }
 
@@ -9607,6 +9648,7 @@ const handleFcmDiagnostics = async (req, res) => {
     searched_locations_preview: searchedServiceAccountPaths.slice(0, 10),
     database: {
       db_connected: dbReachable,
+      db_error: dbError,
       total_registered_device_tokens: dbTokens.length,
       device_tokens: dbTokens.map(d => ({
         ...d,
