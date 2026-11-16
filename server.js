@@ -1721,6 +1721,7 @@ async function ensureSellerBankAccountsSchema(p) {
       { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
       { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
       { name: 'status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
+      { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'created'" },
       { name: 'data', def: 'LONGTEXT NULL DEFAULT NULL' }
     ];
     for (const col of paymentCols) {
@@ -1748,6 +1749,7 @@ async function ensureSellerBankAccountsSchema(p) {
         upi_id VARCHAR(120) NULL DEFAULT NULL,
         account_type VARCHAR(50) NULL DEFAULT 'savings',
         status VARCHAR(40) NOT NULL DEFAULT 'created',
+        payment_status VARCHAR(40) NOT NULL DEFAULT 'created',
         data LONGTEXT NULL DEFAULT NULL,
         created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1776,7 +1778,8 @@ async function ensureSellerBankAccountsSchema(p) {
       { name: 'branch_name', def: 'VARCHAR(120) NULL DEFAULT NULL' },
       { name: 'upi_id', def: 'VARCHAR(120) NULL DEFAULT NULL' },
       { name: 'account_type', def: "VARCHAR(50) NULL DEFAULT 'savings'" },
-      { name: 'bank_verified', def: 'TINYINT(1) NOT NULL DEFAULT 0' }
+      { name: 'bank_verified', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+      { name: 'payment_status', def: "VARCHAR(40) NOT NULL DEFAULT 'pending'" }
     ];
     for (const col of userBankCols) {
       try {
@@ -1788,8 +1791,50 @@ async function ensureSellerBankAccountsSchema(p) {
       } catch (ce) {}
     }
 
+    // 4. Backfill payment_status from status if empty on both tables
+    try {
+      await p.query("UPDATE seller_payment_accounts SET payment_status = status WHERE payment_status IS NULL OR payment_status = ''");
+      await p.query("UPDATE seller_bank_accounts SET payment_status = status WHERE payment_status IS NULL OR payment_status = ''");
+    } catch (e) {}
+
+    // 5. Bidirectional sync between seller_payment_accounts and seller_bank_accounts
+    try {
+      await p.query(`
+        INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+        SELECT seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, COALESCE(payment_status, status, 'created'), created_at, updated_at
+        FROM seller_payment_accounts
+        ON DUPLICATE KEY UPDATE
+          account_reference = VALUES(account_reference),
+          account_holder_name = COALESCE(VALUES(account_holder_name), seller_bank_accounts.account_holder_name),
+          account_number = COALESCE(VALUES(account_number), seller_bank_accounts.account_number),
+          ifsc_code = COALESCE(VALUES(ifsc_code), seller_bank_accounts.ifsc_code),
+          bank_name = COALESCE(VALUES(bank_name), seller_bank_accounts.bank_name),
+          branch_name = COALESCE(VALUES(branch_name), seller_bank_accounts.branch_name),
+          upi_id = COALESCE(VALUES(upi_id), seller_bank_accounts.upi_id),
+          account_type = VALUES(account_type),
+          status = VALUES(status),
+          payment_status = VALUES(payment_status)
+      `);
+      await p.query(`
+        INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+        SELECT seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, COALESCE(payment_status, status, 'created'), created_at, updated_at
+        FROM seller_bank_accounts
+        ON DUPLICATE KEY UPDATE
+          account_reference = VALUES(account_reference),
+          account_holder_name = COALESCE(VALUES(account_holder_name), seller_payment_accounts.account_holder_name),
+          account_number = COALESCE(VALUES(account_number), seller_payment_accounts.account_number),
+          ifsc_code = COALESCE(VALUES(ifsc_code), seller_payment_accounts.ifsc_code),
+          bank_name = COALESCE(VALUES(bank_name), seller_payment_accounts.bank_name),
+          branch_name = COALESCE(VALUES(branch_name), seller_payment_accounts.branch_name),
+          upi_id = COALESCE(VALUES(upi_id), seller_payment_accounts.upi_id),
+          account_type = VALUES(account_type),
+          status = VALUES(status),
+          payment_status = VALUES(payment_status)
+      `);
+    } catch (syncErr) {}
+
     sellerBankAccountsSchemaEnsured = true;
-    console.log('✅ [Vendor DB] Ensured seller_payment_accounts, seller_bank_accounts, and seller bank account fields in users table');
+    console.log('✅ [Vendor DB] Ensured seller_payment_accounts, seller_bank_accounts, payment_status field, and 1:1 parity');
   } catch (err) {
     console.warn('[Vendor DB] ensureSellerBankAccountsSchema notice:', err.message);
   }
@@ -1984,6 +2029,8 @@ function safeSeller(user) {
   data.upi_id = user.upi_id || null;
   data.account_type = user.account_type || 'savings';
   data.bank_verified = Boolean(user.bank_verified);
+  data.payment_status = user.payment_status || (user.bank_verified ? 'verified' : 'created');
+  data.status = user.account_status || 'ACTIVE';
 
   if (user.role) {
     data.role = user.role;
@@ -3738,8 +3785,8 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
             accountType || refreshed[0]?.account_type || 'savings'
           ];
           await pool.query(
-            `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
-             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+            `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', 'created', NOW(), NOW())
              ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
                                      account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
                                      account_number = COALESCE(VALUES(account_number), account_number),
@@ -3748,13 +3795,14 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
                                      branch_name = COALESCE(VALUES(branch_name), branch_name),
                                      upi_id = COALESCE(VALUES(upi_id), upi_id),
                                      account_type = VALUES(account_type),
-                                     status = 'created',
+                                     status = VALUES(status),
+                                     payment_status = VALUES(payment_status),
                                      updated_at = NOW()`,
             bParams
           );
           await pool.query(
-            `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
-             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+            `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+             VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', 'created', NOW(), NOW())
              ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
                                      account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
                                      account_number = COALESCE(VALUES(account_number), account_number),
@@ -3763,10 +3811,12 @@ async function handleSellerProfileUpdate(req, res, targetSellerId = null) {
                                      branch_name = COALESCE(VALUES(branch_name), branch_name),
                                      upi_id = COALESCE(VALUES(upi_id), upi_id),
                                      account_type = VALUES(account_type),
-                                     status = 'created',
+                                     status = VALUES(status),
+                                     payment_status = VALUES(payment_status),
                                      updated_at = NOW()`,
             bParams
           ).catch(() => {});
+          await pool.query('UPDATE users SET payment_status = "created" WHERE id = ?', [sellerId]).catch(() => {});
         } catch (bErr) {
           console.warn('[Bank Sync] Failed syncing to seller_payment_accounts:', bErr.message);
         }
@@ -8033,6 +8083,7 @@ const fallbackBankAccounts = {};
 
 async function getSellerBankData(sellerId) {
   let pRow = null;
+  let bRow = null;
   let uRow = null;
   if (pool) {
     try {
@@ -8041,28 +8092,35 @@ async function getSellerBankData(sellerId) {
       if (pRows.length > 0) pRow = pRows[0];
     } catch (e) {}
     try {
-      const [uRows] = await pool.query('SELECT bank_name, account_number, bank_account, ifsc_code, account_holder_name, branch_name, upi_id, account_type, bank_verified FROM users WHERE id = ? LIMIT 1', [sellerId]);
+      const [bRows] = await pool.query('SELECT * FROM seller_bank_accounts WHERE seller_id = ? LIMIT 1', [sellerId]);
+      if (bRows.length > 0) bRow = bRows[0];
+    } catch (e) {}
+    try {
+      const [uRows] = await pool.query('SELECT bank_name, account_number, bank_account, ifsc_code, account_holder_name, branch_name, upi_id, account_type, bank_verified, payment_status FROM users WHERE id = ? LIMIT 1', [sellerId]);
       if (uRows.length > 0) uRow = uRows[0];
     } catch (e) {}
   }
 
   const fb = fallbackBankAccounts[sellerId] || null;
-  const effectiveAccNum = (pRow && pRow.account_number) || (uRow && (uRow.account_number || uRow.bank_account)) || (fb && fb.account_number) || null;
-  const effectiveHolder = (pRow && pRow.account_holder_name) || (uRow && uRow.account_holder_name) || (fb && fb.account_holder_name) || null;
-  const effectiveIfsc = (pRow && pRow.ifsc_code) || (uRow && uRow.ifsc_code) || (fb && fb.ifsc_code) || null;
-  const effectiveBank = (pRow && pRow.bank_name) || (uRow && uRow.bank_name) || (fb && fb.bank_name) || null;
-  const effectiveBranch = (pRow && pRow.branch_name) || (uRow && uRow.branch_name) || (fb && fb.branch_name) || null;
-  const effectiveUpi = (pRow && pRow.upi_id) || (uRow && uRow.upi_id) || (fb && fb.upi_id) || null;
-  const effectiveType = (pRow && pRow.account_type) || (uRow && uRow.account_type) || (fb && fb.account_type) || 'savings';
-  const effectiveRef = (pRow && pRow.account_reference) || effectiveAccNum || effectiveUpi || (fb && fb.account_reference) || null;
+  const effectiveAccNum = (pRow && pRow.account_number) || (bRow && bRow.account_number) || (uRow && (uRow.account_number || uRow.bank_account)) || (fb && fb.account_number) || null;
+  const effectiveHolder = (pRow && pRow.account_holder_name) || (bRow && bRow.account_holder_name) || (uRow && uRow.account_holder_name) || (fb && fb.account_holder_name) || null;
+  const effectiveIfsc = (pRow && pRow.ifsc_code) || (bRow && bRow.ifsc_code) || (uRow && uRow.ifsc_code) || (fb && fb.ifsc_code) || null;
+  const effectiveBank = (pRow && pRow.bank_name) || (bRow && bRow.bank_name) || (uRow && uRow.bank_name) || (fb && fb.bank_name) || null;
+  const effectiveBranch = (pRow && pRow.branch_name) || (bRow && bRow.branch_name) || (uRow && uRow.branch_name) || (fb && fb.branch_name) || null;
+  const effectiveUpi = (pRow && pRow.upi_id) || (bRow && bRow.upi_id) || (uRow && uRow.upi_id) || (fb && fb.upi_id) || null;
+  const effectiveType = (pRow && pRow.account_type) || (bRow && bRow.account_type) || (uRow && uRow.account_type) || (fb && fb.account_type) || 'savings';
+  const effectiveRef = (pRow && pRow.account_reference) || (bRow && bRow.account_reference) || effectiveAccNum || effectiveUpi || (fb && fb.account_reference) || null;
+  const effectiveStatus = (pRow && (pRow.status || pRow.payment_status)) || (bRow && (bRow.status || bRow.payment_status)) || 'created';
+  const effectivePaymentStatus = (pRow && (pRow.payment_status || pRow.status)) || (bRow && (bRow.payment_status || bRow.status)) || (uRow && uRow.payment_status) || effectiveStatus;
 
-  const isLinked = Boolean(effectiveAccNum || effectiveUpi || (pRow && pRow.account_reference) || effectiveBank);
+  const isLinked = Boolean(effectiveAccNum || effectiveUpi || (pRow && pRow.account_reference) || (bRow && bRow.account_reference) || effectiveBank);
 
   if (!isLinked) {
     return {
       success: true,
       linked: false,
       status: 'not_linked',
+      payment_status: 'unpaid',
       verification_status: 'unverified',
       message: 'No payment account linked yet.'
     };
@@ -8072,9 +8130,9 @@ async function getSellerBankData(sellerId) {
   const masked = accNumStr.length > 4 ? '••••'.repeat(Math.max(1, Math.floor((accNumStr.length - 4) / 4))) + accNumStr.slice(-4) : accNumStr;
 
   const accountData = {
-    id: pRow ? pRow.id : 1,
+    id: (pRow && pRow.id) || (bRow && bRow.id) || 1,
     seller_id: sellerId,
-    provider: (pRow && pRow.provider) || 'razorpay',
+    provider: (pRow && pRow.provider) || (bRow && bRow.provider) || 'razorpay',
     account_reference: effectiveRef,
     account_holder_name: effectiveHolder,
     account_number: effectiveAccNum,
@@ -8085,19 +8143,23 @@ async function getSellerBankData(sellerId) {
     branch_name: effectiveBranch,
     upi_id: effectiveUpi,
     account_type: effectiveType,
-    status: (pRow && pRow.status) || 'created',
-    verification_status: 'verified',
+    status: effectiveStatus,
+    payment_status: effectivePaymentStatus,
+    verification_status: effectiveStatus === 'verified' || (uRow && uRow.bank_verified) ? 'verified' : 'unverified',
     linked: true,
-    created_at: (pRow && pRow.created_at) || new Date().toISOString(),
-    updated_at: (pRow && pRow.updated_at) || new Date().toISOString()
+    created_at: (pRow && pRow.created_at) || (bRow && bRow.created_at) || new Date().toISOString(),
+    updated_at: (pRow && pRow.updated_at) || (bRow && bRow.updated_at) || new Date().toISOString()
   };
 
   return {
     success: true,
     linked: true,
-    verification_status: 'verified',
+    status: effectiveStatus,
+    payment_status: effectivePaymentStatus,
+    verification_status: accountData.verification_status,
     account: accountData,
     bank_account: accountData,
+    payment_account: accountData,
     data: accountData,
     ...accountData
   };
@@ -8121,6 +8183,7 @@ const handleBankOnboarding = async (req, res) => {
   const upi_id = extractField(body, ['upi_id', 'upi', 'vpa', 'upiId']) || null;
   const account_type = extractField(body, ['account_type', 'type', 'accountType']) || 'savings';
   const account_reference = extractField(body, ['account_reference', 'reference', 'ref']) || account_number || upi_id || `acc_${Date.now()}`;
+  const account_status = extractField(body, ['status', 'payment_status', 'account_status']) || 'created';
 
   if (pool) {
     try {
@@ -8128,8 +8191,8 @@ const handleBankOnboarding = async (req, res) => {
 
       // 1. Save to seller_payment_accounts
       await pool.query(
-        `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
-         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+        `INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
          ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
                                  account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
                                  account_number = COALESCE(VALUES(account_number), account_number),
@@ -8138,15 +8201,16 @@ const handleBankOnboarding = async (req, res) => {
                                  branch_name = COALESCE(VALUES(branch_name), branch_name),
                                  upi_id = COALESCE(VALUES(upi_id), upi_id),
                                  account_type = VALUES(account_type),
-                                 status = 'created',
+                                 status = VALUES(status),
+                                 payment_status = VALUES(payment_status),
                                  updated_at = NOW()`,
-        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type]
+        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, account_status, account_status]
       );
 
       // 2. Save to seller_bank_accounts
       await pool.query(
-        `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, created_at, updated_at)
-         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, 'created', NOW(), NOW())
+        `INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+         VALUES (?, 'razorpay', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
          ON DUPLICATE KEY UPDATE account_reference = VALUES(account_reference),
                                  account_holder_name = COALESCE(VALUES(account_holder_name), account_holder_name),
                                  account_number = COALESCE(VALUES(account_number), account_number),
@@ -8155,9 +8219,10 @@ const handleBankOnboarding = async (req, res) => {
                                  branch_name = COALESCE(VALUES(branch_name), branch_name),
                                  upi_id = COALESCE(VALUES(upi_id), upi_id),
                                  account_type = VALUES(account_type),
-                                 status = 'created',
+                                 status = VALUES(status),
+                                 payment_status = VALUES(payment_status),
                                  updated_at = NOW()`,
-        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type]
+        [sellerId, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, account_status, account_status]
       ).catch(() => {});
 
       // 3. Update users table with bank account fields
@@ -8171,9 +8236,10 @@ const handleBankOnboarding = async (req, res) => {
              branch_name = COALESCE(?, branch_name),
              upi_id = COALESCE(?, upi_id),
              account_type = COALESCE(?, account_type),
-             bank_verified = 1
+             bank_verified = 1,
+             payment_status = ?
          WHERE id = ?`,
-        [bank_name, account_number, account_number, ifsc_code, account_holder_name, branch_name, upi_id, account_type, sellerId]
+        [bank_name, account_number, account_number, ifsc_code, account_holder_name, branch_name, upi_id, account_type, account_status, sellerId]
       ).catch(() => {});
     } catch (e) {
       console.warn('[Bank Onboarding] Error updating bank account in DB:', e.message);
@@ -8196,7 +8262,8 @@ const handleBankOnboarding = async (req, res) => {
     branch_name,
     upi_id,
     account_type,
-    status: 'created',
+    status: account_status,
+    payment_status: account_status,
     verification_status: 'verified',
     linked: true,
     updated_at: new Date().toISOString()
@@ -8207,11 +8274,13 @@ const handleBankOnboarding = async (req, res) => {
   res.json({
     success: true,
     status: 'success',
+    payment_status: account_status,
     linked: true,
     verification_status: 'verified',
     message: 'Bank account reference stored successfully.',
     account: accountData,
     bank_account: accountData,
+    payment_account: accountData,
     data: accountData,
     ...accountData
   });
@@ -8224,6 +8293,88 @@ const handleBankStatus = async (req, res) => {
   return res.json(data);
 };
 
+const handleBankAccountDiagnostics = async (req, res) => {
+  let paymentCols = [];
+  let bankCols = [];
+  let orderCols = [];
+  let ptCols = [];
+  let userCols = [];
+  let paymentRowCount = 0;
+  let bankRowCount = 0;
+  let samplePaymentRow = null;
+  let sampleBankRow = null;
+
+  if (pool) {
+    try {
+      await ensureSellerBankAccountsSchema(pool);
+      await ensureOrdersTables(pool);
+
+      const [pCols] = await pool.query('SHOW COLUMNS FROM seller_payment_accounts');
+      paymentCols = pCols.map(c => ({ field: c.Field, type: c.Type }));
+
+      const [bCols] = await pool.query('SHOW COLUMNS FROM seller_bank_accounts');
+      bankCols = bCols.map(c => ({ field: c.Field, type: c.Type }));
+
+      const [oCols] = await pool.query('SHOW COLUMNS FROM orders');
+      orderCols = oCols.map(c => ({ field: c.Field, type: c.Type }));
+
+      const [ptC] = await pool.query('SHOW COLUMNS FROM payment_transactions');
+      ptCols = ptC.map(c => ({ field: c.Field, type: c.Type }));
+
+      const [uC] = await pool.query('SHOW COLUMNS FROM users');
+      userCols = uC.map(c => ({ field: c.Field, type: c.Type }));
+
+      const [pRows] = await pool.query('SELECT * FROM seller_payment_accounts ORDER BY id DESC LIMIT 5');
+      paymentRowCount = pRows.length;
+      samplePaymentRow = pRows[0] || null;
+
+      const [bRows] = await pool.query('SELECT * FROM seller_bank_accounts ORDER BY id DESC LIMIT 5');
+      bankRowCount = bRows.length;
+      sampleBankRow = bRows[0] || null;
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  const pNames = paymentCols.map(c => c.field);
+  const bNames = bankCols.map(c => c.field);
+  const identicalSchema = pNames.length === bNames.length && pNames.every(name => bNames.includes(name));
+
+  res.json({
+    success: true,
+    are_tables_same: identicalSchema,
+    explanation: 'seller_payment_accounts and seller_bank_accounts share the exact same schema, same columns, and are bidirectionally synced.',
+    tables: {
+      seller_payment_accounts: {
+        total_columns: paymentCols.length,
+        has_payment_status: pNames.includes('payment_status'),
+        has_status: pNames.includes('status'),
+        columns: pNames,
+        sample: samplePaymentRow
+      },
+      seller_bank_accounts: {
+        total_columns: bankCols.length,
+        has_payment_status: bNames.includes('payment_status'),
+        has_status: bNames.includes('status'),
+        columns: bNames,
+        sample: sampleBankRow
+      },
+      orders: {
+        has_payment_status: orderCols.map(c => c.field).includes('payment_status'),
+        has_payment_method: orderCols.map(c => c.field).includes('payment_method')
+      },
+      payment_transactions: {
+        has_payment_status: ptCols.map(c => c.field).includes('payment_status'),
+        has_status: ptCols.map(c => c.field).includes('status')
+      },
+      users: {
+        has_payment_status: userCols.map(c => c.field).includes('payment_status'),
+        has_bank_verified: userCols.map(c => c.field).includes('bank_verified')
+      }
+    }
+  });
+};
+
 app.all(
   [
     '/api/seller/bank-account/onboarding',
@@ -8232,7 +8383,12 @@ app.all(
     '/api/seller/bank-details',
     '/api/bank-account',
     '/api/bank-details',
-    '/api/seller/bank_account'
+    '/api/seller/bank_account',
+    '/api/seller/payment-account/onboarding',
+    '/api/seller/payment-account',
+    '/api/seller/payment_account',
+    '/api/seller/payment-details',
+    '/api/payment-account'
   ],
   optionalAuthForNotifs,
   handleBankOnboarding
@@ -8243,10 +8399,24 @@ app.all(
     '/api/seller/bank-account/status',
     '/api/seller/bank/status',
     '/api/seller/bank-status',
-    '/api/bank-status'
+    '/api/bank-status',
+    '/api/seller/payment-account/status',
+    '/api/seller/payment/status',
+    '/api/seller/payment-status',
+    '/api/payment-account/status'
   ],
   optionalAuthForNotifs,
   handleBankStatus
+);
+
+app.get(
+  [
+    '/api/seller/bank-account/diagnostics',
+    '/api/seller/payment-account/diagnostics',
+    '/api/bank-account/diagnostics',
+    '/api/payment-account/diagnostics'
+  ],
+  handleBankAccountDiagnostics
 );
 
 app.get('/api/seller/payouts', authenticateToken, async (req, res) => {
@@ -8600,6 +8770,58 @@ async function ensureOrdersTables(p) {
       if (cols.length === 0) await p.query('ALTER TABLE orders ADD COLUMN tracking_number VARCHAR(100) NULL DEFAULT NULL');
     } catch (e) {}
 
+    // Explicitly guarantee all payment fields exist on orders table
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "payment_status"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN payment_status VARCHAR(40) NOT NULL DEFAULT "unpaid" AFTER order_status');
+        console.log('✅ [Vendor DB] Added payment_status column to orders table');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "payment_method"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN payment_method VARCHAR(40) NOT NULL DEFAULT "cod" AFTER order_status');
+        console.log('✅ [Vendor DB] Added payment_method column to orders table');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "payment_gateway"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN payment_gateway VARCHAR(40) NULL DEFAULT NULL AFTER notes');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "gateway_order_id"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN gateway_order_id VARCHAR(120) NULL DEFAULT NULL AFTER payment_gateway');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "gateway_payment_id"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN gateway_payment_id VARCHAR(120) NULL DEFAULT NULL AFTER gateway_order_id');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "captured_amount"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN captured_amount DECIMAL(10,2) NULL DEFAULT NULL AFTER gateway_payment_id');
+      }
+    } catch (e) {}
+
+    try {
+      const [cols] = await p.query('SHOW COLUMNS FROM orders LIKE "refunded_amount"');
+      if (cols.length === 0) {
+        await p.query('ALTER TABLE orders ADD COLUMN refunded_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER captured_amount');
+      }
+    } catch (e) {}
+
     await p.query(`
       CREATE TABLE IF NOT EXISTS order_activities (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -8653,6 +8875,13 @@ async function ensureOrdersTables(p) {
         INDEX idx_pt_seller (seller_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    try {
+      const [ptCols] = await p.query('SHOW COLUMNS FROM payment_transactions LIKE "payment_status"');
+      if (ptCols.length === 0) {
+        await p.query('ALTER TABLE payment_transactions ADD COLUMN payment_status VARCHAR(40) NOT NULL DEFAULT "captured" AFTER status');
+      }
+    } catch (e) {}
 
     // Ensure product pricing breakdown columns exist
     await ensureProductPriceColumns(p);

@@ -141,7 +141,18 @@ function ensureSellerPaymentAccountsTablePhp(PDO $pdo): void
             $mysqlAdd('seller_payment_accounts', 'branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
             $mysqlAdd('seller_payment_accounts', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
             $mysqlAdd('seller_payment_accounts', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+            $mysqlAdd('seller_payment_accounts', 'payment_status', "`payment_status` VARCHAR(40) NOT NULL DEFAULT 'created'");
             $mysqlAdd('seller_payment_accounts', 'data', "`data` TEXT NULL DEFAULT NULL");
+
+            $mysqlAdd('seller_bank_accounts', 'account_holder_name', "`account_holder_name` VARCHAR(150) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'ifsc_code', "`ifsc_code` VARCHAR(30) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'branch_name', "`branch_name` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
+            $mysqlAdd('seller_bank_accounts', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
+            $mysqlAdd('seller_bank_accounts', 'payment_status', "`payment_status` VARCHAR(40) NOT NULL DEFAULT 'created'");
+            $mysqlAdd('seller_bank_accounts', 'data', "`data` TEXT NULL DEFAULT NULL");
 
             $mysqlAdd('users', 'bank_name', "`bank_name` VARCHAR(120) NULL DEFAULT NULL");
             $mysqlAdd('users', 'account_number', "`account_number` VARCHAR(60) NULL DEFAULT NULL");
@@ -152,6 +163,49 @@ function ensureSellerPaymentAccountsTablePhp(PDO $pdo): void
             $mysqlAdd('users', 'upi_id', "`upi_id` VARCHAR(120) NULL DEFAULT NULL");
             $mysqlAdd('users', 'account_type', "`account_type` VARCHAR(50) NULL DEFAULT 'savings'");
             $mysqlAdd('users', 'bank_verified', "`bank_verified` TINYINT(1) NOT NULL DEFAULT 0");
+            $mysqlAdd('users', 'payment_status', "`payment_status` VARCHAR(40) NOT NULL DEFAULT 'pending'");
+
+            // Backfill payment_status from status if empty
+            try {
+                $pdo->exec("UPDATE seller_payment_accounts SET payment_status = status WHERE payment_status IS NULL OR payment_status = ''");
+                $pdo->exec("UPDATE seller_bank_accounts SET payment_status = status WHERE payment_status IS NULL OR payment_status = ''");
+            } catch (Throwable $e) {}
+
+            // Bidirectional sync
+            try {
+                $pdo->exec("
+                    INSERT INTO seller_bank_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+                    SELECT seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, COALESCE(payment_status, status, 'created'), created_at, updated_at
+                    FROM seller_payment_accounts
+                    ON DUPLICATE KEY UPDATE
+                        account_reference = VALUES(account_reference),
+                        account_holder_name = COALESCE(VALUES(account_holder_name), seller_bank_accounts.account_holder_name),
+                        account_number = COALESCE(VALUES(account_number), seller_bank_accounts.account_number),
+                        ifsc_code = COALESCE(VALUES(ifsc_code), seller_bank_accounts.ifsc_code),
+                        bank_name = COALESCE(VALUES(bank_name), seller_bank_accounts.bank_name),
+                        branch_name = COALESCE(VALUES(branch_name), seller_bank_accounts.branch_name),
+                        upi_id = COALESCE(VALUES(upi_id), seller_bank_accounts.upi_id),
+                        account_type = VALUES(account_type),
+                        status = VALUES(status),
+                        payment_status = VALUES(payment_status)
+                ");
+                $pdo->exec("
+                    INSERT INTO seller_payment_accounts (seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, payment_status, created_at, updated_at)
+                    SELECT seller_id, provider, account_reference, account_holder_name, account_number, ifsc_code, bank_name, branch_name, upi_id, account_type, status, COALESCE(payment_status, status, 'created'), created_at, updated_at
+                    FROM seller_bank_accounts
+                    ON DUPLICATE KEY UPDATE
+                        account_reference = VALUES(account_reference),
+                        account_holder_name = COALESCE(VALUES(account_holder_name), seller_payment_accounts.account_holder_name),
+                        account_number = COALESCE(VALUES(account_number), seller_payment_accounts.account_number),
+                        ifsc_code = COALESCE(VALUES(ifsc_code), seller_payment_accounts.ifsc_code),
+                        bank_name = COALESCE(VALUES(bank_name), seller_payment_accounts.bank_name),
+                        branch_name = COALESCE(VALUES(branch_name), seller_payment_accounts.branch_name),
+                        upi_id = COALESCE(VALUES(upi_id), seller_payment_accounts.upi_id),
+                        account_type = VALUES(account_type),
+                        status = VALUES(status),
+                        payment_status = VALUES(payment_status)
+                ");
+            } catch (Throwable $e) {}
         }
         $ensured = true;
     } catch (Throwable $e) {}
