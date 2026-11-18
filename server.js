@@ -11635,59 +11635,44 @@ const handleCreateOrder = async (req, res) => {
         await conn.commit();
         conn.release();
 
-        // Dispatch Notifications to Sellers and Buyer
+        // Dispatch Notifications to Sellers and Buyer (single non-duplicate push via createNotification)
         try {
           for (const sid of distinctSellers) {
             const sItems = processedItems.filter(i => i.seller_id === sid);
             const sSubtotal = sItems.reduce((acc, c) => acc + c.subtotal, 0);
             await createNotification(pool, {
               userId: sid,
+              recipient_role: 'seller',
+              order_id: newOrderId,
               title: 'New Order Received! 🛍️',
               message: `Order #${orderNumber} has been placed with ${sItems.length} item(s) totaling ₹${sSubtotal.toFixed(2)}.`,
               type: 'order_created',
+              dedup_key: `order_created_seller_${newOrderId}_${sid}`,
+              action_url: `/seller/orders/${newOrderId}`,
               data: {
                 order_id: newOrderId,
                 order_number: orderNumber,
                 items_count: sItems.length,
                 subtotal: sSubtotal,
-                buyer_name: buyerName || 'Customer'
+                buyer_name: buyerName || 'Customer',
+                type: 'new_order'
               }
             });
-
-            // Send push notification directly via Firebase Admin sendOrderNotificationToSeller
-            try {
-              const [tokens] = await pool.query(
-                'SELECT token FROM device_tokens WHERE user_id = ? UNION SELECT fcm_token AS token FROM users WHERE id = ? AND fcm_token IS NOT NULL',
-                [sid, sid]
-              );
-              const validTokens = (tokens || []).map(r => r && r.token).filter(Boolean);
-              if (validTokens.length === 0) {
-                console.warn(`[FIREBASE PUSH] ⚠️ Seller #${sid} has NO device tokens or fcm_token registered in the database! (Offline push cannot be sent until seller registers a device token).`);
-              } else {
-                console.log(`[FIREBASE PUSH] Found ${validTokens.length} token(s) for Seller #${sid}. Dispatching push notification for Order #${orderNumber}...`);
-                for (const tok of validTokens) {
-                  await sendOrderNotificationToSeller(tok, {
-                    id: newOrderId,
-                    order_number: orderNumber,
-                    total_amount: sSubtotal.toFixed(2),
-                    buyer_name: buyerName || 'Customer'
-                  });
-                }
-              }
-            } catch (fcmErr) {
-              console.error(`[FIREBASE PUSH] Exception sending order push notifications for Seller #${sid}:`, fcmErr.message || fcmErr);
-            }
           }
           await createNotification(pool, {
             userId: body.buyer_id || null,
             phone: buyerPhone,
+            recipient_role: 'buyer',
+            order_id: newOrderId,
             title: 'Order Placed Successfully! 🎉',
             message: `Thank you for your order #${orderNumber}! Total amount: ₹${totalAmount.toFixed(2)}.`,
             type: 'order_created',
+            dedup_key: `order_created_buyer_${newOrderId}`,
             data: {
               order_id: newOrderId,
               order_number: orderNumber,
-              total: totalAmount
+              total: totalAmount,
+              type: 'order_created'
             }
           });
         } catch (notifErr) {}
@@ -11700,7 +11685,24 @@ const handleCreateOrder = async (req, res) => {
           }
         } catch (e) {}
 
-        return res.status(201).json({
+        // Auto-create Razorpay gateway order when payment_method is online/razorpay
+        let rzpPayload = null;
+        if (['razorpay', 'online', 'card', 'upi', 'netbanking'].includes(String(paymentMethod || '').toLowerCase())) {
+          try {
+            rzpPayload = await createRazorpayOrderForOrder({
+              id: newOrderId,
+              order_number: orderNumber,
+              total_amount: totalAmount,
+              buyer_name: buyerName,
+              buyer_phone: buyerPhone,
+              gateway_order_id: null
+            });
+          } catch (rzpErr) {
+            console.warn('[PAYMENT] Auto-create Razorpay order warning:', rzpErr.message || rzpErr);
+          }
+        }
+
+        const orderResponsePayload = {
           success: true,
           message: 'Order placed successfully',
           order_id: newOrderId,
@@ -11723,6 +11725,8 @@ const handleCreateOrder = async (req, res) => {
             order_status: 'pending',
             status: 'pending',
             payment_method: paymentMethod,
+            payment_gateway: rzpPayload ? 'razorpay' : null,
+            gateway_order_id: rzpPayload ? rzpPayload.razorpay_order_id : null,
             payment_status: 'unpaid',
             subtotal,
             items_subtotal: subtotal,
@@ -11743,7 +11747,17 @@ const handleCreateOrder = async (req, res) => {
             total_quantity: processedItems.reduce((acc, cur) => acc + cur.quantity, 0),
             created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
           }
-        });
+        };
+
+        if (rzpPayload) {
+          orderResponsePayload.razorpay_order_id = rzpPayload.razorpay_order_id;
+          orderResponsePayload.razorpay_key_id = rzpPayload.razorpay_key_id;
+          orderResponsePayload.amount_in_paise = rzpPayload.amount_in_paise;
+          orderResponsePayload.currency = rzpPayload.currency;
+          orderResponsePayload.razorpay = rzpPayload;
+        }
+
+        return res.status(201).json(orderResponsePayload);
       } catch (txErr) {
         await conn.rollback();
         conn.release();
@@ -12600,13 +12614,291 @@ app.delete(['/api/seller/orders/:id', '/api/sellers/:seller_id/orders/:id', '/ap
 // 4b. Payment Gateway & Razorpay Endpoints
 // ==========================================
 
+function getRazorpayConfigNode() {
+  return {
+    keyId: (process.env.RAZORPAY_KEY_ID || '').trim(),
+    keySecret: (process.env.RAZORPAY_KEY_SECRET || '').trim(),
+    webhookSecret: (process.env.RAZORPAY_WEBHOOK_SECRET || '').trim(),
+    apiBaseUrl: (process.env.RAZORPAY_API_BASE_URL || 'https://api.razorpay.com/v1').replace(/\/+$/, ''),
+    commissionRate: parseFloat(process.env.MARKETPLACE_COMMISSION_RATE || '0.05') || 0.05,
+    routeEnabled: String(process.env.RAZORPAY_ROUTE_ENABLED || 'false').toLowerCase() === 'true'
+  };
+}
+
+function razorpayApiRequestNode(method, endpointPath, payload = null) {
+  const cfg = getRazorpayConfigNode();
+  if (!cfg.keyId || !cfg.keySecret) {
+    return Promise.resolve({ ok: false, statusCode: 0, error: 'Razorpay credentials not configured on server.' });
+  }
+  return new Promise((resolve) => {
+    try {
+      const fullUrl = new URL(`${cfg.apiBaseUrl}${endpointPath.startsWith('/') ? endpointPath : '/' + endpointPath}`);
+      const bodyStr = payload ? JSON.stringify(payload) : null;
+      const authHeader = 'Basic ' + Buffer.from(`${cfg.keyId}:${cfg.keySecret}`).toString('base64');
+      const reqOpts = {
+        hostname: fullUrl.hostname,
+        port: fullUrl.port || 443,
+        path: fullUrl.pathname + fullUrl.search,
+        method: method.toUpperCase(),
+        timeout: 12000,
+        headers: {
+          'Authorization': authHeader,
+          'Accept': 'application/json',
+          ...(bodyStr ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) } : {})
+        }
+      };
+      const req = https.request(reqOpts, (res) => {
+        let raw = '';
+        res.on('data', (chunk) => { raw += chunk; });
+        res.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(raw); } catch (e) {}
+          const ok = res.statusCode >= 200 && res.statusCode < 300;
+          resolve({
+            ok,
+            statusCode: res.statusCode,
+            data: parsed,
+            raw,
+            error: ok ? null : ((parsed && parsed.error && (parsed.error.description || parsed.error.reason)) || `Razorpay API HTTP ${res.statusCode}`)
+          });
+        });
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ ok: false, statusCode: 504, error: 'Razorpay API request timed out.' });
+      });
+      req.on('error', (err) => {
+        resolve({ ok: false, statusCode: 502, error: err.message });
+      });
+      if (bodyStr) req.write(bodyStr);
+      req.end();
+    } catch (e) {
+      resolve({ ok: false, statusCode: 500, error: e.message });
+    }
+  });
+}
+
+function verifyRazorpaySignatureNode(gatewayOrderId, gatewayPaymentId, signature, secret) {
+  if (!gatewayOrderId || !gatewayPaymentId || !signature || !secret) return false;
+  try {
+    const expected = crypto.createHmac('sha256', secret).update(`${gatewayOrderId}|${gatewayPaymentId}`).digest('hex');
+    const expectedBuf = Buffer.from(expected, 'utf8');
+    const providedBuf = Buffer.from(String(signature).trim(), 'utf8');
+    if (expectedBuf.length !== providedBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, providedBuf);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function createRazorpayOrderForOrder(order, forceNew = false) {
+  const cfg = getRazorpayConfigNode();
+  const orderId = Number(order.id);
+  const amountNum = parseFloat(order.total_amount || 0);
+  const amountPaise = Math.max(100, Math.round(amountNum * 100));
+  const rzpKeyId = cfg.keyId || 'rzp_test_knowlipop2026';
+
+  let rzpOrderId = order.gateway_order_id || null;
+  let gatewaySource = 'existing';
+
+  // Detect stale local mock IDs (order_ followed by 16 lowercase hex chars) and upgrade them to real Razorpay IDs
+  const looksLikeLocalMock = rzpOrderId && /^order_[0-9a-f]{16}$/.test(rzpOrderId);
+  const needCreate = forceNew || !rzpOrderId || (looksLikeLocalMock && cfg.keyId && cfg.keySecret);
+
+  if (needCreate) {
+    if (cfg.keyId && cfg.keySecret) {
+      const apiRes = await razorpayApiRequestNode('POST', '/orders', {
+        amount: amountPaise,
+        currency: 'INR',
+        receipt: String(order.order_number || `ORD-${orderId}`).slice(0, 40),
+        payment_capture: 1,
+        notes: {
+          order_id: String(orderId),
+          order_number: String(order.order_number || ''),
+          buyer_phone: String(order.buyer_phone || '')
+        }
+      });
+      if (apiRes.ok && apiRes.data && apiRes.data.id) {
+        rzpOrderId = apiRes.data.id;
+        gatewaySource = 'razorpay_api';
+      } else {
+        throw new Error(apiRes.error || 'Failed to create order with Razorpay API.');
+      }
+    } else {
+      rzpOrderId = `order_${crypto.randomBytes(8).toString('hex')}`;
+      gatewaySource = 'local_fallback';
+    }
+
+    if (pool) {
+      await pool.query(
+        "UPDATE orders SET gateway_order_id = ?, payment_gateway = 'razorpay', updated_at = NOW() WHERE id = ?",
+        [rzpOrderId, orderId]
+      );
+    }
+  }
+
+  return {
+    razorpay_order_id: rzpOrderId,
+    razorpay_key_id: rzpKeyId,
+    amount_in_paise: amountPaise,
+    amount: amountPaise,
+    currency: 'INR',
+    order_id: rzpOrderId,
+    id: rzpOrderId,
+    key_id: rzpKeyId,
+    key: rzpKeyId,
+    order_number: order.order_number,
+    merchant_order_id: orderId,
+    buyer_name: order.buyer_name,
+    buyer_phone: order.buyer_phone,
+    gateway_source: gatewaySource
+  };
+}
+
+async function recordCapturedPaymentForOrderNode(order, paymentId, rzpOrderId, rawPayload = {}, actorRole = 'buyer', actorName = null) {
+  const cfg = getRazorpayConfigNode();
+  const orderId = Number(order.id);
+  const amountNum = parseFloat(order.total_amount || 0);
+  const effectiveRzpOrderId = rzpOrderId || order.gateway_order_id || null;
+  const payloadJson = JSON.stringify(rawPayload || {});
+
+  const commissionRate = cfg.commissionRate;
+  const totalCommission = Math.round(amountNum * commissionRate * 100) / 100;
+  const totalNetSeller = Math.round((amountNum - totalCommission) * 100) / 100;
+
+  let sellerBreakdowns = [];
+  let payoutRecords = [];
+
+  if (pool) {
+    await pool.query(
+      "UPDATE orders SET payment_method = CASE WHEN payment_method = 'cod' THEN 'razorpay' ELSE payment_method END, payment_gateway = 'razorpay', gateway_order_id = COALESCE(?, gateway_order_id), gateway_payment_id = ?, payment_status = 'paid', captured_amount = ?, updated_at = NOW() WHERE id = ?",
+      [effectiveRzpOrderId, paymentId, amountNum, orderId]
+    );
+
+    // Record in payment_transactions (with full gateway_payload and payment_status)
+    const [exTx] = await pool.query(
+      "SELECT id FROM payment_transactions WHERE order_id = ? AND gateway_payment_id = ? AND transaction_type = 'capture' LIMIT 1",
+      [orderId, paymentId]
+    ).catch(() => [[]]);
+
+    if (exTx && exTx.length > 0) {
+      await pool.query(
+        `UPDATE payment_transactions
+         SET status = 'captured', payment_status = 'captured', amount = ?, commission_rate = ?, commission_amount = ?, net_seller_amount = ?, gateway_payload = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [amountNum, commissionRate, totalCommission, totalNetSeller, payloadJson, exTx[0].id]
+      ).catch(() => {});
+    } else {
+      await pool.query(
+        `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, payment_status, commission_rate, commission_amount, net_seller_amount, buyer_phone, buyer_name, gateway_payload, created_at, updated_at)
+         VALUES (?, ?, 'razorpay', ?, ?, 'capture', ?, 'INR', 'captured', 'captured', ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [orderId, order.seller_id || null, effectiveRzpOrderId, paymentId, amountNum, commissionRate, totalCommission, totalNetSeller, order.buyer_phone || null, order.buyer_name || null, payloadJson]
+      ).catch(() => {});
+    }
+
+    // Calculate per-seller breakdowns & create PENDING records in seller_payouts
+    try {
+      const [itemRows] = await pool.query(
+        'SELECT seller_id, SUM(subtotal) AS gross_amount FROM order_items WHERE order_id = ? AND seller_id IS NOT NULL GROUP BY seller_id',
+        [orderId]
+      );
+      const sellerMap = itemRows && itemRows.length > 0
+        ? itemRows.map(r => ({ seller_id: Number(r.seller_id), gross: parseFloat(r.gross_amount || 0) }))
+        : (order.seller_id ? [{ seller_id: Number(order.seller_id), gross: amountNum }] : []);
+
+      for (const s of sellerMap) {
+        const gross = s.gross > 0 ? Math.round(s.gross * 100) / 100 : amountNum;
+        const comm = Math.round(gross * commissionRate * 100) / 100;
+        const net = Math.round((gross - comm) * 100) / 100;
+        sellerBreakdowns.push({ seller_id: s.seller_id, gross_amount: gross, commission_rate: commissionRate, commission_amount: comm, net_seller_amount: net });
+
+        const noteTag = `Order #${orderId} (${order.order_number})`;
+        const [chkP] = await pool.query(
+          "SELECT id FROM seller_payouts WHERE seller_id = ? AND notes LIKE ? LIMIT 1",
+          [s.seller_id, `%Order #${orderId}%`]
+        ).catch(() => [[]]);
+
+        if (!chkP || chkP.length === 0) {
+          const [insP] = await pool.query(
+            `INSERT INTO seller_payouts (seller_id, amount, commission_deducted, net_amount, status, payment_status, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'PENDING', 'PENDING', ?, NOW(), NOW())`,
+            [s.seller_id, gross, comm, net, `Payout pending for ${noteTag}. Payment ID: ${paymentId}`]
+          ).catch(() => [{}]);
+          payoutRecords.push({ id: insP.insertId || null, seller_id: s.seller_id, amount: gross, commission_deducted: comm, net_amount: net, status: 'PENDING' });
+        }
+      }
+    } catch (payoutErr) {
+      console.warn('[PAYMENT] seller_payouts insert warning:', payoutErr.message || payoutErr);
+    }
+
+    // Log order activity
+    await logOrderActivityNode(pool, orderId, 'payment_captured', order.payment_status || 'unpaid', 'paid', {
+      actorRole,
+      actorName: actorName || order.buyer_name || 'Buyer',
+      notes: `Online payment of ₹${amountNum.toFixed(2)} captured successfully via Razorpay (Payment ID: ${paymentId})`
+    });
+
+    // Dispatch notifications to ALL distinct sellers on the order
+    const distinctSellerIds = [...new Set(sellerBreakdowns.map(b => b.seller_id).concat(order.seller_id ? [Number(order.seller_id)] : []).filter(Boolean))];
+    for (const sid of distinctSellerIds) {
+      await createNotification(pool, {
+        userId: sid,
+        title: 'Payment Received! 💳',
+        message: `Payment of ₹${amountNum.toFixed(2)} for Order #${order.order_number} has been captured successfully.`,
+        type: 'payment_received',
+        recipient_role: 'seller',
+        order_id: orderId,
+        dedup_key: `payment_captured_seller_${orderId}_${sid}_${paymentId}`,
+        action_url: `/seller/orders/${orderId}`,
+        data: {
+          order_id: orderId,
+          order_number: order.order_number,
+          amount: amountNum,
+          payment_id: paymentId,
+          type: 'payment_received'
+        }
+      }).catch(() => {});
+    }
+
+    // Dispatch confirmation notification to buyer
+    if (order.buyer_phone) {
+      await createNotification(pool, {
+        userId: null,
+        phone: order.buyer_phone,
+        title: 'Payment Successful! ✅',
+        message: `Your payment of ₹${amountNum.toFixed(2)} for Order #${order.order_number} was received (ID: ${paymentId}).`,
+        type: 'payment_received',
+        recipient_role: 'buyer',
+        order_id: orderId,
+        dedup_key: `payment_captured_buyer_${orderId}_${paymentId}`,
+        data: {
+          order_id: orderId,
+          order_number: order.order_number,
+          amount: amountNum,
+          payment_id: paymentId,
+          type: 'payment_received'
+        }
+      }).catch(() => {});
+    }
+  }
+
+  return {
+    commission_rate: commissionRate,
+    commission_amount: totalCommission,
+    net_seller_amount: totalNetSeller,
+    seller_breakdowns: sellerBreakdowns,
+    payouts: payoutRecords
+  };
+}
+
 const handleCreatePaymentOrder = async (req, res) => {
   const body = req.body || {};
   const query = req.query || {};
   const orderParam = body.order_id || query.order_id || body.order_number || query.order_number || req.params.id;
+  const forceNew = body.force_new === true || query.force_new === '1';
 
   if (!orderParam) {
-    return res.status(422).json({ error: 'order_id or order_number is required.' });
+    return res.status(422).json({ success: false, error: 'order_id or order_number is required.' });
   }
 
   try {
@@ -12623,55 +12915,50 @@ const handleCreatePaymentOrder = async (req, res) => {
     }
 
     if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
+      return res.status(404).json({ success: false, error: 'Order not found.' });
     }
 
-    const orderId = Number(order.id);
-    const amountNum = parseFloat(order.total_amount || 0);
-    const amountPaise = Math.round(amountNum * 100);
-
-    const rzpKeyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_knowlipop2026';
-
-    let rzpOrderId = order.gateway_order_id;
-    if (!rzpOrderId) {
-      rzpOrderId = `order_${crypto.randomBytes(8).toString('hex')}`;
-      if (pool) {
-        await pool.query(
-          "UPDATE orders SET gateway_order_id = ?, payment_gateway = 'razorpay', updated_at = NOW() WHERE id = ?",
-          [rzpOrderId, orderId]
-        );
-      }
+    if (String(order.payment_status || '').toLowerCase() === 'paid') {
+      return res.status(409).json({ success: false, error: `Order #${order.order_number} is already paid.` });
     }
+
+    const rzpData = await createRazorpayOrderForOrder(order, forceNew);
 
     return res.json({
       success: true,
       ok: true,
-      data: {
-        order_id: rzpOrderId,
-        id: rzpOrderId,
-        key_id: rzpKeyId,
-        key: rzpKeyId,
-        amount: amountPaise,
-        currency: 'INR',
-        order_number: order.order_number,
-        merchant_order_id: orderId,
-        buyer_name: order.buyer_name,
-        buyer_phone: order.buyer_phone
-      }
+      razorpay_order_id: rzpData.razorpay_order_id,
+      razorpay_key_id: rzpData.razorpay_key_id,
+      amount_in_paise: rzpData.amount_in_paise,
+      currency: rzpData.currency,
+      gateway_source: rzpData.gateway_source,
+      order: {
+        ...order,
+        gateway_order_id: rzpData.razorpay_order_id,
+        payment_gateway: 'razorpay'
+      },
+      razorpay: rzpData,
+      data: rzpData
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(502).json({ success: false, error: err.message, message: err.message });
   }
 };
 
 const handleVerifyPayment = async (req, res) => {
   const body = req.body || {};
   const orderParam = body.order_id || body.order_number || req.params.id;
-  const paymentId = (body.razorpay_payment_id || body.payment_id || `pay_${crypto.randomBytes(8).toString('hex')}`).trim();
+  const paymentId = (body.razorpay_payment_id || body.gateway_payment_id || body.payment_id || '').trim();
   const rzpOrderId = (body.razorpay_order_id || body.gateway_order_id || '').trim();
+  const rzpSignature = (body.razorpay_signature || '').trim();
+  const actor = req.user || getOptionalUser(req);
+  const isAdmin = Boolean(actor && actor.role === 'admin');
 
   if (!orderParam && !rzpOrderId) {
-    return res.status(422).json({ error: 'order_id, order_number, or razorpay_order_id is required.' });
+    return res.status(422).json({ success: false, error: 'order_id, order_number, or razorpay_order_id is required.' });
+  }
+  if (!paymentId) {
+    return res.status(422).json({ success: false, error: 'razorpay_payment_id (or gateway_payment_id) is required.' });
   }
 
   try {
@@ -12694,89 +12981,207 @@ const handleVerifyPayment = async (req, res) => {
     }
 
     if (!order) {
-      return res.status(404).json({ error: 'Order not found for payment verification.' });
+      return res.status(404).json({ success: false, error: 'Order not found for payment verification.' });
     }
 
     const orderId = Number(order.id);
     const amountNum = parseFloat(order.total_amount || 0);
+    const effectiveRzpOrderId = rzpOrderId || order.gateway_order_id || '';
+    const cfg = getRazorpayConfigNode();
 
-    // If already verified, return idempotent success
-    if (String(order.payment_status).toLowerCase() === 'paid') {
-      return res.json({
-        success: true,
-        ok: true,
-        already_verified: true,
-        message: 'Payment already verified.',
-        order_id: orderId,
-        order_number: order.order_number,
-        payment_status: 'paid'
-      });
-    }
-
-    if (pool) {
-      await pool.query(
-        "UPDATE orders SET payment_status = 'paid', captured_amount = ?, gateway_payment_id = ?, updated_at = NOW() WHERE id = ?",
-        [amountNum, paymentId, orderId]
-      );
-
-      // Record in payment_transactions table
-      const commissionRate = 0.05;
-      const commissionAmount = Math.round(amountNum * commissionRate * 100) / 100;
-      const netSellerAmount = Math.round((amountNum - commissionAmount) * 100) / 100;
-
-      await pool.query(
-        `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, commission_rate, commission_amount, net_seller_amount, buyer_phone, buyer_name, created_at, updated_at)
-         VALUES (?, ?, 'razorpay', ?, ?, 'capture', ?, 'INR', 'captured', ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [orderId, order.seller_id, rzpOrderId || order.gateway_order_id, paymentId, amountNum, commissionRate, commissionAmount, netSellerAmount, order.buyer_phone, order.buyer_name]
-      ).catch(() => {});
-
-      // Log activity
-      await logOrderActivityNode(pool, orderId, 'payment_captured', 'unpaid', 'paid', {
-        actorRole: 'buyer',
-        actorName: order.buyer_name || 'Buyer',
-        notes: `Online payment of ₹${amountNum.toFixed(2)} captured successfully via Razorpay (Payment ID: ${paymentId})`
-      });
-
-      // Dispatch seller notification
-      if (order.seller_id) {
-        await createNotification(pool, {
-          userId: order.seller_id,
-          title: 'Payment Received! 💳',
-          message: `Payment of ₹${amountNum.toFixed(2)} for Order #${order.order_number} has been captured successfully.`,
-          type: 'payment_received',
-          recipient_role: 'seller',
-          order_id: orderId,
-          data: { order_id: orderId, order_number: order.order_number, amount: amountNum, payment_id: paymentId }
-        }).catch(() => {});
+    // Server-side HMAC-SHA256 Razorpay signature verification
+    if (!isAdmin) {
+      if (!cfg.keySecret) {
+        return res.status(500).json({ success: false, error: 'Razorpay secret key is not configured on server.' });
+      }
+      if (!effectiveRzpOrderId || !rzpSignature) {
+        return res.status(400).json({
+          success: false,
+          error: 'Razorpay payment verification requires razorpay_order_id and razorpay_signature.',
+          message: 'Razorpay payment verification requires razorpay_order_id and razorpay_signature.'
+        });
+      }
+      const sigValid = verifyRazorpaySignatureNode(effectiveRzpOrderId, paymentId, rzpSignature, cfg.keySecret);
+      if (!sigValid) {
+        if (pool) {
+          await pool.query(
+            `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, payment_status, error_code, error_description, gateway_payload, created_at, updated_at)
+             VALUES (?, ?, 'razorpay', ?, ?, 'capture_failed', ?, 'INR', 'failed', 'failed', 'BAD_SIGNATURE', 'Razorpay HMAC-SHA256 signature mismatch.', ?, NOW(), NOW())`,
+            [orderId, order.seller_id || null, effectiveRzpOrderId, paymentId, amountNum, JSON.stringify(body)]
+          ).catch(() => {});
+        }
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid Razorpay payment signature. Payment verification rejected.',
+          message: 'Invalid Razorpay payment signature. Payment verification rejected.'
+        });
       }
     }
+
+    // Idempotent check if order is already paid
+    if (String(order.payment_status).toLowerCase() === 'paid') {
+      if (!order.gateway_payment_id || order.gateway_payment_id === paymentId) {
+        return res.json({
+          success: true,
+          ok: true,
+          already_verified: true,
+          message: 'Payment already verified.',
+          order_id: orderId,
+          order_number: order.order_number,
+          payment_status: 'paid',
+          captured_amount: parseFloat(order.captured_amount || amountNum),
+          gateway_payment_id: order.gateway_payment_id || paymentId
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        error: `Order #${order.order_number} is already paid under payment ID ${order.gateway_payment_id}.`
+      });
+    }
+
+    const finSummary = await recordCapturedPaymentForOrderNode(
+      order,
+      paymentId,
+      effectiveRzpOrderId,
+      body,
+      isAdmin ? 'admin' : 'buyer',
+      isAdmin ? (actor.name || 'Admin') : (order.buyer_name || 'Buyer')
+    );
 
     return res.json({
       success: true,
       ok: true,
-      message: 'Payment verified successfully.',
+      signature_verified: !isAdmin,
+      message: 'Payment verified and captured successfully.',
       order_id: orderId,
       order_number: order.order_number,
       payment_status: 'paid',
       captured_amount: amountNum,
-      gateway_payment_id: paymentId
+      gateway_order_id: effectiveRzpOrderId,
+      gateway_payment_id: paymentId,
+      commissions: finSummary
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+const handlePaymentFailed = async (req, res) => {
+  const body = req.body || {};
+  const orderParam = body.order_id || body.order_number || req.params.id;
+  const errObj = body.error || {};
+  const errCode = String(errObj.code || errObj.reason || 'PAYMENT_FAILED').slice(0, 100);
+  const errDesc = String(errObj.description || body.message || 'Payment failed on checkout.');
+
+  try {
+    if (pool && orderParam) {
+      await ensureOrdersTables(pool);
+      const isNum = /^\d+$/.test(String(orderParam).trim());
+      const [rows] = isNum
+        ? await pool.query('SELECT * FROM orders WHERE id = ? OR order_number = ? LIMIT 1', [Number(orderParam), String(orderParam)])
+        : await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [String(orderParam)]);
+      if (rows.length > 0) {
+        const order = rows[0];
+        if (String(order.payment_status || '').toLowerCase() !== 'paid') {
+          await pool.query(
+            "UPDATE orders SET payment_status = CASE WHEN payment_status IN ('unpaid', 'pending') THEN 'failed' ELSE payment_status END, updated_at = NOW() WHERE id = ?",
+            [order.id]
+          );
+          await pool.query(
+            `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, payment_status, error_code, error_description, buyer_phone, buyer_name, gateway_payload, created_at, updated_at)
+             VALUES (?, ?, 'razorpay', ?, ?, 'capture_failed', ?, 'INR', 'failed', 'failed', ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              order.id,
+              order.seller_id || null,
+              order.gateway_order_id || (errObj.metadata && errObj.metadata.order_id) || null,
+              (errObj.metadata && errObj.metadata.payment_id) || null,
+              parseFloat(order.total_amount || 0),
+              errCode,
+              errDesc,
+              order.buyer_phone || null,
+              order.buyer_name || null,
+              JSON.stringify(body)
+            ]
+          ).catch(() => {});
+
+          if (order.buyer_phone) {
+            await createNotification(pool, {
+              phone: order.buyer_phone,
+              recipient_role: 'buyer',
+              order_id: Number(order.id),
+              title: 'Payment Failed ⚠️',
+              message: `Payment for Order #${order.order_number} could not be completed (${errDesc}). You can retry anytime.`,
+              type: 'payment_failed',
+              data: { order_id: Number(order.id), order_number: order.order_number, error_code: errCode }
+            }).catch(() => {});
+          }
+        }
+      }
+    }
+    return res.json({ success: true, ok: true, message: 'Payment failure recorded.' });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+const handleRazorpayWebhook = async (req, res) => {
+  const cfg = getRazorpayConfigNode();
+  const headerSig = req.headers['x-razorpay-signature'] || '';
+  const body = req.body || {};
+
+  if (cfg.webhookSecret && headerSig) {
+    const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(body);
+    const expected = crypto.createHmac('sha256', cfg.webhookSecret).update(rawBody).digest('hex');
+    if (expected !== String(headerSig).trim()) {
+      return res.status(400).json({ success: false, error: 'Invalid webhook signature.' });
+    }
+  }
+
+  const event = String(body.event || '');
+  const paymentEntity = body.payload && body.payload.payment && body.payload.payment.entity;
+  const orderEntity = body.payload && body.payload.order && body.payload.order.entity;
+  const rzpOrderId = (paymentEntity && paymentEntity.order_id) || (orderEntity && orderEntity.id) || '';
+  const paymentId = (paymentEntity && paymentEntity.id) || '';
+
+  try {
+    if (pool && rzpOrderId) {
+      await ensureOrdersTables(pool);
+      const [rows] = await pool.query('SELECT * FROM orders WHERE gateway_order_id = ? LIMIT 1', [rzpOrderId]);
+      if (rows.length > 0) {
+        const order = rows[0];
+        if ((event === 'payment.captured' || event === 'order.paid') && String(order.payment_status || '').toLowerCase() !== 'paid') {
+          await recordCapturedPaymentForOrderNode(order, paymentId || `pay_wh_${Date.now()}`, rzpOrderId, body, 'system', 'Razorpay Webhook');
+        } else if (event === 'payment.failed' && String(order.payment_status || '').toLowerCase() !== 'paid') {
+          await pool.query("UPDATE orders SET payment_status = 'failed', updated_at = NOW() WHERE id = ?", [order.id]);
+          await pool.query(
+            `INSERT INTO payment_transactions (order_id, seller_id, gateway, gateway_order_id, gateway_payment_id, transaction_type, amount, currency, status, payment_status, error_code, error_description, gateway_payload, created_at, updated_at)
+             VALUES (?, ?, 'razorpay', ?, ?, 'capture_failed', ?, 'INR', 'failed', 'failed', ?, ?, ?, NOW(), NOW())`,
+            [order.id, order.seller_id || null, rzpOrderId, paymentId || null, parseFloat(order.total_amount || 0), (paymentEntity && paymentEntity.error_code) || 'WEBHOOK_FAILED', (paymentEntity && paymentEntity.error_description) || 'Payment failed via Razorpay webhook', JSON.stringify(body)]
+          ).catch(() => {});
+        }
+      }
+    }
+    return res.json({ success: true, ok: true, event, received: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
 const handleGetPaymentStatus = async (req, res) => {
   const query = req.query || {};
   const orderParam = req.params.id || query.order_id || query.id || query.order_number;
+  const syncWithGateway = query.sync === '1' || query.sync === 'true';
 
   if (!orderParam) {
-    return res.status(422).json({ error: 'order_id or order_number is required.' });
+    return res.status(422).json({ success: false, error: 'order_id or order_number is required.' });
   }
 
   try {
     let order = null;
     let transactions = [];
+    let payouts = [];
+    let syncedFromGateway = false;
+
     if (pool) {
       await ensureOrdersTables(pool);
       const isNum = /^\d+$/.test(String(orderParam).trim());
@@ -12785,36 +13190,60 @@ const handleGetPaymentStatus = async (req, res) => {
         : await pool.query('SELECT * FROM orders WHERE order_number = ? LIMIT 1', [String(orderParam)]);
       if (rows.length > 0) {
         order = rows[0];
+
+        // Optional live sync against Razorpay API if order is not yet marked paid
+        if (syncWithGateway && String(order.payment_status || '').toLowerCase() !== 'paid' && order.gateway_order_id) {
+          const rzpPayments = await razorpayApiRequestNode('GET', `/orders/${encodeURIComponent(order.gateway_order_id)}/payments`);
+          if (rzpPayments.ok && rzpPayments.data && Array.isArray(rzpPayments.data.items)) {
+            const captured = rzpPayments.data.items.find(p => p.status === 'captured' || p.status === 'authorized');
+            if (captured) {
+              await recordCapturedPaymentForOrderNode(order, captured.id, order.gateway_order_id, captured, 'system', 'Razorpay Live Sync');
+              syncedFromGateway = true;
+              const [refetched] = await pool.query('SELECT * FROM orders WHERE id = ? LIMIT 1', [order.id]);
+              if (refetched.length > 0) order = refetched[0];
+            }
+          }
+        }
+
         const [tRows] = await pool.query('SELECT * FROM payment_transactions WHERE order_id = ? ORDER BY id DESC', [order.id]);
         transactions = tRows;
+        const [pRows] = await pool.query('SELECT * FROM seller_payouts WHERE notes LIKE ? ORDER BY id DESC', [`%Order #${order.id}%`]).catch(() => [[]]);
+        payouts = pRows || [];
       }
     } else {
       order = fallbackOrders.find(o => String(o.id) === String(orderParam) || o.order_number === String(orderParam));
     }
 
     if (!order) {
-      return res.status(404).json({ error: 'Order not found.' });
+      return res.status(404).json({ success: false, error: 'Order not found.' });
     }
+
+    const statusObj = {
+      order_id: Number(order.id),
+      order_number: order.order_number,
+      payment_status: order.payment_status || 'unpaid',
+      payment_method: order.payment_method || 'cod',
+      total_amount: parseFloat(order.total_amount || 0),
+      captured_amount: parseFloat(order.captured_amount || 0),
+      refunded_amount: parseFloat(order.refunded_amount || 0),
+      gateway: order.payment_gateway || 'razorpay',
+      gateway_order_id: order.gateway_order_id,
+      gateway_payment_id: order.gateway_payment_id,
+      synced_from_gateway: syncedFromGateway,
+      transactions_count: transactions.length,
+      transactions,
+      payouts_count: payouts.length,
+      payouts
+    };
 
     return res.json({
       success: true,
       ok: true,
-      data: {
-        order_id: Number(order.id),
-        order_number: order.order_number,
-        payment_status: order.payment_status || 'unpaid',
-        payment_method: order.payment_method || 'cod',
-        total_amount: parseFloat(order.total_amount || 0),
-        captured_amount: parseFloat(order.captured_amount || 0),
-        refunded_amount: parseFloat(order.refunded_amount || 0),
-        gateway: order.payment_gateway || 'razorpay',
-        gateway_order_id: order.gateway_order_id,
-        gateway_payment_id: order.gateway_payment_id,
-        transactions
-      }
+      ...statusObj,
+      data: statusObj
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 };
 
@@ -12826,6 +13255,16 @@ app.all(
 app.all(
   ['/api/payment/verify', '/api/payment/razorpay/verify', '/api/orders/:id/payment-verify', '/api/orders/:id/verify-payment'],
   handleVerifyPayment
+);
+
+app.post(
+  ['/api/payment/failed', '/api/payment/razorpay/failed'],
+  handlePaymentFailed
+);
+
+app.post(
+  ['/api/payment/webhook', '/api/payment/razorpay/webhook'],
+  handleRazorpayWebhook
 );
 
 app.get(
