@@ -2920,6 +2920,7 @@ async function deletionSettlePayoutNode(pool, ctx, delReqId, adminId, input = {}
         await conn.query(
           `UPDATE seller_payouts
            SET status = 'SETTLED',
+               payment_status = 'SETTLED',
                deletion_request_id = COALESCE(deletion_request_id, ?),
                payout_reference = ?,
                settled_by = ?,
@@ -2933,6 +2934,7 @@ async function deletionSettlePayoutNode(pool, ctx, delReqId, adminId, input = {}
         await conn.query(
           `UPDATE seller_payouts
            SET status = 'SETTLED',
+               payment_status = 'SETTLED',
                deletion_request_id = COALESCE(deletion_request_id, ?),
                payout_reference = COALESCE(payout_reference, ?),
                settled_by = ?,
@@ -2953,8 +2955,8 @@ async function deletionSettlePayoutNode(pool, ctx, delReqId, adminId, input = {}
         if (remainingBal > 0.01 || outComm > 0.01) {
           await pool.query(
             `INSERT INTO seller_payouts
-              (seller_id, deletion_request_id, amount, commission_deducted, refund_recovery_deducted, net_amount, status, payout_reference, settled_by, settled_at, notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 0.00, ?, 'SETTLED', ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+              (seller_id, deletion_request_id, amount, commission_deducted, refund_recovery_deducted, net_amount, status, payment_status, payout_reference, settled_by, settled_at, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 0.00, ?, 'SETTLED', 'SETTLED', ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
             [sellerId, delReqId, round2(remainingBal + outComm), outComm, remainingBal, payoutRef, adminId, notes]
           );
         }

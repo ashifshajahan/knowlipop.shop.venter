@@ -8690,53 +8690,723 @@ app.get(
   handleBankAccountDiagnostics
 );
 
-app.get('/api/seller/payouts', authenticateToken, async (req, res) => {
-  const sellerId = (req.user.role === 'admin' && req.query.seller_id)
-    ? parseInt(req.query.seller_id, 10)
-    : Number(req.user.id);
+// ==========================================
+// 3c. Seller & Admin Payout Engine (Full Lifecycle)
+// ==========================================
+
+async function syncPaidOrdersToPayoutsNode(targetSellerId = null) {
+  if (!pool) return 0;
+  let inserted = 0;
+  try {
+    await ensureOrdersTables(pool);
+    await ensureSellerDeletionSchemaNode(pool);
+    const rate = parseFloat(process.env.MARKETPLACE_COMMISSION_RATE || '0.05') || 0.05;
+
+    const whereSeller = targetSellerId ? ' AND (o.seller_id = ? OR oi.seller_id = ?)' : '';
+    const params = targetSellerId ? [targetSellerId, targetSellerId] : [];
+
+    const [rows] = await pool.query(
+      `SELECT o.id AS order_id, o.order_number, o.gateway_payment_id,
+              COALESCE(oi.seller_id, o.seller_id) AS seller_id,
+              COALESCE(SUM(oi.subtotal), o.total_amount) AS gross_amount
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE LOWER(COALESCE(o.payment_status, '')) = 'paid'
+         AND LOWER(COALESCE(o.order_status, '')) NOT IN ('cancelled', 'rejected', 'refunded')
+         ${whereSeller}
+       GROUP BY o.id, o.order_number, o.gateway_payment_id, COALESCE(oi.seller_id, o.seller_id)`,
+      params
+    );
+
+    for (const r of rows || []) {
+      const sid = Number(r.seller_id || 0);
+      const oid = Number(r.order_id || 0);
+      const gross = Math.round((parseFloat(r.gross_amount || 0)) * 100) / 100;
+      if (!sid || !oid || gross <= 0) continue;
+
+      const [existing] = await pool.query(
+        'SELECT id FROM seller_payouts WHERE seller_id = ? AND notes LIKE ? LIMIT 1',
+        [sid, `%Order #${oid}%`]
+      );
+      if (existing.length > 0) continue;
+
+      const comm = Math.round(gross * rate * 100) / 100;
+      const net = Math.round((gross - comm) * 100) / 100;
+      const payRef = r.gateway_payment_id ? ` Payment ID: ${r.gateway_payment_id}` : '';
+      await pool.query(
+        `INSERT INTO seller_payouts (seller_id, amount, commission_deducted, net_amount, status, payment_status, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'PENDING', 'PENDING', ?, NOW(), NOW())`,
+        [sid, gross, comm, net, `Payout pending for Order #${oid} (${r.order_number}).${payRef}`]
+      );
+      inserted++;
+    }
+  } catch (e) {
+    console.warn('[PAYOUT SYNC] Warning:', e.message || e);
+  }
+  return inserted;
+}
+
+async function getSellerBankSnapshotNode(sellerId) {
+  if (!pool || !sellerId) return null;
+  try {
+    const [bRows] = await pool.query('SELECT * FROM seller_bank_accounts WHERE seller_id = ? ORDER BY id DESC LIMIT 1', [sellerId]).catch(() => [[]]);
+    const [pRows] = await pool.query('SELECT * FROM seller_payment_accounts WHERE seller_id = ? ORDER BY id DESC LIMIT 1', [sellerId]).catch(() => [[]]);
+    const [uRows] = await pool.query('SELECT id, name, seller_name, phone, email, bank_name, account_number, bank_account, ifsc_code, account_holder_name, branch_name, upi_id, account_type, bank_verified, payment_status FROM users WHERE id = ? LIMIT 1', [sellerId]).catch(() => [[]]);
+    const b = (bRows && bRows[0]) || {};
+    const p = (pRows && pRows[0]) || {};
+    const u = (uRows && uRows[0]) || {};
+
+    const accountNumber = b.account_number || p.account_number || u.account_number || u.bank_account || null;
+    const ifscCode = b.ifsc_code || p.ifsc_code || u.ifsc_code || null;
+    const upiId = b.upi_id || p.upi_id || u.upi_id || null;
+    const bankName = b.bank_name || p.bank_name || u.bank_name || null;
+    const holderName = b.account_holder_name || p.account_holder_name || u.account_holder_name || u.seller_name || u.name || null;
+    const branchName = b.branch_name || p.branch_name || u.branch_name || null;
+    const linked = Boolean((accountNumber && ifscCode) || upiId || b.account_reference || p.account_reference);
+
+    return {
+      seller_id: Number(sellerId),
+      seller_name: u.seller_name || u.name || null,
+      phone: u.phone || null,
+      email: u.email || null,
+      account_holder_name: holderName,
+      account_number: accountNumber,
+      account_number_masked: accountNumber ? `${'*'.repeat(Math.max(0, String(accountNumber).length - 4))}${String(accountNumber).slice(-4)}` : null,
+      ifsc_code: ifscCode,
+      bank_name: bankName,
+      branch_name: branchName,
+      upi_id: upiId,
+      account_type: b.account_type || p.account_type || u.account_type || 'savings',
+      account_reference: b.account_reference || p.account_reference || null,
+      linked
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function summarizePayoutRowsNode(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  let totalGross = 0;
+  let totalCommission = 0;
+  let totalNet = 0;
+  let pendingAmt = 0;
+  let processingAmt = 0;
+  let settledAmt = 0;
+  let failedAmt = 0;
+  let pendingCount = 0;
+  let processingCount = 0;
+  let settledCount = 0;
+  let failedCount = 0;
+
+  for (const r of list) {
+    const gross = parseFloat(r.amount || 0) || 0;
+    const comm = parseFloat(r.commission_deducted || 0) || 0;
+    const net = parseFloat(r.net_amount !== undefined && r.net_amount !== null ? r.net_amount : gross) || 0;
+    const st = String(r.status || r.payment_status || 'PENDING').toUpperCase();
+
+    totalGross += gross;
+    totalCommission += comm;
+    totalNet += net;
+
+    if (st === 'SETTLED' || st === 'PAID' || st === 'COMPLETED') {
+      settledAmt += net;
+      settledCount++;
+    } else if (st === 'PROCESSING' || st === 'REQUESTED') {
+      processingAmt += net;
+      processingCount++;
+    } else if (st === 'FAILED' || st === 'REJECTED' || st === 'HELD') {
+      failedAmt += net;
+      failedCount++;
+    } else {
+      pendingAmt += net;
+      pendingCount++;
+    }
+  }
+
+  const r2 = (v) => Math.round(v * 100) / 100;
+  return {
+    total_payouts: list.length,
+    total_gross_earnings: r2(totalGross),
+    total_commission: r2(totalCommission),
+    total_net_earnings: r2(totalNet),
+    available_balance: r2(pendingAmt),
+    pending_amount: r2(pendingAmt),
+    processing_amount: r2(processingAmt),
+    settled_amount: r2(settledAmt),
+    failed_amount: r2(failedAmt),
+    pending_count: pendingCount,
+    processing_count: processingCount,
+    settled_count: settledCount,
+    failed_count: failedCount
+  };
+}
+
+const handleGetSellerPayouts = async (req, res) => {
+  const paramSellerId = req.params.seller_id ? parseInt(req.params.seller_id, 10) : null;
+  const querySellerId = req.query.seller_id ? parseInt(req.query.seller_id, 10) : null;
+  let sellerId = Number(req.user.id);
+  if (req.user.role === 'admin' && (paramSellerId || querySellerId)) {
+    sellerId = paramSellerId || querySellerId;
+  } else if (paramSellerId && paramSellerId !== sellerId) {
+    return res.status(403).json({ success: false, status: 'error', message: 'Access denied. You can only view your own payouts.' });
+  }
+
   const useDb = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
 
-  if (useDb) {
+  if (useDb && pool) {
     try {
-      await ensureSellerDeletionSchemaNode(pool);
+      await syncPaidOrdersToPayoutsNode(sellerId);
       const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE seller_id = ? ORDER BY id DESC', [sellerId]);
-      const pendingAmt = rows
-        .filter(p => ['PENDING', 'PROCESSING', 'HELD', 'FAILED'].includes(String(p.status || '').toUpperCase()))
-        .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
-      const settledAmt = rows
-        .filter(p => String(p.status || '').toUpperCase() === 'SETTLED')
-        .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+      const bank = await getSellerBankSnapshotNode(sellerId);
+      const summary = summarizePayoutRowsNode(rows);
       return res.json({
+        success: true,
+        ok: true,
         status: 'success',
+        seller_id: sellerId,
         payouts: rows,
-        summary: {
-          pending_amount: Math.round(pendingAmt * 100) / 100,
-          settled_amount: Math.round(settledAmt * 100) / 100
-        },
+        data: rows,
+        bank_account: bank,
+        bank_linked: Boolean(bank && bank.linked),
+        summary,
         message: rows.length > 0 ? 'Seller payouts retrieved successfully.' : 'No payout records found yet.'
       });
-    } catch (err) {}
+    } catch (err) {
+      console.error('[PAYOUTS] GET seller payouts error:', err.message || err);
+    }
   }
 
   const fbPayouts = (typeof deletionCtx !== 'undefined' ? deletionCtx.getFallbackDeletionStore().payouts : [])
     .filter(p => Number(p.seller_id) === sellerId)
     .sort((a, b) => Number(b.id) - Number(a.id));
-  const pendingAmt = fbPayouts
-    .filter(p => ['PENDING', 'PROCESSING', 'HELD', 'FAILED'].includes(String(p.status || '').toUpperCase()))
-    .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
-  const settledAmt = fbPayouts
-    .filter(p => String(p.status || '').toUpperCase() === 'SETTLED')
-    .reduce((a, b) => a + (parseFloat(b.net_amount || b.amount) || 0), 0);
+  const summary = summarizePayoutRowsNode(fbPayouts);
   return res.json({
+    success: true,
+    ok: true,
     status: 'success',
+    seller_id: sellerId,
     payouts: fbPayouts,
-    summary: {
-      pending_amount: Math.round(pendingAmt * 100) / 100,
-      settled_amount: Math.round(settledAmt * 100) / 100
-    },
+    data: fbPayouts,
+    bank_account: null,
+    bank_linked: false,
+    summary,
     message: fbPayouts.length > 0 ? 'Seller payouts retrieved successfully.' : 'No payout records found yet.'
   });
-});
+};
+
+const handleSellerRequestPayout = async (req, res) => {
+  const body = req.body || {};
+  const paramSellerId = req.params.seller_id ? parseInt(req.params.seller_id, 10) : null;
+  let sellerId = Number(req.user.id);
+  if (req.user.role === 'admin' && (paramSellerId || body.seller_id)) {
+    sellerId = paramSellerId || parseInt(body.seller_id, 10);
+  } else if (paramSellerId && paramSellerId !== sellerId) {
+    return res.status(403).json({ success: false, status: 'error', message: 'Access denied.' });
+  }
+
+  const useDb = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
+  if (!useDb || !pool) {
+    return res.status(503).json({ success: false, status: 'error', message: 'Database unavailable. Please try again later.' });
+  }
+
+  try {
+    await syncPaidOrdersToPayoutsNode(sellerId);
+    const bank = await getSellerBankSnapshotNode(sellerId);
+    const hasDestination = Boolean(bank && ((bank.account_number && bank.ifsc_code) || bank.upi_id));
+    if (!hasDestination && !body.allow_without_bank) {
+      return res.status(422).json({
+        success: false,
+        status: 'error',
+        error: 'BANK_ACCOUNT_REQUIRED',
+        message: 'Please link your bank account (Account Number + IFSC) or UPI ID before requesting a payout.',
+        bank_account: bank
+      });
+    }
+
+    const payoutId = body.payout_id ? parseInt(body.payout_id, 10) : null;
+    const requestedAmount = body.amount !== undefined && body.amount !== '' ? parseFloat(body.amount) : null;
+    const noteText = String(body.notes || body.remarks || '').trim();
+    const destLabel = bank && bank.account_number
+      ? `${bank.bank_name || 'Bank'} (${bank.account_number_masked} / ${bank.ifsc_code || ''})`
+      : (bank && bank.upi_id ? `UPI (${bank.upi_id})` : 'Registered Account');
+
+    let affectedPayouts = [];
+    let totalRequested = 0;
+
+    if (payoutId) {
+      const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? AND seller_id = ? LIMIT 1', [payoutId, sellerId]);
+      if (rows.length === 0) {
+        return res.status(404).json({ success: false, status: 'error', message: 'Payout record not found.' });
+      }
+      const p = rows[0];
+      const curSt = String(p.status || '').toUpperCase();
+      if (curSt === 'SETTLED') {
+        return res.status(409).json({ success: false, status: 'error', message: 'This payout has already been settled.' });
+      }
+      if (curSt === 'PROCESSING') {
+        return res.json({
+          success: true,
+          ok: true,
+          status: 'success',
+          already_requested: true,
+          message: 'Payout request is already being processed.',
+          payout: p,
+          bank_account: bank
+        });
+      }
+      const updatedNotes = `${p.notes || ''} | Seller requested payout to ${destLabel}${noteText ? ' (' + noteText + ')' : ''}`.trim();
+      await pool.query(
+        "UPDATE seller_payouts SET status = 'PROCESSING', payment_status = 'PROCESSING', notes = ?, updated_at = NOW() WHERE id = ?",
+        [updatedNotes, payoutId]
+      );
+      const [refetched] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [payoutId]);
+      affectedPayouts = refetched;
+      totalRequested = parseFloat(p.net_amount || p.amount || 0);
+    } else {
+      const [pendingRows] = await pool.query(
+        "SELECT * FROM seller_payouts WHERE seller_id = ? AND UPPER(COALESCE(status, 'PENDING')) = 'PENDING' ORDER BY id ASC",
+        [sellerId]
+      );
+
+      if (pendingRows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          status: 'error',
+          error: 'NO_PENDING_BALANCE',
+          message: 'No pending payout balance available to withdraw right now.',
+          summary: summarizePayoutRowsNode((await pool.query('SELECT * FROM seller_payouts WHERE seller_id = ?', [sellerId]))[0])
+        });
+      }
+
+      const availableTotal = pendingRows.reduce((acc, r) => acc + (parseFloat(r.net_amount || r.amount || 0) || 0), 0);
+      if (requestedAmount !== null && !isNaN(requestedAmount)) {
+        if (requestedAmount <= 0) {
+          return res.status(422).json({ success: false, status: 'error', message: 'Requested payout amount must be greater than 0.' });
+        }
+        if (requestedAmount > availableTotal + 0.01) {
+          return res.status(422).json({
+            success: false,
+            status: 'error',
+            message: `Requested amount (₹${requestedAmount.toFixed(2)}) exceeds available pending balance (₹${availableTotal.toFixed(2)}).`,
+            available_balance: Math.round(availableTotal * 100) / 100
+          });
+        }
+      }
+
+      // Transition pending payouts to PROCESSING (up to requestedAmount if specified, else all)
+      let running = 0;
+      for (const p of pendingRows) {
+        const net = parseFloat(p.net_amount || p.amount || 0) || 0;
+        if (requestedAmount !== null && !isNaN(requestedAmount) && running > 0 && (running + net) > requestedAmount + 0.01) {
+          continue;
+        }
+        const updatedNotes = `${p.notes || ''} | Seller requested payout to ${destLabel}${noteText ? ' (' + noteText + ')' : ''}`.trim();
+        await pool.query(
+          "UPDATE seller_payouts SET status = 'PROCESSING', payment_status = 'PROCESSING', notes = ?, updated_at = NOW() WHERE id = ?",
+          [updatedNotes, p.id]
+        );
+        affectedPayouts.push({ ...p, status: 'PROCESSING', payment_status: 'PROCESSING', notes: updatedNotes });
+        running += net;
+        if (requestedAmount !== null && !isNaN(requestedAmount) && running >= requestedAmount - 0.01) {
+          break;
+        }
+      }
+      totalRequested = Math.round(running * 100) / 100;
+    }
+
+    // Notify seller that payout request is queued
+    await createNotification(pool, {
+      userId: sellerId,
+      recipient_role: 'seller',
+      title: 'Payout Request Submitted 🏦',
+      message: `Your payout request of ₹${totalRequested.toFixed(2)} to ${destLabel} has been submitted for processing.`,
+      type: 'payout_requested',
+      action_url: '/seller/payouts',
+      data: { seller_id: sellerId, amount: totalRequested, payout_ids: affectedPayouts.map(p => p.id), type: 'payout_requested' }
+    }).catch(() => {});
+
+    const [allRows] = await pool.query('SELECT * FROM seller_payouts WHERE seller_id = ? ORDER BY id DESC', [sellerId]);
+    return res.status(200).json({
+      success: true,
+      ok: true,
+      status: 'success',
+      message: `Payout request of ₹${totalRequested.toFixed(2)} submitted successfully and is now PROCESSING.`,
+      requested_amount: totalRequested,
+      payouts_requested: affectedPayouts,
+      payout: affectedPayouts[0] || null,
+      bank_account: bank,
+      summary: summarizePayoutRowsNode(allRows)
+    });
+  } catch (err) {
+    console.error('[PAYOUTS] Request payout error:', err);
+    return res.status(500).json({ success: false, status: 'error', message: `Failed to request payout: ${err.message}` });
+  }
+};
+
+const handleAdminListPayouts = async (req, res) => {
+  const statusFilter = String(req.query.status || '').trim().toUpperCase();
+  const sellerFilter = req.query.seller_id ? parseInt(req.query.seller_id, 10) : null;
+  const useDb = typeof deletionCtx !== 'undefined' ? await checkDbReachable(pool, deletionCtx) : (dbAvailable !== false);
+
+  if (!useDb || !pool) {
+    const fbPayouts = (typeof deletionCtx !== 'undefined' ? deletionCtx.getFallbackDeletionStore().payouts : []);
+    return res.json({ success: true, ok: true, status: 'success', payouts: fbPayouts, data: fbPayouts, summary: summarizePayoutRowsNode(fbPayouts) });
+  }
+
+  try {
+    await syncPaidOrdersToPayoutsNode(sellerFilter || null);
+
+    let sql = `
+      SELECT sp.*,
+             u.name AS seller_user_name,
+             u.seller_name AS seller_store_name,
+             u.phone AS seller_phone,
+             u.email AS seller_email,
+             COALESCE(sba.account_holder_name, spa.account_holder_name, u.account_holder_name, u.seller_name, u.name) AS bank_holder_name,
+             COALESCE(sba.account_number, spa.account_number, u.account_number, u.bank_account) AS bank_account_number,
+             COALESCE(sba.ifsc_code, spa.ifsc_code, u.ifsc_code) AS bank_ifsc_code,
+             COALESCE(sba.bank_name, spa.bank_name, u.bank_name) AS bank_name,
+             COALESCE(sba.upi_id, spa.upi_id, u.upi_id) AS bank_upi_id
+      FROM seller_payouts sp
+      LEFT JOIN users u ON u.id = sp.seller_id
+      LEFT JOIN seller_bank_accounts sba ON sba.id = (SELECT id FROM seller_bank_accounts WHERE seller_id = sp.seller_id ORDER BY id DESC LIMIT 1)
+      LEFT JOIN seller_payment_accounts spa ON spa.id = (SELECT id FROM seller_payment_accounts WHERE seller_id = sp.seller_id ORDER BY id DESC LIMIT 1)
+      WHERE 1=1
+    `;
+    const params = [];
+    if (sellerFilter) {
+      sql += ' AND sp.seller_id = ?';
+      params.push(sellerFilter);
+    }
+    if (statusFilter && statusFilter !== 'ALL') {
+      sql += ' AND UPPER(COALESCE(sp.status, "PENDING")) = ?';
+      params.push(statusFilter);
+    }
+    sql += ' ORDER BY FIELD(UPPER(COALESCE(sp.status, "PENDING")), "PROCESSING", "PENDING", "HELD", "FAILED", "REJECTED", "SETTLED"), sp.id DESC';
+
+    const [rows] = await pool.query(sql, params);
+    const [allRows] = sellerFilter
+      ? await pool.query('SELECT * FROM seller_payouts WHERE seller_id = ?', [sellerFilter])
+      : await pool.query('SELECT * FROM seller_payouts');
+
+    return res.json({
+      success: true,
+      ok: true,
+      status: 'success',
+      payouts: rows,
+      data: rows,
+      summary: summarizePayoutRowsNode(allRows)
+    });
+  } catch (err) {
+    console.error('[ADMIN PAYOUTS] List error:', err);
+    return res.status(500).json({ success: false, status: 'error', message: `Failed to list payouts: ${err.message}` });
+  }
+};
+
+const handleAdminSettlePayout = async (req, res) => {
+  const payoutId = parseInt(req.params.id, 10);
+  const body = req.body || {};
+  const adminId = Number((req.user && req.user.id) || 1);
+  if (!payoutId || isNaN(payoutId)) {
+    return res.status(422).json({ success: false, status: 'error', message: 'Valid payout ID is required.' });
+  }
+  if (!pool) {
+    return res.status(503).json({ success: false, status: 'error', message: 'Database unavailable.' });
+  }
+
+  try {
+    await ensureSellerDeletionSchemaNode(pool);
+    const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [payoutId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, status: 'error', message: `Payout #${payoutId} not found.` });
+    }
+    const payout = rows[0];
+    if (String(payout.status || '').toUpperCase() === 'SETTLED') {
+      return res.json({
+        success: true,
+        ok: true,
+        status: 'success',
+        already_settled: true,
+        message: `Payout #${payoutId} is already settled (Ref: ${payout.payout_reference || 'N/A'}).`,
+        payout
+      });
+    }
+
+    const sellerId = Number(payout.seller_id);
+    const netAmt = parseFloat(payout.net_amount || payout.amount || 0);
+    const payoutRef = String(body.payout_reference || body.utr || `UTR-KLP-${Date.now()}-${payoutId}`).trim();
+    const gwPayoutId = String(body.gateway_payout_id || `pout_${crypto.randomBytes(6).toString('hex')}`).trim();
+    const extraNote = String(body.notes || body.remarks || 'Settled by Admin').trim();
+    const finalNotes = payout.notes ? `${payout.notes} | ${extraNote} (Ref: ${payoutRef})` : `${extraNote} (Ref: ${payoutRef})`;
+
+    await pool.query(
+      `UPDATE seller_payouts
+       SET status = 'SETTLED',
+           payment_status = 'SETTLED',
+           payout_reference = ?,
+           gateway_payout_id = ?,
+           settled_by = ?,
+           settled_at = NOW(),
+           notes = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [payoutRef, gwPayoutId, adminId, finalNotes, payoutId]
+    );
+
+    // If payout notes reference an Order #<id>, mark that order & transaction as settled too
+    const orderMatch = String(payout.notes || '').match(/Order\s*#(\d+)/i);
+    if (orderMatch) {
+      const refOrderId = parseInt(orderMatch[1], 10);
+      if (refOrderId > 0) {
+        await pool.query('UPDATE orders SET settled_at = COALESCE(settled_at, NOW()), updated_at = NOW() WHERE id = ?', [refOrderId]).catch(() => {});
+        await pool.query(
+          "UPDATE payment_transactions SET status = 'settled', settled_at = COALESCE(settled_at, NOW()), updated_at = NOW() WHERE order_id = ? AND transaction_type = 'capture'",
+          [refOrderId]
+        ).catch(() => {});
+      }
+    }
+
+    const [updatedRows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [payoutId]);
+    const updatedPayout = updatedRows[0];
+
+    // Send live FCM + in-app notification to Seller
+    await createNotification(pool, {
+      userId: sellerId,
+      recipient_role: 'seller',
+      order_id: orderMatch ? parseInt(orderMatch[1], 10) : null,
+      title: 'Payout Processed 💰',
+      message: `Your seller payout of ₹${netAmt.toFixed(2)} has been settled (Ref: ${payoutRef}).`,
+      type: 'payout_processed',
+      dedup_key: `payout_settled_${payoutId}_${payoutRef}`,
+      action_url: '/seller/payouts',
+      data: {
+        payout_id: payoutId,
+        seller_id: sellerId,
+        net_amount: netAmt,
+        payout_reference: payoutRef,
+        gateway_payout_id: gwPayoutId,
+        type: 'payout_processed'
+      }
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      ok: true,
+      status: 'success',
+      message: `Payout #${payoutId} of ₹${netAmt.toFixed(2)} settled successfully (Ref: ${payoutRef}).`,
+      payout: updatedPayout
+    });
+  } catch (err) {
+    console.error('[ADMIN PAYOUTS] Settle error:', err);
+    return res.status(500).json({ success: false, status: 'error', message: `Failed to settle payout: ${err.message}` });
+  }
+};
+
+const handleAdminRejectOrHoldPayout = async (req, res) => {
+  const payoutId = parseInt(req.params.id, 10);
+  const body = req.body || {};
+  const isHold = req.path.includes('/hold');
+  const isFail = req.path.includes('/fail');
+  const targetStatus = String(body.status || (isHold ? 'HELD' : (isFail ? 'FAILED' : 'REJECTED'))).toUpperCase();
+  const reason = String(body.reason || body.notes || body.remarks || (isHold ? 'Payout placed on hold by admin.' : 'Payout rejected by admin.')).trim();
+
+  if (!payoutId || isNaN(payoutId)) {
+    return res.status(422).json({ success: false, status: 'error', message: 'Valid payout ID is required.' });
+  }
+  if (!pool) {
+    return res.status(503).json({ success: false, status: 'error', message: 'Database unavailable.' });
+  }
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [payoutId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, status: 'error', message: `Payout #${payoutId} not found.` });
+    }
+    const payout = rows[0];
+    if (String(payout.status || '').toUpperCase() === 'SETTLED') {
+      return res.status(409).json({ success: false, status: 'error', message: 'Cannot modify an already settled payout.' });
+    }
+    const updatedNotes = `${payout.notes || ''} | ${targetStatus}: ${reason}`.trim();
+    await pool.query(
+      'UPDATE seller_payouts SET status = ?, payment_status = ?, notes = ?, updated_at = NOW() WHERE id = ?',
+      [targetStatus, targetStatus, updatedNotes, payoutId]
+    );
+    const [updatedRows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [payoutId]);
+
+    await createNotification(pool, {
+      userId: Number(payout.seller_id),
+      recipient_role: 'seller',
+      title: `Payout ${targetStatus === 'HELD' ? 'On Hold' : 'Update'} ⚠️`,
+      message: `Payout #${payoutId} (₹${parseFloat(payout.net_amount || payout.amount || 0).toFixed(2)}) status updated to ${targetStatus}: ${reason}`,
+      type: 'payout_updated',
+      action_url: '/seller/payouts',
+      data: { payout_id: payoutId, status: targetStatus, reason, type: 'payout_updated' }
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      ok: true,
+      status: 'success',
+      message: `Payout #${payoutId} updated to ${targetStatus}.`,
+      payout: updatedRows[0]
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: 'error', message: `Failed to update payout: ${err.message}` });
+  }
+};
+
+const handleAdminSettleSellerBatch = async (req, res) => {
+  const body = req.body || {};
+  const sellerId = parseInt(req.params.seller_id || body.seller_id, 10);
+  const adminId = Number((req.user && req.user.id) || 1);
+  if (!sellerId || isNaN(sellerId)) {
+    return res.status(422).json({ success: false, status: 'error', message: 'Valid seller_id is required.' });
+  }
+  if (!pool) {
+    return res.status(503).json({ success: false, status: 'error', message: 'Database unavailable.' });
+  }
+
+  try {
+    await syncPaidOrdersToPayoutsNode(sellerId);
+    const [pendingRows] = await pool.query(
+      "SELECT * FROM seller_payouts WHERE seller_id = ? AND UPPER(COALESCE(status, 'PENDING')) IN ('PENDING', 'PROCESSING') ORDER BY id ASC",
+      [sellerId]
+    );
+    if (pendingRows.length === 0) {
+      return res.status(400).json({ success: false, status: 'error', message: `No pending or processing payouts found for Seller #${sellerId}.` });
+    }
+
+    const payoutRef = String(body.payout_reference || body.utr || `UTR-BATCH-${Date.now()}-S${sellerId}`).trim();
+    const gwPayoutId = String(body.gateway_payout_id || `pout_batch_${crypto.randomBytes(5).toString('hex')}`).trim();
+    const totalNet = Math.round(pendingRows.reduce((a, r) => a + (parseFloat(r.net_amount || r.amount || 0) || 0), 0) * 100) / 100;
+    const ids = pendingRows.map(r => r.id);
+
+    await pool.query(
+      `UPDATE seller_payouts
+       SET status = 'SETTLED',
+           payment_status = 'SETTLED',
+           payout_reference = ?,
+           gateway_payout_id = ?,
+           settled_by = ?,
+           settled_at = NOW(),
+           updated_at = NOW()
+       WHERE id IN (?)`,
+      [payoutRef, gwPayoutId, adminId, ids]
+    );
+
+    await createNotification(pool, {
+      userId: sellerId,
+      recipient_role: 'seller',
+      title: 'Payout Processed 💰',
+      message: `Batch payout of ₹${totalNet.toFixed(2)} (${ids.length} payout(s)) has been settled to your bank account (Ref: ${payoutRef}).`,
+      type: 'payout_processed',
+      dedup_key: `payout_batch_${sellerId}_${payoutRef}`,
+      action_url: '/seller/payouts',
+      data: { seller_id: sellerId, net_amount: totalNet, payout_ids: ids, payout_reference: payoutRef, type: 'payout_processed' }
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      ok: true,
+      status: 'success',
+      message: `Settled ${ids.length} payout(s) totaling ₹${totalNet.toFixed(2)} for Seller #${sellerId}.`,
+      seller_id: sellerId,
+      settled_count: ids.length,
+      total_net_settled: totalNet,
+      payout_reference: payoutRef,
+      gateway_payout_id: gwPayoutId,
+      settled_ids: ids
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: 'error', message: `Batch settlement failed: ${err.message}` });
+  }
+};
+
+const handleAdminCreateManualPayout = async (req, res) => {
+  const body = req.body || {};
+  const sellerId = parseInt(body.seller_id, 10);
+  const amount = parseFloat(body.amount || 0);
+  const commissionRate = body.commission_rate !== undefined ? parseFloat(body.commission_rate) : (parseFloat(process.env.MARKETPLACE_COMMISSION_RATE || '0.05') || 0.05);
+  const commissionDeducted = body.commission_deducted !== undefined ? parseFloat(body.commission_deducted) : Math.round(amount * commissionRate * 100) / 100;
+  const netAmount = body.net_amount !== undefined ? parseFloat(body.net_amount) : Math.round((amount - commissionDeducted) * 100) / 100;
+  const status = String(body.status || 'PENDING').toUpperCase();
+  const notes = String(body.notes || 'Manual payout created by Admin').trim();
+
+  if (!sellerId || isNaN(sellerId) || !amount || amount <= 0) {
+    return res.status(422).json({ success: false, status: 'error', message: 'Valid seller_id and positive amount are required.' });
+  }
+  if (!pool) {
+    return res.status(503).json({ success: false, status: 'error', message: 'Database unavailable.' });
+  }
+
+  try {
+    await ensureSellerDeletionSchemaNode(pool);
+    const [ins] = await pool.query(
+      `INSERT INTO seller_payouts (seller_id, amount, commission_deducted, net_amount, status, payment_status, payout_reference, notes, settled_by, settled_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [
+        sellerId,
+        amount,
+        commissionDeducted,
+        netAmount,
+        status,
+        status,
+        body.payout_reference || null,
+        notes,
+        status === 'SETTLED' ? Number((req.user && req.user.id) || 1) : null,
+        status === 'SETTLED' ? new Date() : null
+      ]
+    );
+    const [rows] = await pool.query('SELECT * FROM seller_payouts WHERE id = ? LIMIT 1', [ins.insertId]);
+    return res.status(201).json({
+      success: true,
+      ok: true,
+      status: 'success',
+      message: 'Seller payout record created successfully.',
+      payout: rows[0]
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: 'error', message: `Failed to create payout: ${err.message}` });
+  }
+};
+
+// Seller payout routes
+app.get(
+  [
+    '/api/seller/payouts',
+    '/api/sellers/payouts',
+    '/api/sellers/:seller_id/payouts',
+    '/api/seller/:seller_id/payouts',
+    '/api/seller/payout',
+    '/api/seller/earnings',
+    '/api/seller/wallet',
+    '/api/payouts'
+  ],
+  authenticateToken,
+  handleGetSellerPayouts
+);
+
+app.post(
+  [
+    '/api/seller/payouts/request',
+    '/api/seller/payouts',
+    '/api/seller/payout/request',
+    '/api/seller/withdraw',
+    '/api/seller/payouts/withdraw',
+    '/api/sellers/:seller_id/payouts/request'
+  ],
+  authenticateToken,
+  requireActiveSellerForMutation,
+  handleSellerRequestPayout
+);
+
+// Admin payout management routes
+app.get(['/api/admin/payouts', '/api/admin/seller-payouts', '/api/payouts/admin'], authenticateToken, requireAdminRole, handleAdminListPayouts);
+app.post(['/api/admin/payouts/create', '/api/admin/payouts'], authenticateToken, requireAdminRole, handleAdminCreateManualPayout);
+app.post(['/api/admin/payouts/settle-seller', '/api/admin/sellers/:seller_id/settle-payout'], authenticateToken, requireAdminRole, handleAdminSettleSellerBatch);
+app.post(['/api/admin/payouts/:id/settle', '/api/admin/payouts/:id/process', '/api/admin/payouts/:id/approve', '/api/admin/payouts/:id/pay', '/api/admin/seller-payouts/:id/settle'], authenticateToken, requireAdminRole, handleAdminSettlePayout);
+app.post(['/api/admin/payouts/:id/reject', '/api/admin/payouts/:id/hold', '/api/admin/payouts/:id/fail'], authenticateToken, requireAdminRole, handleAdminRejectOrHoldPayout);
 
 app.all(['/api/marketplace/commission-preview', '/api/commission-preview'], optionalAuthForNotifs, (req, res) => {
   const body = req.body || {};
