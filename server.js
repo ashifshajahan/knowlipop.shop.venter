@@ -6193,6 +6193,174 @@ app.put('/api/products', authenticateToken, requireActiveSellerForMutation, uplo
 app.patch('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
 app.delete('/api/products', authenticateToken, requireActiveSellerForMutation, upload.any(), handleProductsCollectionCategoryMutation);
 
+// ==========================================
+// 3a. Dedicated Categories REST API Endpoints
+// (GET, POST, PUT, PATCH, DELETE for Mobile & Web)
+// ==========================================
+
+const handleGetCategoriesList = async (req, res) => {
+  const query = req.query || {};
+  const search = String(query.search || query.q || '').trim();
+  const includeInactive = ['1', 'true', 'yes'].includes(String(query.include_inactive || query.include_inactive_categories || '').toLowerCase());
+  const sort = String(query.sort || 'sort_order').trim().toLowerCase();
+
+  try {
+    const list = await getCategoriesListWithCounts(pool, includeInactive, search);
+
+    if (sort === 'name') {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+    } else if (sort === 'products_count' || sort === 'count') {
+      list.sort((a, b) => Number(b.products_count || 0) - Number(a.products_count || 0));
+    } else if (sort === 'id') {
+      list.sort((a, b) => Number(a.id) - Number(b.id));
+    } else {
+      list.sort((a, b) => (Number(a.sort_order || 0) - Number(b.sort_order || 0)) || (Number(a.id) - Number(b.id)));
+    }
+
+    return res.json({
+      success: true,
+      status: true,
+      total: list.length,
+      count: list.length,
+      categories: list,
+      data: list
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: false, error: err.message });
+  }
+};
+
+const handleGetCategoryDetail = async (req, res) => {
+  const param = String(req.params.id || '').trim();
+  if (!param) {
+    return res.status(422).json({ success: false, status: false, message: 'Category ID or slug is required.' });
+  }
+
+  try {
+    const cat = await findCategoryByIdOrSlug(pool, param);
+    if (!cat) {
+      return res.status(404).json({ success: false, status: false, message: 'Category not found.' });
+    }
+
+    const catId = Number(cat.id);
+    let prodCount = 0;
+    let productsPreview = [];
+    if (pool) {
+      const [[cntRow]] = await pool.query(
+        'SELECT COUNT(*) as cnt FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?))',
+        [catId, cat.name]
+      ).catch(() => [[{ cnt: 0 }]]);
+      prodCount = Number(cntRow && cntRow.cnt ? cntRow.cnt : 0);
+
+      const [previewRows] = await pool.query(
+        'SELECT id, name, price, seller_price, mrp, stock, image_url FROM products WHERE is_active = 1 AND (category_id = ? OR LOWER(category) = LOWER(?)) LIMIT 6',
+        [catId, cat.name]
+      ).catch(() => [[]]);
+      productsPreview = previewRows || [];
+    } else {
+      const fbMatches = fallbackProducts.filter(p => Number(p.is_active !== false) === 1 && (Number(p.category_id) === catId || String(p.category || '').toLowerCase() === cat.name.toLowerCase()));
+      prodCount = fbMatches.length;
+      productsPreview = fbMatches.slice(0, 6);
+    }
+
+    const formatted = formatCategoryRecord(cat, prodCount);
+    return res.json({
+      success: true,
+      status: true,
+      category: formatted,
+      data: formatted,
+      products_count: prodCount,
+      products_preview: productsPreview
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: false, error: err.message });
+  }
+};
+
+const handleGetCategoryProducts = async (req, res) => {
+  const param = String(req.params.id || '').trim();
+  if (!param) {
+    return res.status(422).json({ success: false, status: false, message: 'Category ID or slug is required.' });
+  }
+
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || req.query.per_page || '20', 10)));
+  const offset = (page - 1) * limit;
+
+  try {
+    const cat = await findCategoryByIdOrSlug(pool, param);
+    if (!cat) {
+      return res.status(404).json({ success: false, status: false, message: 'Category not found.' });
+    }
+
+    const catId = Number(cat.id);
+    let total = 0;
+    let products = [];
+
+    if (pool) {
+      const [[cntRow]] = await pool.query(
+        'SELECT COUNT(*) as cnt FROM products p LEFT JOIN users u ON u.id = p.seller_id WHERE p.is_active = 1 AND COALESCE(u.account_status, "ACTIVE") NOT IN ("LOCKED", "DELETED") AND (p.category_id = ? OR LOWER(p.category) = LOWER(?))',
+        [catId, cat.name]
+      );
+      total = Number(cntRow && cntRow.cnt ? cntRow.cnt : 0);
+
+      const [rows] = await pool.query(
+        'SELECT p.*, COALESCE(u.seller_name, u.name) as seller_name FROM products p LEFT JOIN users u ON u.id = p.seller_id WHERE p.is_active = 1 AND COALESCE(u.account_status, "ACTIVE") NOT IN ("LOCKED", "DELETED") AND (p.category_id = ? OR LOWER(p.category) = LOWER(?)) ORDER BY p.id DESC LIMIT ? OFFSET ?',
+        [catId, cat.name, limit, offset]
+      );
+      products = (rows || []).map(r => formatProductRecord(r, false));
+    } else {
+      const fbMatches = fallbackProducts.filter(p => Number(p.is_active !== false) === 1 && (Number(p.category_id) === catId || String(p.category || '').toLowerCase() === cat.name.toLowerCase()));
+      total = fbMatches.length;
+      products = fbMatches.slice(offset, offset + limit).map(r => formatProductRecord(r, false));
+    }
+
+    return res.json({
+      success: true,
+      status: true,
+      category: formatCategoryRecord(cat, total),
+      products,
+      data: products,
+      pagination: {
+        total,
+        page,
+        per_page: limit,
+        limit,
+        last_page: Math.ceil(total / limit) || 1
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, status: false, error: err.message });
+  }
+};
+
+const handleCreateCategory = async (req, res) => {
+  const body = req.body || {};
+  const result = await performCategoryMutationNode(pool, 'create', body, true, null);
+  return res.status(result.statusCode).json(result.ok ? result.payload : result.errorBody);
+};
+
+const handleUpdateCategory = async (req, res) => {
+  const body = req.body || {};
+  body.target_category_id = req.params.id;
+  const result = await performCategoryMutationNode(pool, 'update', body, true, req.params.id);
+  return res.status(result.statusCode).json(result.ok ? result.payload : result.errorBody);
+};
+
+const handleDeleteCategory = async (req, res) => {
+  const body = { ...(req.body || {}), target_category_id: req.params.id };
+  const result = await performCategoryMutationNode(pool, 'delete', body, true, req.params.id);
+  return res.status(result.statusCode).json(result.ok ? result.payload : result.errorBody);
+};
+
+app.get(['/api/categories', '/api/category'], handleGetCategoriesList);
+app.get(['/api/categories/:id/products', '/api/category/:id/products'], handleGetCategoryProducts);
+app.get(['/api/categories/:id', '/api/category/:id'], handleGetCategoryDetail);
+app.post(['/api/categories', '/api/category'], optionalAuthForNotifs, upload.any(), handleCreateCategory);
+app.put(['/api/categories/:id', '/api/category/:id'], optionalAuthForNotifs, upload.any(), handleUpdateCategory);
+app.patch(['/api/categories/:id', '/api/category/:id'], optionalAuthForNotifs, upload.any(), handleUpdateCategory);
+app.delete(['/api/categories/:id', '/api/category/:id'], optionalAuthForNotifs, handleDeleteCategory);
+
 function parseBoolBitNode(val, defaultVal = 1) {
   if (val === undefined || val === null) return defaultVal;
   if (typeof val === 'boolean') return val ? 1 : 0;

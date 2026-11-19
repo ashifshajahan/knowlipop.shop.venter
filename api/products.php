@@ -3388,3 +3388,146 @@ function apiDeleteProduct(PDO $pdo, int $id): void
         'message' => 'Product deleted.'
     ]);
 }
+
+// ==========================================
+// Dedicated Category REST API Functions
+// ==========================================
+
+function apiGetCategoriesList(PDO $pdo): void
+{
+    $search = trim((string) ($_GET['search'] ?? ($_GET['q'] ?? '')));
+    $includeInactive = isset($_GET['include_inactive']) && in_array(strtolower((string) $_GET['include_inactive']), ['1', 'true', 'yes'], true);
+    $sort = strtolower(trim((string) ($_GET['sort'] ?? 'sort_order')));
+
+    $list = getCategoriesListPhp($pdo, $includeInactive, $search);
+
+    if ($sort === 'name') {
+        usort($list, fn($a, $b) => strcasecmp((string)$a['name'], (string)$b['name']));
+    } elseif ($sort === 'products_count' || $sort === 'count') {
+        usort($list, fn($a, $b) => (int)($b['products_count'] ?? 0) <=> (int)($a['products_count'] ?? 0));
+    } elseif ($sort === 'id') {
+        usort($list, fn($a, $b) => (int)($a['id'] ?? 0) <=> (int)($b['id'] ?? 0));
+    } else {
+        usort($list, function($a, $b) {
+            $cmp = (int)($a['sort_order'] ?? 0) <=> (int)($b['sort_order'] ?? 0);
+            return $cmp !== 0 ? $cmp : ((int)($a['id'] ?? 0) <=> (int)($b['id'] ?? 0));
+        });
+    }
+
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'total' => count($list),
+        'count' => count($list),
+        'categories' => $list,
+        'data' => $list
+    ]);
+}
+
+function apiGetCategoryDetail(PDO $pdo, mixed $idOrSlug): void
+{
+    ensureProductCategoriesTable($pdo);
+    $cat = findCategoryByIdOrSlugPhp($pdo, (string) $idOrSlug);
+    if (!$cat) {
+        errorResponse('Category not found.', [], 404);
+    }
+
+    $catId = (int) $cat['id'];
+    $cntStmt = $pdo->prepare("SELECT COUNT(*) FROM products WHERE is_active = 1 AND (category_id = :id OR LOWER(category) = LOWER(:name))");
+    $cntStmt->execute([':id' => $catId, ':name' => $cat['name']]);
+    $prodCount = (int) $cntStmt->fetchColumn();
+
+    $previewStmt = $pdo->prepare("SELECT id, name, price, seller_price, mrp, stock, image_url FROM products WHERE is_active = 1 AND (category_id = :id OR LOWER(category) = LOWER(:name)) LIMIT 6");
+    $previewStmt->execute([':id' => $catId, ':name' => $cat['name']]);
+    $previewRows = $previewStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $formatted = formatCategoryRecord($cat, $prodCount);
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'category' => $formatted,
+        'data' => $formatted,
+        'products_count' => $prodCount,
+        'products_preview' => $previewRows
+    ]);
+}
+
+function apiGetCategoryProducts(PDO $pdo, mixed $idOrSlug): void
+{
+    ensureProductCategoriesTable($pdo);
+    $cat = findCategoryByIdOrSlugPhp($pdo, (string) $idOrSlug);
+    if (!$cat) {
+        errorResponse('Category not found.', [], 404);
+    }
+
+    $catId = (int) $cat['id'];
+    $page = max(1, (int) ($_GET['page'] ?? 1));
+    $limit = min(100, max(1, (int) ($_GET['limit'] ?? ($_GET['per_page'] ?? 20))));
+    $offset = ($page - 1) * limit;
+
+    $cntStmt = $pdo->prepare("
+        SELECT COUNT(*) FROM products p
+        LEFT JOIN users u ON u.id = p.seller_id
+        WHERE p.is_active = 1
+          AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
+          AND (p.category_id = :id OR LOWER(p.category) = LOWER(:name))
+    ");
+    $cntStmt->execute([':id' => $catId, ':name' => $cat['name']]);
+    $total = (int) $cntStmt->fetchColumn();
+
+    $pStmt = $pdo->prepare("
+        SELECT p.*, COALESCE(u.seller_name, u.name) as seller_name
+        FROM products p
+        LEFT JOIN users u ON u.id = p.seller_id
+        WHERE p.is_active = 1
+          AND COALESCE(u.account_status, 'ACTIVE') NOT IN ('LOCKED', 'DELETED')
+          AND (p.category_id = :id OR LOWER(p.category) = LOWER(:name))
+        ORDER BY p.id DESC
+        LIMIT :lim OFFSET :off
+    ");
+    $pStmt->bindValue(':id', $catId, PDO::PARAM_INT);
+    $pStmt->bindValue(':name', $cat['name'], PDO::PARAM_STR);
+    $pStmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+    $pStmt->bindValue(':off', $offset, PDO::PARAM_INT);
+    $pStmt->execute();
+
+    $products = array_map(fn($row) => formatProductRecord($row, false), $pStmt->fetchAll(PDO::FETCH_ASSOC));
+
+    jsonResponse([
+        'success' => true,
+        'status' => true,
+        'category' => formatCategoryRecord($cat, $total),
+        'products' => $products,
+        'data' => $products,
+        'pagination' => [
+            'total' => $total,
+            'page' => $page,
+            'per_page' => $limit,
+            'limit' => $limit,
+            'last_page' => (int) ceil($total / $limit) ?: 1
+        ]
+    ]);
+}
+
+function apiCreateCategory(PDO $pdo): void
+{
+    $input = array_merge($_POST, getJsonInput());
+    $res = performCategoryMutationPhp($pdo, 'create', $input, true);
+    jsonResponse($res['payload'] ?? ['message' => 'Category created.'], $res['statusCode'] ?? 201);
+}
+
+function apiUpdateCategory(PDO $pdo, mixed $idOrSlug): void
+{
+    $input = array_merge($_POST, getJsonInput());
+    $input['target_category_id'] = $idOrSlug;
+    $res = performCategoryMutationPhp($pdo, 'update', $input, true, is_numeric($idOrSlug) ? (int)$idOrSlug : null);
+    jsonResponse($res['payload'] ?? ['message' => 'Category updated.'], $res['statusCode'] ?? 200);
+}
+
+function apiDeleteCategory(PDO $pdo, mixed $idOrSlug): void
+{
+    $input = array_merge($_POST, getJsonInput());
+    $input['target_category_id'] = $idOrSlug;
+    $res = performCategoryMutationPhp($pdo, 'delete', $input, true, is_numeric($idOrSlug) ? (int)$idOrSlug : null);
+    jsonResponse($res['payload'] ?? ['message' => 'Category deleted.'], $res['statusCode'] ?? 200);
+}

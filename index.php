@@ -334,6 +334,39 @@ if ($requestUri === '/api/reset-password' || $requestUri === '/api/auth/reset-pa
     apiResetPassword($pdo);
 }
 
+// ==========================================
+// Dedicated Categories REST API: /api/categories or /api/category
+// ==========================================
+if ($requestUri === '/api/categories' || $requestUri === '/api/category') {
+    if ($method === 'GET') {
+        apiGetCategoriesList($pdo);
+    } elseif ($method === 'POST') {
+        apiCreateCategory($pdo);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/(?:categories|category)/([^/]+)/products$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiGetCategoryProducts($pdo, $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
+if (preg_match('#^/api/(?:categories|category)/([^/]+)$#', $requestUri, $matches)) {
+    if ($method === 'GET') {
+        apiGetCategoryDetail($pdo, $matches[1]);
+    } elseif ($method === 'PUT' || $method === 'PATCH' || $method === 'POST') {
+        apiUpdateCategory($pdo, $matches[1]);
+    } elseif ($method === 'DELETE') {
+        apiDeleteCategory($pdo, $matches[1]);
+    } else {
+        errorResponse('Method Not Allowed', [], 405);
+    }
+}
+
 // Products Catalog, Categories & CRUD (All category listing, filtering & editing included inside Product API)
 if ($requestUri === '/api/products') {
     if ($method === 'GET') {
